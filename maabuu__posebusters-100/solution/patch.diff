@@ -1,0 +1,981 @@
+diff --git a/posebusters/cli.py b/posebusters/cli.py
+index d561ef5..7d47f41 100644
+--- a/posebusters/cli.py
++++ b/posebusters/cli.py
+@@ -7,14 +7,15 @@
+ import sys
+ from collections.abc import Iterable
+ from pathlib import Path
+-from typing import Any, TextIO
++from typing import Any, TextIO, cast
+ 
+ import pandas as pd
+ from rdkit.Chem.rdchem import Mol
+ from yaml import safe_load
+ 
+ from . import __version__
+-from .posebusters import PoseBusters
++from .diagnostics import create_diagnostic_output
++from .posebusters import DiagnosticResultTuple, PoseBusters, ResultTuple
+ from .tools.formatting import create_long_output, create_short_output
+ 
+ logger = logging.getLogger(__name__)
+@@ -53,7 +54,7 @@ def bust(  # noqa: PLR0913
+         mode = _select_mode(config, file_paths.columns.tolist())
+         posebusters = PoseBusters(mode, top_n=top_n, max_workers=max_workers, chunk_size=chunk_size)
+         posebusters.file_paths = file_paths
+-        posebusters_results = posebusters._run()
++        posebusters_results = posebusters._run(diagnose=outfmt == "diagnostic")
+     else:
+         # run on single input
+         d = {k for k, v in dict(mol_pred=mol_pred, mol_true=mol_true, mol_cond=mol_cond).items() if v}
+@@ -61,14 +62,23 @@ def bust(  # noqa: PLR0913
+         posebusters = PoseBusters(mode, top_n=top_n, max_workers=max_workers, chunk_size=chunk_size)
+         cols = ["mol_pred", "mol_true", "mol_cond"]
+         posebusters.file_paths = pd.DataFrame([[mol_pred, mol_true, mol_cond] for mol_pred in mol_pred], columns=cols)
+-        posebusters_results = posebusters._run()
++        posebusters_results = posebusters._run(diagnose=outfmt == "diagnostic")
+ 
+     if isinstance(output, Path):
+         output = open(Path(output), "w", encoding="utf-8")
+ 
+-    for i, (k, v) in enumerate(posebusters_results):
++    diagnostic_output = outfmt == "diagnostic"
++    for i, result in enumerate(posebusters_results):
++        if diagnostic_output:
++            k, v, diagnostics = cast(DiagnosticResultTuple, result)
++        else:
++            k, v = cast(ResultTuple, result)
++            diagnostics = []
++
+         results = posebusters._make_table({k: v}, posebusters.config, full_report=full_report)
+         output.write(_format_results(results, outfmt, no_header, i))
++        if diagnostic_output:
++            output.write(create_diagnostic_output(k, diagnostics))
+ 
+ 
+ def _parse_args(args: list[str]) -> argparse.Namespace:
+@@ -90,7 +100,9 @@ def _parse_args(args: list[str]) -> argparse.Namespace:
+     in_group.add_argument("-t", dest="table", type=_path, help=help)
+ 
+     # output options
+-    out_group.add_argument("--outfmt", choices=["short", "long", "csv"], default="short", help="output format")
++    out_group.add_argument(
++        "--outfmt", choices=["short", "long", "csv", "diagnostic"], default="short", help="output format"
++    )
+     out_group.add_argument("--output", type=Path, default=sys.stdout, help="output file (default: stdout)")
+     # out_group.add_argument("--snake_case", action="store_false", help="use snake case for output columns")
+     out_group.add_argument("--full-report", action="store_true", help="print details for each test")
+@@ -123,7 +135,7 @@ def _parse_args(args: list[str]) -> argparse.Namespace:
+         parser.exit(status=1, message="\nProvide either MOL_PRED or TABLE as input.\n")
+ 
+     # full report only works with long and csv output
+-    if namespace.full_report and namespace.outfmt == "short":
++    if namespace.full_report and namespace.outfmt in {"short", "diagnostic"}:
+         logger.warning("Option --full-report ignored. Please use --outfmt long or csv for --full-report.")
+         namespace.full_report = False
+     return namespace
+@@ -139,7 +151,7 @@ def _format_results(df: pd.DataFrame, outfmt: str = "short", no_header: bool = F
+         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+         return df.to_csv(index=True, header=header)
+ 
+-    if outfmt == "short":
++    if outfmt in {"short", "diagnostic"}:
+         return create_short_output(df)
+ 
+     raise ValueError(f"Unknown output format {outfmt}")
+diff --git a/posebusters/diagnostics.py b/posebusters/diagnostics.py
+new file mode 100644
+index 0000000..c150446
+--- /dev/null
++++ b/posebusters/diagnostics.py
+@@ -0,0 +1,410 @@
++"""Diagnostic reporting for failed PoseBusters checks."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any
++
++import pandas as pd
++from rdkit.Chem.rdchem import Mol
++
++from .modules.distance_geometry import col_bape, col_bpe, col_pe
++
++
++@dataclass(frozen=True)
++class AtomRef:
++    """Reference to an atom involved in a diagnostic."""
++
++    index: int
++    element: str
++    atom_name: str | None = None
++    residue_name: str | None = None
++    residue_number: int | None = None
++    chain_id: str | None = None
++    insertion_code: str | None = None
++
++
++@dataclass(frozen=True)
++class Diagnostic:
++    """Structured information explaining one failed check."""
++
++    module: str
++    check: str
++    kind: str
++    ligand_atoms: tuple[AtomRef, ...] = ()
++    condition_atoms: tuple[AtomRef, ...] = ()
++    metrics: dict[str, Any] = field(default_factory=dict)
++
++
++def diagnose_module(
++    module: dict[str, Any],
++    module_output: dict[str, Any],
++    molecules: dict[str, Any],
++) -> list[Diagnostic]:
++    """Create diagnostics for failed outputs from one PoseBusters module."""
++    results = module_output.get("results", {})
++    chosen_outputs = module.get("chosen_binary_test_output", [])
++
++    failed_outputs = [output for output in chosen_outputs if _is_failed(results.get(output))]
++    if not failed_outputs:
++        return []
++
++    failed_output_set = set(failed_outputs)
++
++    details = module_output.get("details")
++    function_name = module["function"]
++    diagnostics: list[Diagnostic] = []
++
++    if details is not None:
++        if function_name == "distance_geometry":
++            diagnostics.extend(
++                _diagnose_distance_geometry(
++                    module,
++                    details,
++                    failed_output_set,
++                    molecules["mol_pred"],
++                )
++            )
++        elif function_name == "flatness":
++            diagnostics.extend(
++                _diagnose_flatness(
++                    module,
++                    details,
++                    failed_output_set,
++                    molecules["mol_pred"],
++                )
++            )
++        elif function_name == "intermolecular_distance":
++            diagnostics.extend(
++                _diagnose_intermolecular_distance(
++                    module,
++                    details,
++                    failed_output_set,
++                    molecules["mol_pred"],
++                    molecules["mol_cond"],
++                )
++            )
++
++    diagnosed_checks = {diagnostic.check for diagnostic in diagnostics}
++
++    for output in failed_outputs:
++        check_name = _check_name(module, output)
++
++        if check_name in diagnosed_checks:
++            continue
++
++        diagnostics.append(
++            Diagnostic(
++                module=module["name"],
++                check=check_name,
++                kind="summary",
++            )
++        )
++
++    return diagnostics
++
++
++def create_diagnostic_output(key: tuple[str, str, int], diagnostics: list[Diagnostic]) -> str:
++    """Format diagnostics for one predicted pose as plain text."""
++    if not diagnostics:
++        return ""
++
++    file_name, molecule_name, position = key
++    header = f"Diagnostics for {file_name}"
++    if molecule_name:
++        header += f" | molecule: {molecule_name}"
++    header += f" | position: {position}"
++
++    lines = ["", header]
++    for diagnostic in diagnostics:
++        lines.extend(_format_diagnostic(diagnostic))
++    return "\n".join(lines) + "\n"
++
++
++def _diagnose_distance_geometry(
++    module: dict[str, Any],
++    details: dict[str, pd.DataFrame],
++    failed_outputs: set[str],
++    mol_pred: Mol,
++) -> list[Diagnostic]:
++    diagnostics: list[Diagnostic] = []
++    parameters = module.get("parameters", {})
++
++    if "bond_lengths_within_bounds" in failed_outputs:
++        threshold = parameters.get("threshold_bad_bond_length", 0.2)
++        bonds = details["bonds"]
++        failures = bonds[(bonds[col_pe] < -threshold) | (bonds[col_pe] > threshold)]
++        for _, row in failures.iterrows():
++            atom_ids = tuple(int(i) for i in row["atom_pair"])
++            diagnostics.append(
++                Diagnostic(
++                    module=module["name"],
++                    check=_check_name(module, "bond_lengths_within_bounds"),
++                    kind="bond_length",
++                    ligand_atoms=_ligand_atom_refs(mol_pred, atom_ids),
++                    metrics={
++                        "distance": float(row["distance"]),
++                        "lower_bound": float(row["lower_bound"]),
++                        "upper_bound": float(row["upper_bound"]),
++                        "percent_error": float(row[col_pe]),
++                        "threshold": float(threshold),
++                    },
++                )
++            )
++
++    if "bond_angles_within_bounds" in failed_outputs:
++        threshold = parameters.get("threshold_bad_angle", 0.2)
++        angles = details["angles"]
++        failures = angles[angles[col_bape] > threshold]
++        for _, row in failures.iterrows():
++            atom_ids = tuple(int(i) for i in row["angle"])
++            diagnostics.append(
++                Diagnostic(
++                    module=module["name"],
++                    check=_check_name(module, "bond_angles_within_bounds"),
++                    kind="bond_angle",
++                    ligand_atoms=_ligand_atom_refs(mol_pred, atom_ids),
++                    metrics={
++                        "distance_1_3": float(row["distance"]),
++                        "lower_bound": float(row["lower_bound"]),
++                        "upper_bound": float(row["upper_bound"]),
++                        "absolute_percent_error": float(row[col_bape]),
++                        "threshold": float(threshold),
++                    },
++                )
++            )
++
++    if "no_internal_clash" in failed_outputs:
++        threshold = parameters.get("threshold_clash", 0.2)
++        clashes = details["clash"]
++        failures = clashes[clashes[col_bpe] < -threshold]
++        for _, row in failures.iterrows():
++            atom_ids = tuple(int(i) for i in row["atom_pair"])
++            diagnostics.append(
++                Diagnostic(
++                    module=module["name"],
++                    check=_check_name(module, "no_internal_clash"),
++                    kind="internal_clash",
++                    ligand_atoms=_ligand_atom_refs(mol_pred, atom_ids),
++                    metrics={
++                        "distance": float(row["distance"]),
++                        "lower_bound": float(row["lower_bound"]),
++                        "percent_error": float(row[col_bpe]),
++                        "threshold": float(threshold),
++                    },
++                )
++            )
++
++    return diagnostics
++
++
++def _diagnose_flatness(
++    module: dict[str, Any],
++    details: dict[str, Any],
++    failed_outputs: set[str],
++    mol_pred: Mol,
++) -> list[Diagnostic]:
++    if "flatness_passes" not in failed_outputs:
++        return []
++
++    parameters = module.get("parameters", {})
++    threshold = float(parameters.get("threshold_flatness", 0.1))
++    check_nonflat = bool(parameters.get("check_nonflat", False))
++    diagnostics: list[Diagnostic] = []
++    seen_groups: set[tuple[int, ...]] = set()
++
++    for system_type, atom_group, max_distance, passes in zip(
++        details["type"],
++        details["planar_group"],
++        details["max_distance"],
++        details["flatness_passes"],
++    ):
++        if passes:
++            continue
++        atom_ids = tuple(int(i) for i in atom_group)
++        canonical_group = tuple(sorted(atom_ids))
++        if canonical_group in seen_groups:
++            continue
++        seen_groups.add(canonical_group)
++        diagnostics.append(
++            Diagnostic(
++                module=module["name"],
++                check=_check_name(module, "flatness_passes"),
++                kind="nonflatness" if check_nonflat else "flatness",
++                ligand_atoms=_ligand_atom_refs(mol_pred, atom_ids),
++                metrics={
++                    "system_type": str(system_type),
++                    "max_distance": float(max_distance),
++                    "threshold": threshold,
++                },
++            )
++        )
++
++    return diagnostics
++
++
++def _diagnose_intermolecular_distance(
++    module: dict[str, Any],
++    details: pd.DataFrame,
++    failed_outputs: set[str],
++    mol_pred: Mol,
++    mol_cond: Mol,
++) -> list[Diagnostic]:
++    diagnostics: list[Diagnostic] = []
++    parameters = module.get("parameters", {})
++
++    if "not_too_far_away" in failed_outputs:
++        metrics = {
++            "max_distance": float(parameters.get("max_distance", 5.0)),
++            "search_distance": float(parameters.get("search_distance", 6.0)),
++        }
++        ligand_atoms: tuple[AtomRef, ...] = ()
++        condition_atoms: tuple[AtomRef, ...] = ()
++        if not details.empty:
++            row = details.loc[details["distance"].idxmin()]
++            ligand_idx = int(row["ligand_atom_id"])
++            condition_idx = int(row["protein_atom_id"])
++            ligand_atoms = _ligand_atom_refs(mol_pred, (ligand_idx,))
++            condition_atoms = (_condition_atom_ref(mol_cond, condition_idx),)
++            metrics["distance"] = float(row["distance"])
++
++        diagnostics.append(
++            Diagnostic(
++                module=module["name"],
++                check=_check_name(module, "not_too_far_away"),
++                kind="intermolecular_max_distance",
++                ligand_atoms=ligand_atoms,
++                condition_atoms=condition_atoms,
++                metrics=metrics,
++            )
++        )
++
++    if "no_clashes" in failed_outputs:
++        failures = details[details["clash"]]
++        for _, row in failures.iterrows():
++            ligand_idx = int(row["ligand_atom_id"])
++            condition_idx = int(row["protein_atom_id"])
++            diagnostics.append(
++                Diagnostic(
++                    module=module["name"],
++                    check=_check_name(module, "no_clashes"),
++                    kind="intermolecular_clash",
++                    ligand_atoms=_ligand_atom_refs(mol_pred, (ligand_idx,)),
++                    condition_atoms=(_condition_atom_ref(mol_cond, condition_idx),),
++                    metrics={
++                        "distance": float(row["distance"]),
++                        "sum_radii": float(row["sum_radii"]),
++                        "sum_radii_scaled": float(row["sum_radii_scaled"]),
++                        "relative_distance": float(row["relative_distance"]),
++                        "clash_cutoff": float(parameters.get("clash_cutoff", 0.75)),
++                    },
++                )
++            )
++
++    return diagnostics
++
++
++def _check_name(module: dict[str, Any], output: str) -> str:
++    return str(module.get("rename_outputs", {}).get(output, output))
++
++
++def _is_failed(value: Any) -> bool:
++    if value is None:
++        return False
++    try:
++        if bool(pd.isna(value)):
++            return False
++    except (TypeError, ValueError):
++        pass
++    return not bool(value)
++
++
++def _ligand_atom_refs(mol: Mol, atom_ids: tuple[int, ...]) -> tuple[AtomRef, ...]:
++    return tuple(AtomRef(index=i, element=mol.GetAtomWithIdx(i).GetSymbol()) for i in atom_ids)
++
++
++def _condition_atom_ref(mol: Mol, atom_id: int) -> AtomRef:
++    atom = mol.GetAtomWithIdx(atom_id)
++    info = atom.GetPDBResidueInfo()
++    if info is None:
++        return AtomRef(index=atom_id, element=atom.GetSymbol())
++
++    return AtomRef(
++        index=atom_id,
++        element=atom.GetSymbol(),
++        atom_name=info.GetName().strip() or None,
++        residue_name=info.GetResidueName().strip() or None,
++        residue_number=info.GetResidueNumber(),
++        chain_id=info.GetChainId().strip() or None,
++        insertion_code=info.GetInsertionCode().strip() or None,
++    )
++
++
++def _format_diagnostic(diagnostic: Diagnostic) -> list[str]:
++    lines = [f"  {diagnostic.check}:"]
++    ligand_atoms = _format_atoms(diagnostic.ligand_atoms)
++    condition_atoms = _format_atoms(diagnostic.condition_atoms)
++    metrics = diagnostic.metrics
++
++    if ligand_atoms:
++        lines.append(f"    ligand atoms (RDKit indices): {ligand_atoms}")
++    if condition_atoms:
++        lines.append(f"    conditioning atom: {condition_atoms}")
++
++    if diagnostic.kind == "bond_length":
++        lines.append(f"    distance: {metrics['distance']:.3f} Å")
++        lines.append(f"    DG bounds: {metrics['lower_bound']:.3f}-{metrics['upper_bound']:.3f} Å")
++        lines.append(f"    deviation: {100 * metrics['percent_error']:.1f}%")
++        lines.append(f"    allowed deviation: {100 * metrics['threshold']:.1f}%")
++    elif diagnostic.kind == "bond_angle":
++        lines.append(f"    1,3 distance: {metrics['distance_1_3']:.3f} Å")
++        lines.append(f"    DG bounds: {metrics['lower_bound']:.3f}-{metrics['upper_bound']:.3f} Å")
++        lines.append(f"    deviation beyond bounds: {100 * metrics['absolute_percent_error']:.1f}%")
++        lines.append(f"    allowed deviation: {100 * metrics['threshold']:.1f}%")
++    elif diagnostic.kind == "internal_clash":
++        lines.append(f"    distance: {metrics['distance']:.3f} Å")
++        lines.append(f"    DG lower bound: {metrics['lower_bound']:.3f} Å")
++        lines.append(f"    deviation below bound: {100 * metrics['percent_error']:.1f}%")
++        lines.append(f"    allowed deviation: {100 * metrics['threshold']:.1f}%")
++    elif diagnostic.kind in {"flatness", "nonflatness"}:
++        lines.append(f"    matched system: {metrics['system_type']}")
++        lines.append(f"    maximum distance from plane: {metrics['max_distance']:.3f} Å")
++        relation = "minimum required" if diagnostic.kind == "nonflatness" else "maximum allowed"
++        lines.append(f"    {relation}: {metrics['threshold']:.3f} Å")
++    elif diagnostic.kind == "intermolecular_clash":
++        lines.append(f"    distance: {metrics['distance']:.3f} Å")
++        lines.append(f"    sum of radii: {metrics['sum_radii']:.3f} Å")
++        lines.append(f"    scaled sum of radii: {metrics['sum_radii_scaled']:.3f} Å")
++        lines.append(f"    relative distance: {metrics['relative_distance']:.3f}")
++        lines.append(f"    minimum allowed relative distance: {metrics['clash_cutoff']:.3f}")
++    elif diagnostic.kind == "intermolecular_max_distance":
++        if "distance" in metrics:
++            lines.append(f"    nearest retained distance: {metrics['distance']:.3f} Å")
++        else:
++            lines.append(f"    no conditioning atom found within search distance: {metrics['search_distance']:.3f} Å")
++        lines.append(f"    maximum allowed distance: {metrics['max_distance']:.3f} Å")
++    elif diagnostic.kind == "summary":
++        lines.append("    failed (no additional diagnostic details)")
++
++    return lines
++
++
++def _format_atoms(atoms: tuple[AtomRef, ...]) -> str:
++    return ", ".join(_format_atom(atom) for atom in atoms)
++
++
++def _format_atom(atom: AtomRef) -> str:
++    label = f"{atom.index} ({atom.element})"
++    if atom.residue_name is None:
++        return label
++
++    residue = atom.residue_name
++    if atom.chain_id:
++        residue += f" {atom.chain_id}"
++    if atom.residue_number is not None:
++        residue += f":{atom.residue_number}"
++    if atom.insertion_code:
++        residue += atom.insertion_code
++    if atom.atom_name:
++        residue += f" {atom.atom_name}"
++    return f"{label}; {residue}"
+diff --git a/posebusters/posebusters.py b/posebusters/posebusters.py
+index 5c0d3f6..14a18e1 100644
+--- a/posebusters/posebusters.py
++++ b/posebusters/posebusters.py
+@@ -10,12 +10,13 @@
+ from functools import partial
+ from math import ceil
+ from pathlib import Path
+-from typing import Any
++from typing import Any, cast
+ 
+ import pandas as pd
+ from rdkit.Chem.rdchem import Mol
+ from yaml import safe_load
+ 
++from .diagnostics import Diagnostic, diagnose_module
+ from .modules.distance_geometry import check_geometry
+ from .modules.energy_ratio import check_energy_ratio
+ from .modules.flatness import check_flatness
+@@ -58,6 +59,7 @@
+ ResultKey = tuple[str, str, int]
+ ResultList = list[tuple[str, str, Any]]
+ ResultTuple = tuple[ResultKey, ResultList]
++DiagnosticResultTuple = tuple[ResultKey, ResultList, list[Diagnostic]]
+ ResultDict = dict[ResultKey, ResultList]
+ 
+ 
+@@ -170,13 +172,18 @@ def bust_table(self, mol_table: pd.DataFrame, full_report: bool = False) -> pd.D
+         results = self._collect_in_table(generator, full_report=full_report)
+         return results
+ 
+-    def _run(self) -> Generator[ResultTuple]:
++    def _run(self, diagnose: bool = False) -> Generator[ResultTuple | DiagnosticResultTuple]:
+         """Run all tests on molecules provided in file paths.
+ 
+         Yields:
+             Generator of result dictionaries.
+         """
+         self._initialize_modules()
++        # Run diagnostics sequentially to preserve stable pose indices for multi-pose SDF files.
++        if diagnose:
++            yield from self._run_single_thread(diagnose=True)
++            return
++
+         max_workers = self.config.get("max_workers", None)
+         chunk_size = self.config.get("chunk_size", 100)
+         if max_workers is not None and max_workers <= 0:
+@@ -186,9 +193,9 @@ def _run(self) -> Generator[ResultTuple]:
+         else:
+             yield from self._run_parallel_over_poses(max_workers=max_workers, chunk_size=chunk_size)
+ 
+-    def _run_single_thread(self) -> Generator[ResultTuple]:
++    def _run_single_thread(self, diagnose: bool = False) -> Generator[ResultTuple | DiagnosticResultTuple]:
+         for _, paths in self.file_paths.iterrows():
+-            yield from self._run_multiple_poses(paths)
++            yield from self._run_multiple_poses(paths, diagnose=diagnose)
+ 
+     def _run_parallel_over_files(
+         self, timeout: int | None = None, max_workers: int | None = None
+@@ -233,9 +240,11 @@ def _run_parallel_over_poses(
+ 
+     def _run_and_combine(self, paths: pd.Series, indices: Iterable[int] | None = None) -> list[ResultTuple]:
+         """Run and collect all tests for all poses in the prediction file."""
+-        return list(self._run_multiple_poses(paths, indices=indices))
++        return cast(list[ResultTuple], list(self._run_multiple_poses(paths, indices=indices)))
+ 
+-    def _run_multiple_poses(self, paths: pd.Series, indices: Iterable[int] | None = None) -> Generator[ResultTuple]:
++    def _run_multiple_poses(
++        self, paths: pd.Series, indices: Iterable[int] | None = None, diagnose: bool = False
++    ) -> Generator[ResultTuple | DiagnosticResultTuple]:
+         """Run all tests on indexed poses in the prediction file.
+ 
+         Args:
+@@ -261,14 +270,29 @@ def _run_multiple_poses(self, paths: pd.Series, indices: Iterable[int] | None =
+             mol_args["mol_pred"] = mol_pred
+ 
+             key: ResultKey = (str(paths["mol_pred"]), self._get_name(mol_pred), i)
+-            results: ResultList = self._run_one_pose(mol_args)
+-
+-            yield key, results
++            if diagnose:
++                results, diagnostics = self._run_one_pose_with_diagnostics(mol_args)
++                yield key, results, diagnostics
++            else:
++                results = self._run_one_pose(mol_args)
++                yield key, results
+ 
+     def _run_one_pose(self, molecules: dict[str, Any]) -> ResultList:
+         """Run all tests on a single pose."""
++        results, _ = self._execute_one_pose(molecules, diagnose=False)
++        return results
++
++    def _run_one_pose_with_diagnostics(self, molecules: dict[str, Any]) -> tuple[ResultList, list[Diagnostic]]:
++        """Run all tests on a single pose and retain supported failure diagnostics."""
++        return self._execute_one_pose(molecules, diagnose=True)
++
++    def _execute_one_pose(self, molecules: dict[str, Any], diagnose: bool) -> tuple[ResultList, list[Diagnostic]]:
++        """Run all tests on a single pose and optionally collect diagnostics."""
+         results = []
+-        for name, fname, func, args in zip(self.module_name, self.fname, self.module_func, self.module_args):
++        diagnostics: list[Diagnostic] = []
++        for module, name, fname, func, args in zip(
++            self.config["modules"], self.module_name, self.fname, self.module_func, self.module_args
++        ):
+             # pick needed arguments for module
+             args_needed = {k: v for k, v in molecules.items() if k in args}
+ 
+@@ -284,9 +308,10 @@ def _run_one_pose(self, molecules: dict[str, Any]) -> ResultList:
+ 
+             # save to object
+             results.extend([(name, k, v) for k, v in module_output["results"].items()])
+-            # self.results[results_key]["details"].append(module_output["details"])
++            if diagnose:
++                diagnostics.extend(diagnose_module(module, module_output, molecules))
+ 
+-        return results
++        return results, diagnostics
+ 
+     def _initialize_modules(self) -> None:
+         self.module_name = []
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index b28dd8d..8bac3ab 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -34,6 +34,9 @@ def test_parse_args() -> None:
+     assert not args.full_report
+     assert args.outfmt == "long"
+ 
++    args = _parse_args([mol_pred_1ia1, "--outfmt", "diagnostic"])
++    assert args.outfmt == "diagnostic"
++
+ 
+ def test_bust_mols() -> None:
+     bust([Path(mol_pred_1ia1)], Path(mol_true_1ia1), Path(mol_cond_1ia1))
+diff --git a/tests/test_diagnostics.py b/tests/test_diagnostics.py
+new file mode 100644
+index 0000000..5c45c44
+--- /dev/null
++++ b/tests/test_diagnostics.py
+@@ -0,0 +1,339 @@
++from __future__ import annotations
++
++from io import StringIO
++from pathlib import Path
++from typing import Any, cast
++
++import pandas as pd
++import pytest
++from rdkit.Chem import Conformer, MolFromPDBBlock, MolFromSmiles, SDWriter
++
++from posebusters.cli import bust
++from posebusters.diagnostics import create_diagnostic_output, diagnose_module
++from posebusters.modules.distance_geometry import check_geometry
++from posebusters.modules.flatness import check_flatness, nonflat
++from posebusters.modules.intermolecular_distance import check_intermolecular_distance
++from posebusters.posebusters import DiagnosticResultTuple, PoseBusters, ResultTuple
++
++GEOMETRY_MODULE: dict[str, Any] = {
++    "name": "Geometry",
++    "function": "distance_geometry",
++    "parameters": {
++        "threshold_bad_bond_length": 0.25,
++        "threshold_bad_angle": 0.25,
++        "threshold_clash": 0.3,
++    },
++    "chosen_binary_test_output": [
++        "bond_lengths_within_bounds",
++        "bond_angles_within_bounds",
++        "no_internal_clash",
++    ],
++    "rename_outputs": {
++        "bond_lengths_within_bounds": "Bond lengths",
++        "bond_angles_within_bounds": "Bond angles",
++        "no_internal_clash": "Internal steric clash",
++    },
++}
++
++NONFLAT_MODULE: dict[str, Any] = {
++    "name": "Ring non-flatness",
++    "function": "flatness",
++    "parameters": {
++        "flat_systems": nonflat,
++        "check_nonflat": True,
++        "threshold_flatness": 0.05,
++    },
++    "chosen_binary_test_output": ["flatness_passes"],
++    "rename_outputs": {"flatness_passes": "Non-aromatic ring non-flatness"},
++}
++
++INTERMOLECULAR_MODULE: dict[str, Any] = {
++    "name": "Distance to protein",
++    "function": "intermolecular_distance",
++    "parameters": {
++        "radius_type": "vdw",
++        "radius_scale": 1.0,
++        "clash_cutoff": 0.75,
++        "ignore_types": {"hydrogens", "organic_cofactors", "inorganic_cofactors", "waters"},
++        "max_distance": 5.0,
++    },
++    "chosen_binary_test_output": ["not_too_far_away", "no_clashes"],
++    "rename_outputs": {
++        "not_too_far_away": "Protein-ligand maximum distance",
++        "no_clashes": "Minimum distance to protein",
++    },
++}
++
++
++def test_diagnose_geometry_uses_existing_failure_metrics(mol_pred_6yr2_t1c):
++    out = check_geometry(
++        mol_pred_6yr2_t1c,
++        threshold_bad_bond_length=0.25,
++        threshold_bad_angle=0.25,
++        threshold_clash=0.3,
++    )
++    assert out["results"]["bond_lengths_within_bounds"] is False
++    assert out["results"]["no_internal_clash"] is False
++
++    diagnostics = diagnose_module(GEOMETRY_MODULE, out, {"mol_pred": mol_pred_6yr2_t1c})
++
++    bond_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "bond_length"]
++    clash_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "internal_clash"]
++
++    assert len(bond_diagnostics) == 2
++    assert tuple(atom.index for atom in bond_diagnostics[0].ligand_atoms) == (1, 3)
++    bond_row = out["details"]["bonds"][
++        out["details"]["bonds"]["atom_pair"].apply(lambda atoms: tuple(atoms) == (1, 3))
++    ].iloc[0]
++    assert bond_diagnostics[0].metrics["distance"] == pytest.approx(float(bond_row["distance"]))
++    assert bond_diagnostics[0].metrics["upper_bound"] == pytest.approx(float(bond_row["upper_bound"]))
++    assert bond_diagnostics[0].metrics["percent_error"] == pytest.approx(float(bond_row["percent_error"]))
++
++    assert len(clash_diagnostics) == out["results"]["number_clashes"]
++    assert tuple(atom.index for atom in clash_diagnostics[0].ligand_atoms) == (1, 5)
++    clash_row = out["details"]["clash"][
++        out["details"]["clash"]["atom_pair"].apply(lambda atoms: tuple(atoms) == (1, 5))
++    ].iloc[0]
++    assert clash_diagnostics[0].metrics["distance"] == pytest.approx(float(clash_row["distance"]))
++    assert clash_diagnostics[0].metrics["lower_bound"] == pytest.approx(float(clash_row["lower_bound"]))
++
++    summary_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "summary"]
++
++    assert not any(diagnostic.check == "Bond lengths" for diagnostic in summary_diagnostics)
++    assert not any(diagnostic.check == "Internal steric clash" for diagnostic in summary_diagnostics)
++
++
++def test_diagnose_angle_reports_atom_triple_and_dg_distance():
++    molecule = MolFromSmiles("CCC")
++    assert molecule is not None
++    conformer = Conformer(molecule.GetNumAtoms())
++    conformer.SetAtomPosition(0, (0.0, 0.0, 0.0))
++    conformer.SetAtomPosition(1, (1.54, 0.0, 0.0))
++    conformer.SetAtomPosition(2, (0.77, 1.3337, 0.0))
++    molecule.AddConformer(conformer)
++
++    out = check_geometry(
++        molecule,
++        threshold_bad_bond_length=0.25,
++        threshold_bad_angle=0.25,
++        threshold_clash=0.3,
++    )
++    assert out["results"]["bond_angles_within_bounds"] is False
++
++    diagnostics = diagnose_module(GEOMETRY_MODULE, out, {"mol_pred": molecule})
++    angle_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "bond_angle"]
++
++    assert len(angle_diagnostics) == 1
++    diagnostic = angle_diagnostics[0]
++    assert tuple(atom.index for atom in diagnostic.ligand_atoms) == (0, 1, 2)
++    angle_row = out["details"]["angles"][
++        out["details"]["angles"]["angle"].apply(lambda atoms: tuple(atoms) == (0, 1, 2))
++    ].iloc[0]
++    assert diagnostic.metrics["distance_1_3"] == pytest.approx(float(angle_row["distance"]))
++    assert diagnostic.metrics["lower_bound"] == pytest.approx(float(angle_row["lower_bound"]))
++    assert diagnostic.metrics["absolute_percent_error"] == pytest.approx(
++        float(angle_row["bound_absolute_percent_error"])
++    )
++
++
++def test_diagnose_flatness_reports_failed_atom_group(mol_pip_wrong):
++    out = check_flatness(mol_pip_wrong, flat_systems=nonflat, check_nonflat=True, threshold_flatness=0.05)
++    assert out["results"]["flatness_passes"] is False
++
++    diagnostics = diagnose_module(NONFLAT_MODULE, out, {"mol_pred": mol_pip_wrong})
++
++    # Several SMARTS patterns match this same ring; diagnostic output de-duplicates the atom group.
++    assert len(diagnostics) == 1
++    diagnostic = diagnostics[0]
++    assert diagnostic.kind == "nonflatness"
++    assert {atom.index for atom in diagnostic.ligand_atoms} == {0, 1, 2, 3, 4, 5}
++    assert diagnostic.metrics["max_distance"] == pytest.approx(0.0027241122)
++    assert diagnostic.metrics["threshold"] == 0.05
++
++
++def test_diagnose_intermolecular_clash_reports_residue():
++    ligand = MolFromSmiles("C")
++    assert ligand is not None
++    ligand_conf = Conformer(ligand.GetNumAtoms())
++    ligand_conf.SetAtomPosition(0, (1.0, 0.0, 0.0))
++    ligand.AddConformer(ligand_conf)
++
++    protein = MolFromPDBBlock(
++        "ATOM      1  CA  ALA A  10       0.000   0.000   0.000  1.00 20.00           C  \nEND\n",
++        sanitize=False,
++        removeHs=False,
++        proximityBonding=False,
++    )
++    assert protein is not None
++
++    parameters = INTERMOLECULAR_MODULE["parameters"]
++    out = check_intermolecular_distance(ligand, protein, **parameters)
++    assert out["results"]["no_clashes"] is False
++
++    diagnostics = diagnose_module(INTERMOLECULAR_MODULE, out, {"mol_pred": ligand, "mol_cond": protein})
++    clash_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "intermolecular_clash"]
++
++    assert len(clash_diagnostics) == 1
++    diagnostic = clash_diagnostics[0]
++    assert diagnostic.ligand_atoms[0].index == 0
++    assert diagnostic.condition_atoms[0].index == 0
++    assert diagnostic.condition_atoms[0].atom_name == "CA"
++    assert diagnostic.condition_atoms[0].residue_name == "ALA"
++    assert diagnostic.condition_atoms[0].residue_number == 10
++    assert diagnostic.condition_atoms[0].chain_id == "A"
++    assert diagnostic.metrics["distance"] == pytest.approx(1.0)
++    assert diagnostic.metrics["relative_distance"] < 0.75
++
++
++def test_create_diagnostic_output_contains_atom_ids_and_metrics(mol_pip_wrong):
++    out = check_flatness(mol_pip_wrong, flat_systems=nonflat, check_nonflat=True, threshold_flatness=0.05)
++    diagnostics = diagnose_module(NONFLAT_MODULE, out, {"mol_pred": mol_pip_wrong})
++
++    text = create_diagnostic_output(("ligand.sdf", "PIP", 3), diagnostics)
++
++    assert "Diagnostics for ligand.sdf | molecule: PIP | position: 3" in text
++    assert "Non-aromatic ring non-flatness" in text
++    assert "ligand atoms (RDKit indices)" in text
++    assert "maximum distance from plane: 0.003 Å" in text
++    assert "minimum required: 0.050 Å" in text
++
++
++def test_cli_diagnose_multi_sdf(tmp_path, mol_pip_ideal, mol_pip_wrong):
++    sdf_path = tmp_path / "poses.sdf"
++    mol_pip_ideal.SetProp("_Name", "good_pose")
++    mol_pip_wrong.SetProp("_Name", "bad_pose")
++    with SDWriter(str(sdf_path)) as writer:
++        writer.write(mol_pip_ideal)
++        writer.write(mol_pip_wrong)
++
++    output = StringIO()
++    bust(
++        [Path(sdf_path)],
++        config=Path("posebusters/config/mol_fast.yml"),
++        outfmt="diagnostic",
++        output=output,
++    )
++    text = output.getvalue()
++
++    assert "good_pose" in text
++    assert "bad_pose" in text
++    assert f"Diagnostics for {sdf_path} | molecule: bad_pose | position: 1" in text
++    assert "Non-aromatic ring non-flatness" in text
++    assert f"Diagnostics for {sdf_path} | molecule: good_pose | position: 0" not in text
++
++
++def test_diagnose_mode_preserves_standard_results(mol_pip_wrong):
++    buster = PoseBusters("mol_fast")
++    buster.file_paths = pd.DataFrame([[mol_pip_wrong, None, None]], columns=["mol_pred", "mol_true", "mol_cond"])
++    normal = list(buster._run())
++
++    buster.file_paths = pd.DataFrame([[mol_pip_wrong, None, None]], columns=["mol_pred", "mol_true", "mol_cond"])
++    diagnosed = list(buster._run(diagnose=True))
++
++    assert len(normal) == len(diagnosed) == 1
++    normal_key, normal_results = cast(ResultTuple, normal[0])
++    diagnosed_key, diagnosed_results, diagnostics = cast(DiagnosticResultTuple, diagnosed[0])
++    assert diagnosed_key == normal_key
++    assert diagnosed_results == normal_results
++    assert diagnostics
++
++
++def test_diagnose_reports_failed_check_without_details():
++    module = {
++        "name": "Energy ratio",
++        "function": "energy_ratio",
++        "chosen_binary_test_output": ["energy_ratio_passes"],
++        "rename_outputs": {
++            "energy_ratio_passes": "Internal energy",
++        },
++    }
++
++    module_output = {
++        "results": {
++            "energy_ratio_passes": False,
++        }
++    }
++
++    diagnostics = diagnose_module(
++        module,
++        module_output,
++        {},
++    )
++
++    assert len(diagnostics) == 1
++
++    diagnostic = diagnostics[0]
++    assert diagnostic.module == "Energy ratio"
++    assert diagnostic.check == "Internal energy"
++    assert diagnostic.kind == "summary"
++    assert diagnostic.ligand_atoms == ()
++    assert diagnostic.condition_atoms == ()
++    assert diagnostic.metrics == {}
++
++    text = create_diagnostic_output(
++        ("ligand.sdf", "test_ligand", 0),
++        diagnostics,
++    )
++
++    assert "Internal energy:" in text
++    assert "failed (no additional diagnostic details)" in text
++
++
++def test_diagnose_reports_summary_alongside_detailed_diagnostic(
++    mol_pred_6yr2_t1c,
++):
++    out = check_geometry(
++        mol_pred_6yr2_t1c,
++        threshold_bad_bond_length=0.25,
++        threshold_bad_angle=0.25,
++        threshold_clash=0.3,
++    )
++
++    module = {
++        **GEOMETRY_MODULE,
++        "chosen_binary_test_output": [
++            *GEOMETRY_MODULE["chosen_binary_test_output"],
++            "other_check",
++        ],
++        "rename_outputs": {
++            **GEOMETRY_MODULE["rename_outputs"],
++            "other_check": "Other check",
++        },
++    }
++
++    out["results"]["other_check"] = False
++
++    diagnostics = diagnose_module(
++        module,
++        out,
++        {"mol_pred": mol_pred_6yr2_t1c},
++    )
++
++    assert any(diagnostic.kind == "bond_length" for diagnostic in diagnostics)
++    assert any(diagnostic.kind == "internal_clash" for diagnostic in diagnostics)
++
++    summary = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "summary"]
++
++    assert len(summary) == 1
++    assert summary[0].check == "Other check"
++
++
++def test_diagnostic_output_format_includes_short_result_and_details(tmp_path, mol_pip_wrong):
++    sdf_path = tmp_path / "bad_pose.sdf"
++    mol_pip_wrong.SetProp("_Name", "bad_pose")
++    with SDWriter(str(sdf_path)) as writer:
++        writer.write(mol_pip_wrong)
++
++    output = StringIO()
++    bust(
++        [Path(sdf_path)],
++        config=Path("posebusters/config/mol_fast.yml"),
++        outfmt="diagnostic",
++        output=output,
++    )
++    text = output.getvalue()
++
++    assert "bad_pose" in text
++    assert "passes (" in text
++    assert f"Diagnostics for {sdf_path} | molecule: bad_pose | position: 0" in text
++    assert "Non-aromatic ring non-flatness" in text

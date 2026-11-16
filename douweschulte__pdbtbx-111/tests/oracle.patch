@@ -1,0 +1,554 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9f379a9..9a6db08 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,6 +15,7 @@ include = ["src/**/*", "LICENSE", "README.md"]
+ rstar = { version = "0.11", optional = true}
+ serde = { version = "~1.0", optional = true, features = ["derive"] }
+ rayon = {version = "1", optional = true}
++flate2 = { version = "1.0", optional = true }
+ doc-cfg = "0.1"
+ indexmap = "1.8"
+ 
+@@ -22,8 +23,9 @@ indexmap = "1.8"
+ serde_json = "~1.0"
+ 
+ [features]
+-default = ["rayon", "rstar", "serde"]
++default = ["rayon", "rstar", "serde", "compression"]
+ unstable-doc-cfg = []
++compression = ["flate2"]
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+@@ -34,4 +36,4 @@ opt-level = 3
+ [[bench]]
+ name = "benchmark"
+ harness = false
+-path = "benches/benchmark.rs"
++path = "benches/benchmark.rs"
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index a0999bb..c304a27 100644
+--- a/README.md
++++ b/README.md
+@@ -20,6 +20,7 @@ It started as a way to use Rust in a scientific project. But it moved to an open
+ * Douwe Schulte
+ * [Tianyi Shi](https://github.com/TianyiShi2001)
+ * [DocKDE](https://github.com/DocKDE)
++* [Oliver Wissett](https://github.com/OWissett)
+ 
+ ## Supported features
+ As the main goal of this library is to allow access to the atomical data many metadata features of both PDB and mmCIF are unsupported. For both file formats the recent versions (PDB v3.30 and mmcif v5.338) are used, but as both are quite stable file formats the exact version should not matter to end users.
+diff --git a/src/read/general.rs b/src/read/general.rs
+index 4b85ffc..3d23ecc 100644
+--- a/src/read/general.rs
++++ b/src/read/general.rs
+@@ -5,6 +5,13 @@ use crate::error::*;
+ use crate::structs::PDB;
+ use crate::StrictnessLevel;
+ 
++#[cfg(feature = "compression")]
++use super::mmcif::open_mmcif_bufread;
++#[cfg(feature = "compression")]
++use flate2::read::GzDecoder;
++#[cfg(feature = "compression")]
++use std::fs;
++
+ /// Open an atomic data file, either PDB or mmCIF/PDBx. The correct type will be
+ /// determined based on the file extension.
+ ///
+@@ -32,6 +39,59 @@ pub fn open(
+     }
+ }
+ 
++/// Open a compressed atomic data file, either PDB or mmCIF/PDBx. The correct type will be
++/// determined based on the file extension (.pdb.gz or .cif.gz).
++///
++/// # Errors
++/// Returns a `PDBError` if a `BreakingError` is found. Otherwise it returns the PDB with all errors/warnings found while parsing it.
++///
++/// # Related
++/// If you want to open a file from memory see [`open_raw`]. There are also function to open a specified file type directly
++/// see [`crate::open_pdb`] and [`crate::open_mmcif`] respectively.
++#[cfg(feature = "compression")]
++pub fn open_gz(
++    filename: impl AsRef<str>,
++    level: StrictnessLevel,
++) -> Result<(PDB, Vec<PDBError>), Vec<PDBError>> {
++    let filename = filename.as_ref();
++
++    if check_extension(filename, "gz") {
++        // open a decompression stream
++        let file = fs::File::open(filename).map_err(|_| {
++            vec![PDBError::new(
++                ErrorLevel::BreakingError,
++                "Could not open file",
++                "Could not open the given file, make sure it exists and you have the correct permissions",
++                Context::show(filename),
++            )]
++        })?;
++
++        let decompressor = GzDecoder::new(file);
++
++        let reader = std::io::BufReader::new(decompressor);
++
++        if check_extension(&filename[..filename.len() - 3], "pdb") {
++            open_pdb_raw(reader, Context::show(filename), level)
++        } else if check_extension(&filename[..filename.len() - 3], "cif") {
++            open_mmcif_bufread(reader, level)
++        } else {
++            Err(vec![PDBError::new(
++                ErrorLevel::BreakingError,
++                "Incorrect extension",
++                "Could not determine the type of the given file, make it .pdb.gz or .cif.gz",
++                Context::show(filename),
++            )])
++        }
++    } else {
++        Err(vec![PDBError::new(
++            ErrorLevel::BreakingError,
++            "Incorrect extension",
++            "Could not determine the type of the given file, make it .pdb.gz or .cif.gz",
++            Context::show(filename),
++        )])
++    }
++}
++
+ /// Open a stream with either PDB or mmCIF data. The distinction is made on the start of the first line.
+ /// If it starts with `HEADER` it is a PDB file, if it starts with `data_` it is a mmCIF file.
+ ///
+diff --git a/src/read/mmcif/parser.rs b/src/read/mmcif/parser.rs
+index 588b9ec..65997c0 100644
+--- a/src/read/mmcif/parser.rs
++++ b/src/read/mmcif/parser.rs
+@@ -35,6 +35,25 @@ pub fn open_mmcif(
+     open_mmcif_raw(&contents, level)
+ }
+ 
++/// Open's mmCIF file from a BufRead. This allows opening mmCIF files directly from memory.
++///
++/// This is particularly useful if you want to open a compressed file, as you can use the BufReader
++pub(crate) fn open_mmcif_bufread(
++    mut bufreader: impl BufRead,
++    level: StrictnessLevel,
++) -> Result<(PDB, Vec<PDBError>), Vec<PDBError>> {
++    let mut contents = String::new();
++    if let Err(e) = bufreader.read_to_string(&mut contents) {
++        return Err(vec![PDBError::new(
++            ErrorLevel::BreakingError,
++            "Error while reading file",
++            format!("Error: {e}"),
++            Context::none(),
++        )]);
++    }
++    open_mmcif_raw(&contents, level)
++}
++
+ /// Parse the given mmCIF `&str` into a PDB struct. This allows opening mmCIF files directly from memory.
+ /// Returns a PDBError if a BreakingError is found. Otherwise it returns the PDB with all errors/warnings found while parsing it.
+ ///
+diff --git a/src/read/mod.rs b/src/read/mod.rs
+index 90b4809..821dd2e 100644
+--- a/src/read/mod.rs
++++ b/src/read/mod.rs
+@@ -6,6 +6,6 @@ mod mmcif;
+ mod pdb;
+ use super::check_extension;
+ 
+-pub use general::{open, open_raw};
++pub use general::{open, open_gz, open_raw};
+ pub use mmcif::{open_mmcif, open_mmcif_raw};
+ pub use pdb::{open_pdb, open_pdb_raw};
+diff --git a/src/save/general.rs b/src/save/general.rs
+index c3819b0..be56458 100644
+--- a/src/save/general.rs
++++ b/src/save/general.rs
+@@ -1,3 +1,5 @@
++use flate2::Compression;
++
+ use super::*;
+ use crate::structs::PDB;
+ use crate::StrictnessLevel;
+@@ -26,3 +28,48 @@ pub fn save(
+         )])
+     }
+ }
++
++/// Save the given PDB struct to the given file and compressing to gz, validating it beforehand.
++/// If validation gives rise to problems, use the `save_raw` function. The correct file
++/// type (pdb or mmCIF/PDBx) will be determined based on the given file extension.
++/// # Errors
++/// Fails if the validation fails with the given `level`.
++pub fn save_gz(
++    pdb: &PDB,
++    filename: impl AsRef<str>,
++    level: StrictnessLevel,
++    compression_level: Option<Compression>,
++) -> Result<(), Vec<PDBError>> {
++    let filename = filename.as_ref();
++    if check_extension(filename, "gz") {
++        // safety check to prevent out of bounds indexing
++        if filename.len() < 3 {
++            return Err(vec![PDBError::new(
++                ErrorLevel::BreakingError,
++                "Filename too short",
++                "Could not determine the type of the given file, make it .pdb.gz or .cif.gz",
++                Context::show(filename),
++            )]);
++        }
++
++        if check_extension(&filename[..filename.len() - 3], "pdb") {
++            save_pdb_gz(pdb, filename, level, compression_level)
++        } else if check_extension(&filename[..filename.len() - 3], "cif") {
++            save_mmcif_gz(pdb, filename, level, compression_level)
++        } else {
++            Err(vec![PDBError::new(
++                ErrorLevel::BreakingError,
++                "Incorrect extension",
++                "Could not determine the type of the given file, make it .pdb.gz or .cif.gz",
++                Context::show(filename),
++            )])
++        }
++    } else {
++        Err(vec![PDBError::new(
++            ErrorLevel::BreakingError,
++            "Incorrect extension",
++            "Could not determine the type of the given file, make it .pdb.gz or .cif.gz",
++            Context::show(filename),
++        )])
++    }
++}
+diff --git a/src/save/mmcif.rs b/src/save/mmcif.rs
+index 7d629dc..86c8c04 100644
+--- a/src/save/mmcif.rs
++++ b/src/save/mmcif.rs
+@@ -1,3 +1,6 @@
++#[cfg(feature = "compression")]
++use flate2::{write::GzEncoder, Compression};
++
+ use crate::error::*;
+ use crate::structs::*;
+ use crate::validate;
+@@ -16,7 +19,43 @@ pub fn save_mmcif(
+     filename: impl AsRef<str>,
+     level: StrictnessLevel,
+ ) -> Result<(), Vec<PDBError>> {
++    save_mmcif_(pdb, filename, level, BufWriter::new)
++}
++
++/// Save the given PDB struct to the given file as mmCIF or PDBx and compresses to .gz
++/// # Errors
++/// It validates the PDB. It fails if the validation fails with the given `level`, or if the file could not be opened.
++/// If validation gives rise to problems, use the `save_raw` function.
++#[cfg(feature = "compression")]
++pub fn save_mmcif_gz(
++    pdb: &PDB,
++    filename: impl AsRef<str>,
++    level: StrictnessLevel,
++    compression_level: Option<Compression>,
++) -> Result<(), Vec<PDBError>> {
++    save_mmcif_(pdb, filename, level, |file| {
++        BufWriter::new(GzEncoder::new(
++            file,
++            compression_level.unwrap_or(Compression::default()),
++        ))
++    })
++}
++
++/// Generic function to save the given PDB struct to the given file as mmCIF or PDBx,
++/// to some writer function, e.g. a GzEncoder or BufWriter.
++fn save_mmcif_<T, W>(
++    pdb: &PDB,
++    filename: impl AsRef<str>,
++    level: StrictnessLevel,
++    writer: W,
++) -> Result<(), Vec<PDBError>>
++where
++    T: Write,
++    W: FnOnce(File) -> BufWriter<T>,
++{
++    // Validates the PDB, and returns early if any errors are found
+     let filename = filename.as_ref();
++
+     let mut errors = validate(pdb);
+     for error in &errors {
+         if error.fails(level) {
+@@ -24,6 +63,7 @@ pub fn save_mmcif(
+         }
+     }
+ 
++    // Creates a writer for the file
+     let file = match File::create(filename) {
+         Ok(f) => f,
+         Err(_e) => {
+@@ -37,7 +77,11 @@ pub fn save_mmcif(
+         }
+     };
+ 
+-    save_mmcif_raw(pdb, BufWriter::new(file));
++    let writer = writer(file);
++
++    // Now call the writer function
++    save_mmcif_raw(pdb, writer);
++
+     Ok(())
+ }
+ 
+@@ -60,11 +104,11 @@ pub fn save_mmcif_raw<T: Write>(pdb: &PDB, mut sink: BufWriter<T>) {
+     // Header
+     write!(
+         "data_{}
+-# 
+-_entry.id   {} 
+-# 
+-_audit_conform.dict_name       mmcif_pdbx.dic 
+-_audit_conform.dict_version    5.338 
++#
++_entry.id   {}
++#
++_audit_conform.dict_name       mmcif_pdbx.dic
++_audit_conform.dict_version    5.338
+ _audit_conform.dict_location   http://mmcif.pdb.org/dictionaries/ascii/mmcif_pdbx.dic",
+         name,
+         name
+@@ -75,9 +119,9 @@ _audit_conform.dict_location   http://mmcif.pdb.org/dictionaries/ascii/mmcif_pdb
+         write!(
+             "# Unit cell definition
+ _cell.entry_id           {}
+-_cell.length_a           {} 
+-_cell.length_b           {} 
+-_cell.length_c           {} 
++_cell.length_a           {}
++_cell.length_b           {}
++_cell.length_c           {}
+ _cell.angle_alpha        {}
+ _cell.angle_beta         {}
+ _cell.angle_gamma        {}
+@@ -208,8 +252,8 @@ _struct_ncs_oper.vector[3]     {}"#,
+     if let Some(symmetry) = &pdb.symmetry {
+         write!(
+             "# Space group definition
+-_symmetry.entry_id                         {} 
+-_symmetry.space_group_name_H-M             '{}' 
++_symmetry.entry_id                         {}
++_symmetry.space_group_name_H-M             '{}'
+ _symmetry.pdbx_full_space_group_name_H-M   '{}'
+ _symmetry.Int_Tables_number                {}",
+             name,
+@@ -224,24 +268,24 @@ _symmetry.Int_Tables_number                {}",
+         .any(|a| a.anisotropic_temperature_factors().is_some());
+     write!(
+         "loop_
+-_atom_site.group_PDB 
+-_atom_site.id 
+-_atom_site.type_symbol 
+-_atom_site.label_atom_id 
+-_atom_site.label_alt_id 
+-_atom_site.label_comp_id 
+-_atom_site.label_asym_id 
+-_atom_site.auth_asym_id 
+-_atom_site.label_entity_id 
+-_atom_site.label_seq_id 
+-_atom_site.auth_seq_id 
+-_atom_site.pdbx_PDB_ins_code 
+-_atom_site.Cartn_x 
+-_atom_site.Cartn_y 
+-_atom_site.Cartn_z 
+-_atom_site.occupancy 
+-_atom_site.B_iso_or_equiv 
+-_atom_site.pdbx_formal_charge 
++_atom_site.group_PDB
++_atom_site.id
++_atom_site.type_symbol
++_atom_site.label_atom_id
++_atom_site.label_alt_id
++_atom_site.label_comp_id
++_atom_site.label_asym_id
++_atom_site.auth_asym_id
++_atom_site.label_entity_id
++_atom_site.label_seq_id
++_atom_site.auth_seq_id
++_atom_site.pdbx_PDB_ins_code
++_atom_site.Cartn_x
++_atom_site.Cartn_y
++_atom_site.Cartn_z
++_atom_site.occupancy
++_atom_site.B_iso_or_equiv
++_atom_site.pdbx_formal_charge
+ _atom_site.pdbx_PDB_model_num{}",
+         if anisou {
+             "
+diff --git a/src/save/mod.rs b/src/save/mod.rs
+index dceb5a4..563c8e8 100644
+--- a/src/save/mod.rs
++++ b/src/save/mod.rs
+@@ -5,6 +5,6 @@ mod mmcif;
+ /// Save PDB files
+ mod pdb;
+ 
+-pub use general::save;
+-pub use mmcif::{save_mmcif, save_mmcif_raw};
+-pub use pdb::{save_pdb, save_pdb_raw};
++pub use general::{save, save_gz};
++pub use mmcif::{save_mmcif, save_mmcif_gz, save_mmcif_raw};
++pub use pdb::{save_pdb, save_pdb_gz, save_pdb_raw};
+diff --git a/src/save/pdb.rs b/src/save/pdb.rs
+index 3339f96..2fb2af8 100644
+--- a/src/save/pdb.rs
++++ b/src/save/pdb.rs
+@@ -1,15 +1,20 @@
+-use crate::error::*;
+ use crate::structs::*;
+ use crate::StrictnessLevel;
+ use crate::TransformationMatrix;
+-use crate::{validate, validate_pdb};
+ 
+ use std::cmp;
+ use std::fs::File;
+-use std::io::prelude::*;
+ use std::io::BufWriter;
+ use std::iter;
+ 
++use std::io::Write;
++
++use crate::PDB;
++use crate::{validate, validate_pdb, Context, ErrorLevel, PDBError};
++
++#[cfg(feature = "compression")]
++use flate2::{write::GzEncoder, Compression};
++
+ /// Save the given PDB struct to the given file, validating it beforehand.
+ ///
+ /// # Errors
+@@ -24,7 +29,49 @@ pub fn save_pdb(
+     filename: impl AsRef<str>,
+     level: StrictnessLevel,
+ ) -> Result<(), Vec<PDBError>> {
++    save_pdb_(pdb, filename, level, BufWriter::new)
++}
++
++/// Save the given PDB struct to the given file, validating it beforehand, and use gzip compression.
++///
++/// # Errors
++/// It fails if the validation fails with the given `level`.
++/// If validation gives rise to problems, use the `save_raw` function.
++///
++/// # Known Problems
++/// Saving SEQRES lines is experimental, as there are many nitpicky things to consider
++/// when generating SEQRES records, which are not all implemented (yet).
++///
++#[cfg(feature = "compression")]
++pub fn save_pdb_gz(
++    pdb: &PDB,
++    filename: impl AsRef<str>,
++    level: StrictnessLevel,
++    compression_level: Option<Compression>,
++) -> Result<(), Vec<PDBError>> {
++    save_pdb_(pdb, filename, level, |file| {
++        let encoder = match compression_level {
++            Some(level) => GzEncoder::new(file, level),
++            None => GzEncoder::new(file, Compression::default()),
++        };
++        BufWriter::new(encoder)
++    })
++}
++
++/// Generic function to save the given PDB struct to the given file, validating it beforehand.
++fn save_pdb_<T, W>(
++    pdb: &PDB,
++    filename: impl AsRef<str>,
++    level: StrictnessLevel,
++    writer: W,
++) -> Result<(), Vec<PDBError>>
++where
++    T: Write,
++    W: FnOnce(File) -> BufWriter<T>,
++{
++    // Validates the PDB, and returns early if any errors are found
+     let filename = filename.as_ref();
++
+     let mut errors = validate(pdb);
+     errors.extend(validate_pdb(pdb));
+     for error in &errors {
+@@ -33,20 +80,25 @@ pub fn save_pdb(
+         }
+     }
+ 
++    // Creates a writer for the file
+     let file = match File::create(filename) {
+         Ok(f) => f,
+-        Err(e) => {
++        Err(_e) => {
+             errors.push(PDBError::new(
+                 ErrorLevel::BreakingError,
+                 "Could not open file",
+-                format!("Could not open the file for writing, make sure you have permission for this file and no other program is currently using it.\n{e}"),
++                "Could not open the file for writing, make sure you have permission for this file and no other program is currently using it.",
+                 Context::show(filename)
+             ));
+             return Err(errors);
+         }
+     };
+ 
+-    save_pdb_raw(pdb, BufWriter::new(file), level);
++    let writer = writer(file);
++
++    // Now call the writer function
++    save_pdb_raw(pdb, writer, level);
++
+     Ok(())
+ }
+ 
+diff --git a/tests/read_write_pdbs.rs b/tests/read_write_pdbs.rs
+index e0db48e..1af51ba 100644
+--- a/tests/read_write_pdbs.rs
++++ b/tests/read_write_pdbs.rs
+@@ -159,6 +159,24 @@ fn save_pdb_strict() {
+     assert!(res.is_ok());
+     let (_pdb, errors) = crate::open(&name, StrictnessLevel::Strict).unwrap();
+     assert_eq!(errors.len(), 0);
++
++    // Do it also for gzip
++    #[cfg(feature = "compression")]
++    {
++        let name = env::current_dir()
++            .unwrap()
++            .as_path()
++            .join(Path::new("dump"))
++            .join(Path::new("save_test.pdb.gz"))
++            .into_os_string()
++            .into_string()
++            .unwrap();
++
++        let res = save_gz(&pdb, &name, StrictnessLevel::Strict, None);
++        assert!(res.is_ok());
++        let (_pdb, errors) = crate::open_gz(&name, StrictnessLevel::Strict).unwrap();
++        assert_eq!(errors.len(), 0);
++    }
+ }
+ 
+ fn save_mmcif_strict() {
+@@ -182,4 +200,22 @@ fn save_mmcif_strict() {
+     assert!(res.is_ok());
+     let (_pdb, errors) = crate::open(&name, StrictnessLevel::Strict).unwrap();
+     assert_eq!(errors.len(), 0);
++
++    // Do it also for gzip
++    #[cfg(feature = "compression")]
++    {
++        let name = env::current_dir()
++            .unwrap()
++            .as_path()
++            .join(Path::new("dump"))
++            .join(Path::new("save_test.cif.gz"))
++            .into_os_string()
++            .into_string()
++            .unwrap();
++
++        let res = save_gz(&pdb, &name, StrictnessLevel::Strict, None);
++        assert!(res.is_ok());
++        let (_pdb, errors) = crate::open_gz(&name, StrictnessLevel::Strict).unwrap();
++        assert_eq!(errors.len(), 0);
++    }
+ }

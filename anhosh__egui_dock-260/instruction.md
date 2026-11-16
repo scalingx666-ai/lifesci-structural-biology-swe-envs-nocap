@@ -1,0 +1,15 @@
+# Issue
+
+**Title:** Update egui to 0.31
+
+## Description
+
+## egui_dock 0.16.0 - 2025-02-07
+
+### Breaking changes
+
+- Upgraded to egui 0.31.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `951a656dea3f`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

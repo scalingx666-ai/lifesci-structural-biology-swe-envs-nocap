@@ -1,0 +1,956 @@
+diff --git a/fastfold/model/fastnn/embedders.py b/fastfold/model/fastnn/embedders.py
+index 874e4010..31f19500 100644
+--- a/fastfold/model/fastnn/embedders.py
++++ b/fastfold/model/fastnn/embedders.py
+@@ -231,12 +231,20 @@ def forward(self,
+         )
+ 
+         # [*, N, N, C_z]
+-        z = self.template_pointwise_att(
+-            t,
+-            z,
+-            template_mask=batch["template_mask"].to(dtype=z.dtype),
+-            chunk_size=chunk_size * 256 if chunk_size is not None else chunk_size,
+-        )
++        if inplace:
++            z = self.template_pointwise_att.inplace(
++                t,
++                z,
++                template_mask=batch["template_mask"].to(dtype=z.dtype),
++                chunk_size=chunk_size * 5 if chunk_size is not None else chunk_size,
++            )
++        else:
++            z = self.template_pointwise_att(
++                t,
++                z,
++                template_mask=batch["template_mask"].to(dtype=z.dtype),
++                chunk_size=chunk_size * 5 if chunk_size is not None else chunk_size,
++            )
+ 
+         ret = {}
+         ret["template_pair_embedding"] = z
+diff --git a/fastfold/model/fastnn/ops.py b/fastfold/model/fastnn/ops.py
+index 59341236..336e8a56 100644
+--- a/fastfold/model/fastnn/ops.py
++++ b/fastfold/model/fastnn/ops.py
+@@ -1166,7 +1166,7 @@ def forward(self, m, mask):
+             q = torch.sum(m_part * mask_part.unsqueeze(-1), dim=-2) / (
+                 torch.sum(mask_part, dim=-1)[..., None] + self.eps
+             )
+-
++            q = q * self.scaling
+             q = self.to_q(q)
+             q = q.view(q.shape[:-1] + (self.n_head, -1))
+ 
+diff --git a/fastfold/model/fastnn/template.py b/fastfold/model/fastnn/template.py
+index 69c6e687..2528c551 100644
+--- a/fastfold/model/fastnn/template.py
++++ b/fastfold/model/fastnn/template.py
+@@ -111,25 +111,71 @@ def forward(self,
+         # [*, N_res, N_res, 1, C_z]
+         biases = [bias]
+         if chunk_size is not None:
+-            para_dim_t0 = t.shape[0]
+-            para_dim_t1 = t.shape[1]
+-            chunk_size_t = chunk_size * 4
++            out = torch.empty_like(z)
+             mask = torch.sum(template_mask.to(z.device)) > 0
++            for t0 in range(t.shape[0]):
++                for t1 in range(0, t.shape[1], chunk_size):
++                    tt = t[t0, t1:t1 + chunk_size, :].unsqueeze(0)
++                    tt = tt.to(z.device)
++                    out[t0, t1:t1 + chunk_size, :] = self.mha(
++                        q_x=z[t0, t1:t1 + chunk_size, :].unsqueeze(0),
++                        kv_x=tt,
++                        biases=biases
++                    ).squeeze(0) * mask
++        else:
++            out = self.mha(q_x=z, kv_x=t, biases=biases)
++            # [*, N_res, N_res, C_z]
++            out = out * (torch.sum(template_mask) > 0)
++            
++        out = out.squeeze(-2)
++
++        return out
++
++    def inplace(self, 
++        t: torch.Tensor, 
++        z: torch.Tensor, 
++        template_mask: Optional[torch.Tensor] = None,
++        chunk_size: Optional[int] = None
++    ) -> torch.Tensor:
++        """
++        Args:
++            t:
++                [*, N_templ, N_res, N_res, C_t] template embedding
++            z:
++                [*, N_res, N_res, C_t] pair embedding
++            template_mask:
++                [*, N_templ] template mask
++        Returns:
++            [*, N_res, N_res, C_z] pair embedding update
++        """
++        if template_mask is None:
++            template_mask = t.new_ones(t.shape[:-3])
+ 
+-            for ti in range(0, para_dim_t0, chunk_size_t):
+-                t0 = t[ti:ti + chunk_size_t, :, :, :]
+-                t0 = t0.to(z.device)
+-                para_dim_t_part = t0.shape[0]
+-                for i in range(0, para_dim_t_part, chunk_size):
+-                    for j in range(0, para_dim_t1, chunk_size):
+-                        z[i + ti:i + ti + chunk_size, j:j + chunk_size, :, :] += self.mha(
+-                            q_x=z[i + ti:i + ti + chunk_size, j:j + chunk_size, :, :], kv_x=t0[i:i + chunk_size, j:j + chunk_size, :, :], biases=biases
+-                            ) * mask
++        bias = self.inf * (template_mask[..., None, None, None, None, :] - 1)
++
++        # [*, N_res, N_res, 1, C_z]
++        z = z.unsqueeze(-2)
++
++        # [*, N_res, N_res, N_temp, C_t]
++        t = permute_final_dims(t, (1, 2, 0, 3))
++
++        # [*, N_res, N_res, 1, C_z]
++        biases = [bias]
++        if chunk_size is not None:
++            mask = torch.sum(template_mask.to(z.device)) > 0
++            for t0 in range(t.shape[0]):
++                for t1 in range(0, t.shape[1], chunk_size):
++                    tt = t[t0, t1:t1 + chunk_size, :].unsqueeze(0)
++                    tt = tt.to(z.device)
++                    z[t0, t1:t1 + chunk_size, :] += self.mha(
++                        q_x=z[t0, t1:t1 + chunk_size, :].unsqueeze(0),
++                        kv_x=tt,
++                        biases=biases
++                    ).squeeze(0) * mask
+         else:
+-            t = self.mha(q_x=z, kv_x=t, biases=biases)
++            t = self.mha(q_x=z, kv_x=t, biases=biases) * (torch.sum(template_mask) > 0)
+             # [*, N_res, N_res, C_z]
+-            t = t * (torch.sum(template_mask) > 0)
+-            z = z + t
++            z += t
+             
+         z = z.squeeze(-2)
+ 
+@@ -204,13 +250,13 @@ def forward(
+             single_mask_row = scatter(single_mask, dim=1)
+             single_mask_col = scatter(single_mask, dim=2)
+ 
+-            single = self.TriangleMultiplicationOutgoing(single, single_mask_row)
+-            single = row_to_col(single)
+-            single = self.TriangleMultiplicationIncoming(single, single_mask_col)
+-            single = col_to_row(single)
+             single = self.TriangleAttentionStartingNode(single, single_mask_row)
+             single = row_to_col(single)
+             single = self.TriangleAttentionEndingNode(single, single_mask_col)
++            single = col_to_row(single)
++            single = self.TriangleMultiplicationOutgoing(single, single_mask_row)
++            single = row_to_col(single)
++            single = self.TriangleMultiplicationIncoming(single, single_mask_col)
+             single = self.PairTransition(single)
+             single = col_to_row(single)
+             z[i] = single
+@@ -251,19 +297,21 @@ def inplace(
+             single_mask_row = scatter(single_mask, dim=1)
+             single_mask_col = scatter(single_mask, dim=2)
+ 
+-            single = self.TriangleMultiplicationOutgoing(single, single_mask_row)
+-            single = row_to_col(single)
+-            single = self.TriangleMultiplicationIncoming(single, single_mask_col)
+-            single = col_to_row(single)
+             single = self.TriangleAttentionStartingNode(single, single_mask_row)
+             single = row_to_col(single)
+             single = self.TriangleAttentionEndingNode(single, single_mask_col)
++            single = col_to_row(single)
++            single = self.TriangleMultiplicationOutgoing(single, single_mask_row)
++            single = row_to_col(single)
++            single = self.TriangleMultiplicationIncoming(single, single_mask_col)
+             single = self.PairTransition(single)
+             single = col_to_row(single)
+             z[0][i] = single.to(z[0].device)
+ 
+         # z = torch.cat(single_templates, dim=-4)
+         if self.last_block:
++            if isinstance(chunk_size, int) and 1 <= chunk_size <= 4:
++                z[0] = z[0].to(mask.device)
+             z[0] = gather(z[0], dim=1)
+             z[0] = z[0][:, :-padding_size, :-padding_size, :]
+ 
+diff --git a/fastfold/utils/inject_fastnn.py b/fastfold/utils/inject_fastnn.py
+index a1f9e2b8..2562fbc9 100644
+--- a/fastfold/utils/inject_fastnn.py
++++ b/fastfold/utils/inject_fastnn.py
+@@ -16,6 +16,8 @@
+ 
+ from fastfold.model.fastnn import EvoformerStack, ExtraMSAStack
+ from fastfold.model.fastnn.embedders import TemplateEmbedder
++from fastfold.model.fastnn.ops import RecyclingEmbedder
++
+ 
+ def copy_layernorm(model_fast, model_ori):
+     model_fast.weight.copy_(model_ori.weight)
+@@ -317,8 +319,28 @@ def inject_template(model):
+         model.template_embedder = fast_module
+ 
+ 
++def inject_embedder(model):
++    with torch.no_grad():
++        target_module = model.recycling_embedder
++        fast_module = RecyclingEmbedder(
++            c_m=target_module.c_m,
++            c_z=target_module.c_z,
++            min_bin=target_module.min_bin,
++            max_bin=target_module.max_bin,
++            no_bins=target_module.no_bins,
++            inf=target_module.inf
++        )
++        copy_native_linear(fast_module.linear, target_module.linear)
++        copy_layernorm(fast_module.layer_norm_m, target_module.layer_norm_m)
++        copy_layernorm(fast_module.layer_norm_z, target_module.layer_norm_z)
++        if target_module.training == False:
++            fast_module.eval()
++        model.recycling_embedder = fast_module
++
++
+ def inject_fastnn(model):
+     inject_evoformer(model)
+     inject_extramsa(model)
+     inject_template(model)
++    inject_embedder(model)
+     return model
+\ No newline at end of file
+diff --git a/fastfold/utils/test_utils.py b/fastfold/utils/test_utils.py
+new file mode 100644
+index 00000000..1f8ca7ec
+--- /dev/null
++++ b/fastfold/utils/test_utils.py
+@@ -0,0 +1,17 @@
++import os
++
++
++def get_param_path():
++    # develop
++    if os.path.exists('/data/scratch/alphafold/alphafold/params/params_model_1.npz'):
++        return '/data/scratch/alphafold/alphafold/params/params_model_1.npz'
++    # test
++    return '/data/scratch/fastfold/weight.npz'
++
++
++def get_data_path():
++    # develop
++    if os.path.exists('/home/lczxl/data2/fastfold/example_input/mono_batch.pkl'):
++        return '/home/lczxl/data2/fastfold/example_input/mono_batch.pkl'
++    # test
++    return '/data/scratch/fastfold/mono_batch.pkl'
+diff --git a/tests/test_fastnn/test_evoformer.py b/tests/test_fastnn/test_evoformer.py
+index 207af9fc..6ab65f2b 100644
+--- a/tests/test_fastnn/test_evoformer.py
++++ b/tests/test_fastnn/test_evoformer.py
+@@ -1,87 +1,72 @@
+ import torch
+ import pytest
+ import os
++import copy
+ import torch.multiprocessing as mp
+ from functools import partial
+ import fastfold
+-from torch import nn
+ from fastfold.config import model_config
+-from fastfold.model.nn.evoformer import EvoformerBlock as TargetEvoformer
+-from fastfold.model.fastnn.evoformer import Evoformer as FastEvoformer
+-from fastfold.utils.inject_fastnn import copy_evoformer_para
+ from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from fastfold.utils.test_utils import get_param_path
+ 
+ 
+ @pytest.mark.parametrize('world_size', [1, 2])
+ @pytest.mark.parametrize('chunk_size', [None, 3])
+ @pytest.mark.parametrize('inplace', [False, True])
+ def test_state_dict(world_size, chunk_size, inplace):
+-    run_func = partial(_test_evoformer, world_size=world_size, chunk_size=chunk_size, inplace=inplace)
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++
++    fast_module = copy.deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++
++    target_module = target_module.evoformer
++    fast_module = fast_module.evoformer
++
++    target_module_1 = target_module.blocks[0].eval().cuda()
++    target_module_2 = target_module.blocks[-1].eval().cuda()
++    fast_module_1 = fast_module.blocks[0].eval().cuda()
++    fast_module_2 = fast_module.blocks[-1].eval().cuda()
++    
++    run_func = partial(_test_evoformer, world_size=world_size, chunk_size=chunk_size, 
++                       inplace=inplace, fast_module_1=fast_module_1, fast_module_2=fast_module_2, 
++                       target_module_1=target_module_1, target_module_2=target_module_2, config=config)
+     mp.spawn(run_func, nprocs=world_size)
+ 
+ 
+-def _test_evoformer(rank, world_size, chunk_size, inplace):
++def _test_evoformer(rank, world_size, chunk_size, inplace, fast_module_1, fast_module_2, 
++                    target_module_1, target_module_2, config):
+     os.environ['RANK'] = str(rank)
+     os.environ['LOCAL_RANK'] = str(rank)
+     os.environ['WORLD_SIZE'] = str(world_size)
+     # init distributed for Dynamic Axial Parallelism
+     fastfold.distributed.init_dap()
+-    
+-    config = model_config('model_1').model["evoformer_stack"]
+-    with torch.no_grad():
+-        target_module = TargetEvoformer(
+-            c_m=config["c_m"],
+-            c_z=config["c_z"],
+-            c_hidden_msa_att=config["c_hidden_msa_att"],
+-            c_hidden_opm=config["c_hidden_opm"],
+-            c_hidden_mul=config["c_hidden_mul"],
+-            c_hidden_pair_att=config["c_hidden_pair_att"],
+-            no_heads_msa=config["no_heads_msa"],
+-            no_heads_pair=config["no_heads_pair"],
+-            transition_n=config["transition_n"],
+-            msa_dropout=config["msa_dropout"],
+-            pair_dropout=config["pair_dropout"],
+-            inf=config["inf"],
+-            eps=config["eps"],
+-            is_multimer=False,
+-        )
+-        fast_module_1 = FastEvoformer(
+-            c_m=config["c_m"],
+-            c_z=config["c_z"],
+-            first_block=True,
+-            last_block=False,
+-            is_multimer=False,
+-        )
+-        fast_module_2 = FastEvoformer(
+-            c_m=config["c_m"],
+-            c_z=config["c_z"],
+-            first_block=False,
+-            last_block=True,
+-            is_multimer=False,
+-        )
+-        copy_evoformer_para(fast_module_1, target_module)
+-        copy_evoformer_para(fast_module_2, target_module)
+ 
+-    target_module = target_module.eval().cuda()
+-    fast_module_1 = fast_module_1.eval().cuda()
+-    fast_module_2 = fast_module_2.eval().cuda()
++    msa_len = 80
++    seq_len = 80
++    
++    target_module_1 = target_module_1.cuda()
++    target_module_2 = target_module_2.cuda()
++    fast_module_1 = fast_module_1.cuda()
++    fast_module_2 = fast_module_2.cuda()
+ 
+-    msa_len = 88
+-    seq_len = 378
+-    m = torch.randn((msa_len, seq_len, config["c_m"])).cuda()
++    m = torch.randn((msa_len, seq_len, 256)).cuda()
+     m_mask = torch.ones((msa_len, seq_len)).cuda()
+-    m_mask[:, :-5] = 0
+-    z = torch.randn((seq_len, seq_len, config["c_z"])).cuda()
++    z = torch.randn((seq_len, seq_len, 128)).cuda()
+     z_mask = torch.ones((seq_len, seq_len)).cuda()
+-    z_mask[:, :-5] = 0
+ 
+-    m_out, z_out = target_module(m, z, m_mask, z_mask)
+-    m_out, z_out = target_module(m_out, z_out, m_mask, z_mask)
+-    
+-    if chunk_size:
+-        set_chunk_size(chunk_size)
++    set_chunk_size(chunk_size)
+     with torch.no_grad():
+-        if inplace:
++        m_out, z_out = target_module_1(m, z, m_mask, z_mask)
++        m_out, z_out = target_module_2(m_out, z_out, m_mask, z_mask)
++
++        if not inplace:
+             m_fast, z_fast = fast_module_1(m, z, m_mask, z_mask)
+             m_fast, z_fast = fast_module_2(m_fast, z_fast, m_mask, z_mask)
+         else:
+@@ -89,5 +74,8 @@ def _test_evoformer(rank, world_size, chunk_size, inplace):
+             m_fast, z_fast = fast_module_2.inplace(m_fast, z_fast, m_mask, z_mask)
+             m_fast = m_fast[0]
+             z_fast = z_fast[0]
+-    assert torch.allclose(m_out, m_fast, atol=1e-8)
+-    assert torch.allclose(z_out, z_fast, atol=1e-8)
++
++    error = torch.mean(torch.abs(m_out - m_fast))
++    assert error < 1e-4, f"Test m failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
++    error = torch.mean(torch.abs(z_out - z_fast))
++    assert error < 1e-4, f"Test z failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
+diff --git a/tests/test_fastnn/test_evoformer_stack.py b/tests/test_fastnn/test_evoformer_stack.py
+new file mode 100644
+index 00000000..67389ff2
+--- /dev/null
++++ b/tests/test_fastnn/test_evoformer_stack.py
+@@ -0,0 +1,75 @@
++import torch
++import pytest
++import os
++import copy
++import torch.multiprocessing as mp
++from functools import partial
++import fastfold
++from fastfold.config import model_config
++from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from fastfold.utils.test_utils import get_param_path
++
++
++@pytest.mark.parametrize('world_size', [1, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
++@pytest.mark.parametrize('inplace', [False, True])
++def test_state_dict(world_size, chunk_size, inplace):
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++
++    fast_module = copy.deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++
++    target_module = target_module.evoformer
++    fast_module = fast_module.evoformer
++    target_module = target_module.eval()
++    fast_module = fast_module.eval()
++    
++    run_func = partial(_test_evoformer_stack, world_size=world_size, chunk_size=chunk_size, 
++                       inplace=inplace, fast_module=fast_module, target_module=target_module, config=config)
++    mp.spawn(run_func, nprocs=world_size)
++
++
++def _test_evoformer_stack(rank, world_size, chunk_size, inplace, fast_module, target_module, config):
++    os.environ['RANK'] = str(rank)
++    os.environ['LOCAL_RANK'] = str(rank)
++    os.environ['WORLD_SIZE'] = str(world_size)
++    # init distributed for Dynamic Axial Parallelism
++    fastfold.distributed.init_dap()
++
++    target_module = target_module.cuda()
++    fast_module = fast_module.cuda()
++
++    msa_len = 80
++    seq_len = 64
++    m = torch.randn((msa_len, seq_len, 256)).cuda()
++    m_mask = torch.ones((msa_len, seq_len)).cuda().to(dtype=m.dtype)
++    z = torch.randn((seq_len, seq_len, 128)).cuda()
++    z_mask = torch.ones((seq_len, seq_len)).cuda().to(dtype=z.dtype)
++
++    with torch.no_grad():
++        m_out, z_out, s_out = target_module(
++        m, z, m_mask, z_mask, chunk_size=chunk_size, _mask_trans=config.model._mask_trans)
++
++        set_chunk_size(chunk_size)
++        if not inplace:
++            m_fast, z_fast, s_fast = fast_module(
++                m, z, m_mask, z_mask, chunk_size=chunk_size, _mask_trans=config.model._mask_trans)
++        else:
++            m_fast, z_fast, s_fast = fast_module.inplace(
++                [m], [z], m_mask, z_mask, chunk_size=chunk_size, _mask_trans=config.model._mask_trans)
++            m_fast = m_fast[0]
++            z_fast = z_fast[0]
++
++    error = torch.mean(torch.abs(m_out - m_fast))
++    assert error < 1e-3, f"Test m failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
++    error = torch.mean(torch.abs(z_out - z_fast))
++    assert error < 1e-3, f"Test z failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
++    error = torch.mean(torch.abs(s_out - s_fast))
++    assert error < 1e-3, f"Test s failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
+diff --git a/tests/test_fastnn/test_extramsa_stack.py b/tests/test_fastnn/test_extramsa_stack.py
+new file mode 100644
+index 00000000..26fe0229
+--- /dev/null
++++ b/tests/test_fastnn/test_extramsa_stack.py
+@@ -0,0 +1,71 @@
++import torch
++import pytest
++import os
++import copy
++import torch.multiprocessing as mp
++from functools import partial
++import fastfold
++from fastfold.config import model_config
++from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from fastfold.utils.test_utils import get_param_path
++
++
++@pytest.mark.parametrize('world_size', [1, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
++@pytest.mark.parametrize('inplace', [False, True])
++def test_state_dict(world_size, chunk_size, inplace):
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++    fast_module = copy.deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++    
++    target_module = target_module.extra_msa_stack
++    target_module = target_module.eval()
++    fast_module = fast_module.extra_msa_stack
++    fast_module = fast_module.eval()
++    
++    run_func = partial(_test_extramsa_stack, world_size=world_size, chunk_size=chunk_size, inplace=inplace, 
++                       target_module=target_module, fast_module=fast_module, config=config)
++    mp.spawn(run_func, nprocs=world_size)
++
++
++def _test_extramsa_stack(rank, world_size, chunk_size, inplace, target_module, fast_module, config):
++    os.environ['RANK'] = str(rank)
++    os.environ['LOCAL_RANK'] = str(rank)
++    os.environ['WORLD_SIZE'] = str(world_size)
++    # init distributed for Dynamic Axial Parallelism
++    fastfold.distributed.init_dap()
++
++    target_module = target_module.cuda()
++    fast_module = fast_module.cuda()
++
++    extra_msa_len = 300
++    seq_len = 64
++    m = torch.randn((extra_msa_len, seq_len, 64)).cuda()
++    m_mask = torch.ones((extra_msa_len, seq_len)).cuda().to(dtype=m.dtype)
++    m_mask[64:, :] = 0.
++    z = torch.randn((seq_len, seq_len, 128)).cuda()
++    z_mask = torch.ones((seq_len, seq_len)).cuda().to(dtype=z.dtype)
++
++    with torch.no_grad():
++        z_out = target_module(
++            m, z, msa_mask=m_mask, pair_mask=z_mask, chunk_size=chunk_size, _mask_trans=config.model._mask_trans)
++
++        set_chunk_size(chunk_size)
++        if not inplace:
++            z_fast = fast_module(
++                m, z, msa_mask=m_mask, pair_mask=z_mask, chunk_size=chunk_size, _mask_trans=config.model._mask_trans)
++        else:
++            z_fast = fast_module.inplace(
++                [m], [z], msa_mask=m_mask, pair_mask=z_mask, chunk_size=chunk_size, _mask_trans=config.model._mask_trans)
++            z_fast = z_fast[0]
++
++    error = torch.mean(torch.abs(z_out - z_fast))
++    assert error < 1e-3, f"Test z failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
+diff --git a/tests/test_fastnn/test_msa_att_col.py b/tests/test_fastnn/test_msa_att_col.py
+new file mode 100644
+index 00000000..cffd6fca
+--- /dev/null
++++ b/tests/test_fastnn/test_msa_att_col.py
+@@ -0,0 +1,75 @@
++import torch
++import pytest
++import os
++from copy import deepcopy
++import torch.multiprocessing as mp
++from functools import partial
++import fastfold
++from fastfold.config import model_config
++from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from colossalai.context.parallel_mode import ParallelMode
++from colossalai.core import global_context as gpc
++from fastfold.distributed.comm import gather, scatter, row_to_col
++from fastfold.utils.test_utils import get_param_path
++
++
++@pytest.mark.parametrize('world_size', [1, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
++def test_state_dict(world_size, chunk_size):
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++
++    fast_module = deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++
++    target_module = target_module.evoformer.blocks[0].msa_att_col.eval()
++    fast_module = fast_module.evoformer.blocks[0].msa.MSAColumnAttention.eval()
++    
++    run_func = partial(_test_msa_att_col, world_size=world_size, chunk_size=chunk_size, 
++                       fast_module=fast_module, target_module=target_module, config=config)
++    mp.spawn(run_func, nprocs=world_size)
++
++
++def _test_msa_att_col(rank, world_size, chunk_size, fast_module, target_module, config):
++    os.environ['RANK'] = str(rank)
++    os.environ['LOCAL_RANK'] = str(rank)
++    os.environ['WORLD_SIZE'] = str(world_size)
++    # init distributed for Dynamic Axial Parallelism
++    fastfold.distributed.init_dap()
++
++    target_module = target_module.cuda()
++    fast_module = fast_module.cuda()
++
++    msa_len = 300
++    seq_len = 300
++    m = torch.randn((msa_len, seq_len, 256)).cuda()
++    m_mask = torch.ones((msa_len, seq_len)).cuda().to(dtype=m.dtype)
++    
++    fast_m = deepcopy(m).unsqueeze(0)
++    dap_size = gpc.get_world_size(ParallelMode.TENSOR)
++    seq_length = m_mask.size(-1)
++    padding_size = (int(seq_length / dap_size) + 1) * dap_size - seq_length
++    fast_m = torch.nn.functional.pad(fast_m, (0, 0, 0, padding_size))
++    fast_m = scatter(fast_m, dim=1)
++    fast_m_mask = deepcopy(m_mask).unsqueeze(0)
++    fast_m_mask = torch.nn.functional.pad(fast_m_mask, (0, padding_size))
++
++    with torch.no_grad():
++        m_out = m + target_module(m, mask=m_mask, chunk_size=chunk_size)
++
++        set_chunk_size(chunk_size)
++        fast_m = row_to_col(fast_m)
++        fast_m_mask = scatter(fast_m_mask, dim=2)
++        m_fast = fast_module(fast_m, fast_m_mask)
++        m_fast = m_fast.squeeze(0)
++        m_fast = gather(m_fast, dim=1)
++        m_fast = m_fast[:, :-padding_size, :]
++
++    error = torch.max(torch.abs(m_out - m_fast))
++    assert error < 5e-5, f"Test m failed at chunk size: {chunk_size}. The position dif is {error}"
+diff --git a/tests/test_fastnn/test_msa_att_row.py b/tests/test_fastnn/test_msa_att_row.py
+new file mode 100644
+index 00000000..addc2a14
+--- /dev/null
++++ b/tests/test_fastnn/test_msa_att_row.py
+@@ -0,0 +1,83 @@
++import torch
++import pytest
++import os
++from copy import deepcopy
++import torch.multiprocessing as mp
++from functools import partial
++import fastfold
++from fastfold.config import model_config
++from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from colossalai.context.parallel_mode import ParallelMode
++from colossalai.core import global_context as gpc
++from fastfold.utils.test_utils import get_param_path
++
++from fastfold.distributed.comm import gather, scatter
++
++
++@pytest.mark.parametrize('world_size', [1, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
++def test_state_dict(world_size, chunk_size):
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++
++    fast_module = deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++
++    target_module1 = target_module.evoformer.blocks[0].msa_att_row.eval()
++    target_module2 = target_module.evoformer.blocks[0].msa_dropout_layer.eval()
++    
++    fast_module = fast_module.evoformer.blocks[0].msa.MSARowAttentionWithPairBias.eval()
++    
++    run_func = partial(_test_msa_att_row, world_size=world_size, chunk_size=chunk_size, 
++                       fast_module=fast_module, target_module1=target_module1, target_module2=target_module2, config=config)
++    mp.spawn(run_func, nprocs=world_size)
++
++
++def _test_msa_att_row(rank, world_size, chunk_size, fast_module, target_module1, target_module2, config):
++    os.environ['RANK'] = str(rank)
++    os.environ['LOCAL_RANK'] = str(rank)
++    os.environ['WORLD_SIZE'] = str(world_size)
++    # init distributed for Dynamic Axial Parallelism
++    fastfold.distributed.init_dap()
++
++    target_module1 = target_module1.cuda()
++    target_module2 = target_module2.cuda()
++    fast_module = fast_module.cuda()
++
++    msa_len = 300
++    seq_len = 300
++    m = torch.randn((msa_len, seq_len, 256)).cuda()
++    m_mask = torch.ones((msa_len, seq_len)).cuda().to(dtype=m.dtype)
++    z = torch.randn((seq_len, seq_len, 128)).cuda()
++    z_mask = torch.ones((seq_len, seq_len)).cuda().to(dtype=z.dtype)
++    
++    fast_m = deepcopy(m).unsqueeze(0)
++    fast_z = deepcopy(z).unsqueeze(0)
++    dap_size = gpc.get_world_size(ParallelMode.TENSOR)
++    seq_length = z_mask.size(-1)
++    padding_size = (int(seq_length / dap_size) + 1) * dap_size - seq_length
++    fast_m = torch.nn.functional.pad(fast_m, (0, 0, 0, padding_size))
++    fast_z = torch.nn.functional.pad(fast_z, (0, 0, 0, padding_size, 0, padding_size))
++    fast_m = scatter(fast_m, dim=1)
++    fast_z = scatter(fast_z, dim=1)
++    fast_m_mask = deepcopy(m_mask).unsqueeze(0)
++    fast_m_mask = torch.nn.functional.pad(fast_m_mask, (0, padding_size))
++
++    with torch.no_grad():
++        m_out = m + target_module2(target_module1(m, z=z, mask=m_mask, chunk_size=chunk_size))
++
++        set_chunk_size(chunk_size)
++        fast_m_mask = scatter(fast_m_mask, dim=1)
++        m_fast = fast_module(fast_m, fast_z, fast_m_mask)
++        m_fast = m_fast.squeeze(0)
++        m_fast = gather(m_fast, dim=0)
++        m_fast = m_fast[:, :-padding_size, :]
++
++    error = torch.max(torch.abs(m_out - m_fast))
++    assert error < 5e-5, f"Test m failed at chunk size: {chunk_size}. The position dif is {error}"
+diff --git a/tests/test_fastnn/test_msa_global_att_col.py b/tests/test_fastnn/test_msa_global_att_col.py
+new file mode 100644
+index 00000000..7850a873
+--- /dev/null
++++ b/tests/test_fastnn/test_msa_global_att_col.py
+@@ -0,0 +1,76 @@
++import torch
++import pytest
++import os
++from copy import deepcopy
++import torch.multiprocessing as mp
++from functools import partial
++import fastfold
++from fastfold.config import model_config
++from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from colossalai.context.parallel_mode import ParallelMode
++from colossalai.core import global_context as gpc
++from fastfold.distributed.comm import gather, scatter, row_to_col
++from fastfold.utils.test_utils import get_param_path
++
++
++@pytest.mark.parametrize('world_size', [1, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
++def test_state_dict(world_size, chunk_size):
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++
++    fast_module = deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++
++    target_module = target_module.extra_msa_stack.blocks[0].msa_att_col.eval()
++    fast_module = fast_module.extra_msa_stack.blocks[0].msa_stack.MSAColumnAttention.eval()
++    
++    run_func = partial(_test_msa_global_att_col, world_size=world_size, chunk_size=chunk_size, 
++                       fast_module=fast_module, target_module=target_module, config=config)
++    mp.spawn(run_func, nprocs=world_size)
++
++
++def _test_msa_global_att_col(rank, world_size, chunk_size, fast_module, target_module, config):
++    os.environ['RANK'] = str(rank)
++    os.environ['LOCAL_RANK'] = str(rank)
++    os.environ['WORLD_SIZE'] = str(world_size)
++    # init distributed for Dynamic Axial Parallelism
++    fastfold.distributed.init_dap()
++
++    target_module = target_module.cuda()
++    fast_module = fast_module.cuda()
++
++    msa_len = 512
++    seq_len = 128
++    m = torch.randn((msa_len, seq_len, 64)).cuda()
++    m_mask = torch.ones((msa_len, seq_len)).cuda().to(dtype=m.dtype)
++    m_mask[128:, :] = 0
++    
++    fast_m = deepcopy(m).unsqueeze(0)
++    dap_size = gpc.get_world_size(ParallelMode.TENSOR)
++    seq_length = m_mask.size(-1)
++    padding_size = (int(seq_length / dap_size) + 1) * dap_size - seq_length
++    fast_m = torch.nn.functional.pad(fast_m, (0, 0, 0, padding_size))
++    fast_m = scatter(fast_m, dim=1)
++    fast_m_mask = deepcopy(m_mask).unsqueeze(0)
++    fast_m_mask = torch.nn.functional.pad(fast_m_mask, (0, padding_size))
++
++    with torch.no_grad():
++        m_out = m + target_module(m, mask=m_mask, chunk_size=chunk_size)
++
++        set_chunk_size(chunk_size)
++        fast_m = row_to_col(fast_m)
++        fast_m_mask = scatter(fast_m_mask, dim=2)
++        m_fast = fast_module(fast_m, fast_m_mask)
++        m_fast = m_fast.squeeze(0)
++        m_fast = gather(m_fast, dim=1)
++        m_fast = m_fast[:, :-padding_size, :]
++
++    error = torch.max(torch.abs(m_out - m_fast))
++    assert error < 5e-5, f"Test m failed at chunk size: {chunk_size}. The position dif is {error}"
+diff --git a/tests/test_fastnn/test_template_embedder.py b/tests/test_fastnn/test_template_embedder.py
+new file mode 100644
+index 00000000..b717703b
+--- /dev/null
++++ b/tests/test_fastnn/test_template_embedder.py
+@@ -0,0 +1,78 @@
++import torch
++import pytest
++import pickle
++import os
++import copy
++import torch.multiprocessing as mp
++from functools import partial
++import fastfold
++from fastfold.config import model_config
++from fastfold.model.fastnn.ops import set_chunk_size
++from fastfold.model.hub import AlphaFold
++from fastfold.utils.inject_fastnn import inject_fastnn
++from fastfold.utils.import_weights import import_jax_weights_
++from fastfold.utils.tensor_utils import tensor_tree_map
++from fastfold.utils.test_utils import get_param_path, get_data_path
++
++
++@pytest.mark.parametrize('world_size', [1, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
++@pytest.mark.parametrize('inplace', [False, True])
++def test_state_dict(world_size, chunk_size, inplace):
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    target_module = AlphaFold(config)
++    import_jax_weights_(target_module, get_param_path())
++
++    fast_module = copy.deepcopy(target_module)
++    fast_module = inject_fastnn(fast_module)
++
++    target_module = target_module.template_embedder
++    fast_module = fast_module.template_embedder
++    target_module = target_module.eval()
++    fast_module = fast_module.eval()
++    
++    batch = pickle.load(open(get_data_path(), 'rb'))
++    fetch_cur_batch = lambda t: t[..., 0]
++    feats = tensor_tree_map(fetch_cur_batch, batch)
++    template_feats = {k: v for k, v in feats.items() if k.startswith("template_")}
++    
++    run_func = partial(_test_template_embedder, world_size=world_size, chunk_size=chunk_size, 
++                       inplace=inplace, fast_module=fast_module, target_module=target_module, config=config, 
++                       template_feats=template_feats)
++    mp.spawn(run_func, nprocs=world_size)
++
++
++def _test_template_embedder(rank, world_size, chunk_size, inplace, fast_module, target_module, config, template_feats):
++    os.environ['RANK'] = str(rank)
++    os.environ['LOCAL_RANK'] = str(rank)
++    os.environ['WORLD_SIZE'] = str(world_size)
++    # init distributed for Dynamic Axial Parallelism
++    fastfold.distributed.init_dap()    
++    
++    target_module = target_module.cuda()
++    fast_module = fast_module.cuda()
++
++    template_feats = copy.deepcopy(template_feats)
++    for k, v in template_feats.items():
++        template_feats[k] = v.cuda()
++
++    seq_len = 33
++    z = torch.randn((seq_len, seq_len, 128)).cuda()
++    z_mask = torch.ones((seq_len, seq_len)).cuda().to(dtype=z.dtype)
++
++    with torch.no_grad():
++        template_embeds = target_module(copy.deepcopy(template_feats), z, z_mask.to(dtype=z.dtype), 0, None)
++        z_out = z + template_embeds["template_pair_embedding"]
++
++        set_chunk_size(chunk_size)
++        if inplace:
++            template_embeds = fast_module(copy.deepcopy(template_feats), z, z_mask.to(dtype=z.dtype), 0, chunk_size, inplace=inplace)
++            z_fast = template_embeds["template_pair_embedding"]
++        else:
++            template_embeds = fast_module(copy.deepcopy(template_feats), z, z_mask.to(dtype=z.dtype), 0, chunk_size)
++            z_fast = z + template_embeds["template_pair_embedding"]
++
++    error = torch.mean(torch.abs(z_out - z_fast))
++    assert error < 1e-5, f"Test z failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {error}"
+diff --git a/tests/test_inference.py b/tests/test_inference.py
+index bdc3347e..eb9b29f1 100644
+--- a/tests/test_inference.py
++++ b/tests/test_inference.py
+@@ -10,45 +10,42 @@
+ from fastfold.model.hub import AlphaFold
+ from fastfold.config import model_config
+ from fastfold.model.fastnn import set_chunk_size
+-from fastfold.utils import inject_fastnn
++from fastfold.utils.inject_fastnn import inject_fastnn
+ from fastfold.utils.import_weights import import_jax_weights_
++from fastfold.utils.test_utils import get_param_path, get_data_path
+ 
+ 
+ @pytest.mark.parametrize('world_size', [1, 2])
+-@pytest.mark.parametrize('chunk_size', [None, 2])
++@pytest.mark.parametrize('chunk_size', [None, 3])
+ @pytest.mark.parametrize('inplace', [False, True])
+ def test_state_dict(world_size, chunk_size, inplace):
+-    run_func = partial(run_dist, world_size=world_size, chunk_size=chunk_size, inplace=inplace)
++    config = model_config('model_1')
++    config.globals.chunk_size = chunk_size
++    config.globals.inplace = False
++    model = AlphaFold(config)
++    import_jax_weights_(model, get_param_path())
++    model.eval()
++    
++    fastmodel = copy.deepcopy(model)
++    fastmodel = inject_fastnn(fastmodel)
++    fastmodel.eval()
++    
++    run_func = partial(run_dist, world_size=world_size, chunk_size=chunk_size, inplace=inplace, model=model, fastmodel=fastmodel, config=config)
+     mp.spawn(run_func, nprocs=world_size)
+ 
+ 
+-def run_dist(rank, world_size, chunk_size, inplace):
++def run_dist(rank, world_size, chunk_size, inplace, model, fastmodel, config):
+     os.environ['RANK'] = str(rank)
+     os.environ['LOCAL_RANK'] = str(rank)
+     os.environ['WORLD_SIZE'] = str(world_size)
+     # init distributed for Dynamic Axial Parallelism
+     fastfold.distributed.init_dap()
+-    inference(chunk_size, inplace)
+-
+-
+ 
+-def inference(chunk_size, inplace):
+-
+-    config = model_config('model_1')
+-    config.globals.chunk_size = chunk_size
+-    config.globals.inplace = False
+-    model = AlphaFold(config)
+-    import_jax_weights_(model, '/data/scratch/fastfold/weight.npz')
+-    model.eval()
+     model.cuda()
+-
+-    fastmodel = copy.deepcopy(model)
+-    fastmodel = inject_fastnn(fastmodel)
+-    fastmodel.eval()
+     fastmodel.cuda()
+ 
+     set_chunk_size(model.globals.chunk_size)
+-    batch = pickle.load(open('/data/scratch/fastfold/mono_batch.pkl', 'rb'))
++    batch = pickle.load(open(get_data_path(), 'rb'))
+     batch = {k: torch.as_tensor(v).cuda() for k, v in batch.items()}
+     fastbatch = copy.deepcopy(batch)
+ 
+@@ -58,4 +55,4 @@ def inference(chunk_size, inplace):
+         fastout = fastmodel(fastbatch)
+ 
+     pos_dif = torch.max(torch.abs(fastout["final_atom_positions"] - out["final_atom_positions"]))
+-    assert pos_dif < 1.5, f"Test failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {pos_dif}"
++    assert pos_dif < 5e-4, f"Test failed at chunk size: {chunk_size}, inplace: {inplace}. The position dif is {pos_dif}"

@@ -1,0 +1,701 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f01bd41b2..b4e9ceabe 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [[#290](https://github.com/nf-core/proteinfold/issues/290)] - Update Alphafold2 split images to make them compatible Hopper gpus.
+ - [[PR #302](https://github.com/nf-core/proteinfold/pull/302)] - Fix HF3 dbs and max_template_date.
+ - [[#305](https://github.com/nf-core/proteinfold/pull/305)] - Stop RFAA and HF3 symlinking scripts into workdir.
++- [[PR #306](https://github.com/nf-core/proteinfold/pull/306)] - extract_output.py -> extract_metrics.py so pLDDT, MSA, PAE emitted as raw data .tsv files
+ 
+ ### Parameters
+ 
+diff --git a/bin/extract_metrics.py b/bin/extract_metrics.py
+new file mode 100755
+index 000000000..02a66eb3a
+--- /dev/null
++++ b/bin/extract_metrics.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python
++import pickle
++import os
++import argparse
++import json
++#import torch moved to a conditional import since too bulky import if not used
++import numpy as np
++import csv
++from utils import plddt_from_struct_b_factor
++
++# TODO: add extraction of other values, iPTM, etc
++# TODO: look into have a --prog argument that could set filenames etc, logically seperate it?
++# {id}_{prog}_{metric}.tsv might be easier for MultiQC to parse a complex workdir, than without the .prog
++
++# Mapping of characters to integers for MSA parsing.
++# 20 is for unknown characters, and 21 is for gaps.
++AA_to_int = {
++    "A": 0, "C": 1, "D": 2, "E": 3, "F": 4, "G": 5, "H": 6, "I": 7, "K": 8, "L": 9,
++    "M": 10, "N": 11, "P": 12, "Q": 13, "R": 14, "S": 15, "T": 16, "V": 17, "W": 18, "Y": 19,
++   ".": 20, "-": 21
++}
++
++def a3m_to_int(a3m_file):
++    """
++    Convert an A3M MSA representation into an integer representation (0-21).
++    """
++    with open(a3m_file, "r") as f:
++        msa = f.read()
++
++    # Convert each sequence in the MSA
++    int_sequences = []
++    for idx, line in enumerate(msa.splitlines()):
++        if idx == 0 and not line.startswith(">"):  # If there's an additional header (non-FASTA) skip it. E.g ColabFold
++            continue
++
++        if not line.startswith(">"):  # Ignore header lines
++            filtered_line = ''.join(char for char in line if not char.islower()) # Remove inserts (lower-case chars) in a3m
++            int_sequence = [AA_to_int.get(char.upper(), 20) for char in filtered_line]
++            int_sequences.append(int_sequence)
++
++    int_sequences_array = np.array(int_sequences, dtype=object)
++    return int_sequences_array
++
++def format_msa_rows(msa_data):
++    return [[str(x) for x in val] for val in msa_data]
++
++def format_pae_rows(pae_data):
++    return [[f"{num:.4f}" for num in row] for row in pae_data]
++
++def write_tsv(file_path, rows):
++    with open(file_path, 'w') as out_f:
++        writer = csv.writer(out_f, delimiter='\t')
++        writer.writerows(rows)
++
++def extract_structs_plddt_to_tsv(id, structures):
++    """
++    Write out a tsv file contain pLDDTs for reading by MultiQC in nf-core/proteinfold
++    Uses utils function with BioPython PDB package to extract residue pLDDT values from the b-factor column.
++    """
++    plddt_cols = [plddt_from_struct_b_factor(structure) for structure in structures]
++    res_counts = [len(plddt_col) for plddt_col in plddt_cols]
++
++    if len(set(res_counts)) != 1:
++        raise ValueError("Not all structures have the same number of residues!")
++
++    rank_names = [f"rank_{i}" for i in range(len(structures))]
++    # Create header as the first row
++    plddt_rows =  [["Positions"] + rank_names]
++    res_id_col = list(range(len(plddt_cols[0])))
++    plddt_rows.extend(zip(res_id_col, *plddt_cols))  # Combine lists column-wise to make rows
++    write_tsv(f"{id}_plddt.tsv", plddt_rows)
++
++def read_pkl(id, pkl_files):
++    """
++    Adapted from the Galaxy AlphaFold tool (https://github.com/usegalaxy-au/tools-au/blob/de94df520c8dc7b8652aedb92e90f6ebb312f95f/tools/alphafold/scripts/outputs.py), originally authored by @neoformit and @graceahall and funded by Australian Biocommons and QCIF Australia.
++    """
++    for pkl_file in pkl_files:
++        print(f"Processing {pkl_file}")
++        data = pickle.load(open(pkl_file, "rb"))
++
++        # Process MSA data
++        if pkl_file.endswith("features.pkl"): # AlphaFold2.3
++            # TODO: AlphaFold2.3 fills end rows with 0s in AlpahFold muliter for an alanine  nf-core/proteinfold Issue #300
++            write_tsv(f"{id}_msa.tsv", format_msa_rows(data["msa"]))
++        elif pkl_file.endswith("final_features.pkl"): # HelixFold3
++            write_tsv(f"{id}_msa.tsv", format_msa_rows(data["feat"]["msa"]))
++    # AlphaFold2.3 non-summary, for each pkl. TODO: Need to either read in ranking_debug.json to get the ranking order, or do it later in the workflow.
++        else:
++            model_id = os.path.basename(pkl_file).replace("result_model_", "").replace(".pkl", "")
++            write_tsv(f"{id}_{model_id}_lddt.tsv", format_msa_rows(data["plddt"]))
++
++            if 'predicted_aligned_error' not in data.keys():
++                print(f"No PAE output in {pkl_file}, it was likely a monomer calculation")
++                write_tsv(f"{id}_{model_id}_pae.tsv", None)
++            else:
++                write_tsv(f"{id}_{model_id}_pae.tsv", format_pae_rows(data["predicted_aligned_error"]))
++
++def read_a3m(id, a3m_files):
++    # ColabFold, RosettaFold-All-Atom, Boltz-1
++    for a3m_file in a3m_files:
++        int_seqs = a3m_to_int(a3m_file)
++        write_tsv(f"{id}_msa.tsv", format_msa_rows(int_seqs))
++
++def read_npz(id, npz_files):
++   for idx, npz_file in enumerate(npz_files):
++        data = np.load(npz_file)
++       #Boltz PAE files if --write_full_pae is used
++        if npz_file.split('/')[-1].startswith('pae') and npz_file.endswith('.npz'):
++            write_tsv(f"{id}_{idx}_pae.tsv", format_pae_rows(data["pae"]))
++
++def read_json(id, json_files):
++    for idx, json_file in enumerate(json_files):
++        with open(json_file, 'r') as f:
++            data = json.load(f)
++            if json_file.endswith("_data.json"): #AF3 output with MSA info
++                # Can't just used format_msa_rows since there's FASTA headers in the json content
++                unpaired_MSAs = data['sequences'][0]['protein']['unpairedMsa']
++                msa_lines = [line for line in unpaired_MSAs.split("\n") if not line.startswith(">") and line.strip()]
++                msa_rows = [[str(AA_to_int.get(residue, 20)) for residue in line] for line in msa_lines]
++                write_tsv(f"{id}_msa.tsv", msa_rows)
++            #AF3 output with PAE info, or HF3 PAE data. TODO: Need to make sure the workflow points to [protein]/[protein]_rank1/all_results.json
++            elif "pae" in data:
++                write_tsv(f"{id}_{idx}_pae.tsv", format_pae_rows(data["pae"]))
++
++def read_pt(id, pt_files):
++    for pt_file in pt_files:
++        with open(pt_file, 'rb') as f:   # TODO: point to [protein]_aux.pt
++            data = torch.load(f, map_location="cpu")
++            if 'pae' in data:
++                # The pt file has the pae data as a tensor that needs to be cast to a list
++                write_tsv(f"{id}_pae.tsv", format_pae_rows(data["pae"].tolist()))
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--pkls", dest="pkls", required=False, nargs="+") # For reading both HelixFold3 and AlphaFold2 MSA formats
++    parser.add_argument("--npzs", dest="npzs", required=False, nargs="+") # For reading the Boltz-1 PAE formats. TODO: Boltz-1 MSA not implemented (go straight to .a3m file), implement
++    parser.add_argument("--a3ms", dest="a3ms", required=False, nargs="+") # For reading the RosettaFold-All-Atom, ColabFold, and Boltz-1 MSA formats
++    parser.add_argument("--jsons", dest="jsons", required=False, nargs="+") # For reading the AF3 MSA & PAE, HF3 PAE
++    parser.add_argument("--pts", dest="pts", required=False, nargs="+") # For read RFAA pytorch model to get PAE data
++    parser.add_argument("--structs", dest="structs", required=False, nargs="+")
++    parser.add_argument("--name", default="untitled", dest="name") # might need a --name $meta.id
++    parser.add_argument("--output_dir", default=".", dest="output_dir")
++    args = parser.parse_args()
++
++    if args.pkls:
++        read_pkl(args.name, args.pkls)
++    if args.a3ms:
++        read_a3m(args.name, args.a3ms)
++    if args.npzs:
++        read_npz(args.name, args.npzs)
++    if args.jsons:
++        read_json(args.name, args.jsons)
++    if args.pts:
++        import torch # moved to a conditional import since too bulky import if not used
++        read_pt(args.name, args.pts)
++    if args.structs:
++        extract_structs_plddt_to_tsv(args.name, args.structs)
++
++if __name__ == "__main__":
++    main()
+diff --git a/bin/extract_output.py b/bin/extract_output.py
+deleted file mode 100755
+index 3b22f8e56..000000000
+--- a/bin/extract_output.py
++++ /dev/null
+@@ -1,32 +0,0 @@
+-#!/usr/bin/env python
+-import pickle
+-import os
+-import argparse
+-
+-
+-def read_pkl(id, pkl_files):
+-    for pkl_file in pkl_files:
+-        dict_data = pickle.load(open(pkl_file, "rb"))
+-        if pkl_file.endswith("features.pkl"):
+-            with open(f"{id}_msa.tsv", "w") as out_f:
+-                for val in dict_data["msa"]:
+-                    out_f.write("\t".join([str(x) for x in val]) + "\n")
+-        else:
+-            model_id = (
+-                os.path.basename(pkl_file)
+-                .replace("result_model_", "")
+-                .replace("_pred_0.pkl", "")
+-            )
+-            with open(f"{id}_lddt_{model_id}.tsv", "w") as out_f:
+-                out_f.write("\t".join([str(x) for x in dict_data["plddt"]]) + "\n")
+-
+-
+-parser = argparse.ArgumentParser()
+-parser.add_argument("--pkls", dest="pkls", required=True, nargs="+")
+-parser.add_argument("--name", dest="name")
+-parser.add_argument("--output_dir", dest="output_dir")
+-parser.set_defaults(output_dir="")
+-parser.set_defaults(name="")
+-args = parser.parse_args()
+-
+-read_pkl(args.name, args.pkls)
+diff --git a/bin/utils.py b/bin/utils.py
+new file mode 100755
+index 000000000..f804ac879
+--- /dev/null
++++ b/bin/utils.py
+@@ -0,0 +1,43 @@
++from Bio import PDB
++import numpy as np
++
++def plddt_from_struct_b_factor(struct_file):
++    """
++    Uses the BioPython PDB package to extract residue pLDDT values from the b-factor column. Iterates over PDB objects rather than processes raw file
++    """
++    if str(struct_file).endswith(".pdb"):
++        parser = PDB.PDBParser(QUIET=True)
++        structure = parser.get_structure(id=id, file=struct_file)
++    elif str(struct_file).endswith(".cif"):
++        parser = PDB.MMCIFParser(QUIET=True)
++        structure = parser.get_structure(structure_id=id, filename=struct_file)
++    else:
++        print(f"{struct_file} is neither a PDB or mmCIF file!")
++
++    res_list = []
++    res_plddts = []
++    plddt_tot = 0
++
++    for model in structure:
++        for chain in model:
++            chain_res_list = chain.get_unpacked_list()
++            res_list.extend(chain_res_list)
++            for residue in chain:
++                atom_list = residue.get_unpacked_list()
++                atom_plddt_tot = 0
++                for atom in residue:  # ESMFold and others have separate atom-wise values, so doing atom-wise to cover that and residue-wise
++                    atom_plddt = atom.get_bfactor()
++                    atom_plddt_tot += atom_plddt
++
++                res_plddt = float(atom_plddt_tot / len(atom_list))
++
++                if (res_plddt < 1):  # RFAA the multiplication of mean isn't failing. Anyway covering to a [0,100] range for any structure file1
++                    res_plddt *= 100
++
++                res_plddts.append(res_plddt)
++                plddt_tot += res_plddt
++
++    res_plddts = np.array(res_plddts)
++    res_plddts = np.round(res_plddts, 2)
++
++    return res_plddts
+diff --git a/docs/output.md b/docs/output.md
+index e505d5bc6..2089495aa 100644
+--- a/docs/output.md
++++ b/docs/output.md
+@@ -25,7 +25,7 @@ The directories listed below will be created in the output directory after the p
+ <details markdown="1">
+ <summary>Output files</summary>
+ 
+-- `alphafold2/standard/` or `alphafold2/split_msa_prediction/` based on the selected mode. It contains the computed MSAs, unrelaxed structures, relaxed structures, ranked structures, raw model outputs, prediction metadata, and section timings. Specifically, `<SEQUENCE NAME>_plddt_mqc.tsv` presents the pLDDT scores per residue for each of the 5 predicted models.
++- `alphafold2/standard/` or `alphafold2/split_msa_prediction/` based on the selected mode. It contains the computed MSAs, unrelaxed structures, relaxed structures, ranked structures, raw model outputs, prediction metadata, and section timings. Specifically, `<SEQUENCE NAME>_plddt.tsv` presents the pLDDT scores per residue for each of the 5 predicted models.
+   - `top_ranked_structures/<SEQUENCE NAME>.pdb` that is the structure with the highest pLDDT score per input (ranked first)
+ - `DBs/` that contains symbolic links to the downloaded database and parameter files
+ 
+@@ -91,7 +91,7 @@ Below you can find an indicative example of the TSV file with the pLDDT scores p
+ <details markdown="1">
+ <summary>Output files</summary>
+ 
+-- `colabfold/webserver/` or `colabfold/local/` based on the selected mode. It contains the computed MSAs, unrelaxed structures, relaxed structures, ranked structures, raw model outputs, prediction metadata, and section timings. Specifically, `<SEQUENCE NAME>_plddt_mqc.tsv` presents the pLDDT scores per residue for each of the 5 predicted models.
++- `colabfold/webserver/` or `colabfold/local/` based on the selected mode. It contains the computed MSAs, unrelaxed structures, relaxed structures, ranked structures, raw model outputs, prediction metadata, and section timings. Specifically, `<SEQUENCE NAME>_plddt.tsv` presents the pLDDT scores per residue for each of the 5 predicted models.
+   - `top_ranked_structures/<SEQUENCE NAME>.pdb` that is the structure with the highest pLDDT score per input (ranked first)
+ - `DBs/` that contains symbolic links to the downloaded database and parameter files
+ 
+@@ -117,7 +117,7 @@ Below you can find some indicative examples of the output images produced by Col
+ <summary>Output files</summary>
+ 
+ - `esmfold/default`
+-  contains the predicted structures. Specifically, `<SEQUENCE NAME>_plddt_mqc.tsv` presents the pLDDT scores per residue for each of the predicted models.
++  contains the predicted structures. Specifically, `<SEQUENCE NAME>_plddt.tsv` presents the pLDDT scores per residue for each of the predicted models.
+   - `top_ranked_structures/<SEQUENCE NAME>.pdb` that is the structure with the highest pLDDT score per input (ranked first)
+ - `DBs/` that contains symbolic links to the downloaded database and parameter files
+ 
+@@ -185,7 +185,7 @@ Below you can find an indicative example of the TSV file with the pLDDT scores p
+ 
+ - `run/`
+   - `<SEQUENCE NAME>_rosettafold_all_atom.pdb` that is the structure with the highest pLDDT score (ranked first)
+-  - `<SEQUENCE NAME>_plddt_mqc.tsv` that presents the pLDDT scores per residue for the predicted model
++  - `<SEQUENCE NAME>_plddt.tsv` that presents the pLDDT scores per residue for the predicted model
+   - `<SEQUENCE NAME>_aux.pt` pytorch file with confidence metrics stored (can load with torch.load(file, map_location="cpu"))
+   - `<SEQUENCE NAME>/` that contains the computed MSAs, prediction metadata
+ 
+@@ -198,7 +198,7 @@ Below you can find an indicative example of the TSV file with the pLDDT scores p
+ 
+ - `run/`
+   - `<SEQUENCE NAME>_helixfold3.pdb` that is the structure with the highest pLDDT score (ranked first)
+-  - `<SEQUENCE NAME>_plddt_mqc.tsv` that presents the pLDDT scores per residue for the predicted model
++  - `<SEQUENCE NAME>_plddt.tsv` that presents the pLDDT scores per residue for the predicted model
+   - `<SEQUENCE NAME>/` that contains the computed MSAs, prediction metadata, ranked structures, raw model outputs etc.
+ 
+ </details>
+diff --git a/modules/local/run_alphafold2/main.nf b/modules/local/run_alphafold2/main.nf
+index 0cb976a08..df4080f0b 100644
+--- a/modules/local/run_alphafold2/main.nf
++++ b/modules/local/run_alphafold2/main.nf
+@@ -25,10 +25,15 @@ process RUN_ALPHAFOLD2 {
+ 
+     output:
+     path ("${fasta.baseName}*")
+-    tuple val(meta), path ("${meta.id}_alphafold2.pdb")   , emit: top_ranked_pdb
+-    tuple val(meta), path ("${fasta.baseName}/ranked*pdb"), emit: pdb
+-    tuple val(meta), path ("${fasta.baseName}/*_msa.tsv") , emit: msa
+-    tuple val(meta), path ("*_mqc.tsv")                   , emit: multiqc
++    tuple val(meta), path ("${meta.id}_alphafold2.pdb")    , emit: top_ranked_pdb
++    tuple val(meta), path ("${fasta.baseName}/ranked*.pdb"), emit: pdb
++    // TODO: re-label multiqc -> plddt so multiqc channel can take in all metrics
++    tuple val(meta), path ("${meta.id}_plddt.tsv")         , emit: multiqc
++    tuple val(meta), path ("${meta.id}_msa.tsv")           , emit: msa
++    // TODO: alphafold2_model_preset == "monomer" the pae file won't exist.
++    // Default is monomer_ptm which does calculate metrics. Good default, metrics worth it for minor performance loss
++    // Nevertheless PAE has to be optional since not all alphafold2 NN models are handled to generate PAE
++    tuple val(meta), path ("${meta.id}_*_pae.tsv")          , optional: true, emit: paes
+     path "versions.yml", emit: versions
+ 
+     when:
+@@ -66,18 +71,10 @@ process RUN_ALPHAFOLD2 {
+         $args
+ 
+     cp "${fasta.baseName}"/ranked_0.pdb ./"${meta.id}"_alphafold2.pdb
+-    cd "${fasta.baseName}"
+-    awk '{print \$6"\\t"\$11}' ranked_0.pdb | uniq > ranked_0_plddt.tsv
+-    for i in 1 2 3 4
+-        do awk '{print \$6"\\t"\$11}' ranked_\$i.pdb | uniq | awk '{print \$2}' > ranked_"\$i"_plddt.tsv
+-    done
+-    paste ranked_0_plddt.tsv ranked_1_plddt.tsv ranked_2_plddt.tsv ranked_3_plddt.tsv ranked_4_plddt.tsv > plddt.tsv
+-    echo -e Positions"\\t"rank_0"\\t"rank_1"\\t"rank_2"\\t"rank_3"\\t"rank_4 > header.tsv
+-    cat header.tsv plddt.tsv > ../"${meta.id}"_plddt_mqc.tsv
+ 
+-    extract_output.py --name ${meta.id} \\
+-        --pkls features.pkl
+-    cd ..
++    extract_metrics.py --name ${meta.id} \\
++        --pkls ${fasta.baseName}/features.pkl \\
++        --structs ${fasta.baseName}/ranked*.pdb
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+@@ -87,15 +84,16 @@ process RUN_ALPHAFOLD2 {
+ 
+     stub:
+     """
+-    touch ./"${meta.id}"_alphafold2.pdb
+-    touch ./"${meta.id}"_mqc.tsv
++    touch "${meta.id}_alphafold2.pdb"
++    touch "${meta.id}_plddt.tsv"
++    touch "${meta.id}_msa.tsv"
++    touch "${meta.id}_0_pae.tsv"
+     mkdir "${fasta.baseName}"
+     touch "${fasta.baseName}/ranked_0.pdb"
+     touch "${fasta.baseName}/ranked_1.pdb"
+     touch "${fasta.baseName}/ranked_2.pdb"
+     touch "${fasta.baseName}/ranked_3.pdb"
+     touch "${fasta.baseName}/ranked_4.pdb"
+-    touch "${fasta.baseName}/${fasta.baseName}_msa.tsv"
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/local/run_alphafold2_msa/main.nf b/modules/local/run_alphafold2_msa/main.nf
+index db3e01f1a..8e19ac172 100644
+--- a/modules/local/run_alphafold2_msa/main.nf
++++ b/modules/local/run_alphafold2_msa/main.nf
+@@ -25,7 +25,7 @@ process RUN_ALPHAFOLD2_MSA {
+ 
+     output:
+     path ("${fasta.baseName}*")
+-    tuple val(meta), path ("${fasta.baseName}.features.pkl"), emit: features
++    tuple val(meta), path ("${fasta.baseName}/features.pkl"), emit: features
+     path "versions.yml"                                     , emit: versions
+ 
+     when:
+@@ -61,8 +61,6 @@ process RUN_ALPHAFOLD2_MSA {
+         --obsolete_pdbs_path=./pdb_mmcif/obsolete.dat  \
+         $args
+ 
+-    cp "${fasta.baseName}"/features.pkl ./"${fasta.baseName}".features.pkl
+-
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+         python: \$(python3 --version | sed 's/Python //g')
+@@ -71,7 +69,7 @@ process RUN_ALPHAFOLD2_MSA {
+ 
+     stub:
+     """
+-    touch ./"${fasta.baseName}".features.pkl
++    touch ./"${fasta.baseName}"/features.pkl
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/local/run_alphafold2_pred/main.nf b/modules/local/run_alphafold2_pred/main.nf
+index f6b20732c..617af1de9 100644
+--- a/modules/local/run_alphafold2_pred/main.nf
++++ b/modules/local/run_alphafold2_pred/main.nf
+@@ -21,15 +21,20 @@ process RUN_ALPHAFOLD2_PRED {
+     path ('uniref90/*')
+     path ('pdb_seqres/*')
+     path ('uniprot/*')
+-    tuple val(meta2), path(msa)
++    tuple val(meta2), path(features)
+ 
+     output:
+     path ("${fasta.baseName}*")
+-    tuple val(meta), path ("${meta.id}_alphafold2.pdb")   , emit: top_ranked_pdb
+-    tuple val(meta), path ("${fasta.baseName}/ranked*pdb"), emit: pdb
+-    tuple val(meta), path ("*_msa.tsv")                   , emit: msa
+-    tuple val(meta), path ("*_mqc.tsv")                   , emit: multiqc
+-    path "versions.yml"                                   , emit: versions
++    tuple val(meta), path ("${meta.id}_alphafold2.pdb")     , emit: top_ranked_pdb
++    tuple val(meta), path ("${fasta.baseName}/ranked*.pdb") , emit: pdb
++    tuple val(meta), path ("${meta.id}_msa.tsv")            , emit: msa
++    // TODO: re-label multiqc -> plddt so multiqc channel can take in all metrics
++    tuple val(meta), path ("${meta.id}_plddt.tsv")          , emit: multiqc
++    // TODO: alphafold2_model_preset == "monomer" the pae file won't exist.
++    // Default is monomer_ptm which does calculate metrics. Good default, metrics worth it for minor performance loss
++    // Nevertheless PAE has to be optional since not all alphafold2 NN models are handled to generate PAE
++    tuple val(meta), path ("${meta.id}_*_pae.tsv")          , optional: true, emit: paes
++    path "versions.yml"                                     , emit: versions
+ 
+     when:
+     task.ext.when == null || task.ext.when
+@@ -47,22 +52,15 @@ process RUN_ALPHAFOLD2_PRED {
+         --model_preset=${alphafold2_model_preset} \
+         --output_dir=\$PWD \
+         --data_dir=\$PWD \
+-        --msa_path=${msa} \
++        --msa_path=${features} \
+         $args
+ 
+     cp "${fasta.baseName}"/ranked_0.pdb ./"${meta.id}"_alphafold2.pdb
+-    cd "${fasta.baseName}"
+-    awk '{print \$6"\\t"\$11}' ranked_0.pdb | uniq > ranked_0_plddt.tsv
+-    for i in 1 2 3 4
+-        do awk '{print \$6"\\t"\$11}' ranked_\$i.pdb | uniq | awk '{print \$2}' > ranked_"\$i"_plddt.tsv
+-    done
+-    paste ranked_0_plddt.tsv ranked_1_plddt.tsv ranked_2_plddt.tsv ranked_3_plddt.tsv ranked_4_plddt.tsv > plddt.tsv
+-    echo -e Positions"\\t"rank_0"\\t"rank_1"\\t"rank_2"\\t"rank_3"\\t"rank_4 > header.tsv
+-    cat header.tsv plddt.tsv > ../"${meta.id}"_plddt_mqc.tsv
+ 
+-    cd ..
+-    extract_output.py --name ${meta.id} \\
+-        --pkls ${msa}
++    extract_metrics.py --name ${meta.id} \\
++        --pkls ${features} \\
++        --structs ${fasta.baseName}/ranked*.pdb
++
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+         python: \$(python3 --version | sed 's/Python //g')
+@@ -71,15 +69,16 @@ process RUN_ALPHAFOLD2_PRED {
+ 
+     stub:
+     """
+-    touch ./"${meta.id}"_alphafold2.pdb
+-    touch ./"${meta.id}"_mqc.tsv
++    touch "${meta.id}_alphafold2.pdb"
++    touch "${meta.id}_plddt.tsv"
++    touch "${meta.id}_msa.tsv"
++    touch "${meta.id}_0_pae.tsv"
+     mkdir "${fasta.baseName}"
+     touch "${fasta.baseName}/ranked_0.pdb"
+     touch "${fasta.baseName}/ranked_1.pdb"
+     touch "${fasta.baseName}/ranked_2.pdb"
+     touch "${fasta.baseName}/ranked_3.pdb"
+     touch "${fasta.baseName}/ranked_4.pdb"
+-    touch ${meta.id}_msa.tsv
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/local/run_boltz/main.nf b/modules/local/run_boltz/main.nf
+index b04148ed4..c51322237 100644
+--- a/modules/local/run_boltz/main.nf
++++ b/modules/local/run_boltz/main.nf
+@@ -34,7 +34,7 @@ process RUN_BOLTZ {
+     def args = task.ext.args ?: ''
+ 
+     """
+-    boltz predict "${fasta}" ${args} --cache ./
++    boltz predict "${fasta}" ${args} --cache ./ --write_full_pae --output_format pdb
+     cp boltz_results_*/predictions/*/*.pdb ./${meta.id}_boltz.pdb
+ 
+     echo -e Atom_serial_number"\\t"Atom_name"\\t"Residue_name"\\t"Residue_sequence_number"\\t"pLDDT > ${meta.id}_plddt_mqc.tsv
+diff --git a/modules/local/run_esmfold/main.nf b/modules/local/run_esmfold/main.nf
+index e2f76e739..004f63e72 100644
+--- a/modules/local/run_esmfold/main.nf
++++ b/modules/local/run_esmfold/main.nf
+@@ -10,8 +10,15 @@ process RUN_ESMFOLD {
+     val numRec
+ 
+     output:
+-    tuple val(meta), path ("${meta.id}_esmfold.pdb")  , emit: pdb
+-    tuple val(meta), path ("${meta.id}_plddt_mqc.tsv"), emit: multiqc
++    tuple val(meta), path ("${meta.id}_esmfold.pdb")  , emit: top_ranked_pdb
++    tuple val(meta), path ("*.pdb")                   , emit: pdb
++    tuple val(meta), path ("${meta.id}_plddt.tsv")    , emit: multiqc
++    // No MSA information in ESMFold
++    // PAE from ESMFold is an absolute pain to retrieve, skipping.
++    // https://github.com/facebookresearch/esm/issues/582
++    // Since neither MSA or PAE exist, the optional will be handled with a NO_FILE in main.nf
++    tuple val(meta), path ("${meta.id}_msa.tsv")      , optional: true, emit: msa
++    tuple val(meta), path ("${meta.id}_*_pae.tsv")    , optional: true, emit: paes
+     path "versions.yml"                               , emit: versions
+ 
+     when:
+@@ -24,6 +31,8 @@ process RUN_ESMFOLD {
+     def args = task.ext.args ?: ''
+     def VERSION = '1.0.3' // WARN: Version information not provided by tool on CLI. Please update this string when bumping container versions.
+ 
++    // KR - note: removed the *.pdb -> tmp.pdb, tmp.pdb  -> esmfold.pdb. Why not just take directly?
++    // Only one .pdb per ESMFold run
+     """
+     esm-fold \
+         -i ${fasta} \
+@@ -32,12 +41,7 @@ process RUN_ESMFOLD {
+         --num-recycles ${numRec} \
+         $args
+ 
+-    mv  *.pdb tmp.pdb
+-    mv  tmp.pdb ${meta.id}_esmfold.pdb
+-
+-    awk '{print \$2"\\t"\$3"\\t"\$4"\\t"\$6"\\t"\$11}' ${meta.id}_esmfold.pdb | grep -v 'N/A' | uniq > plddt.tsv
+-    echo -e Atom_serial_number"\\t"Atom_name"\\t"Residue_name"\\t"Residue_sequence_number"\\t"pLDDT > header.tsv
+-    cat header.tsv plddt.tsv > ${meta.id}_plddt_mqc.tsv
++    mv  *.pdb ${meta.id}_esmfold.pdb
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+@@ -48,8 +52,8 @@ process RUN_ESMFOLD {
+     stub:
+     def VERSION = '1.0.3' // WARN: Version information not provided by tool on CLI. Please update this string when bumping container versions.
+     """
+-    touch ./${meta.id}_esmfold.pdb
+-    touch ./${meta.id}_plddt_mqc.tsv
++    touch "${meta.id}_esmfold.pdb"
++    touch "${meta.id}_plddt.tsv"
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/local/run_helixfold3/main.nf b/modules/local/run_helixfold3/main.nf
+index a16e9af10..28cd39384 100644
+--- a/modules/local/run_helixfold3/main.nf
++++ b/modules/local/run_helixfold3/main.nf
+@@ -24,11 +24,13 @@ process RUN_HELIXFOLD3 {
+     path ('maxit_src')
+ 
+     output:
+-    path ("${meta.id}*")
+     tuple val(meta), path ("${meta.id}_helixfold3.pdb") , emit: top_ranked_pdb
+-    tuple val(meta), path ("${meta.id}/ranked*pdb")     , emit: pdb
+-    tuple val(meta), path ("*_mqc.tsv")                 , emit: multiqc
+     tuple val(meta), path ("${meta.id}_helixfold3.cif") , emit: main_cif
++    tuple val(meta), path ("${meta.id}/ranked*.pdb")    , emit: pdb
++    tuple val(meta), path ("${meta.id}_plddt.tsv")      , emit: multiqc
++    tuple val(meta), path ("${meta.id}_msa.tsv")        , emit: msa
++    // If ${meta.id}-rank*/all_results.json" doesn't have PAE vales in the key, this will be empty
++    tuple val(meta), path ("${meta.id}_*_pae.tsv")      , optional: true, emit: paes
+     path ("versions.yml")                               , emit: versions
+ 
+     when:
+@@ -64,20 +66,14 @@ process RUN_HELIXFOLD3 {
+         --output_dir="\$PWD" \
+         $args
+ 
+-    cp ${fasta.baseName}/*-rank1/predicted_structure.pdb ./${meta.id}_helixfold3.pdb
+-    cp ${fasta.baseName}/*-rank1/predicted_structure.cif ./${meta.id}_helixfold3.cif
+-    cd "${fasta.baseName}"
+-    awk '{print \$6"\\t"\$11}' ${fasta.baseName}-rank1/predicted_structure.pdb > ranked_1_plddt.tsv
+-    for i in 2 3 4
+-        do awk '{print \$6"\\t"\$11}' ${fasta.baseName}-rank\$i/predicted_structure.pdb | awk '{print \$2}' > ranked_"\$i"_plddt.tsv
+-    done
+-    paste ranked_1_plddt.tsv ranked_2_plddt.tsv ranked_3_plddt.tsv ranked_4_plddt.tsv > plddt.tsv
+-    echo -e Positions"\\t"rank_1"\\t"rank_2"\\t"rank_3"\\t"rank_4 > header.tsv
+-    cat header.tsv plddt.tsv > ../${meta.id}_plddt_mqc.tsv
+-    for i in 1 2 3 4
+-        do cp "${fasta.baseName}-rank\$i/predicted_structure.pdb" ./ranked_\$i.pdb
+-    done
+-    cd ..
++    cp "${fasta.baseName}/${fasta.baseName}-rank1/predicted_structure.pdb" "./${meta.id}_helixfold3.pdb"
++    cp "${fasta.baseName}/${fasta.baseName}-rank1/predicted_structure.cif" "./${meta.id}_helixfold3.cif"
++
++
++    extract_output.py --name ${meta.id} \\
++        --structs "${fasta.baseName}/${fasta.baseName}-rank*/predicted_structure.pdb" \\
++        --pkls "${fasta.baseName}/final_features.pkl" \\
++        --jsons "${fasta.baseName}-rank*/all_results.json"
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+@@ -87,14 +83,17 @@ process RUN_HELIXFOLD3 {
+ 
+     stub:
+     """
+-    touch ./${meta.id}_helixfold3.cif
+-    touch ./${meta.id}_helixfold3.pdb
+-    touch ./${meta.id}_plddt_mqc.tsv
+-    mkdir "${fasta.baseName}"
+-    touch "${fasta.baseName}/ranked_1.pdb"
+-    touch "${fasta.baseName}/ranked_2.pdb"
+-    touch "${fasta.baseName}/ranked_3.pdb"
+-    touch "${fasta.baseName}/ranked_4.pdb"
++    touch "${meta.id}_helixfold3.cif"
++    touch "${meta.id}_helixfold3.pdb"
++    touch "${meta.id}_plddt.tsv"
++    touch "${meta.id}_msa.tsv"
++    touch "${meta.id}_0_pae.tsv"
++    mkdir "${meta.id}"
++    touch "${meta.id}/ranked_1.pdb"
++    touch "${meta.id}/ranked_2.pdb"
++    touch "${meta.id}/ranked_3.pdb"
++    touch "${meta.id}/ranked_4.pdb"
++
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/local/run_rosettafold_all_atom/main.nf b/modules/local/run_rosettafold_all_atom/main.nf
+index 782e2bf44..6c9bef3db 100644
+--- a/modules/local/run_rosettafold_all_atom/main.nf
++++ b/modules/local/run_rosettafold_all_atom/main.nf
+@@ -17,30 +17,33 @@ process RUN_ROSETTAFOLD_ALL_ATOM {
+ 
+     output:
+     tuple val(meta), path ("${meta.id}_rosettafold_all_atom.pdb"), emit: pdb
+-    tuple val(meta), path ("*_mqc.tsv")                          , emit: multiqc
++    tuple val(meta), path ("${meta.id}_plddt.tsv")               , emit: multiqc
++    tuple val(meta), path ("${meta.id}_msa.tsv")                 , emit: msa
++    // I think there should always be PAE from the .pt PyTorch model. extract_metrics.py has condition import torch to handle this
++    tuple val(meta), path ("${meta.id}_*_pae.tsv")               , emit: paes
+     path "versions.yml"                                          , emit: versions
+ 
+     when:
+     task.ext.when == null || task.ext.when
+ 
++
++    // TODO: I'm not convinced --a3ms to chain /A/msa is entirely what I want here, but the MSA isn't easily stored elsewhere
+     script:
+     // Exit if running this module with -profile conda / -profile mamba
+     if (workflow.profile.tokenize(',').intersect(['conda', 'mamba']).size() >= 1) {
+         error("Local RUN_ROSETTAFOLD_ALL_ATOM module does not support Conda. Please use Docker / Singularity / Podman instead.")
+     }
+     def args = task.ext.args ?: ''
+-    def VERSION = '1.2.0dev' // WARN: Version information not provided by tool on CLI. Please update this string when bumping container versions.
+-
+     """
+     mamba run --name RFAA python /app/RoseTTAFold-All-Atom/rf2aa/run_inference.py \
+     --config-dir /app/RoseTTAFold-All-Atom/rf2aa/config/inference \
+     --config-name "${yaml}" \
+     $args
+ 
+-    cp "${yaml.baseName}.pdb" "${meta.id}_rosettafold_all_atom.pdb"
+-    awk '{printf "%s\\t%.0f\\n", \$6, \$11 * 100}' ${meta.id}_rosettafold_all_atom.pdb | uniq > plddt.tsv
+-    echo -e Positions"\\t"${meta.id}_rosettafold_all_atom.pdb > header.tsv
+-    cat header.tsv plddt.tsv > "${meta.id}_plddt_mqc.tsv"
++    mamba run --name RFAA extract_metrics.py --name ${meta.id} \\
++        --structs "${yaml.baseName}_rosettafold_all_atom.pdb" \\
++        --a3ms "${yaml.baseName}/A/t000_.msa0.a3m" \\
++        --pts ${yaml.baseName}_aux.pt
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+@@ -50,14 +53,12 @@ process RUN_ROSETTAFOLD_ALL_ATOM {
+ 
+     stub:
+     """
+-    touch ./${meta.id}_rosettafold_all_atom.pdb
+-    touch ./${meta.id}_plddt_mqc.tsv
+-    touch ./${meta.id}_aux.pt
+-    touch ./${meta.id}.pdb
+-    touch ./header.tsv
+-    touch ./plddt.tsv
+-    mkdir ./outputs
+-    mkdir ./${meta.id}
++    touch "${meta.id}_rosettafold_all_atom.pdb"
++    touch "${meta.id}.pdb"
++    touch "${meta.id}_aux.pt"
++    touch "${meta.id}_plddt.tsv"
++    touch "${meta.id}_msa.tsv"
++    touch "${meta.id}_0_pae.tsv"
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":

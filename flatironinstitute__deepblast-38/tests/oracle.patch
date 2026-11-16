@@ -1,0 +1,200 @@
+diff --git a/deepblast/alignment.py b/deepblast/alignment.py
+index 0bb13ca..936eb62 100644
+--- a/deepblast/alignment.py
++++ b/deepblast/alignment.py
+@@ -1,14 +1,15 @@
+ import torch
+ import torch.nn as nn
+ from deepblast.language_model import BiLM, pretrained_language_models
+-from deepblast.nw import NeedlemanWunschDecoder
++from deepblast.nw import NeedlemanWunschDecoder as NWDecoderCPU
++from deepblast.nw_cuda import NeedlemanWunschDecoder as NWDecoderCUDA
+ from deepblast.embedding import StackedRNN, EmbedLinear
+ 
+ 
+ class NeedlemanWunschAligner(nn.Module):
+ 
+     def __init__(self, n_alpha, n_input, n_units, n_embed,
+-                 n_layers=2, lm=None):
++                 n_layers=2, lm=None, device='gpu'):
+         """ NeedlemanWunsch Alignment model
+ 
+         Parameters
+@@ -42,9 +43,12 @@ def __init__(self, n_alpha, n_input, n_units, n_embed,
+                 n_alpha, n_input, n_units, n_embed, n_layers, lm=lm)
+         else:
+             self.embedding = EmbedLinear(n_alpha, n_input, n_embed, lm=lm)
+-
+         self.gap_score = nn.Linear(n_embed * 2, 1)
+-        self.nw = NeedlemanWunschDecoder(operator='softmax')
++        # TODO: make cpu compatible version
++        # if device == 'cpu':
++        #     self.nw = NWDecoderCPU(operator='softmax')
++        # else:
++        self.nw = NWDecoderCUDA(operator='softmax')
+ 
+     def forward(self, x, y):
+         """ Generate alignment matrix.
+@@ -70,12 +74,8 @@ def forward(self, x, y):
+             ymean = zy.mean(axis=1)   # dim B x D
+             merged = torch.cat((xmean, ymean), axis=1)  # dim B x 2D
+             A = self.gap_score(merged)
+-            # TODO enable batching on needleman-wunsch
+-            B, N, M = theta.shape
+-            aln = torch.zeros((B, M, N), device=theta.device)
+-            for b in range(B):
+-                # TODO: Somehow all of the dimensions are backwards
+-                aln[b] = self.nw.decode(theta[b], A[b]).T
++            print(theta.shape, A.shape)
++            aln = self.nw.decode(theta, A)
+             return aln
+ 
+     def traceback(self, x, y):
+@@ -90,6 +90,6 @@ def traceback(self, x, y):
+             A = self.gap_score(merged)
+             B, _, _ = theta.shape
+             for b in range(B):
+-                aln = self.nw.decode(theta[b], A[b])
++                aln = self.nw.decode(theta[b].unsqueeze(0), A[b].unsqueeze(0))
+                 decoded = self.nw.traceback(aln)
+                 yield decoded, aln
+diff --git a/deepblast/nw_cuda.py b/deepblast/nw_cuda.py
+index aac3c4b..e66193a 100644
+--- a/deepblast/nw_cuda.py
++++ b/deepblast/nw_cuda.py
+@@ -177,13 +177,13 @@ def forward(ctx, theta, A, operator):
+         Vt = torch.zeros((B), dtype=theta.dtype)
+         bpg = (B + (tpb - 1)) // tpb  # blocks per grid
+ 
+-        d_theta = cuda.to_device(theta.detach().numpy())
+-        d_A = cuda.to_device(A.detach().numpy())
+-        d_Q = cuda.to_device(Q.detach().numpy())
+-        d_Vt = cuda.to_device(Vt.detach().numpy())
++        d_theta = cuda.to_device(theta.detach().cpu().numpy())
++        d_A = cuda.to_device(A.detach().cpu().numpy())
++        d_Q = cuda.to_device(Q.detach().cpu().numpy())
++        d_Vt = cuda.to_device(Vt.detach().cpu().numpy())
+ 
+         _forward_pass_kernel[tpb, bpg](d_theta, d_A, d_Q, d_Vt)
+-        d_Vt.copy_to_host(Vt.detach().numpy())
++        d_Vt.copy_to_host(Vt.detach().cpu().numpy())
+ 
+         ctx.save_for_backward(theta, A, Q)
+         ctx.others = operator
+@@ -244,7 +244,7 @@ def backward(ctx, Ztheta, ZA):
+         """
+         # operator = ctx.others
+         d_Q, d_E  = ctx.device_arrays
+-        
++
+         B, ZN, ZM = Ztheta.shape
+         bpg = (B + (tpb - 1)) // tpb  # blocks per grid
+ 
+@@ -252,11 +252,12 @@ def backward(ctx, Ztheta, ZA):
+         Vtd = torch.zeros(B, dtype=Ztheta.dtype)
+         Ed = torch.zeros((B, ZN, ZM), dtype=Ztheta.dtype)
+ 
+-        d_Ztheta = cuda.to_device(Ztheta.detach().numpy())
+-        d_ZA = cuda.to_device(ZA.detach().numpy())
+-        d_Vtd = cuda.to_device(Vtd.detach().numpy())
+-        d_Qd = cuda.to_device(Qd.detach().numpy())
+-        d_Ed = cuda.to_device(Ed.detach().numpy())
++        # TODO: need to figure out how to remove data bottleneck
++        d_Ztheta = cuda.to_device(Ztheta.detach().cpu().numpy())
++        d_ZA = cuda.to_device(ZA.detach().cpu().numpy())
++        d_Vtd = cuda.to_device(Vtd.detach().cpu().numpy())
++        d_Qd = cuda.to_device(Qd.detach().cpu().numpy())
++        d_Ed = cuda.to_device(Ed.detach().cpu().numpy())
+ 
+         _adjoint_forward_pass_kernel[tpb, bpg](d_Q, d_Ztheta, d_ZA, d_Vtd,
+                                                d_Qd)
+@@ -283,28 +284,36 @@ def traceback(self, grad):
+         Parameters
+         ----------
+         grad : torch.Tensor
+-            Gradients of the alignment matrix of dimension N x M.
++            Gradients of the alignment matrix.
+ 
+         Returns
+         -------
+         states : list of tuple
+             Indices representing matches.
+         """
+-        # m, x, y = 1, 0, 2
++        m, x, y = 1, 0, 2
+         N, M = grad.shape
+         states = torch.zeros(max(N, M))
+-        T = max(N, M)
+         i, j = N - 1, M - 1
+-        states = [(i, j)]
+-        for t in reversed(range(T)):
++        states = [(i, j, m)]
++        max_ = -100000
++        while True:
+             idx = torch.Tensor([[i - 1, j], [i - 1, j - 1], [i, j - 1]]).long()
++            left = max_ if i <= 0 else grad[i - 1, j]
++            diag = max_ if (i <= 0 and j <= 0) else grad[i - 1, j - 1]
++            upper = max_ if j <= 0 else grad[i, j - 1]
++            if diag == max_ and upper == max_ and left == max_:
++                break
+             ij = torch.argmax(
+-                torch.Tensor(
+-                    [grad[i - 1, j], grad[i - 1, j - 1], grad[i, j - 1]]))
++                torch.Tensor([left, diag, upper ])
++            )
++            xmy = torch.Tensor([x, m, y])
+             i, j = int(idx[ij][0]), int(idx[ij][1])
+-            states.append((i, j))
++            s = int(xmy[ij])
++            states.append((i, j, s))
+         return states[::-1]
+ 
++
+     def decode(self, theta, A):
+         """ Shortcut for doing inference. """
+         with torch.enable_grad():
+diff --git a/deepblast/tests/test_nw_cuda.py b/deepblast/tests/test_nw_cuda.py
+index cfe24c5..f032b33 100644
+--- a/deepblast/tests/test_nw_cuda.py
++++ b/deepblast/tests/test_nw_cuda.py
+@@ -47,6 +47,7 @@ def test_decoding(self):
+         v = needle(theta, A)
+         v.backward()
+         decoded = needle.traceback(theta.grad.squeeze())
++        decoded = [(x[0], x[1]) for x in decoded]
+         states = [(0, 0), (1, 0), (2, 0), (3, 1), (4, 2), (4, 3)]
+         self.assertListEqual(states, decoded)
+ 
+diff --git a/deepblast/trainer.py b/deepblast/trainer.py
+index 67cc415..4120b40 100644
+--- a/deepblast/trainer.py
++++ b/deepblast/trainer.py
+@@ -77,6 +77,7 @@ def training_step(self, batch, batch_idx):
+         x, y, s, A = batch
+         self.aligner.train()
+         predA = self.aligner(x, y)
++        print(len(x[0]), len(y[0]), A.shape, predA.shape)
+         loss = self.loss_func(A, predA)
+         assert torch.isnan(loss).item() is False
+         tensorboard_logs = {'train_loss': loss}
+@@ -193,7 +194,7 @@ def add_model_specific_args(parent_parser):
+             '--batch-size', help='Training batch size',
+             required=False, type=int, default=32)
+         parser.add_argument(
+-            '--finetune', help='Perform finetuning (does not work with mean)',
++            '--finetune', help='Perform finetuning',
+             default=False, required=False, type=bool)
+         parser.add_argument(
+             '--clip-ends',
+diff --git a/setup.py b/setup.py
+index 72bc6d9..3464062 100644
+--- a/setup.py
++++ b/setup.py
+@@ -36,6 +36,7 @@
+           'scikit-learn',
+           'numba',
+           'pytorch-lightning>=0.8.1',
++          'matplotlib',
+           'pillow'
+       ],
+       scripts=glob('scripts/*'),

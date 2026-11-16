@@ -1,0 +1,227 @@
+diff --git a/src/cfreesasa.pxd b/src/cfreesasa.pxd
+index c47426b..2c61daf 100644
+--- a/src/cfreesasa.pxd
++++ b/src/cfreesasa.pxd
+@@ -135,6 +135,10 @@ cdef extern from "freesasa.h":
+                                                   const freesasa_classifier* classifier,
+                                                   int options)
+ 
++    freesasa_structure* freesasa_structure_get_chains(
++                                                const freesasa_structure *structure,
++                                                const char *chains)
++
+     freesasa_structure* freesasa_structure_new()
+ 
+     int freesasa_structure_n(freesasa_structure *structure)
+diff --git a/src/structure.pyx b/src/structure.pyx
+index bc8dc3a..f361712 100644
+--- a/src/structure.pyx
++++ b/src/structure.pyx
+@@ -1,5 +1,8 @@
++import string
++import warnings
+ from cfreesasa cimport *
+ from libc.stdio cimport FILE, fopen, fclose
++from libc.stdlib cimport malloc, realloc
+ 
+ cdef class Structure:
+     """
+@@ -90,7 +93,8 @@ cdef class Structure:
+         if classifier._isCClassifier():
+             classifier._get_address(<size_t>&self._c_classifier)
+ 
+-        self._c_options = Structure._get_structure_options(options)
++        Structure._validate_options(options)
++        self._c_options = Structure._get_bitfield_from_options(options)
+ 
+         if fileName is None:
+             self._c_structure = freesasa_structure_new()
+@@ -372,19 +376,25 @@ cdef class Structure:
+         return [coord[3*i], coord[3*i+1], coord[3*i+2]]
+ 
+     @staticmethod
+-    def _get_structure_options(param):
+-        options = 0
+-
++    def _validate_options(param):
+         # check validity of options
+         knownOptions = {'hetatm','hydrogen','join-models','separate-models',
+-                        'separate-chains','skip-unknown','halt-at-unknown'}
+-        unknownOptions = []
+-        for key in param:
+-            if not key in knownOptions:
+-                unknownOptions.append(key)
++                        'separate-chains', 'chain-groups', 'skip-unknown', 'halt-at-unknown'}
++        unknownOptions = set(param.keys()).difference(knownOptions)
+         if len(unknownOptions) > 0:
+             raise AssertionError("Option(s): ",unknownOptions," unknown.")
++        
++        # 'chain-groups' additional checks
++        if param.get('chain-groups', False):
++            if param.get('separate-chains', False):
++                raise ValueError("'chain_groups' and 'separate-chains' cannot be set simultaneously.")
++            allowed_chars = set(string.ascii_lowercase + string.ascii_uppercase + '+')
++            if not all([character in allowed_chars for character in param['chain-groups']]):
++                raise ValueError("'{}' is not a valid chain-groups selection.".format(param['chain-groups']))
+ 
++    @staticmethod
++    def _get_bitfield_from_options(param):
++        options = 0
+         # calculate bitfield
+         if 'hetatm' in param and param['hetatm']:
+             options |= FREESASA_INCLUDE_HETATM
+@@ -423,8 +433,8 @@ def structureArray(fileName,
+     Create array of structures from PDB file.
+ 
+     Split PDB file into several structures by either by treating
+-    chains separately, by treating each MODEL as a separate
+-    structure, or both.
++    chains separately and/or by treating each MODEL as a separate
++    structure and/or grouping chains.
+ 
+     Args:
+         fileName (str): The PDB file.
+@@ -449,33 +459,64 @@ def structureArray(fileName,
+     assert fileName is not None
+     # we need to have at least one of these
+     assert(('separate-chains' in options and options['separate-chains'] is True)
+-           or ('separate-models' in options and options['separate-models'] is True))
+-    structure_options = Structure._get_structure_options(options)
++           or ('separate-models' in options and options['separate-models'] is True)
++           or (options.get('chain-groups', False)))
++
++    Structure._validate_options(options)
++    structure_options = Structure._get_bitfield_from_options(options)
+     cdef FILE *input
+     input = fopen(fileName,'rb')
+     if input is NULL:
+         raise IOError("File '%s' could not be opened." % fileName)
+-    cdef int n
+ 
+     verbosity = getVerbosity()
+ 
+     if classifier is not None:
+         setVerbosity(silent)
+-    cdef freesasa_structure** sArray = freesasa_structure_array(input,&n,NULL,structure_options)
++    
++    cdef int n
++    cdef freesasa_structure** sArray
++    if options.get('separate-chains', False) or options.get('separate-models', False):
++        sArray = freesasa_structure_array(input,&n,NULL,structure_options)
++    else:
++        sArray = <freesasa_structure **> malloc(sizeof(freesasa_structure *))
++        sArray[0] = freesasa_structure_from_pdb(input, NULL, structure_options)
++        n = 1
+     fclose(input)
+ 
++    if sArray is NULL:
++        raise Exception("Problems reading structures in '%s'." % fileName)
++    if sArray[0] is NULL:
++        free(sArray)
++        raise Exception("Problems reading structures in '%s'." % fileName)
++
++    cdef freesasa_structure* group
++    if options.get('chain-groups', False):
++        # Add groups from each model
++        chain_groups = options['chain-groups'].split('+')
++        n_groups = len(chain_groups)
++        n_total = n * (1 + n_groups)
++        sArray = <freesasa_structure**> realloc(sArray, n_total * sizeof(freesasa_structure*))
++        if sArray is NULL:
++            raise Exception("Out of memory when allocating '%i' structures from '%s'." % (n_total, fileName))
++        for i in range(0, n):
++            for j, chainID_group in enumerate(chain_groups):
++                idx = j + (i * n_groups) + n
++                group = freesasa_structure_get_chains(sArray[i], chainID_group)
++                sArray[idx] = group
++        n = n_total
++
+     if classifier is not None:
+         setVerbosity(verbosity)
+ 
+-    if sArray is NULL:
+-        raise Exception("Problems reading structures in '%s'." % fileName)
+     structures = []
+-    for i in range(0,n):
++    for i in range(0, n):
+         structures.append(Structure())
+         structures[-1]._set_address(<size_t> &sArray[i])
+         if classifier is not None:
+             structures[-1].setRadiiWithClassifier(classifier)
+     free(sArray)
++    
+     return structures
+ 
+ 
+@@ -504,7 +545,8 @@ def structureFromBioPDB(bioPDBStructure, classifier=None, options = Structure.de
+     structure = Structure()
+     if (classifier is None):
+         classifier = Classifier()
+-    optbitfield = Structure._get_structure_options(options)
++    Structure._validate_options(options)
++    optbitfield = Structure._get_bitfield_from_options(options)
+ 
+     atoms = bioPDBStructure.get_atoms()
+ 
+diff --git a/test.py b/test.py
+index bb55c71..d49606f 100644
+--- a/test.py
++++ b/test.py
+@@ -191,32 +191,42 @@ def testStructure(self):
+         s.addAtom(' CA ', 'ALA','   1','A',1,1,1)
+         self.assertEqual(s.radius(0), 1.87)
+ 
++
+     def testStructureArray(self):
+         # default separates chains, only uses first model (129 atoms per chain)
+-        ss = structureArray("lib/tests/data/2jo4.pdb")
+-        self.assertTrue(len(ss) == 4)
+-        for s in ss:
+-            self.assertTrue(s.nAtoms() == 129)
+-
+-        # include all models, separate chains, and include hydrogen and hetatm (286 atoms per chain)
++        ss = structureArray("lib/tests/data/2jo4.pdb", {"separate-chains": False,
++            "chain-groups": "AD+B"})
++        self.assertTrue(len(ss) == 3)
++        
++        self.assertTrue(ss[0].nAtoms() == 129 * 4)
++        self.assertTrue(ss[1].nAtoms() == 129 * 2)
++        self.assertTrue(ss[2].nAtoms() == 129)
++
++        # include all models, separate chains and include hydrogens and hetatms (286 atoms per chain)
+         setVerbosity(nowarnings)
+-        ss = structureArray("lib/tests/data/2jo4.pdb",{'separate-models' : True,
+-                                                 'hydrogen' : True,
+-                                                 'hetatm' : True,
+-                                                 'separate-chains' : True})
+-        self.assertTrue(len(ss) == 4*10)
+-        for s in ss:
+-            self.assertTrue(s.nAtoms() == 286)
+ 
+-        # include all models, and include hydrogen and hetatm (286 atoms per chain)
+         ss = structureArray("lib/tests/data/2jo4.pdb",{'separate-models' : True,
+                                              'hydrogen' : True,
+                                              'hetatm' : True})
+         self.assertTrue(len(ss) == 10)
+         for s in ss:
+             self.assertTrue(s.nAtoms() == 286*4)
+-        setVerbosity(normal)
++        
++        # include all models, separate in groups and include hydrogens and hetatms (286 atoms per chain)
++        ss = structureArray("lib/tests/data/2jo4.pdb",{'separate-models' : True,
++                                                 'hydrogen' : True,
++                                                 'hetatm' : True,
++                                                 'separate-chains' : False,
++                                                 "chain-groups": "AD+C"})
++        self.assertTrue(len(ss) == 2*10+10)
++        for i in range(10):
++            self.assertTrue(ss[i].nAtoms() == 286*4)
++        for i in range(10, 30, 2):
++            self.assertTrue(ss[i].nAtoms() == 286*2)
++        for i in range(11, 30, 2):
++            self.assertTrue(ss[i].nAtoms() == 286)
+ 
++        setVerbosity(normal)
+         # check that the structures initialized this way can be used for calculations
+         ss = structureArray("lib/tests/data/1ubq.pdb")
+         self.assertTrue(len(ss) == 1)

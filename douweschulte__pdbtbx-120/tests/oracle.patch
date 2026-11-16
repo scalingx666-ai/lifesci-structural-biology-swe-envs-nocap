@@ -1,0 +1,248 @@
+diff --git a/src/read/general.rs b/src/read/general.rs
+index 3d23ecc..8247243 100644
+--- a/src/read/general.rs
++++ b/src/read/general.rs
+@@ -12,8 +12,13 @@ use flate2::read::GzDecoder;
+ #[cfg(feature = "compression")]
+ use std::fs;
+ 
++/// Standard return type for reading a file.
++pub type ReadResult = std::result::Result<(PDB, Vec<PDBError>), Vec<PDBError>>;
++
+ /// Open an atomic data file, either PDB or mmCIF/PDBx. The correct type will be
+-/// determined based on the file extension.
++/// determined based on the file extension. This function is equivalent to
++/// [`ReadOptions::read()`] with default options, apart from the `level` which
++/// can be set by the `level` parameter.
+ ///
+ /// # Errors
+ /// Returns a `PDBError` if a `BreakingError` is found. Otherwise it returns the PDB with all errors/warnings found while parsing it.
+@@ -21,14 +26,19 @@ use std::fs;
+ /// # Related
+ /// If you want to open a file from memory see [`open_raw`]. There are also function to open a specified file type directly
+ /// see [`crate::open_pdb`] and [`crate::open_mmcif`] respectively.
+-pub fn open(
++pub fn open(filename: impl AsRef<str>, level: StrictnessLevel) -> ReadResult {
++    open_with_options(filename, &ReadOptions::new().set_level(level))
++}
++
++/// Opens a files based on the given options.
++pub(in crate::read) fn open_with_options(
+     filename: impl AsRef<str>,
+-    level: StrictnessLevel,
+-) -> Result<(PDB, Vec<PDBError>), Vec<PDBError>> {
++    options: &ReadOptions,
++) -> ReadResult {
+     if check_extension(&filename, "pdb") {
+-        open_pdb(filename, level)
++        open_pdb(filename, options.level)
+     } else if check_extension(&filename, "cif") {
+-        open_mmcif(filename, level)
++        open_mmcif(filename, options.level)
+     } else {
+         Err(vec![PDBError::new(
+             ErrorLevel::BreakingError,
+@@ -46,13 +56,11 @@ pub fn open(
+ /// Returns a `PDBError` if a `BreakingError` is found. Otherwise it returns the PDB with all errors/warnings found while parsing it.
+ ///
+ /// # Related
+-/// If you want to open a file from memory see [`open_raw`]. There are also function to open a specified file type directly
+-/// see [`crate::open_pdb`] and [`crate::open_mmcif`] respectively.
++/// If you want to open a file from memory see [`open_raw`], [`crate::open_pdb_raw`] and [`crate::open_mmcif_bufread`].
++/// These functions are useful if you are using a non-standard compression algorithm or way of
++/// storing the data.
+ #[cfg(feature = "compression")]
+-pub fn open_gz(
+-    filename: impl AsRef<str>,
+-    level: StrictnessLevel,
+-) -> Result<(PDB, Vec<PDBError>), Vec<PDBError>> {
++pub fn open_gz(filename: impl AsRef<str>, level: StrictnessLevel) -> ReadResult {
+     let filename = filename.as_ref();
+ 
+     if check_extension(filename, "gz") {
+@@ -106,7 +114,7 @@ pub fn open_gz(
+ pub fn open_raw<T: std::io::Read + std::io::Seek>(
+     mut input: std::io::BufReader<T>,
+     level: StrictnessLevel,
+-) -> Result<(PDB, Vec<PDBError>), Vec<PDBError>> {
++) -> ReadResult {
+     let mut first_line = String::new();
+     if input.read_line(&mut first_line).is_err() {
+         return Err(vec![PDBError::new(
+diff --git a/src/read/mmcif/parser.rs b/src/read/mmcif/parser.rs
+index 65997c0..92a91e6 100644
+--- a/src/read/mmcif/parser.rs
++++ b/src/read/mmcif/parser.rs
+@@ -38,7 +38,7 @@ pub fn open_mmcif(
+ /// Open's mmCIF file from a BufRead. This allows opening mmCIF files directly from memory.
+ ///
+ /// This is particularly useful if you want to open a compressed file, as you can use the BufReader
+-pub(crate) fn open_mmcif_bufread(
++pub fn open_mmcif_bufread(
+     mut bufreader: impl BufRead,
+     level: StrictnessLevel,
+ ) -> Result<(PDB, Vec<PDBError>), Vec<PDBError>> {
+diff --git a/src/read/mod.rs b/src/read/mod.rs
+index 821dd2e..2338c8e 100644
+--- a/src/read/mod.rs
++++ b/src/read/mod.rs
+@@ -2,10 +2,14 @@
+ mod general;
+ /// Parse mmCIF/PDBx files
+ mod mmcif;
++/// Read options
++mod read_options;
++
+ /// Parse PDB files
+ mod pdb;
+ use super::check_extension;
+ 
+ pub use general::{open, open_gz, open_raw};
+-pub use mmcif::{open_mmcif, open_mmcif_raw};
++pub use mmcif::{open_mmcif, open_mmcif_bufread, open_mmcif_raw};
+ pub use pdb::{open_pdb, open_pdb_raw};
++pub use read_options::{Format, ReadOptions};
+diff --git a/src/read/read_options.rs b/src/read/read_options.rs
+new file mode 100644
+index 0000000..0759604
+--- /dev/null
++++ b/src/read/read_options.rs
+@@ -0,0 +1,119 @@
++use crate::StrictnessLevel;
++
++use super::general::{open_with_options, ReadResult};
++
++/// Used to set which format to read the file in.
++#[derive(Debug, Clone, Copy, Default)]
++pub enum Format {
++    /// Load PDB files
++    Pdb,
++    /// Load mmCIF files
++    Mmcif,
++    /// Automatically detect the format
++    #[default]
++    Auto,
++}
++
++impl From<&str> for Format {
++    fn from(s: &str) -> Self {
++        match s {
++            "pdb" => Self::Pdb,
++            "mmcif" => Self::Mmcif,
++            _ => panic!("Unknown format: {}", s),
++        }
++    }
++}
++
++/// Options and flags which can be used to configure how a structure file is
++/// opened.
++///
++/// This builder exposes the ability to configure how a [`PDB`] is loaded.
++///
++/// Generally speaking, when using `ReadOptions`, you'll first call
++/// [`ReadOptions::new`], then chain calls to methods to set each option, then
++/// call [`ReadOptions::read`].
++///
++/// # Examples
++///
++/// Opening a file to read:
++///
++/// ```no_run
++/// use pdbtbx::*;
++///
++/// let pdb = ReadOptions::new()
++///     .set_format(Format::Auto)
++///     .set_level(StrictnessLevel::Loose)
++///     .set_discard_hydrogens(true)
++///     .read("1CRN.pdb");
++//
++/// ```
++#[derive(Debug, Default)]
++pub struct ReadOptions {
++    /// The format to read the file in.
++    pub(crate) format: Format,
++
++    /// The strictness level to use when reading the file.
++    pub(crate) level: StrictnessLevel,
++
++    /// Controls whether to capitalise the chains in the structure.
++    pub(crate) capitalise_chains: bool,
++
++    /// Decompress
++    #[cfg(feature = "compression")]
++    pub(crate) decompress: bool,
++
++    /// Discard hydrogens
++    pub(crate) discard_hydrogens: bool,
++
++    /// Only read the first model
++    pub(crate) only_first_model: bool,
++}
++
++impl ReadOptions {
++    /// Constructs a new [`ReadOptions`] object with default values.
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Sets the format to read the file in.
++    pub fn set_format(&mut self, format: Format) -> &mut Self {
++        self.format = format;
++        self
++    }
++
++    /// Sets the strictness level to use when reading the file.
++    pub fn set_level(&mut self, level: StrictnessLevel) -> &mut Self {
++        self.level = level;
++        self
++    }
++
++    /// Sets whether to capitalise the chains in the structure.
++    pub fn set_capitalise_chains(&mut self, capitalise_chains: bool) -> &mut Self {
++        self.capitalise_chains = capitalise_chains;
++        self
++    }
++
++    /// Sets whether to decompress the file.
++    #[cfg(feature = "compression")]
++    pub fn set_decompress(&mut self, decompress: bool) -> &mut Self {
++        self.decompress = decompress;
++        self
++    }
++
++    /// Sets whether to discard hydrogens.
++    pub fn set_discard_hydrogens(&mut self, discard_hydrogens: bool) -> &mut Self {
++        self.discard_hydrogens = discard_hydrogens;
++        self
++    }
++
++    /// Sets whether to only keep the first model.
++    pub fn set_only_first_model(&mut self, only_first_model: bool) -> &mut Self {
++        self.only_first_model = only_first_model;
++        self
++    }
++
++    /// Reads a file into a [`PDB`] structure.
++    pub fn read(&self, path: &str) -> ReadResult {
++        open_with_options(path, self)
++    }
++}
+diff --git a/src/strictness_level.rs b/src/strictness_level.rs
+index 7fc5eab..30eacff 100644
+--- a/src/strictness_level.rs
++++ b/src/strictness_level.rs
+@@ -3,12 +3,13 @@ use std::fmt::Display;
+ #[cfg(doc)]
+ use crate::ErrorLevel;
+ 
+-#[derive(PartialEq, Eq, Debug, Copy, Clone)]
++#[derive(PartialEq, Eq, Debug, Copy, Clone, Default)]
+ /// The strictness to operate in, this defines at which [`ErrorLevel`] the program should stop execution upon finding an error.
+ pub enum StrictnessLevel {
+     /// With `Strict` the program will always stop execution upon finding an error.
+     Strict,
+     /// With `Medium` the program will allow [`ErrorLevel::GeneralWarning`].
++    #[default]
+     Medium,
+     /// With `Loose` the program will allow [`ErrorLevel::GeneralWarning`] and [`ErrorLevel::LooseWarning`].
+     Loose,

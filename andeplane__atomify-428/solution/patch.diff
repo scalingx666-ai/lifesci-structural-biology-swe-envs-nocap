@@ -1,0 +1,490 @@
+diff --git a/e2e/data-viewer.spec.ts b/e2e/data-viewer.spec.ts
+new file mode 100644
+index 00000000..bb89dfcb
+--- /dev/null
++++ b/e2e/data-viewer.spec.ts
+@@ -0,0 +1,68 @@
++import { expect, test } from "@playwright/test";
++import {
++  createBlankProject,
++  gotoApp,
++  readContentsRecord,
++  waitForEngine,
++} from "./helpers";
++
++const atomicData = `LAMMPS data file\n\n2 atoms\n1 atom types\n\n0 4 xlo xhi\n0 4 ylo yhi\n0 4 zlo zhi\n\nAtoms # atomic\n\n1 1 1 1 1\n2 1 3 3 3\n`;
++
++const molecularData = `LAMMPS data file\n\n2 atoms\n1 bonds\n1 atom types\n1 bond types\n\n0 4 xlo xhi\n0 4 ylo yhi\n0 4 zlo zhi\n\nAtoms # full\n\n1 1 1 0 1 1 1\n2 1 1 0 2 2 2\n\nBonds\n\n1 1 1 2\n`;
++for (const [style, data] of [
++  ["atomic", atomicData],
++  ["full", molecularData],
++]) {
++  test(`${style} data opens as an interactive structure with zero integrated steps`, async ({
++    page,
++  }) => {
++    await gotoApp(page);
++    await createBlankProject(page, "Data viewer", "data-viewer");
++    await page.getByTestId("upload-input").setInputFiles({
++      name: "sample.data",
++      mimeType: "text/plain",
++      buffer: Buffer.from(data),
++    });
++    await waitForEngine(page);
++    await page.getByTestId("view-data-sample.data").click();
++    await expect(page.getByRole("textbox", { name: "Atom style" })).toHaveValue(
++      style,
++    );
++    await page.getByRole("combobox", { name: "Units" }).selectOption("lj");
++    await page
++      .getByTestId("view-data-modal")
++      .getByRole("button", { name: "View structure", exact: true })
++      .click();
++    await expect(page.getByTestId("status-pill-completed").first()).toBeVisible(
++      {
++        timeout: 60_000,
++      },
++    );
++    const canvas = page.getByTestId("run-detail").locator("canvas").first();
++    await expect(canvas).toBeVisible();
++    const meta = await readContentsRecord(
++      page,
++      "data-viewer/runs/run-001/.atomify/run.json",
++    );
++    expect(meta?.content).toMatchObject({
++      viewOnly: true,
++      status: "completed",
++      stats: { timesteps: 0, numAtoms: 2 },
++    });
++    const source = await readContentsRecord(page, "data-viewer/sample.data");
++    expect(source?.content).toBe(data);
++    const before = await canvas.screenshot();
++    const box = (await canvas.boundingBox())!;
++    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
++    await page.mouse.down();
++    await page.mouse.move(
++      box.x + box.width / 2 + 90,
++      box.y + box.height / 2 + 25,
++      { steps: 8 },
++    );
++    await page.mouse.up();
++    await expect
++      .poll(async () => (await canvas.screenshot()).equals(before))
++      .toBe(false);
++  });
++}
+diff --git a/e2e/run.spec.ts b/e2e/run.spec.ts
+index 9f046e3e..2b742b3d 100644
+--- a/e2e/run.spec.ts
++++ b/e2e/run.spec.ts
+@@ -52,10 +52,13 @@ test("run a simulation end-to-end and inspect the recorded run", async ({
+     // The console defaults to collapsed; expand it to watch the live output
+     // (the choice is remembered for the session, so later steps see it open).
+     await page.getByTestId("run-console-toggle").click();
+-    // Live console follows the engine output.
+-    await expect(page.getByTestId("run-console")).toContainText("LAMMPS", {
+-      timeout: 60_000,
+-    });
++    // Run setup survives the per-run buffer reset; the engine banner does not.
++    await expect(page.getByTestId("run-console")).toContainText(
++      "Created 108 atoms",
++      {
++        timeout: 60_000,
++      },
++    );
+   });
+ 
+   await test.step("live analysis lists computes and opens the figure", async () => {
+diff --git a/src/shell/FilesTab.tsx b/src/shell/FilesTab.tsx
+index e6653ccb..7dec997b 100644
+--- a/src/shell/FilesTab.tsx
++++ b/src/shell/FilesTab.tsx
+@@ -40,6 +40,8 @@ import {
+   RowIconButton,
+ } from "./ui";
+ 
++import ViewDataModal from "./modals/ViewDataModal";
++
+ type FileKind = "folder" | "script" | "notebook" | "doc";
+ 
+ function kindOf(entry: FileStat): FileKind {
+@@ -104,6 +106,7 @@ const FilesTab = () => {
+   const setScreen = useStoreActions((actions) => actions.projects.setScreen);
+   const ui = useShellUI();
+ 
++  const [viewDataPath, setViewDataPath] = useState<string | null>(null);
+   const [search, setSearch] = useState("");
+   const [newFileOpen, setNewFileOpen] = useState(false);
+   const [renameTarget, setRenameTarget] = useState<string | null>(null);
+@@ -410,6 +413,16 @@ const FilesTab = () => {
+                       <TargetIcon />
+                     </RowIconButton>
+                   )}
++                  {editable && kind === "doc" && (
++                    <RowIconButton
++                      title="View structure"
++                      disabled={!ui.engineReady}
++                      data-testid={`view-data-${entry.path}`}
++                      onClick={() => setViewDataPath(entry.path)}
++                    >
++                      <PlayIcon />
++                    </RowIconButton>
++                  )}
+                   {editable && (
+                     <RowIconButton
+                       title="Edit"
+@@ -494,6 +507,10 @@ const FilesTab = () => {
+         </div>
+       </div>
+ 
++      <ViewDataModal
++        path={viewDataPath}
++        onClose={() => setViewDataPath(null)}
++      />
+       <PromptModal
+         open={newFileOpen}
+         title="New file"
+diff --git a/src/shell/RunDetail.tsx b/src/shell/RunDetail.tsx
+index f4e66190..bcb02536 100644
+--- a/src/shell/RunDetail.tsx
++++ b/src/shell/RunDetail.tsx
+@@ -28,6 +28,7 @@ const CONSOLE_COLLAPSED_KEY = "atomify_run_console_collapsed";
+ 
+ const RunDetail = ({ runId }: { runId: string }) => {
+   const active = useStoreState((state) => state.projects.active);
++  const loadedSimulationId = useStoreState((s) => s.simulation.simulation?.id);
+   const activeRun = useStoreState((state) => state.projects.activeRun);
+   const lammpsOutput = useStoreState((state) => state.simulation.lammpsOutput);
+   const runTimesteps = useStoreState(
+@@ -66,6 +67,12 @@ const RunDetail = ({ runId }: { runId: string }) => {
+   const meta = entry?.meta ?? null;
+   const live = activeRun?.runId === runId && activeRun?.dirName === dirName;
+ 
++  const viewStructure =
++    meta?.viewOnly &&
++    meta.status === "completed" &&
++    !activeRun &&
++    loadedSimulationId === `${dirName}/runs/${runId}`;
++
+   const [log, setLog] = useState<string[] | null>(null);
+   const [frameUrl, setFrameUrl] = useState<string | null>(null);
+   const [outputs, setOutputs] = useState<FileStat[]>([]);
+@@ -430,7 +437,7 @@ const RunDetail = ({ runId }: { runId: string }) => {
+                 }
+           }
+         >
+-          {live ? (
++          {live || viewStructure ? (
+             <View visible pane />
+           ) : frameUrl ? (
+             <img
+diff --git a/src/shell/modals/ViewDataModal.tsx b/src/shell/modals/ViewDataModal.tsx
+new file mode 100644
+index 00000000..6fc2736c
+--- /dev/null
++++ b/src/shell/modals/ViewDataModal.tsx
+@@ -0,0 +1,123 @@
++import { useEffect, useState } from "react";
++import { useStoreActions, useStoreState } from "../../hooks";
++import {
++  dataFileAtomStyle,
++  dataFileViewerScript,
++} from "../../utils/dataFileViewer";
++import { ModalShell, PrimaryButton } from "../ui";
++
++export default function ViewDataModal({
++  path,
++  onClose,
++}: {
++  path: string | null;
++  onClose: () => void;
++}) {
++  const [atomStyle, setAtomStyle] = useState("atomic");
++  const [units, setUnits] = useState("real");
++  const [error, setError] = useState<string>();
++  const [loaded, setLoaded] = useState(false);
++  const [busy, setBusy] = useState(false);
++  const active = useStoreState((s) => s.projects.active);
++  const readFile = useStoreActions((a) => a.projects.readFile);
++  const writeFile = useStoreActions((a) => a.projects.writeFile);
++  const startRuns = useStoreActions((a) => a.projects.startRuns);
++  useEffect(() => {
++    let current = true;
++    setError(undefined);
++    setLoaded(false);
++    setUnits("real");
++    setAtomStyle("atomic");
++    if (path)
++      void readFile(path)
++        .then((text) => {
++          if (current) {
++            setAtomStyle(dataFileAtomStyle(text));
++            setLoaded(true);
++          }
++        })
++        .catch((e) => {
++          if (current) setError(String(e));
++        });
++    return () => {
++      current = false;
++    };
++  }, [path, readFile]);
++  const view = async () => {
++    if (!path || !active || busy) return;
++    setBusy(true);
++    try {
++      const content = dataFileViewerScript(path, atomStyle, units);
++      let name = "in.view-data";
++      let suffix = 2;
++      while (active.files.some((f) => f.path === name))
++        name = `in.view-data-${suffix++}`;
++      await writeFile({ path: name, content });
++      onClose();
++      await startRuns([
++        {
++          inputScript: name,
++          vars: {},
++          useKokkos: false,
++          threads: 1,
++          viewOnly: true,
++        },
++      ]);
++    } catch (e) {
++      setError(e instanceof Error ? e.message : String(e));
++    } finally {
++      setBusy(false);
++    }
++  };
++  return (
++    <ModalShell
++      open={path !== null}
++      onClose={onClose}
++      title="View data file"
++      testId="view-data-modal"
++    >
++      <div style={{ padding: 24, display: "grid", gap: 16 }}>
++        <p>
++          View {path} without integrating any timesteps. Select the atom style
++          and units used when the file was written. Force-field coefficients are
++          ignored.
++        </p>
++        <label>
++          Atom style
++          <input
++            aria-label="Atom style"
++            className="shell-input"
++            value={atomStyle}
++            onChange={(e) => setAtomStyle(e.target.value)}
++          />
++        </label>
++        <label>
++          Units
++          <select
++            aria-label="Units"
++            className="shell-input"
++            value={units}
++            onChange={(e) => setUnits(e.target.value)}
++          >
++            {[
++              "lj",
++              "real",
++              "metal",
++              "si",
++              "cgs",
++              "electron",
++              "micro",
++              "nano",
++            ].map((u) => (
++              <option key={u}>{u}</option>
++            ))}
++          </select>
++        </label>
++        {error && <p role="alert">{error}</p>}
++        <PrimaryButton disabled={busy || !loaded} onClick={() => void view()}>
++          {busy ? "Loading…" : "View structure"}
++        </PrimaryButton>
++      </div>
++    </ModalShell>
++  );
++}
+diff --git a/src/storage/types.ts b/src/storage/types.ts
+index f1538dcc..e2ccb591 100644
+--- a/src/storage/types.ts
++++ b/src/storage/types.ts
+@@ -67,6 +67,8 @@ export type RunStatus =
+ 
+ /** Contents of `<dirName>/runs/<runId>/.atomify/run.json`. */
+ export interface RunMeta {
++  /** A read-only structural inspection; no dynamics were integrated. */
++  viewOnly?: boolean;
+   schemaVersion: 1;
+   id: string;
+   inputScript: string;
+diff --git a/src/store/projects.ts b/src/store/projects.ts
+index 433fb70f..4b74afbb 100644
+--- a/src/store/projects.ts
++++ b/src/store/projects.ts
+@@ -87,6 +87,7 @@ export interface CreateProjectPayload {
+ }
+ 
+ export interface RunRequest {
++  viewOnly?: boolean;
+   dirName: string;
+   quick: boolean;
+   inputScript: string;
+@@ -1127,6 +1128,7 @@ export const projectsModel: ProjectsModel = {
+     );
+     const snapshotFiles = new Set(copied);
+     let runMeta: RunMeta = {
++      ...(request.viewOnly ? { viewOnly: true } : {}),
+       schemaVersion: 1,
+       id: runId,
+       inputScript: request.inputScript,
+diff --git a/src/utils/dataFileViewer.test.ts b/src/utils/dataFileViewer.test.ts
+new file mode 100644
+index 00000000..09c2a884
+--- /dev/null
++++ b/src/utils/dataFileViewer.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, it } from "vitest";
++import { dataFileAtomStyle, dataFileViewerScript } from "./dataFileViewer";
++
++describe("data-file viewing", () => {
++  it("detects annotated atom styles and offers a default for older data", () => {
++    expect(dataFileAtomStyle("Atoms # full\n\n1 2 3")).toBe("full");
++    expect(dataFileAtomStyle("Atoms\n\n1 2 3")).toBe("atomic");
++  });
++  it("quotes paths, ignores force coefficients and does not integrate dynamics", () => {
++    const script = dataFileViewerScript("water sample.data", "full", "real");
++    expect(script).toContain('read_data "water sample.data" nocoeff');
++    expect(script).toContain("bond_style zero");
++    expect(script).toContain("mass * 1.0");
++    expect(script).toMatch(/run 0\n$/);
++  });
++  it("preserves sphere masses and rejects command-expanding filenames", () => {
++    expect(dataFileViewerScript("grains.data", "sphere", "si")).not.toContain(
++      "mass *",
++    );
++    expect(() => dataFileViewerScript("a\nclear", "atomic", "lj")).toThrow();
++    expect(() => dataFileViewerScript("$name.data", "atomic", "lj")).toThrow();
++    expect(() =>
++      dataFileViewerScript("a.data", "atomic\nclear", "lj"),
++    ).toThrow();
++  });
++});
+diff --git a/src/utils/dataFileViewer.ts b/src/utils/dataFileViewer.ts
+new file mode 100644
+index 00000000..985c092d
+--- /dev/null
++++ b/src/utils/dataFileViewer.ts
+@@ -0,0 +1,56 @@
++/** LAMMPS data files often annotate their Atoms section with the atom style. */
++export function dataFileAtomStyle(content: string): string {
++  return (
++    content.match(
++      /^[ \t]*Atoms[ \t]*#[ \t]*([\w/]+(?:[ \t]+[\w/]+)*)[ \t]*$/m,
++    )?.[1] ?? "atomic"
++  );
++}
++
++/** Read coordinates/topology without requiring the original force field. */
++export function dataFileViewerScript(
++  path: string,
++  atomStyle: string,
++  units: string,
++): string {
++  if (/[\r\n"'$]/.test(path))
++    throw new Error(
++      "Rename the data file to remove quotes, dollar signs, or line breaks before viewing it.",
++    );
++  if (!/^[\w/]+(?:[ \t]+[\w/]+)*$/.test(atomStyle))
++    throw new Error("Enter a valid LAMMPS atom style.");
++  if (!/^(lj|real|metal|si|cgs|electron|micro|nano)$/.test(units))
++    throw new Error("Choose a LAMMPS unit system.");
++  // Zero styles let LAMMPS initialize topology without simulating a force field.
++  const molecular = /\b(full|molecular|bond|angle|template)\b/.test(atomStyle);
++  const perAtomMass = /\b(sphere|ellipsoid|peri|line|tri|body)\b/.test(
++    atomStyle,
++  );
++  return [
++    "# View structure only: no timesteps are integrated.",
++    `units ${units}`,
++    `atom_style ${atomStyle}`,
++    "pair_style zero 1.0",
++    ...(molecular
++      ? [
++          "bond_style zero",
++          "angle_style zero",
++          "dihedral_style zero",
++          "improper_style zero",
++        ]
++      : []),
++    `read_data "${path}" nocoeff`,
++    ...(!perAtomMass ? ["mass * 1.0"] : []),
++    "pair_coeff * *",
++    ...(molecular
++      ? [
++          'if "$(extract_setting(nbondtypes)) > 0" then "bond_coeff *"',
++          'if "$(extract_setting(nangletypes)) > 0" then "angle_coeff *"',
++          'if "$(extract_setting(ndihedraltypes)) > 0" then "dihedral_coeff *"',
++          'if "$(extract_setting(nimpropertypes)) > 0" then "improper_coeff *"',
++        ]
++      : []),
++    "run 0",
++    "",
++  ].join("\n");
++}
+diff --git a/src/wasm/lammps.worker.ts b/src/wasm/lammps.worker.ts
+index a41057e2..c8dc5637 100644
+--- a/src/wasm/lammps.worker.ts
++++ b/src/wasm/lammps.worker.ts
+@@ -318,15 +318,17 @@ ctx.onmessage = async (ev: MessageEvent<WorkerCommand>) => {
+         // strand if something on the run path unexpectedly rejects.
+         const { requestId } = cmd;
+         runActive = true;
++        let runError = "";
+         try {
+           if (adapter) {
+             await adapter.runFile(cmd.path);
++            // run 0 does not invoke the per-step callback. Capture the final
++            // initialized structure now, after WASM has finished unwinding.
++            if (!adapter.getErrorMessage()) streamStep();
+           }
+         } catch (error) {
+-          post({
+-            type: "error",
+-            message: error instanceof Error ? error.message : String(error),
+-          });
++          runError = error instanceof Error ? error.message : String(error);
++          post({ type: "error", message: runError });
+         } finally {
+           runActive = false;
+           // Run is over (wasm no longer suspended): apply commands that
+@@ -335,9 +337,11 @@ ctx.onmessage = async (ev: MessageEvent<WorkerCommand>) => {
+           post({
+             type: "runFinished",
+             requestId,
+-            error: adapter
+-              ? adapter.getErrorMessage()
+-              : "LAMMPS module not loaded",
++            error:
++              runError ||
++              (adapter
++                ? adapter.getErrorMessage()
++                : "LAMMPS module not loaded"),
+           });
+         }
+         break;
+@@ -378,7 +382,12 @@ ctx.onmessage = async (ev: MessageEvent<WorkerCommand>) => {
+         try {
+           const { files, skipped } = snapshotWorkdir(cmd.dir, cmd.maxBytes);
+           post(
+-            { type: "workdirSnapshot", requestId: cmd.requestId, files, skipped },
++            {
++              type: "workdirSnapshot",
++              requestId: cmd.requestId,
++              files,
++              skipped,
++            },
+             files.map((file) => file.bytes),
+           );
+         } catch (error) {

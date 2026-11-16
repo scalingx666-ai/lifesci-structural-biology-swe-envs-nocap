@@ -1,0 +1,329 @@
+diff --git a/HISTORY.md b/HISTORY.md
+index 3e2c06b16f..88b4dc63ad 100644
+--- a/HISTORY.md
++++ b/HISTORY.md
+@@ -1,3 +1,11 @@
++# v0.4.12
++
++## New Features
++
++- `@registermodel` macro is now a no-op. custom models that have a `components::Vector{String}` automatically support the printing interface and if they have `model.params.Mw`, they support molecular weight calculations.
++
++- Cubic roots now use a real solver. this allows more stability and correctness in challenging EoS
++
+ # v0.4.11
+ 
+ ## New Features
+diff --git a/NEWS.md b/NEWS.md
+index c2dcd8c68f..86ead3eb12 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,4 +1,16 @@
+-# v0.4.12
++# v0.4.13
+ 
+ ## New Features
+-## Bug fixes
+\ No newline at end of file
++
++- (Experimental) Initial `Symbolics.jl` support for bulk properties on `EoSModel`. In particular, all Activity models, cubic models, SAFT models without association, and empiric models are supported. for example, this is now supported:
++
++```julia
++@variables y(..)[1:4], n(..)[1:4]
++mixture = UNIFAC(["water","ethanol","methanol","1-propanol"])
++moles = [n(t)[i] for i in 1:4] #Clapeyron accepts mole amounts, so it is not necessary to perform transformations to mole fractions
++bc_l = y(t, 0.0) .~ activity_coefficient(mixture, 1.0, 298.15, moles)
++```
++
++## Bug Fixes
++
++- automatic precompile is disabled in this version.
+\ No newline at end of file
+diff --git a/Project.toml b/Project.toml
+index 49513e882c..57a0d00629 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -1,7 +1,7 @@
+ name = "Clapeyron"
+ uuid = "7c7805af-46cc-48c9-995b-ed0ed2dc909a"
+ authors = ["Hon Wa Yew <yewhonwa@gmail.com>", "Pierre Walker <pwalker@mit.edu>", "Andrés Riedemann <andres.riedemann@gmail.com>"]
+-version = "0.4.12"
++version = "0.4.13"
+ 
+ [deps]
+ BlackBoxOptim = "a134a8b2-14d6-55f6-9291-3336d3ab0209"
+@@ -41,12 +41,20 @@ Preferences = "1"
+ Roots = "^2.0.14"
+ Scratch = "^1.1"
+ StaticArrays = "^1.5.9"
++Symbolics = "5"
+ Tables = "^1.8"
+ ThermoState = "^0.5"
+ Unitful = "^1.12"
+ julia = "1.6"
+ 
++[weakdeps]
++Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
++
++[extensions]
++ClapeyronSymbolicsExt = "Symbolics"
++
+ [extras]
++Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+ 
+ [targets]
+diff --git a/ext/ClapeyronSymbolicsExt.jl b/ext/ClapeyronSymbolicsExt.jl
+new file mode 100644
+index 0000000000..8212e367e7
+--- /dev/null
++++ b/ext/ClapeyronSymbolicsExt.jl
+@@ -0,0 +1,147 @@
++module ClapeyronSymbolicsExt
++using Clapeyron
++using Clapeyron.ForwardDiff
++using Clapeyron.Solvers
++using Clapeyron.EoSFunctions
++
++using Symbolics
++
++using Clapeyron: log1p,log,sqrt,^
++using Clapeyron: SA
++
++Solvers.log(x::Num) = Base.log(x)
++Solvers.log1p(x::Num) = Base.log1p(x)
++Solvers.sqrt(x::Num) = Base.log1p(x)
++EoSFunctions.xlogx(x::Num,k) = x*Base.log(x*k)
++EoSFunctions.xlogx(x::Num) = x*Base.log(x)
++Solvers.:^(x::Num,y) = Base.:^(x,y)
++Solvers.:^(x,y::Num) = Base.:^(x,y)
++Solvers.:^(x::Num,y::Int) = Base.:^(x,y)
++Solvers.:^(x::Num,y::Num) = Base.:^(x,y)
++
++function Solvers.derivative(f::F,x::Symbolics.Num) where {F}
++    fx = f(x)
++    dfx = Symbolics.derivative(fx,x)
++    Symbolics.simplify(dfx)
++end
++
++function Solvers.gradient(f::F,x::A) where {F,A<:AbstractArray{Symbolics.Num}}
++    fx = f(x)
++    Symbolics.gradient(fx,x)
++end
++
++function Solvers.hessian(f::F,x::A) where {F,A<:AbstractArray{Symbolics.Num}}
++    fx = f(x)
++    Symbolics.hessian(fx,x)
++end
++#=
++function Solvers.:^(x::Num, y::ForwardDiff.Dual{Ty}) where Ty
++    _y = ForwardDiff.value(y)
++    fy = x^_y
++    dy = log(x)*fy
++    ForwardDiff.Dual{Ty}(fy, dy * ForwardDiff.partials(y))
++end
++
++function Solvers.:^(x::ForwardDiff.Dual{Tx},y::Symbolics.Num) where Tx
++    _x = ForwardDiff.value(x)
++    fx = _x^y
++    dx = y*_x^(y-1)
++    #partials(x) * y * ($f)(v, y - 1)
++    ForwardDiff.Dual{Tx}(fx, dx * ForwardDiff.partials(x))
++end
++
++function Solvers.:^(x::ForwardDiff.Dual{Tx,Num},y::Int) where Tx
++    _x = ForwardDiff.value(x)
++    fx = _x^y
++    dx = y*_x^(y-1)
++    #partials(x) * y * ($f)(v, y - 1)
++    ForwardDiff.Dual{Tx}(fx, dx * ForwardDiff.partials(x))
++end
++=#
++
++function Clapeyron.∂f∂V(model,V::Num,T,z)
++    eos_v = eos(model,V,T,z)
++    return Symbolics.derivative(eos_v,V)
++end
++
++function Clapeyron.∂f∂T(model,V::Num,T,z)
++    eos_T = eos(model,V,T,z)
++    return Symbolics.derivative(eos_T,T)
++end
++
++function Solvers.f∂f(f::F, x::Num) where {F}
++    fx = f(x)
++    return fx,Symbolics.derivative(fx,x)
++end
++
++function Solvers.f∂f∂2f(f::F, x::Num) where {F}
++    fx,dfx = Solvers.f∂f(f,x)
++    return fx,dfx,Symbolics.derivative(dfx,x)
++end
++
++function fgradf2_sym(f,V,T)
++    fvt = f(V,T)
++    dv = Symbolics.derivative(fvt,V)
++    dT = Symbolics.derivative(fvt,T)
++    return fvt,SA[dv,dT]
++end
++
++function Solvers.fgradf2(f,V::Num,T)
++    @variables T̃
++    fvt,dvt = fgradf2_sym(f,V,T̃)
++    t_dict = Dict(T̃ => T)
++    fvt,Symbolics.substitute(dvt,t_dict)
++end
++
++function Solvers.fgradf2(f,V,T::Num)
++    @variables Ṽ
++    fvt,dvt = fgradf2_sym(f,Ṽ,T)
++    v_dict = Dict(Ṽ => V)
++    fvt,Symbolics.substitute(dvt,v_dict)
++end
++
++Solvers.fgradf2(f,V::Num,T::Num) = fgradf2_sym(f,V,T)
++
++gradient2_sym(f,V,T) = last(fgradf2_sym(f,V,T))
++
++function Solvers.gradient2(f,V::Num,T)
++    @variables T̃
++    dvt = gradient2_sym(f,V,T̃)
++    t_dict = Dict(T̃ => T)
++    Symbolics.substitute(dvt,t_dict)
++end
++
++function Solvers.gradient2(f,V,T::Num)
++    @variables Ṽ
++    dvt = gradient2_sym(f,Ṽ,T)
++    v_dict = Dict(Ṽ => V)
++    Symbolics.substitute(dvt,v_dict)
++end
++
++Solvers.gradient2(f,V::Num,T::Num) = gradient2_sym(f,V,T)
++
++function ∂2_sym(f,V,T)
++    fvt,gvt = fgradf2_sym(f,V,T)
++    x = SA[V,T]
++    hvt = Symbolics.jacobian(gvt,x)
++    return fvt,gvt,hvt
++end
++
++function Solvers.∂2(f,V::Num,T)
++    @variables T̃
++    fvt,gvt,hvt = ∂2_sym(f,V,T̃)
++    t_dict = Dict(T̃ => T)
++    fvt,Symbolics.substitute(gvt,t_dict),Symbolics.substitute(hvt,t_dict)
++end
++
++function Solvers.∂2(f,V,T::Num)
++    @variables Ṽ
++    fvt,gvt,hvt = ∂2_sym(f,Ṽ,T)
++    v_dict = Dict(Ṽ => V)
++    fvt,Symbolics.substitute(gvt,v_dict),Symbolics.substitute(hvt,v_dict)
++end
++
++Solvers.∂2(f,V::Num,T::Num) = ∂2_sym(f,V,T)
++
++
++end #module
+\ No newline at end of file
+diff --git a/src/Clapeyron.jl b/src/Clapeyron.jl
+index 238f81cac7..7e7a893f06 100755
+--- a/src/Clapeyron.jl
++++ b/src/Clapeyron.jl
+@@ -196,5 +196,5 @@ include("utils/misc.jl")
+ include("estimation/estimation.jl")
+ 
+ #precompile workload. should be loaded at the end
+-include("precompile.jl")
++#include("precompile.jl")
+ end # module
+diff --git a/src/methods/VT.jl b/src/methods/VT.jl
+index db2b7d5cfa..fe2a435aec 100755
+--- a/src/methods/VT.jl
++++ b/src/methods/VT.jl
+@@ -253,7 +253,7 @@ end
+ function VT_partial_property(model::EoSModel,V,T,z,property::ℜ) where {ℜ}
+     fun(x) = property(model,V,T,x)
+     TT = gradient_type(V,T,z)
+-    return ForwardDiff.gradient(fun,z)::TT
++    return Solvers.gradient(fun,z)::TT
+ end
+ 
+ VT_chemical_potential(model::EoSModel, V, T, z=SA[1.]) = VT_partial_property(model,V,T,z,eos)
+diff --git a/src/methods/differentials.jl b/src/methods/differentials.jl
+index e0cfcf3e6d..6e3c2d7d8e 100755
+--- a/src/methods/differentials.jl
++++ b/src/methods/differentials.jl
+@@ -142,7 +142,7 @@ function f_hess(model,V,T,z)
+     f(w) = eos(model,first(w),last(w),z)
+     V,T = promote(V,T)
+     VT_vec = SVector(V,T)
+-    return ForwardDiff.hessian(f,VT_vec)
++    return Solvers.hessian(f,VT_vec)
+ end
+ 
+ """
+diff --git a/src/models/Activity/equations.jl b/src/models/Activity/equations.jl
+index 2b54521b43..1fa4ece02d 100755
+--- a/src/models/Activity/equations.jl
++++ b/src/models/Activity/equations.jl
+@@ -18,12 +18,12 @@ end
+ #for use in models that have gibbs free energy defined.
+ function activity_coefficient(model::ActivityModel,p,T,z)
+     X = gradient_type(p,T,z)
+-    return exp.(ForwardDiff.gradient(x->excess_gibbs_free_energy(model,p,T,x),z)/(R̄*T))::X
++    return exp.(Solvers.gradient(x->excess_gibbs_free_energy(model,p,T,x),z)/(R̄*T))::X
+ end
+ 
+ function test_activity_coefficient(model::ActivityModel,p,T,z)
+     X = gradient_type(p,T,z)
+-    return exp.(ForwardDiff.gradient(x->excess_gibbs_free_energy(model,p,T,x),z)/(R̄*T))::X
++    return exp.(Solvers.gradient(x->excess_gibbs_free_energy(model,p,T,x),z)/(R̄*T))::X
+ end
+ 
+ x0_sat_pure(model::ActivityModel,T) = x0_sat_pure(model.puremodel[1],T)
+diff --git a/src/models/ideal/ideal.jl b/src/models/ideal/ideal.jl
+index 487b4b1591..b5afecf7ba 100755
+--- a/src/models/ideal/ideal.jl
++++ b/src/models/ideal/ideal.jl
+@@ -1,6 +1,5 @@
+ 
+ function eos(model::IdealModel, V, T, z=SA[1.0])
+-    negative_vt(V,T) && return nan_num(V,T,z)
+     return N_A*k_B*sum(z)*T * a_ideal(model,V,T,z)
+ end
+ 
+diff --git a/src/modules/solvers/Solvers.jl b/src/modules/solvers/Solvers.jl
+index b23feec23e..5c5fa90061 100644
+--- a/src/modules/solvers/Solvers.jl
++++ b/src/modules/solvers/Solvers.jl
+@@ -48,8 +48,8 @@ function x_sol(res::NLSolvers.ConvergenceInfo{NLSolvers.BrentMin{Float64}})
+     return res.info.x
+ end
+ include("poly.jl")
+-include("ad.jl")
+ include("nanmath.jl")
++include("ad.jl")
+ include("nlsolve.jl")
+ include("fixpoint/fixpoint.jl")
+ include("fixpoint/ADNewton.jl")
+diff --git a/src/modules/solvers/ad.jl b/src/modules/solvers/ad.jl
+index ac0f8d8b00..4300d81d0c 100644
+--- a/src/modules/solvers/ad.jl
++++ b/src/modules/solvers/ad.jl
+@@ -6,6 +6,14 @@ struct ∂Tag end
+     return ForwardDiff.derivative(f,x)
+ end
+ 
++@inline function gradient(f::F, x) where {F}
++    return ForwardDiff.gradient(f,x)
++end
++
++@inline function hessian(f::F, x) where {F}
++    return ForwardDiff.hessian(f,x)
++end
++
+ @inline function gradient2(f::F, x1::R,x2::R) where {F,R<:Real}
+     T = typeof(ForwardDiff.Tag(f, R))
+     _1 = one(R)

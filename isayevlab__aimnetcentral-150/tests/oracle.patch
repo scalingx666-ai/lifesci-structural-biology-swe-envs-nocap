@@ -1,0 +1,78 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 912e3b2..ebd7c8e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
+ 
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [Unreleased]
++
++### Fixed
++
++- **Batched gas-phase Coulomb memory:** with `mol_idx` and the default `simple` Coulomb, the all-pairs neighbor buffer was sized by the batch's total atom count, so a flat batch of many molecules allocated an `N × N` matrix (about 14 GB at 60k atoms). It is now sized by the largest molecule, and memory grows linearly with the batch. Energies and forces are unchanged; periodic inputs keep the previous sizing ([#151](https://github.com/isayevlab/aimnetcentral/issues/151)).
++
+ ## [0.2.5] - 2026-10-23
+ 
+ 0.2.5 is a pre-1.0 release. Despite the patch-level version number it contains breaking changes, so if you pin `aimnet~=0.2.0` (or `>=0.2,<0.3`), read the breaking-changes list below before upgrading.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 9a5bbd1..66422f1 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -2061,7 +2061,8 @@ def make_nbmat(self, data: dict[str, Tensor], *, streaming_coulomb: bool = False
+         # Unified neighbor list when LR module cutoffs are similar
+         if self._nblist_lr is not None:
+             if self._coulomb_cutoff == float("inf"):
+-                self._nblist_lr.max_neighbors = N
++                # Every atom pairs with its own molecule only, so the largest one bounds the row.
++                self._nblist_lr.max_neighbors = N if cell is not None else self._max_mol_size
+             nbmat_lr, _, shifts_lr = self._nblist_lr(
+                 positions=data["coord"],
+                 cell=cell_batched,
+@@ -2082,7 +2083,7 @@ def make_nbmat(self, data: dict[str, Tensor], *, streaming_coulomb: bool = False
+         else:
+             if self._nblist_coulomb is not None:
+                 if self._coulomb_cutoff == float("inf"):
+-                    self._nblist_coulomb.max_neighbors = N
++                    self._nblist_coulomb.max_neighbors = N if cell is not None else self._max_mol_size
+                 nbmat_coulomb, _, shifts_coulomb = self._nblist_coulomb(
+                     positions=data["coord"],
+                     cell=cell_batched,
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index 8cc84c0..19fbfef 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -1048,6 +1048,33 @@ def _make_methane(self, offset: float = 0.0) -> dict:
+             "charge": torch.tensor([0.0]),
+         }
+ 
++    def test_flat_batch_coulomb_list_sized_by_largest_molecule(self, monkeypatch):
++        """All-pairs Coulomb in a mol_idx batch never needs more columns than the largest molecule."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        nblist = calc._nblist_lr if calc._nblist_lr is not None else calc._nblist_coulomb
++        assert nblist is not None
++        requested = []
++        call = type(nblist).__call__
++
++        def record(self, *args, **kwargs):
++            if self is nblist:
++                requested.append(self.max_neighbors)
++            return call(self, *args, **kwargs)
++
++        monkeypatch.setattr(type(nblist), "__call__", record)
++        mols = [self._make_water(offset=10.0 * i) for i in range(20)] + [self._make_methane(offset=300.0)]
++        batch = {
++            "coord": torch.cat([m["coord"] for m in mols]),
++            "numbers": torch.cat([m["numbers"] for m in mols]),
++            "charge": torch.cat([m["charge"] for m in mols]),
++            "mol_idx": torch.cat([torch.full((len(m["numbers"]),), i) for i, m in enumerate(mols)]),
++        }
++        energies = calc(batch)["energy"]
++
++        assert requested and max(requested) <= 5  # methane, not the 65 atoms of the batch
++        single = [calc(m)["energy"].item() for m in (mols[0], mols[-1])]
++        assert energies[[0, -1]].tolist() == pytest.approx(single, abs=1e-4)
++
+     def test_batch_vs_individual_mode0(self):
+         """nb_mode=0: Dense pairwise format (3D input, no nbmat)."""
+         calc = AIMNet2Calculator("aimnet2", nb_threshold=0)

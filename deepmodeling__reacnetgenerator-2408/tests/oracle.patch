@@ -1,0 +1,904 @@
+diff --git a/reacnetgenerator/_detect.py b/reacnetgenerator/_detect.py
+index 4714cfdc7..d4d1fd56d 100644
+--- a/reacnetgenerator/_detect.py
++++ b/reacnetgenerator/_detect.py
+@@ -39,6 +39,7 @@
+ except ImportError:  # pragma: no cover
+     raise ImportError("Open Babel 3.1.0 is required.")
+ from ase import Atom, Atoms
++from ase.neighborlist import natural_cutoffs, neighbor_list
+ from packaging import version
+ 
+ from .dps import dps  # type:ignore
+@@ -182,10 +183,6 @@ def _readstepfunc(self, item) -> Tuple[List[bytes], Tuple[int, int]]:
+         pass
+ 
+     def _connectmolecule(self, bond, level):
+-        # return list([b''.join((listtobytes(mol),
+-        #                        listtobytes(bondlist))) for mol, bondlist in zip(*dps(bond, level))])
+-        # int() because sometimes, the elements in bondlist are type numpy.int64 sometimes are int
+-        # which cause the different bytes results from same bond-network.
+         mols, bondlists = dps(bond, level)
+         return [
+             b"".join(
+@@ -267,6 +264,142 @@ def _get_bo(x):
+ 
+ 
+ class _DetectCrd(_Detect):
++    use_ase: bool
++    ase_cutoff_mult: float
++    custom_cutoffs: Optional[str]
++
++    def __init__(self, rng):
++        SharedRNGData.__init__(
++            self,
++            rng,
++            [
++                "inputfilename",
++                "atomname",
++                "stepinterval",
++                "nproc",
++                "pbc",
++                "cell",
++                "use_ase",
++                "ase_cutoff_mult",
++                "custom_cutoffs",
++            ],
++            ["N", "atomtype", "step", "timestep", "temp1it", "moleculetempfilename"],
++        )
++        self._parsed_custom_cutoffs = self._parse_custom_cutoffs(self.custom_cutoffs)
++
++    def _parse_custom_cutoffs(self, cutoff_str):
++        """Parse the custom cutoff string into a dictionary.
++
++        Parameters
++        ----------
++        cutoff_str : str
++            Custom cutoffs in the format "El1-El2:dist,El3-El4:dist"
++
++        Returns
++        -------
++        dict
++            Dictionary with frozenset pairs as keys and cutoffs as values
++        """
++        if not cutoff_str:
++            return {}
++
++        result = {}
++        pairs = cutoff_str.split(",")
++        for pair in pairs:
++            pair = pair.strip()  # Clean input to allow spaces
++            if not pair:  # Skip empty segments
++                continue
++
++            if ":" not in pair:
++                raise ValueError(
++                    f"Invalid custom cutoff format '{pair}'. Expected 'Element1-Element2:distance'. "
++                    f"Example: 'Al-O:2.5,C-H:1.1'"
++                )
++
++            atom_pair_str, dist_str = pair.split(":", 1)
++            atom_pair_str = atom_pair_str.strip()
++            dist_str = dist_str.strip()
++
++            if "-" not in atom_pair_str:
++                raise ValueError(
++                    f"Invalid custom cutoff format '{pair}'. Expected 'Element1-Element2:distance'. "
++                    f"Example: 'Al-O:2.5,C-H:1.1'"
++                )
++
++            atom1, atom2 = atom_pair_str.split("-", 1)
++            atom1 = atom1.strip()
++            atom2 = atom2.strip()
++
++            try:
++                distance = float(dist_str)
++            except ValueError:
++                raise ValueError(
++                    f"Invalid distance value '{dist_str}' in '{pair}'. Expected a number. "
++                    f"Example: 'Al-O:2.5,C-H:1.1'"
++                )
++
++            result[frozenset({atom1, atom2})] = distance
++        return result
++
++    def _getbondfromase(self, step_atoms: Atoms, cell: np.ndarray):
++        """Perceive bonds using ASE neighbor list with custom cutoffs.
++
++        Parameters
++        ----------
++        step_atoms : ase.Atoms
++            Atoms in a step.
++        cell : np.ndarray
++            Cell in the shape (3, 3).
++
++        Returns
++        -------
++        list[list[int]]
++            Connected atoms for each atom.
++        list[list[int]]
++            Bond levels (all set to 1 since ASE doesn't detect bond order).
++        """
++        step_atoms.set_cell(cell)
++        step_atoms.set_pbc(self.pbc)
++        if self.pbc:
++            step_atoms.wrap()
++
++        # Build per-atom natural cutoff radii (with global multiplier)
++        radii = natural_cutoffs(step_atoms, mult=self.ase_cutoff_mult)
++        symbols = step_atoms.get_chemical_symbols()
++
++        # Build a per-symbol radius lookup (same symbol always has same radius)
++        radii_by_symbol: dict = {}
++        for sym, r in zip(symbols, radii):
++            radii_by_symbol[sym] = r
++
++        # Build complete per-pair cutoff dict for all unique element pairs.
++        # ASE neighbor_list dict format: {('El1', 'El2'): distance}
++        # Pairs NOT in the dict get cutoff=0, so we must cover ALL pairs.
++        unique_symbols = sorted(set(symbols))
++        cutoff_dict: dict = {}
++        for s1 in unique_symbols:
++            for s2 in unique_symbols:
++                pair = frozenset({s1, s2})
++                if pair in self._parsed_custom_cutoffs:
++                    cutoff_dict[(s1, s2)] = self._parsed_custom_cutoffs[pair]
++                else:
++                    cutoff_dict[(s1, s2)] = radii_by_symbol[s1] + radii_by_symbol[s2]
++
++        i_list, j_list = neighbor_list("ij", step_atoms, cutoff=cutoff_dict)
++
++        atomnumber = len(step_atoms)
++        bond: list = [[] for _ in range(atomnumber)]
++        bondlevel: list = [[] for _ in range(atomnumber)]
++
++        for i, j in zip(i_list, j_list):
++            if i < j and j not in bond[i]:
++                bond[i].append(j)
++                bond[j].append(i)
++                bondlevel[i].append(1)
++                bondlevel[j].append(1)
++
++        return bond, bondlevel
++
+     def _getbondfromcrd(
+         self, step_atoms: Atoms, cell: np.ndarray
+     ) -> Tuple[List[List[int]], List[List[int]]]:
+@@ -286,6 +419,11 @@ def _getbondfromcrd(
+         list[list[int]]
+             Bond orders for each atom. 12 is an aromatic bond.
+         """
++        # Check if ASE mode is enabled
++        if self.use_ase:
++            return self._getbondfromase(step_atoms, cell)
++
++        # Otherwise, use the original OpenBabel logic
+         atomnumber = len(step_atoms)
+         # Use openbabel to connect atoms
+         mol = openbabel.OBMol()
+@@ -296,7 +434,7 @@ def _getbondfromcrd(
+             a = mol.NewAtom(idx)
+             a.SetAtomicNum(int(num))
+             a.SetVector(*position)
+-        # Apply period boundry conditions
++        # Apply period boundary conditions
+         # openbabel#1853, supported in v3.1.0
+         if self.pbc:
+             uc = openbabel.OBUnitCell()
+diff --git a/reacnetgenerator/commandline.py b/reacnetgenerator/commandline.py
+index e177e6b4d..93b7bceb0 100644
+--- a/reacnetgenerator/commandline.py
++++ b/reacnetgenerator/commandline.py
+@@ -76,6 +76,23 @@ def main_parser() -> argparse.ArgumentParser:
+         choices=["bond", "lammpsbondfile", "dump", "lammpsdumpfile", "xyz", "extxyz"],
+         default="lammpsbondfile",
+     )
++    parser.add_argument(
++        "--use-ase",
++        help="Enable ASE mode for bond detection",
++        action="store_true",
++    )
++    parser.add_argument(
++        "--ase-cutoff-mult",
++        help="Global multiplier for natural cutoffs",
++        type=float,
++        default=1.2,
++    )
++    parser.add_argument(
++        "--ase-pair-cutoffs",
++        help="Custom cutoffs for specific element pairs in the format 'El1-El2:dist,El3-El4:dist'",
++        type=str,
++        default=None,
++    )
+     parser.add_argument("--nopbc", help="Disable PBC.", action="store_true")
+     parser.add_argument(
+         "--cell",
+@@ -170,6 +187,9 @@ def _commandline():
+         b=np.array(args.matrixb).reshape((2, 2)),
+         pbc=not args.nopbc,
+         cell=args.cell,
++        use_ase=args.use_ase,
++        ase_cutoff_mult=args.ase_cutoff_mult,
++        custom_cutoffs=args.ase_pair_cutoffs,
+     ).runanddraw()
+ 
+ 
+@@ -222,4 +242,10 @@ def parm2cmd(pp: dict) -> List[str]:
+     for ii in ["nproc", "selectatoms", "stepinterval", "split", "maxspecies"]:
+         if pp.get(ii, None):
+             commands.extend((f"--{ii}", str(pp[ii])))
++    if pp.get("use_ase", False):
++        commands.append("--use-ase")
++    if pp.get("ase_cutoff_mult", 1.2) != 1.2:
++        commands.extend(("--ase-cutoff-mult", str(pp["ase_cutoff_mult"])))
++    if pp.get("custom_cutoffs", None):
++        commands.extend(("--ase-pair-cutoffs", str(pp["custom_cutoffs"])))
+     return commands
+diff --git a/reacnetgenerator/reacnetgen.py b/reacnetgenerator/reacnetgen.py
+index edfb69552..2691db97d 100644
+--- a/reacnetgenerator/reacnetgen.py
++++ b/reacnetgenerator/reacnetgen.py
+@@ -168,6 +168,9 @@ def __init__(self, **kwargs: Any) -> None:
+             "needprintspecies": True,
+             "urls": [],
+             "matrix_size": 100,
++            "use_ase": False,
++            "ase_cutoff_mult": 1.2,
++            "custom_cutoffs": None,
+         }
+         none_key = ["selectatoms", "species", "pos", "k", "speciescenter", "cell"]
+         accept_keys = [
+@@ -226,6 +229,17 @@ def __init__(self, **kwargs: Any) -> None:
+             kwargs["getoriginfile"] = True
+         if kwargs["selectatoms"] is None:
+             kwargs["selectatoms"] = kwargs["atomname"]
++
++        # Handle ASE auto-enable logic
++        if kwargs.get("use_ase", False) is False and (
++            kwargs.get("ase_cutoff_mult", 1.2) != 1.2
++            or kwargs.get("custom_cutoffs", None) is not None
++        ):
++            logger.warning(
++                "ASE parameters detected. Automatically enabling --use-ase mode."
++            )
++            kwargs["use_ase"] = True
++
+         self.__dict__.update(kwargs)
+         if self.cell is not None:
+             if len(self.cell) == 9:
+diff --git a/tests/test_ase.py b/tests/test_ase.py
+new file mode 100644
+index 000000000..575dbd1c7
+--- /dev/null
++++ b/tests/test_ase.py
+@@ -0,0 +1,234 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Test ASE mode functionality."""
++
++import os
++from pathlib import Path
++
++import numpy as np
++import pytest
++from ase import Atoms
++
++from reacnetgenerator import ReacNetGenerator
++from reacnetgenerator._detect import _DetectLAMMPSdump
++
++p_inputs = Path(__file__).parent / "inputs"
++
++
++class TestASEMode:
++    """Test ASE mode functionality."""
++
++    @pytest.fixture(autouse=True)
++    def chdir(self, tmp_path):
++        """Change directory to tmp_path."""
++        start_directory = os.getcwd()
++        os.chdir(tmp_path)
++        yield
++        os.chdir(start_directory)
++
++    def test_ase_mode_disabled_by_default(self):
++        """Test that ASE mode is disabled by default."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++        )
++        assert not getattr(rng, "use_ase", False)
++        assert rng.ase_cutoff_mult == 1.2
++        assert rng.custom_cutoffs is None
++
++    def test_ase_mode_enabled_manually(self):
++        """Test that ASE mode can be enabled manually."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            use_ase=True,
++        )
++        assert rng.use_ase
++
++    def test_ase_auto_enable_with_custom_cutoffs(self):
++        """Test that ASE mode is auto-enabled when custom cutoffs are provided."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            custom_cutoffs="H-O:1.5,O-O:2.0",
++        )
++        assert rng.use_ase
++        assert rng.custom_cutoffs == "H-O:1.5,O-O:2.0"
++
++    def test_ase_auto_enable_with_modified_mult(self):
++        """Test that ASE mode is auto-enabled when cutoff multiplier is modified."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            ase_cutoff_mult=1.5,
++        )
++        assert rng.use_ase
++        assert rng.ase_cutoff_mult == 1.5
++
++    def test_ase_parse_custom_cutoffs(self):
++        """Test parsing of custom cutoff strings."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            use_ase=True,
++            custom_cutoffs="H-O:1.5,O-O:2.0",
++        )
++        # Get a concrete instance instead of abstract class
++        detect_class = _DetectLAMMPSdump(rng)
++        parsed = detect_class._parse_custom_cutoffs(rng.custom_cutoffs)
++
++        assert frozenset({"H", "O"}) in parsed
++        assert frozenset({"O", "O"}) in parsed
++        assert parsed[frozenset({"H", "O"})] == 1.5
++        assert parsed[frozenset({"O", "O"})] == 2.0
++
++    def test_ase_parse_custom_cutoffs_order_independence(self):
++        """Test that custom cutoff parsing is order-independent."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            use_ase=True,
++            custom_cutoffs="H-O:1.5,O-H:2.0",  # Same pair in different order
++        )
++        # Get a concrete instance instead of abstract class
++        detect_class = _DetectLAMMPSdump(rng)
++        parsed = detect_class._parse_custom_cutoffs(rng.custom_cutoffs)
++
++        # Both should map to the same frozenset and take the last value
++        assert frozenset({"H", "O"}) in parsed
++        # In case of duplicate entries, the last one should be used
++        assert parsed[frozenset({"H", "O"})] == 2.0
++
++    def test_ase_getbondfromase_method(self):
++        """Test the _getbondfromase method directly."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            use_ase=True,
++        )
++        detect_class = _DetectLAMMPSdump(rng)
++
++        # Create a simple water molecule
++        atoms = Atoms(
++            "H2O",
++            positions=[[0.757, 0.586, 0.0], [-0.757, 0.586, 0.0], [0.0, 0.0, 0.0]],
++        )
++        cell = np.eye(3) * 10  # Large cell to avoid PBC issues
++
++        # This should not raise an error
++        bond, bondlevel = detect_class._getbondfromase(atoms, cell)
++
++        # Should have 3 atoms
++        assert len(bond) == 3
++        assert len(bondlevel) == 3
++
++        # Should have O-H bonds
++        # The oxygen (index 2) should be bonded to both hydrogens (0, 1)
++        assert 0 in bond[2] or 1 in bond[2]
++        assert 2 in bond[0] or 2 in bond[1]
++
++        # All bond levels should be 1 (single bonds)
++        for bond_levels in bondlevel:
++            for level in bond_levels:
++                assert level == 1
++
++    def test_ase_duplicate_bond_prevention(self):
++        """Test that duplicate bonds are prevented in ASE mode."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=p_inputs / "water.dump",
++            atomname=["H", "O"],
++            pbc=False,
++            use_ase=True,
++            ase_cutoff_mult=5.0,  # Very high multiplier to force many neighbors
++        )
++        detect_class = _DetectLAMMPSdump(rng)
++
++        # Create a simple water molecule
++        atoms = Atoms(
++            "H2O",
++            positions=[[0.757, 0.586, 0.0], [-0.757, 0.586, 0.0], [0.0, 0.0, 0.0]],
++        )
++        # Use a small cell to create periodic images
++        cell = np.eye(3) * 5.0
++
++        # This should not raise an error and should not have duplicate bonds
++        bond, bondlevel = detect_class._getbondfromase(atoms, cell)
++
++        # Check that there are no duplicate entries in bond lists
++        for i, neighbors in enumerate(bond):
++            # Check that all neighbors are unique
++            assert len(neighbors) == len(set(neighbors)), (
++                f"Duplicate bonds found for atom {i}"
++            )
++            # Check that the corresponding bond levels are also unique
++            assert len(bondlevel[i]) == len(set(bondlevel[i])) or len(
++                bondlevel[i]
++            ) == len(neighbors)
++
++    def test_ase_with_custom_cutoffs_integration(self):
++        """Integration test for ASE mode with custom cutoffs."""
++        # Create a temporary file with a simple water molecule
++        water_file = "test_water.dump"
++        with open(water_file, "w") as f:
++            f.write("""ITEM: TIMESTEP
++0
++ITEM: NUMBER OF ATOMS
++3
++ITEM: BOX BOUNDS pp pp pp
++0.0 10.0
++0.0 10.0
++0.0 10.0
++ITEM: ATOMS id type x y z
++1 1 0.757 0.586 0.0
++2 1 -0.757 0.586 0.0
++3 2 0.0 0.0 0.0
++""")
++
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=water_file,
++            atomname=["H", "O"],
++            pbc=True,
++            use_ase=True,
++            custom_cutoffs="H-O:1.5",  # Custom cutoff for H-O bonds
++        )
++
++        # Run the detection process
++        detect_class = _DetectLAMMPSdump.gettype(rng)
++        detect_class.detect()
++
++        # Should have processed the file
++        assert hasattr(detect_class, "temp1it")
++        assert detect_class.temp1it > 0
++
++    def test_ase_warning_on_auto_enable(self, caplog):
++        """Test that a warning is logged when ASE mode is auto-enabled."""
++        with caplog.at_level("WARNING"):
++            rng = ReacNetGenerator(
++                inputfiletype="lammpsdumpfile",
++                inputfilename=p_inputs / "water.dump",
++                atomname=["H", "O"],
++                pbc=False,
++                custom_cutoffs="H-O:1.5",  # This should trigger auto-enable
++            )
++
++            # Check that the warning was logged
++            assert (
++                "ASE parameters detected. Automatically enabling --use-ase mode."
++                in caplog.text
++            )
++            assert rng.use_ase
+diff --git a/tests/test_ase_cli.py b/tests/test_ase_cli.py
+new file mode 100644
+index 000000000..c144b6596
+--- /dev/null
++++ b/tests/test_ase_cli.py
+@@ -0,0 +1,65 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Test ASE mode command line interface."""
++
++from pathlib import Path
++
++from reacnetgenerator.commandline import main_parser
++
++p_inputs = Path(__file__).parent / "inputs"
++
++
++class TestASECommandLine:
++    """Test ASE mode command line interface."""
++
++    def test_ase_cli_arguments_exist(self):
++        """Test that ASE-related command line arguments exist."""
++        parser = main_parser()
++
++        # Parse an example command with ASE args
++        args = parser.parse_args(
++            [
++                "-i",
++                str(p_inputs / "water.dump"),
++                "-a",
++                "H",
++                "O",
++                "--use-ase",
++                "--ase-cutoff-mult",
++                "1.5",
++                "--ase-pair-cutoffs",
++                "H-O:1.2,C-H:2.0",
++            ]
++        )
++
++        # Check that the arguments are parsed correctly
++        assert args.use_ase is True
++        assert args.ase_cutoff_mult == 1.5
++        assert args.ase_pair_cutoffs == "H-O:1.2,C-H:2.0"
++
++    def test_ase_cli_default_values(self):
++        """Test that ASE-related command line arguments have correct defaults."""
++        parser = main_parser()
++
++        # Parse a minimal command without ASE args
++        args = parser.parse_args(["-i", str(p_inputs / "water.dump"), "-a", "H", "O"])
++
++        # Check default values
++        assert args.use_ase is False
++        assert args.ase_cutoff_mult == 1.2
++        assert args.ase_pair_cutoffs is None
++
++    def test_ase_cli_help_contains_ase_args(self):
++        """Test that ASE-related arguments exist in the parser."""
++        parser = main_parser()
++
++        # Check specific arguments exist in the parser
++        actions = {action.dest: action for action in parser._actions}
++        assert "use_ase" in actions
++        assert "ase_cutoff_mult" in actions
++        assert "ase_pair_cutoffs" in actions
++
++        # Check that the help text contains expected content
++        help_text = parser.format_help()
++        assert "--use-ase" in help_text
++        assert "--ase-cutoff-mult" in help_text
++        assert "--ase-pair-cutoffs" in help_text
+diff --git a/tests/test_detect.py b/tests/test_detect.py
+index e245f05af..03e45ac9d 100644
+--- a/tests/test_detect.py
++++ b/tests/test_detect.py
+@@ -22,10 +22,10 @@ class TestDetect:
+     @pytest.fixture(autouse=True)
+     def chdir(self, tmp_path):
+         """Change directory to tmp_path."""
+-        start_direcroty = os.getcwd()
++        start_directory = os.getcwd()
+         os.chdir(tmp_path)
+         yield
+-        os.chdir(start_direcroty)
++        os.chdir(start_directory)
+ 
+     @pytest.fixture(
+         params=[
+@@ -61,3 +61,234 @@ def test_reacnetgen(self, reacnetgen):
+         )
+         # assert this is a single molecule
+         assert reacnetgen.temp1it == 1
++
++
++# Additional tests for ASE detection and Scipy clustering features
++try:
++    from ase import Atoms
++
++    ASE_AVAILABLE = True
++except ImportError:
++    ASE_AVAILABLE = False
++
++try:
++    import scipy
++
++    print(scipy.__version__)
++    SCIPY_AVAILABLE = True
++except ImportError:
++    SCIPY_AVAILABLE = False
++
++from reacnetgenerator._detect import _DetectLAMMPSdump
++
++
++class TestParseCustomCutoffs:
++    """Test the _parse_custom_cutoffs method."""
++
++    @pytest.fixture
++    def detect_instance(self):
++        """Create a detect instance for testing."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename="dummy",
++            atomname=["H", "O", "C", "Al"],
++        )
++        return _DetectLAMMPSdump(rng)
++
++    def test_valid_simple_format(self, detect_instance):
++        """Test parsing a valid simple format."""
++        result = detect_instance._parse_custom_cutoffs("H-O:1.5")
++        expected = {frozenset({"H", "O"}): 1.5}
++        assert result == expected
++
++    def test_valid_multiple_pairs(self, detect_instance):
++        """Test parsing multiple valid pairs."""
++        result = detect_instance._parse_custom_cutoffs("H-O:1.5,C-H:2.0")
++        expected = {frozenset({"H", "O"}): 1.5, frozenset({"C", "H"}): 2.0}
++        assert result == expected
++
++    def test_with_spaces(self, detect_instance):
++        """Test parsing with spaces in the input."""
++        result = detect_instance._parse_custom_cutoffs("H - O : 1.5 , C - H : 2.0")
++        expected = {frozenset({"H", "O"}): 1.5, frozenset({"C", "H"}): 2.0}
++        assert result == expected
++
++    def test_invalid_missing_colon(self, detect_instance):
++        """Test that missing colon raises ValueError."""
++        with pytest.raises(ValueError) as exc_info:
++            detect_instance._parse_custom_cutoffs("H-O1.5")
++        assert "Invalid custom cutoff format 'H-O1.5'" in str(exc_info.value)
++        assert "Expected 'Element1-Element2:distance'" in str(exc_info.value)
++        assert "Example: 'Al-O:2.5,C-H:1.1'" in str(exc_info.value)
++
++    def test_invalid_missing_dash(self, detect_instance):
++        """Test that missing dash raises ValueError."""
++        with pytest.raises(ValueError) as exc_info:
++            detect_instance._parse_custom_cutoffs("HO:1.5")
++        assert "Invalid custom cutoff format 'HO:1.5'" in str(exc_info.value)
++        assert "Expected 'Element1-Element2:distance'" in str(exc_info.value)
++
++    def test_invalid_distance_non_numeric(self, detect_instance):
++        """Test that non-numeric distance raises ValueError."""
++        with pytest.raises(ValueError) as exc_info:
++            detect_instance._parse_custom_cutoffs("H-O:invalid")
++        assert "Invalid distance value 'invalid'" in str(exc_info.value)
++        assert "Expected a number" in str(exc_info.value)
++        assert "Example: 'Al-O:2.5,C-H:1.1'" in str(exc_info.value)
++
++
++@pytest.mark.skipif(not ASE_AVAILABLE, reason="ASE is not available")
++class TestGetBondFromASE:
++    """Test the _getbondfromase method."""
++
++    @pytest.fixture
++    def detect_instance(self):
++        """Create a detect instance for testing."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename="dummy",
++            atomname=["H", "O"],
++            use_ase=True,
++        )
++        return _DetectLAMMPSdump(rng)
++
++    def test_water_molecule_bonds(self, detect_instance):
++        """Test that water molecule detects 2 bonds with default settings."""
++        # Create a simple water molecule
++        atoms = Atoms(
++            "H2O",
++            positions=[[0.757, 0.586, 0.0], [-0.757, 0.586, 0.0], [0.0, 0.0, 0.0]],
++        )
++        cell = np.eye(3) * 10  # Large cell to avoid PBC issues
++
++        bond, _bondlevel = detect_instance._getbondfromase(atoms, cell)
++
++        # Should have 3 atoms
++        assert len(bond) == 3
++
++        # Count total bonds (each bond is counted twice - once for each atom)
++        total_bonds = sum(len(neighbors) for neighbors in bond)
++        assert total_bonds == 4  # 2 actual bonds, each counted twice
++
++        # Check that oxygen is bonded to both hydrogens
++        assert 0 in bond[2]  # O (index 2) bonded to H (index 0)
++        assert 1 in bond[2]  # O (index 2) bonded to H (index 1)
++        assert 2 in bond[0]  # H (index 0) bonded to O (index 2)
++        assert 2 in bond[1]  # H (index 1) bonded to O (index 2)
++
++    def test_duplicate_bond_prevention_with_pbc(self, detect_instance):
++        """Test that duplicate bonds are prevented with PBC."""
++        # Create a simple water molecule
++        atoms = Atoms(
++            "H2O",
++            positions=[[0.757, 0.586, 0.0], [-0.757, 0.586, 0.0], [0.0, 0.0, 0.0]],
++        )
++        # Use a small cell to create potential duplicate scenarios
++        cell = np.eye(3) * 5.0
++
++        bond, _bondlevel = detect_instance._getbondfromase(atoms, cell)
++
++        # Check that there are no duplicate entries in bond lists
++        for i, neighbors in enumerate(bond):
++            # Check that all neighbors are unique
++            assert len(neighbors) == len(set(neighbors)), (
++                f"Duplicate bonds found for atom {i}"
++            )
++
++    def test_custom_cutoffs_override(self, detect_instance):
++        """Test that custom cutoffs override global settings."""
++        # Modify the detect instance to have custom cutoffs
++        detect_instance.rng.custom_cutoffs = "H-O:1.0"  # Very short cutoff
++
++        # Create a simple water molecule where H-O distance is ~1.0 Angstrom
++        atoms = Atoms(
++            "H2O", positions=[[0.5, 0.0, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]
++        )  # H-O distance is 0.5
++        cell = np.eye(3) * 10
++
++        bond, _bondlevel = detect_instance._getbondfromase(atoms, cell)
++
++        # With a 1.0 cutoff, H-O should still be bonded
++        # Check that oxygen is bonded to at least one hydrogen
++        assert 0 in bond[2] or 1 in bond[2]  # O (index 2) bonded to H (index 0 or 1)
++
++
++@pytest.mark.skipif(not SCIPY_AVAILABLE, reason="Scipy is not available")
++class TestScipyClustering:
++    """Test the Scipy clustering in _connectmolecule method."""
++
++    @pytest.fixture
++    def detect_instance(self):
++        """Create a detect instance for testing."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename="dummy",
++            atomname=["H", "O"],
++            use_ase=True,
++        )
++        return _DetectLAMMPSdump(rng)
++
++    def test_large_linear_chain_scipy_clustering(self, detect_instance):
++        """Test scipy clustering with a large linear chain."""
++        # Create a large linear chain of atoms: 0-1-2-3-...-499
++        n_atoms = 500
++        bond = [[] for _ in range(n_atoms)]
++        level = [[] for _ in range(n_atoms)]
++
++        # Create linear chain bonds
++        for i in range(n_atoms - 1):
++            bond[i].append(i + 1)
++            bond[i + 1].append(i)
++            level[i].append(1)
++            level[i + 1].append(1)
++
++        # Use the _connectmolecule method which should use scipy when available
++        result = detect_instance._connectmolecule(bond, level)
++
++        # Should have 1 component containing all atoms
++        assert len(result) == 1
++
++        # The component should contain all atoms
++        # The first part of the component bytes contains the atom indices
++        # Need to extract the atom list from the bytes format
++        # This is tricky since it's in the internal format, so just check length
++        # The result format is: atom_indices + bond_pairs + bond_levels
++        assert len(result) == 1  # Single connected component
++
++
++class TestAutoEnableLogic:
++    """Test the auto-enable logic for ASE mode."""
++
++    def test_auto_enable_with_custom_cutoffs(self, tmp_path):
++        """Test that ASE mode is auto-enabled when custom cutoffs are provided."""
++        # Create a temporary file for input
++        dummy_file = tmp_path / "dummy.dump"
++        dummy_file.write_text("")
++
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=str(dummy_file),
++            atomname=["H", "O"],
++            use_ase=False,  # Explicitly set to False
++            custom_cutoffs="H-O:1.5",  # But provide custom cutoffs
++        )
++
++        # Should be auto-enabled
++        assert rng.use_ase is True
++
++    def test_auto_enable_with_modified_multiplier(self, tmp_path):
++        """Test that ASE mode is auto-enabled when multiplier is modified."""
++        # Create a temporary file for input
++        dummy_file = tmp_path / "dummy.dump"
++        dummy_file.write_text("")
++
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=str(dummy_file),
++            atomname=["H", "O"],
++            use_ase=False,  # Explicitly set to False
++            ase_cutoff_mult=1.5,  # But modify multiplier
++        )
++
++        # Should be auto-enabled
++        assert rng.use_ase is True
+diff --git a/tests/test_reacnetgen.py b/tests/test_reacnetgen.py
+index 793b1589c..272e6ebb3 100644
+--- a/tests/test_reacnetgen.py
++++ b/tests/test_reacnetgen.py
+@@ -165,3 +165,68 @@ def test_re_mo(self, reacnetgen_param):
+         r = _CollectSMILESPaths(reacnetgen)
+         r.atomname = np.array(["Mo", "O"])
+         assert r._re("[Mo]") == "[Mo]"
++
++
++# Additional test for the auto-enable logic
++class TestAutoEnableLogic:
++    """Test the auto-enable logic for ASE mode."""
++
++    @pytest.fixture(autouse=True)
++    def chdir(self, tmp_path):
++        """Change directory to tmp_path."""
++        start_directory = os.getcwd()
++        os.chdir(tmp_path)
++        yield
++        os.chdir(start_directory)
++
++    def test_auto_enable_with_custom_cutoffs(self, tmp_path):
++        """Test that ASE mode is auto-enabled when custom cutoffs are provided."""
++        # Create a temporary file for input
++        dummy_file = tmp_path / "dummy.dump"
++        dummy_file.write_text("")
++
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=str(dummy_file),
++            atomname=["H", "O"],
++            use_ase=False,  # Explicitly set to False
++            custom_cutoffs="H-O:1.5",  # But provide custom cutoffs
++        )
++
++        # Should be auto-enabled
++        assert rng.use_ase is True
++
++    def test_auto_enable_with_modified_multiplier(self, tmp_path):
++        """Test that ASE mode is auto-enabled when multiplier is modified."""
++        # Create a temporary file for input
++        dummy_file = tmp_path / "dummy.dump"
++        dummy_file.write_text("")
++
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=str(dummy_file),
++            atomname=["H", "O"],
++            use_ase=False,  # Explicitly set to False
++            ase_cutoff_mult=1.5,  # But modify multiplier
++        )
++
++        # Should be auto-enabled
++        assert rng.use_ase is True
++
++    def test_no_auto_enable_with_defaults(self, tmp_path):
++        """Test that ASE mode is not auto-enabled when using defaults."""
++        # Create a temporary file for input
++        dummy_file = tmp_path / "dummy.dump"
++        dummy_file.write_text("")
++
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename=str(dummy_file),
++            atomname=["H", "O"],
++            use_ase=False,  # Explicitly set to False
++            ase_cutoff_mult=1.2,  # Default value
++            custom_cutoffs=None,  # Default value
++        )
++
++        # Should remain False
++        assert rng.use_ase is False

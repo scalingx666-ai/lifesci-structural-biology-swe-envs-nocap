@@ -1,0 +1,333 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 50c2427..1e314bb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ 
+ ### Changed
+ 
++- Migrated Ewald Coulomb to the nvalchemiops (>=0.4) energy+autograd API: energies are bit-identical and forces/stress unchanged to kernel rounding (<=2e-06 eV/A), the upstream `DeprecationWarning` for Ewald is gone, and Ewald dense Hessians / HVPs are now true relaxed-charge autograd derivatives (comparable with simple/DSF) instead of fixed-charge finite differences. The `eps` argument of `hessian_vector_product` now applies to PME only. PME intentionally remains on the legacy explicit-terms path: its charge-gradient backward misbehaves inside the full calculator graph under `create_graph=True` (train mode), tracked in a dedicated issue; PME behavior is bit-identical to the previous release.
+ - Hardened `make test`: the parallel run now hides CUDA and caps per-worker threads (`CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1`); previously xdist workers either all initialized the first GPU (OOM on CUDA boxes) or oversubscribed the CPU with per-worker torch thread pools. A new `make test-gpu` target runs the GPU-marked tests serially on CUDA.
+ - Bumped `nvalchemi-toolkit-ops` to `>=0.4.0` and `warp-lang` to `>=1.13,<2` (installs 1.15). Energies, charges, and Hessians are bit-identical to 0.3.1; explicit force/virial outputs shift within float32 accumulation noise (max 6.7e-05 eV/A on a periodic system, 40x inside the project's cross-version acceptance of 1e-4 Hartree/A). The 0.4.0 direct-output flags used by the Ewald/PME path (`compute_forces`/`compute_virial`) are deprecated upstream and now emit `DeprecationWarning`; migrating to the autograd-based API is tracked as follow-up work.
+ 
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index f2b37cd..8c57817 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -1028,10 +1028,10 @@ def _run_external_modules(
+         coulomb_terms = None
+         deterministic = getattr(self, "_deterministic", False)
+         if self.external_coulomb is not None:
++            # Ewald is always energy-in-graph now; the flag selects the DSF
++            # closed-form torch path or the legacy PME training wrapper.
+             training_derivatives = (
+-                self.external_coulomb.method in ("ewald", "pme", "dsf")
+-                and getattr(self, "_train", False)
+-                and (forces or stress)
++                self.external_coulomb.method in ("pme", "dsf") and getattr(self, "_train", False) and (forces or stress)
+             )
+             if deterministic:
+                 if self.external_coulomb.method == "dsf":
+@@ -1051,7 +1051,7 @@ def _run_external_modules(
+                 "training_derivatives": training_derivatives,
+                 "hessian": hessian,
+             }
+-            if training_derivatives and stress and self.external_coulomb.method in ("ewald", "pme"):
++            if training_derivatives and stress and self.external_coulomb.method == "pme":
+                 strain_inputs = getattr(self, "_external_strain_inputs", None)
+                 if strain_inputs is not None:
+                     kwargs.update(strain_inputs)
+@@ -1908,8 +1908,9 @@ def hessian_vector_product(
+         vectors : Tensor
+             Direction(s), shape ``(N, 3)`` or ``(K, N, 3)`` over the real atoms.
+         eps : float
+-            Central-difference step (Angstrom) for the periodic Ewald/PME
+-            long-range term. Ignored for ``simple``/``dsf``.
++            Central-difference step (Angstrom) for the periodic PME
++            long-range term. Ignored for ``simple``/``dsf``/``ewald``
++            (their products are exact reverse-mode autograd).
+         create_graph : bool
+             If ``True``, keep the differentiable autograd block of the HVP in
+             the graph so it can compose with an outer loss. The Ewald/PME
+@@ -2105,11 +2106,17 @@ def _hessian_vector_product_impl(
+                 allow_unused=True,
+             )[0]
+             hv = hv_full[:N]
+-            if method in ("ewald", "pme") and self.external_coulomb is not None:
++            if method == "pme" and self.external_coulomb is not None:
+                 # Full-periodic fixed-position curvature (directional FD).
++                # Ewald needs no FD block: its energy is in the autograd graph
++                # and the vjp above captures the full periodic curvature.
+                 hv = hv.to(torch.float64) + self.external_coulomb._coul_nvalchemi_fd_hvp(
+                     prepared, backend=method, vec=v, step=eps
+                 )
++            elif method == "ewald":
++                # Preserve the documented float64 return contract for periodic
++                # systems (established by the former FD block).
++                hv = hv.to(torch.float64)
+             outs.append(hv)
+         result = torch.stack(outs, 0)
+         return result[0] if single else result
+diff --git a/aimnet/calculators/derivatives.py b/aimnet/calculators/derivatives.py
+index b61d2d8..7df8ae1 100644
+--- a/aimnet/calculators/derivatives.py
++++ b/aimnet/calculators/derivatives.py
+@@ -153,8 +153,9 @@ def calculate_hessian(forces: Tensor, coord: Tensor) -> Tensor:
+     The returned dense Hessian is a **detached value**: it carries no
+     autograd graph back to the coordinates or model parameters. This is by
+     design (it is materialized via ``torch.func.vmap`` over a vjp of the
+-    already-built force graph, and the periodic Ewald/PME block is a
+-    fixed-charge finite-difference term that is non-differentiable). Forces
++    already-built force graph, and the periodic PME block is a fixed-charge
++    finite-difference term that is non-differentiable; Ewald is a full
++    relaxed-charge autograd term since the 0.4 energy-graph migration). Forces
+     DO compose with an upstream coordinate-builder graph, but the Hessian
+     does not, so you cannot backpropagate through ``eval(..., hessian=True)``.
+ 
+diff --git a/aimnet/modules/lr.py b/aimnet/modules/lr.py
+index 334d9de..4fb89a7 100644
+--- a/aimnet/modules/lr.py
++++ b/aimnet/modules/lr.py
+@@ -257,19 +257,23 @@ class LRCoulomb(nn.Module):
+     through the model-predicted charges, so its Hessian includes the
+     charge-response (the d^2E / (dq . dr) coupling).
+ 
+-    Ewald/PME call ``nvalchemiops`` directly. Inference uses
+-    ``hybrid_forces=True`` so energy remains differentiable through charges
+-    and fixed-charge geometry derivatives are returned as explicit terms.
+-    Training derivative paths use a small local ``autograd.Function`` wrapper
+-    because the installed nvalchemiops coordinate backward kernels do not
+-    currently provide a registered backward-of-backward. Ewald/PME Hessians are
+-    provided by finite-difference of the analytic nvalchemiops forces
+-    (:meth:`_coul_nvalchemi_fd_hessian`) and are FIXED-CHARGE: they omit the
+-    d^2E / (dq . dr) charge-response coupling.
+-
+-    Because of this, DSF (relaxed-charge) and Ewald/PME (fixed-charge) Hessians
+-    differ slightly for an otherwise-equivalent system, which matters when
+-    comparing vibrational frequencies / IR across backends.
++    Ewald calls ``nvalchemiops`` (>=0.4) energy-only with positions,
++    charges, and cell left in the autograd graph: forces, stress, dense
++    Hessians, and HVPs come from the calculator's total-energy autograd and
++    are RELAXED-CHARGE (they include the d^2E / (dq . dr) charge-response
++    coupling), directly comparable with the DSF torch path.
++
++    PME remains on the legacy path for now: inference uses
++    ``hybrid_forces=True`` (energy differentiable through charges,
++    fixed-charge geometry derivatives as explicit terms), training uses the
++    local ``_PeriodicCoulombFunction`` wrapper, and Hessians come from
++    finite-difference of the analytic forces
++    (:meth:`_coul_nvalchemi_fd_hessian`) and are FIXED-CHARGE. The PME
++    energy-graph route is blocked on a charge-gradient backward anomaly that
++    appears only inside the full calculator graph under
++    ``create_graph=True``; see the migration tracking issue. Until then, PME
++    Hessians differ slightly from DSF/Ewald relaxed-charge Hessians, which
++    matters when comparing vibrational frequencies / IR across backends.
+     """
+ 
+     def __init__(
+@@ -669,6 +673,39 @@ def _coul_nvalchemi(
+         num_systems = int(mol_idx_real.max().item()) + 1
+         fn = particle_mesh_ewald if backend == "pme" else ewald_summation
+ 
++        if backend == "ewald":
++            # nvalchemiops >=0.4 energy-graph contract (Ewald only for now):
++            # a single energy-only call with positions, charges, and cell left
++            # in the autograd graph. Forces, stress, charge-relaxation, dense
++            # Hessians, and HVPs all flow through the calculator's
++            # total-energy autograd; when stress is requested the strained
++            # coord/cell from set_grad_tensors carry the strain gradients.
++            # PME intentionally stays on the legacy explicit-terms path below:
++            # its charge-gradient backward misbehaves inside the full
++            # calculator graph under create_graph=True (train mode), see the
++            # migration notes in docs and the tracking issue.
++            energies_per_atom = fn(
++                positions=coord_real,
++                charges=charges_real,
++                cell=cell,
++                batch_idx=mol_idx_real,
++                neighbor_matrix=nbmat_real,
++                neighbor_matrix_shifts=shifts_real,
++                mask_value=N,
++                accuracy=float(self.ewald_accuracy),
++            )
++            ke = constants.Hartree * constants.Bohr
++            energies_per_system = torch.zeros(num_systems, dtype=torch.float64, device=coord.device)
++            e_periodic = energies_per_system.scatter_add(
++                0,
++                mol_idx_real.to(torch.int64),
++                (energies_per_atom * ke).double(),
++            )
++            if self.subtract_sr:
++                data = ops.lazy_calc_dij(data, "")
++                e_periodic = e_periodic - self.coul_simple_sr(data)
++            return e_periodic, None
++
+         if training_derivatives:
+             is_pme = backend == "pme"
+             needs_strain_grad = scaling is not None and scaling.requires_grad
+@@ -916,20 +953,9 @@ def forward(
+                     compute_virial=compute_virial,
+                 )
+         elif self.method == "ewald":
+-            e, terms = self._coul_nvalchemi(
+-                data,
+-                backend="ewald",
+-                compute_forces=compute_forces or hessian,
+-                compute_virial=compute_virial,
+-                training_derivatives=training_derivatives,
+-                scaling=scaling,
+-                coord_unstrained=coord_unstrained,
+-                cell_unstrained=cell_unstrained,
+-            )
+-            if hessian:
+-                if terms is None:
+-                    terms = ExternalDerivativeTerms()
+-                terms.hessian = self._coul_nvalchemi_fd_hessian(data, backend="ewald")
++            # Energy stays in the autograd graph; all derivatives come from
++            # the calculator's autograd (nvalchemiops >=0.4).
++            e, terms = self._coul_nvalchemi(data, backend="ewald")
+         elif self.method == "pme":
+             e, terms = self._coul_nvalchemi(
+                 data,
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index fc3d150..3d25e65 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -443,9 +443,9 @@ def test_external_coulomb_uses_derivative_flags(self, method):
+         assert calc.external_coulomb.calls == [(True, True)]
+         torch.testing.assert_close(data["energy"], torch.ones(1, dtype=torch.float64))
+ 
+-    @pytest.mark.parametrize("method", ["ewald", "pme"])
++    @pytest.mark.parametrize("method", ["pme"])
+     def test_external_coulomb_training_derivatives_flag_for_train(self, method):
+-        """Ewald/PME switch to training-derivative mode for force/stress training."""
++        """PME switches to training-derivative mode for force/stress training."""
+         calc = AIMNet2Calculator.__new__(AIMNet2Calculator)
+         calc.external_coulomb = RecordingExternalCoulomb(method)
+         calc.external_dftd3 = None
+@@ -456,6 +456,18 @@ def test_external_coulomb_training_derivatives_flag_for_train(self, method):
+         kwargs = calc.external_coulomb.kwargs[0]
+         assert kwargs["training_derivatives"] is True
+ 
++    def test_external_coulomb_ewald_never_requests_training_derivatives(self):
++        """Ewald is energy-in-graph unconditionally; train mode must not flip the flag."""
++        calc = AIMNet2Calculator.__new__(AIMNet2Calculator)
++        calc.external_coulomb = RecordingExternalCoulomb("ewald")
++        calc.external_dftd3 = None
++        calc._train = True
++
++        calc._run_external_modules({"energy": torch.zeros(1)}, forces=True, stress=True)
++
++        kwargs = calc.external_coulomb.kwargs[0]
++        assert kwargs["training_derivatives"] is False
++
+     @pytest.mark.parametrize("method", ["ewald", "pme"])
+     def test_external_coulomb_training_derivatives_false_for_eval(self, method):
+         """Ewald/PME inference requests explicit terms rather than training derivatives."""
+diff --git a/tests/test_lr.py b/tests/test_lr.py
+index 4d72207..31efa0d 100644
+--- a/tests/test_lr.py
++++ b/tests/test_lr.py
+@@ -887,7 +887,7 @@ def test_pme_pbc_gradient_wrt_coords(self, pbc_crystal_small, device):
+ class TestLRCoulombBackendInterface:
+     """Tests for the common external Coulomb derivative interface."""
+ 
+-    @pytest.mark.parametrize("method", ["ewald", "pme"])
++    @pytest.mark.parametrize("method", ["pme"])  # ewald is energy-in-graph; see ewald-specific tests
+     def test_ewald_pme_inference_returns_explicit_terms(self, pbc_crystal_small, device, method):
+         """Inference-style Ewald/PME returns explicit fixed-charge terms."""
+         module = LRCoulomb(method=method).to(device)
+@@ -1155,7 +1155,7 @@ def test_force_loss_backward_does_not_raise(self, pbc_crystal_small, device, met
+         for g in param_grads:
+             assert torch.isfinite(g).all()
+ 
+-    @pytest.mark.parametrize("method", ["ewald", "pme"])
++    @pytest.mark.parametrize("method", ["pme"])  # ewald is energy-in-graph; see ewald-specific tests
+     def test_energy_backward_matches_hybrid_explicit_forces(self, pbc_crystal_small, device, method):
+         """Native autograd forces match hybrid fixed-charge explicit forces."""
+         torch.manual_seed(1)
+@@ -1207,3 +1207,39 @@ def test_lrcoulomb_rejects_unknown_method_and_envelope():
+         LRCoulomb(method="not-a-method")
+     with pytest.raises(ValueError, match="Unknown envelope"):
+         LRCoulomb(envelope="not-an-envelope")
++
++
++class TestEwaldEnergyGraph:
++    """Contract tests for the Ewald energy-in-graph migration (nvalchemiops >=0.4)."""
++
++    def test_ewald_inference_returns_energy_in_graph_no_terms(self, pbc_crystal_small, device):
++        import warnings
++
++        from aimnet.calculators import AIMNet2Calculator
++
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True, device=device)
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++            calc.set_lrcoulomb_method("ewald")
++        module = calc.external_coulomb
++
++        captured = {}
++        orig = module._coul_nvalchemi
++
++        def spy(data, backend, **kw):
++            e, terms = orig(data, backend, **kw)
++            captured["terms"] = terms
++            captured["e_requires_grad"] = e.requires_grad
++            return e, terms
++
++        module._coul_nvalchemi = spy
++        data_calc = {
++            "coord": pbc_crystal_small["coord"].to(device),
++            "numbers": pbc_crystal_small["numbers"].to(device),
++            "cell": pbc_crystal_small["cell"].to(device),
++            "charge": 0.0,
++        }
++        res = calc(data_calc, forces=True)
++        assert captured["terms"] is None
++        assert captured["e_requires_grad"]
++        assert torch.isfinite(res["forces"]).all()
+diff --git a/tests/test_pbc.py b/tests/test_pbc.py
+index 69dc2cd..9fd8bcb 100644
+--- a/tests/test_pbc.py
++++ b/tests/test_pbc.py
+@@ -1143,7 +1143,7 @@ def test_hessian_finite(self, pbc_crystal_small, device, method):
+         assert torch.isfinite(res["hessian"]).all()
+         assert res["hessian"].abs().sum() > 0
+ 
+-    @pytest.mark.parametrize("method", ["ewald", "pme"])
++    @pytest.mark.parametrize("method", ["pme"])  # ewald is energy-in-graph; see ewald-specific tests
+     def test_fd_hessian_matches_energy_fd(self, pbc_crystal_small, device, method):
+         """The FD-of-forces full-periodic block equals the central-FD-of-energy Hessian.
+ 
+@@ -1286,3 +1286,31 @@ def test_calculator_pbc_batched(self, pbc_crystal_small, device, method):
+         assert torch.isfinite(res["energy"]).all()
+         assert torch.isfinite(res["forces"]).all()
+         assert torch.isfinite(res["stress"]).all()
++
++
++@pytest.mark.slow
++def test_ewald_hessian_consistent_with_forces(pbc_crystal_small):
++    """Autograd Ewald Hessian rows equal central differences of analytic forces."""
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++    with warnings.catch_warnings():
++        warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++        calc.set_lrcoulomb_method("ewald")
++    device = calc.device
++    data = {
++        "coord": pbc_crystal_small["coord"].to(device),
++        "numbers": pbc_crystal_small["numbers"].to(device),
++        "cell": pbc_crystal_small["cell"].to(device),
++        "charge": 0.0,
++    }
++    H = calc(dict(data), hessian=True)["hessian"].double().cpu()
++    h = 1e-3
++    coord = data["coord"].clone()
++    for a, x in [(0, 0), (1, 2)]:
++        dp = coord.clone()
++        dp[a, x] += h
++        dm = coord.clone()
++        dm[a, x] -= h
++        fp = calc({**data, "coord": dp}, forces=True)["forces"].double().cpu()
++        fm = calc({**data, "coord": dm}, forces=True)["forces"].double().cpu()
++        fd_row = -(fp - fm) / (2 * h)
++        torch.testing.assert_close(H[a, x], fd_row, rtol=0.05, atol=5e-3)

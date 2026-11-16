@@ -1,0 +1,765 @@
+diff --git a/src/misc/IBM.cu b/src/misc/IBM.cu
+index 51365ea2..2b8bede9 100644
+--- a/src/misc/IBM.cu
++++ b/src/misc/IBM.cu
+@@ -1,7 +1,6 @@
+-/*Raul P. Pelaez 2019-2021. Immersed Boundary Method (IBM).
++/*Raul P. Pelaez 2019-2025. Immersed Boundary Method (IBM).
+   See IBM.cuh
+  */
+-#include<type_traits>
+ #include<third_party/uammd_cub.cuh>
+ #include "utils/atomics.cuh"
+ #include "IBM_utils.cuh"
+@@ -96,7 +95,11 @@ namespace uammd{
+       __shared__ int3 P; //Neighbour cell offset
+       __shared__ int3 support;
+       using KernelValueType = decltype(detail::phiX(kernel,real(), real3()));
+-      extern __shared__ KernelValueType weights[];
++      // Declaring as char is required because an "extern" declaration cannot
++      // have two different types in two different template instantiations:
++      // XREF: https://stackoverflow.com/questions/27570552/templated-cuda-kernel-with-dynamic-shared-memory
++      extern __shared__ unsigned char s_mem[];
++      KernelValueType* weights = reinterpret_cast<KernelValueType*>(s_mem);
+       if(tid==0){
+ 	pi = make_real3(pos[id]);
+ 	vi = particleQuantity[id];
+@@ -120,6 +123,8 @@ namespace uammd{
+ 	const int3 cellj = grid.pbc_cell(make_int3(celli.x + ii - P.x, celli.y + jj - P.y, is2D?0:(celli.z + kk - P.z)));
+ 	if(cellj.x<0 or cellj.y <0 or cellj.z<0)
+ 	  continue;
++	if(cellj.x >= grid.cellDim.x or cellj.y >= grid.cellDim.y or cellj.z >= grid.cellDim.z)
++	  continue;
+ 	const int jcell = cell2index(cellj);
+ 	const auto kern = detail::computeWeightFromShared(weights, ii, jj, kk, support);
+ 	const auto weight = weightCompute(vi, kern);
+@@ -168,7 +173,8 @@ namespace uammd{
+       __shared__ typename BlockReduce::TempStorage temp_storage;
+       __shared__ int3 support;
+       using KernelValueType = decltype(detail::phiX(kernel,real(), real3()));
+-      extern __shared__ KernelValueType weights[];
++      extern __shared__ unsigned char s_mem[];
++      KernelValueType* weights = reinterpret_cast<KernelValueType*>(s_mem);
+       if(id<numberParticles){
+ 	if(tid==0){
+ 	  pi = make_real3(pos[id]);
+@@ -194,6 +200,8 @@ namespace uammd{
+ 	  const int3 cellj = grid.pbc_cell(make_int3(celli.x + ii - P.x, celli.y + jj - P.y, is2D?0:(celli.z + kk - P.z)));
+ 	  if(cellj.x<0 or cellj.y <0 or cellj.z<0)
+ 	    continue;
++	  if(cellj.x >= grid.cellDim.x or cellj.y >= grid.cellDim.y or cellj.z >= grid.cellDim.z)
++	    continue;
+ 	  const real dV = qw(cellj, grid);
+ 	  const int jcell = cell2index(cellj);
+ 	  const auto kern = detail::computeWeightFromShared(weights, ii, jj, kk, support);
+diff --git a/src/misc/IBM.cuh b/src/misc/IBM.cuh
+index 6581a834..3ab3aa64 100644
+--- a/src/misc/IBM.cuh
++++ b/src/misc/IBM.cuh
+@@ -1,4 +1,4 @@
+-/*Raul P. Pelaez 2019-2020. Immersed Boundary Method (IBM).
++/*Raul P. Pelaez 2019-2025. Immersed Boundary Method (IBM).
+ This class contains functions to spread marker information to a grid and
+ interpolate information from a grid to some marker positions. This can be
+ adapted to aid in, for example, an Immersed Boundary Method or a NUFFT method.
+diff --git a/src/misc/IBM_kernels.cuh b/src/misc/IBM_kernels.cuh
+index 22ba9214..65652013 100644
+--- a/src/misc/IBM_kernels.cuh
++++ b/src/misc/IBM_kernels.cuh
+@@ -85,7 +85,7 @@ namespace uammd{
+     struct BarnettMagland{
+     private:
+       real computeNorm() const{
+-	auto foo=[=](real r){return BM(r, alpha, beta);};
++	auto foo=[this](real r){return BM(r, alpha, beta);};
+ 	real norm = 2.0*detail::integrate(foo, 0, alpha, 20000);
+ 	return norm;
+       }
+diff --git a/src/utils/Grid.cuh b/src/utils/Grid.cuh
+index 5405b50e..2b9c0fda 100644
+--- a/src/utils/Grid.cuh
++++ b/src/utils/Grid.cuh
+@@ -1,9 +1,11 @@
+-/*Raul P.Pelaez 2017. Grid utility.
++/*Raul P.Pelaez 2017-2025. Grid utility.
+ 
+-Given a certain box and a number of cells, subdivides the box in that number of cells and allows to:
+-    -Obtain the cell in which a position is located (taking into account PBC according to Box).
+-    -Compute the linear 1D index of a certain cell in the grid
+-    -Apply PBC to a cell (as in cellx=-1 goes to cellx=cellDim.x-1)
++Given a certain box and a number of cells, subdivides the box in that number of
++cells and allows to:
++-Obtain the cell in which a position is located (taking into account PBC
++according to Box).
++-Compute the linear 1D index of a certain cell in the grid
++-Apply PBC to a cell (as in cellx=-1 goes to cellx=cellDim.x-1)
+ 
+  */
+ #ifndef GRID_CUH
+@@ -12,167 +14,203 @@ Given a certain box and a number of cells, subdivides the box in that number of
+ #include "Box.cuh"
+ #include "vector.cuh"
+ #include <algorithm>
+-#include<vector>
+-
+-namespace uammd{
+-
+-  struct Grid{
+-    int3 gridPos2CellIndex;
+-
+-    int3 cellDim;
+-    real3 cellSize;
+-    real3 invCellSize;
+-    Box box;
+-    real cellVolume;
+-    Grid(): Grid(Box(), make_int3(0,0,0)){}
+-
+-    Grid(Box box, real3 minCellSize):
+-      Grid(box, make_int3(box.boxSize/minCellSize)){}
+-    Grid(Box box, real minCellSize):
+-      Grid(box, make_real3(minCellSize)){}
+-
+-    Grid(Box box, int3 in_cellDim):
+-      box(box),
+-      cellDim(in_cellDim){
+-
+-      if(cellDim.z == 0) cellDim.z = 1;
+-      cellSize = box.boxSize/make_real3(cellDim);
+-      invCellSize = 1.0/cellSize;
+-      if(box.boxSize.z == real(0.0)) invCellSize.z = 0;
+-
+-      gridPos2CellIndex = make_int3( 1,
+-				     cellDim.x,
+-				     cellDim.x*cellDim.y);
+-      cellVolume = cellSize.x*cellSize.y;
+-      if(cellDim.z > 1) cellVolume *= cellSize.z;
+-    }
+-    template<class VecType>
+-    inline __host__ __device__ int3 getCell(const VecType &r) const{
+-	// return  int( (p+0.5L)/cellSize )
+-	int3 cell = make_int3((box.apply_pbc(make_real3(r)) + real(0.5)*box.boxSize)*invCellSize);
+-	//Anti-Traquinazo guard, you need to explicitly handle the case where a particle
+-	// is exactly at the box limit, AKA -L/2. This is due to the precision loss when
+-	// casting int from floats, which gives non-correct results very near the cell borders.
+-	// This is completly neglegible in all cases, except with the cell 0, that goes to the cell
+-	// cellDim, which is catastrophic.
+-	//Doing the previous operation in double precision (by changing 0.5f to 0.5) also works, but it is a bit of a hack and the performance appears to be the same as this.
+-	//TODO: Maybe this can be skipped if the code is in double precision mode
+-	if(cell.x==cellDim.x) cell.x = 0;
+-	if(cell.y==cellDim.y) cell.y = 0;
+-	if(cell.z==cellDim.z) cell.z = 0;
+-	return cell;
+-    }
++#include <vector>
+ 
+-    inline __host__ __device__ int getCellIndex(const int3 &cell) const{
+-	return dot(cell, gridPos2CellIndex);
+-    }
++namespace uammd {
+ 
+-    inline __host__ __device__ int getCellIndex(const int2 &cell) const{
+-      return dot(cell, make_int2(gridPos2CellIndex));
+-    }
++struct Grid {
++  int3 gridPos2CellIndex;
+ 
+-    inline __host__  __device__ int3 pbc_cell(const int3 &cell) const{
+-	int3 cellPBC;
+-	cellPBC.x = pbc_cell_coord<0>(cell.x);
+-	cellPBC.y = pbc_cell_coord<1>(cell.y);
+-	cellPBC.z = pbc_cell_coord<2>(cell.z);
+-	return cellPBC;
+-    }
++  int3 cellDim;
++  real3 cellSize;
++  real3 invCellSize;
++  Box box;
++  real cellVolume;
++  Grid() : Grid(Box(), make_int3(0, 0, 0)) {}
+ 
+-    template<int coordinate>
+-    inline __host__  __device__ int pbc_cell_coord(int cell) const{
+-	int ncells = 0;
+-	if(coordinate == 0){
+-	  ncells = cellDim.x;
+-	}
+-	if(coordinate == 1){
+-	  ncells = cellDim.y;
+-	}
+-
+-	if(coordinate == 2){
+-	  ncells = cellDim.z;
+-	}
+-
+-	if(cell <= -1) cell += ncells;
+-	else if(cell >= ncells) cell -= ncells;
+-	return cell;
+-    }
++  Grid(Box box, real3 minCellSize)
++      : Grid(box, make_int3(box.boxSize / minCellSize)) {}
++  Grid(Box box, real minCellSize) : Grid(box, make_real3(minCellSize)) {}
+ 
+-    inline __host__ __device__ int getNumberCells() const{ return cellDim.x*cellDim.y*cellDim.z;}
++  Grid(Box box, int3 in_cellDim) : box(box), cellDim(in_cellDim) {
+ 
+-    inline __host__ __device__ real getCellVolume(int3 cell) const{ return getCellVolume();}
++    if (cellDim.z == 0)
++      cellDim.z = 1;
++    cellSize = box.boxSize / make_real3(cellDim);
++    invCellSize = 1.0 / cellSize;
++    if (box.boxSize.z == real(0.0))
++      invCellSize.z = 0;
+ 
+-    inline __host__ __device__ real getCellVolume() const{ return cellVolume;}
++    gridPos2CellIndex = make_int3(1, cellDim.x, cellDim.x * cellDim.y);
++    cellVolume = cellSize.x * cellSize.y;
++    if (cellDim.z > 1)
++      cellVolume *= cellSize.z;
++  }
++  template <class VecType>
++  inline __host__ __device__ int3 getCell(const VecType &r) const {
++    // return  int( (p+0.5L)/cellSize )
++    int3 cell = make_int3(
++        (box.apply_pbc(make_real3(r)) + real(0.5) * box.boxSize) * invCellSize);
++    // Anti-Traquinazo guard, you need to explicitly handle the case where a
++    // particle
++    //  is exactly at the box limit, AKA -L/2. This is due to the precision loss
++    //  when casting int from floats, which gives non-correct results very near
++    //  the cell borders. This is completly neglegible in all cases, except with
++    //  the cell 0, that goes to the cell cellDim, which is catastrophic.
++    // Doing the previous operation in double precision (by changing 0.5f to
++    // 0.5) also works, but it is a bit of a hack and the performance appears to
++    // be the same as this.
++    // TODO: Maybe this can be skipped if the code is in double precision mode
++    if (cell.x == cellDim.x)
++      cell.x = 0;
++    if (cell.y == cellDim.y)
++      cell.y = 0;
++    if (cell.z == cellDim.z)
++      cell.z = 0;
++    return cell;
++  }
+ 
+-    inline __host__ __device__ real3 getCellSize(int3 cell) const{return getCellSize();}
++  inline __host__ __device__ int getCellIndex(const int3 &cell) const {
++    return dot(cell, gridPos2CellIndex);
++  }
+ 
+-    inline __host__ __device__ real3 getCellSize() const{return cellSize;}
++  inline __host__ __device__ int getCellIndex(const int2 &cell) const {
++    return dot(cell, make_int2(gridPos2CellIndex));
++  }
+ 
+-    inline __host__ __device__ real3 distanceToCellCenter(real3 pos, int3 cell) const{
+-      return box.apply_pbc(pos + box.boxSize*real(0.5) - getCellCenter(cell));
+-    }
++  inline __host__ __device__ int3 pbc_cell(const int3 &cell) const {
++    int3 cellPBC;
++    cellPBC.x = pbc_cell_coord<0>(cell.x);
++    cellPBC.y = pbc_cell_coord<1>(cell.y);
++    cellPBC.z = pbc_cell_coord<2>(cell.z);
++    return cellPBC;
++  }
+ 
+-    inline __host__ __device__ real3 getCellCenter(int3 cell) const{
+-      return cellSize*(make_real3(cell)+real(0.5));
++  template <int coordinate>
++  inline __host__ __device__ int pbc_cell_coord(int cell) const {
++    int ncells = 0;
++    if (coordinate == 0 && box.isPeriodicX()) {
++      ncells = cellDim.x;
+     }
+-
+-    inline __host__ __device__ real3 distanceToCellUpperLeftCorner(real3 pos, int3 cell) const{
+-      return box.apply_pbc(pos + box.boxSize*real(0.5) - cellSize*make_real3(cell));
++    if (coordinate == 1 && box.isPeriodicY()) {
++      ncells = cellDim.y;
++    }
++    if (coordinate == 2 && box.isPeriodicZ()) {
++      ncells = cellDim.z;
+     }
++    if (cell <= -1)
++      cell += ncells;
++    else if (cell >= ncells)
++      cell -= ncells;
++    return cell;
++  }
+ 
+-  };
++  inline __host__ __device__ int getNumberCells() const {
++    return cellDim.x * cellDim.y * cellDim.z;
++  }
++
++  inline __host__ __device__ real getCellVolume(int3 cell) const {
++    return getCellVolume();
++  }
++
++  inline __host__ __device__ real getCellVolume() const { return cellVolume; }
++
++  inline __host__ __device__ real3 getCellSize(int3 cell) const {
++    return getCellSize();
++  }
+ 
+-  //Looks for the closest (equal or greater) number of nodes of the form 2^a*3^b*5^c*7^d*11^e
+-  int3 nextFFTWiseSize3D(int3 size){
+-    int* cdim = &size.x;
+-    using integral = uint64_t;
+-    integral max_dim = std::max({size.x, size.y, size.z});
+-    integral n= 14;
+-    integral n5 = 6; //number higher than this are not reasonable...
+-    integral n7 = 5;
+-    integral n11 = 4;
+-    auto powint = [](integral base, integral exp){if(exp==0) return integral(1); integral res = base; fori(0,exp-1) res*=base; return res;};
+-    std::vector<integral> tmp(n*n*n5*n7*n11, 0);
+-    do{
+-      tmp.resize(n*n*n5*n7*n11, 0);
+-      for(integral i=0; i<n; i++)for(integral j=0; j<n; j++)
+-	for(integral k=0; k<n5;k++)for(integral k7=0; k7<n7; k7++)for(integral k11=0; k11<n11; k11++){
+-	      if(k11>4 or k7>5 or k>6) continue;
+-	      integral id = i+n*j+n*n*k+n*n*n5*k7+n*n*n5*n7*k11;
+-	      tmp[id] = 0;
+-	      //Current fft wise size
+-	      integral number = integral(powint(2,i))*powint(3,j)*powint(5,k)*powint(7, k7);
+-	      //This is to prevent overflow
+-	      if(!(i==n-1 and j==n-1 and k==n5-1 and k7==n7-1 and k11<n11-1))
+-		number *= powint(11, k11);
+-	      else
+-		continue;
+-	      //The fastest FFTs always have at least a factor of 2
+-	      if(i==0) continue;
+-	      //I have seen empirically that factors 11 and 7 only works well with at least a factor 2 involved
+-	      if((k11>0 && (i==0))) continue;
+-	      tmp[id] = number;
+-	    }
+-      n++;
+-      /*Sort this array in ascending order*/
+-      std::sort(tmp.begin(), tmp.end());
+-    }while(tmp.back()<max_dim); /*if n is not enough, include more*/
+-
+-    //I have empirically seen that these sizes produce slower FFTs than they should in several platforms
+-    constexpr integral forbiddenSizes [] = {28, 98, 150, 154, 162, 196, 242};
+-    /*Now look for the nearest value in tmp that is greater than each cell dimension and it is not forbidden*/
+-    forj(0,3){
+-      for(integral i=0; i<tmp.size(); i++){
+-	if(tmp[i]<integral(cdim[j])) continue;
+-	for(integral k =0;k<sizeof(forbiddenSizes)/sizeof(integral); k++) if(tmp[i] == forbiddenSizes[k]) continue;
+-	int set = int(tmp[i]);
+-	if(tmp[i]>=powint(2,31)) set = -1;
+-	cdim[j] = set;
+-	break;
+-      }
++  inline __host__ __device__ real3 getCellSize() const { return cellSize; }
++
++  inline __host__ __device__ real3 distanceToCellCenter(real3 pos,
++                                                        int3 cell) const {
++    return box.apply_pbc(pos + box.boxSize * real(0.5) - getCellCenter(cell));
++  }
++
++  inline __host__ __device__ real3 getCellCenter(int3 cell) const {
++    return cellSize * (make_real3(cell) + real(0.5));
++  }
++
++  inline __host__ __device__ real3
++  distanceToCellUpperLeftCorner(real3 pos, int3 cell) const {
++    return box.apply_pbc(pos + box.boxSize * real(0.5) -
++                         cellSize * make_real3(cell));
++  }
++};
++
++// Looks for the closest (equal or greater) number of nodes of the form
++// 2^a*3^b*5^c*7^d*11^e
++int3 nextFFTWiseSize3D(int3 size) {
++  int *cdim = &size.x;
++  using integral = uint64_t;
++  integral max_dim = std::max({size.x, size.y, size.z});
++  integral n = 14;
++  integral n5 = 6; // number higher than this are not reasonable...
++  integral n7 = 5;
++  integral n11 = 4;
++  auto powint = [](integral base, integral exp) {
++    if (exp == 0)
++      return integral(1);
++    integral res = base;
++    fori(0, exp - 1) res *= base;
++    return res;
++  };
++  std::vector<integral> tmp(n * n * n5 * n7 * n11, 0);
++  do {
++    tmp.resize(n * n * n5 * n7 * n11, 0);
++    for (integral i = 0; i < n; i++)
++      for (integral j = 0; j < n; j++)
++        for (integral k = 0; k < n5; k++)
++          for (integral k7 = 0; k7 < n7; k7++)
++            for (integral k11 = 0; k11 < n11; k11++) {
++              if (k11 > 4 or k7 > 5 or k > 6)
++                continue;
++              integral id = i + n * j + n * n * k + n * n * n5 * k7 +
++                            n * n * n5 * n7 * k11;
++              tmp[id] = 0;
++              // Current fft wise size
++              integral number = integral(powint(2, i)) * powint(3, j) *
++                                powint(5, k) * powint(7, k7);
++              // This is to prevent overflow
++              if (!(i == n - 1 and j == n - 1 and k == n5 - 1 and
++                    k7 == n7 - 1 and k11 < n11 - 1))
++                number *= powint(11, k11);
++              else
++                continue;
++              // The fastest FFTs always have at least a factor of 2
++              if (i == 0)
++                continue;
++              // I have seen empirically that factors 11 and 7 only works well
++              // with at least a factor 2 involved
++              if ((k11 > 0 && (i == 0)))
++                continue;
++              tmp[id] = number;
++            }
++    n++;
++    /*Sort this array in ascending order*/
++    std::sort(tmp.begin(), tmp.end());
++  } while (tmp.back() < max_dim); /*if n is not enough, include more*/
++
++  // I have empirically seen that these sizes produce slower FFTs than they
++  // should in several platforms
++  constexpr integral forbiddenSizes[] = {28, 98, 150, 154, 162, 196, 242};
++  /*Now look for the nearest value in tmp that is greater than each cell
++   * dimension and it is not forbidden*/
++  forj(0, 3) {
++    for (integral i = 0; i < tmp.size(); i++) {
++      if (tmp[i] < integral(cdim[j]))
++        continue;
++      for (integral k = 0; k < sizeof(forbiddenSizes) / sizeof(integral); k++)
++        if (tmp[i] == forbiddenSizes[k])
++          continue;
++      int set = int(tmp[i]);
++      if (tmp[i] >= powint(2, 31))
++        set = -1;
++      cdim[j] = set;
++      break;
+     }
+-    return size;
+   }
++  return size;
+ }
++} // namespace uammd
+ 
+ #endif
+diff --git a/src/utils/vector.cuh b/src/utils/vector.cuh
+index df4ed98c..6ba072a6 100644
+--- a/src/utils/vector.cuh
++++ b/src/utils/vector.cuh
+@@ -916,6 +916,7 @@ VECATTR int2 make_int2(int3 a){return make_int2(a.x, a.y);}
+ 
+ VECATTR int3 make_int3(int a){return make_int3(a,a,a);}
+ VECATTR int3 make_int3(int2 a, int b){return make_int3(a.x,a.y,b);}
++VECATTR int3 make_int3(int3 a){return a;}
+ 
+ VECATTR int3 operator /(int3 a, int3 b){
+   return make_int3( a.x/b.x, a.y/b.y, a.z/b.z);
+diff --git a/test/misc/ibm/CMakeLists.txt b/test/misc/ibm/CMakeLists.txt
+index 8c9704fd..cadbbeca 100644
+--- a/test/misc/ibm/CMakeLists.txt
++++ b/test/misc/ibm/CMakeLists.txt
+@@ -1,3 +1,6 @@
++include(GoogleTest)
++
++
+ add_executable(ibm test_ibm.cu)
+ uammd_setup_target(ibm)
+ target_include_directories(ibm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+@@ -8,5 +11,17 @@ target_link_libraries(
+   GTest::gtest_main
+   GTest::gmock_main
+ )
+-include(GoogleTest)
+ gtest_discover_tests(ibm)
++
++
++add_executable(ibm_regular test_ibm_regular.cu)
++uammd_setup_target(ibm_regular)
++target_include_directories(ibm_regular PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++set_target_properties(ibm_regular PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++target_link_libraries(
++  ibm_regular
++  PRIVATE
++  GTest::gtest_main
++  GTest::gmock_main
++)
++gtest_discover_tests(ibm_regular)
+diff --git a/test/misc/ibm/test_ibm_regular.cu b/test/misc/ibm/test_ibm_regular.cu
+new file mode 100644
+index 00000000..24bf971e
+--- /dev/null
++++ b/test/misc/ibm/test_ibm_regular.cu
+@@ -0,0 +1,271 @@
++#include "misc/IBM.cuh"
++#include "misc/IBM_kernels.cuh"
++#include <gtest/gtest.h>
++#include <numeric>
++#include <random>
++#include <thrust/device_vector.h>
++#include <thrust/host_vector.h>
++#include <vector>
++
++using namespace uammd;
++struct ConstantKernel {
++  int3 support;
++  inline __host__ __device__ int phi(real r, real3 pos) const { return 1; }
++};
++
++TEST(Spreading, ConstantKernelCenter) {
++  thrust::device_vector<real3> pos(1);
++  thrust::device_vector<int> values(1, 1);
++  int3 n = {3, 3, 3};
++  real3 L = make_real3(1, 1, 1);
++  thrust::device_vector<int> field(n.x * n.y * n.z, 0);
++  pos[0] = make_real3(0, 0, 0);
++  auto kernel = std::make_shared<ConstantKernel>(ConstantKernel{n});
++  Grid grid(Box(L), n);
++  IBM<ConstantKernel, Grid> ibm(kernel, grid);
++  ibm.spread(pos.begin(), values.begin(), field.data().get(), pos.size());
++  thrust::host_vector<int> h_field = field;
++  auto sum = std::accumulate(h_field.begin(), h_field.end(), 0);
++  EXPECT_EQ(sum, n.x * n.y * n.z);
++}
++
++TEST(Spreading, ConstantKernelCornerPeriodic) {
++  thrust::device_vector<real3> pos(1);
++  thrust::device_vector<int> values(1, 1);
++  int3 n = {3, 3, 3};
++  real3 L = make_real3(3, 3, 3);
++  thrust::device_vector<int> field(n.x * n.y * n.z, 0);
++  pos[0] = make_real3(-1, -1, -1);
++  auto kernel = std::make_shared<ConstantKernel>(ConstantKernel{n});
++  Grid grid(Box(L), n);
++  IBM<ConstantKernel, Grid> ibm(kernel, grid);
++  ibm.spread(pos.begin(), values.begin(), field.data().get(), pos.size());
++  thrust::host_vector<int> h_field = field;
++  auto sum = std::accumulate(h_field.begin(), h_field.end(), 0);
++  EXPECT_EQ(sum, n.x * n.y * n.z);
++}
++
++TEST(Spreading, ConstantKernelCornerNonPeriodic) {
++  thrust::device_vector<real3> pos(1);
++  thrust::device_vector<int> values(1, 1);
++  int3 n = {3, 3, 3};
++  real3 L = make_real3(3, 3, 3);
++  thrust::device_vector<int> field(n.x * n.y * n.z, 0);
++  pos[0] = make_real3(-1, -1, -1);
++  auto kernel = std::make_shared<ConstantKernel>(ConstantKernel{n});
++  Box box(L);
++  box.setPeriodicity(false, false, false);
++  Grid grid(box, n);
++  IBM<ConstantKernel, Grid> ibm(kernel, grid);
++  ibm.spread(pos.begin(), values.begin(), field.data().get(), pos.size());
++  thrust::host_vector<int> h_field = field;
++  auto sum = std::accumulate(h_field.begin(), h_field.end(), 0);
++  EXPECT_EQ(sum, 8);
++}
++
++using PeskinBase = IBM_kernels::Peskin::threePoint;
++struct Peskin3pt {
++  static constexpr int support = 3;
++  Peskin3pt(real3 h) : m_phiX(h.x), m_phiY(h.y), m_phiZ(h.z) {}
++
++  __host__ __device__ real phiX(real rr, real3 pos = real3()) const {
++    return m_phiX.phi(rr, pos);
++  }
++
++  __host__ __device__ real phiY(real rr, real3 pos = real3()) const {
++    return m_phiY.phi(rr, pos);
++  }
++
++  __host__ __device__ real phiZ(real rr, real3 pos = real3()) const {
++    return m_phiZ.phi(rr, pos);
++  }
++
++private:
++  PeskinBase m_phiX, m_phiY, m_phiZ;
++};
++
++template <typename Container1, typename Container2>
++auto manual_spread(Container1 &pos, Container2 &quantity, int3 n, real3 L) {
++  std::vector<real> field(n.x * n.y * n.z, 0.0);
++  real3 h = L / make_real3(n);
++  for (int i = 0; i < pos.size(); ++i) {
++    real3 p = pos[i];
++    auto q = quantity[i];
++    for (int iz = 0; iz < n.z; ++iz) {
++      real z = -L.z / 2.0 + (iz + 0.5) * h.z;
++      for (int iy = 0; iy < n.y; ++iy) {
++        real y = -L.y / 2.0 + (iy + 0.5) * h.y;
++        for (int ix = 0; ix < n.x; ++ix) {
++          real x = -L.x / 2.0 + (ix + 0.5) * h.x;
++          real weight = Peskin3pt(h).phiX(x - p.x) *
++                        Peskin3pt(h).phiY(y - p.y) * Peskin3pt(h).phiZ(z - p.z);
++          int idx = ix + iy * n.x + iz * n.x * n.y;
++          field[idx] = weight * q;
++        }
++      }
++    }
++  }
++  return field;
++}
++
++TEST(Spreading, PeskinKernelSpread) {
++  int n_val = 8;
++  int3 n = make_int3(n_val);
++  real3 L = make_real3(16.0);
++  thrust::host_vector<real3> h_pos(1);
++  h_pos[0] = make_real3(0.0, 0.0, 0.0);
++  thrust::device_vector<real3> pos = h_pos;
++  thrust::host_vector<real> h_quantity(1, 1.0);
++  thrust::device_vector<real> quantity = h_quantity;
++  int fieldSize = n.x * n.y * n.z;
++  thrust::device_vector<real> field(fieldSize, 0.0);
++  Box box(L);
++  Grid grid(box, n);
++  real3 h = L / make_real3(n);
++  auto kernel = std::make_shared<Peskin3pt>(h);
++  IBM<Peskin3pt, Grid> ibm(kernel, grid);
++  ibm.spread(pos.data().get(), quantity.data().get(), field.data().get(),
++             pos.size());
++  thrust::host_vector<real> h_field = field;
++  auto expected = manual_spread(h_pos, h_quantity, n, L);
++  for (int i = 0; i < fieldSize; ++i) {
++    EXPECT_NEAR(h_field[i], expected[i], 1e-10);
++  }
++}
++
++template <typename Foo> real integrate(const Foo &foo, real width) {
++  real a = -width / 2.0;
++  real b = width / 2.0;
++  int N = 10000;
++  real dx = (b - a) / (N - 1);
++  real sum = 0.0;
++  for (int i = 0; i < N; ++i) {
++    real x = a + i * dx;
++    real val = foo(x);
++    sum += val;
++  }
++  return sum * dx;
++}
++
++// Verify the adjoint property of spread and interpolate in 3D.
++// A unit quantity is spread then interpolated; after dividing by the
++// kernel-squared integral dV, we should recover 1.
++// This should work regardless of the cell size in each direction
++TEST(SpreadInterp, Adjoint3DNonRegular) {
++  int numberParticles = 1;
++  int3 n = make_int3(64, 32, 7);
++  real3 L = make_real3(64.0);
++  thrust::host_vector<real3> h_pos(1);
++  h_pos[0] = make_real3(0.0, 0.0, 0.0);
++  thrust::device_vector<real3> pos = h_pos;
++  thrust::host_vector<real> h_quantity(1, 1.0);
++  thrust::device_vector<real> quantity = h_quantity;
++  thrust::device_vector<real> field(n.x * n.y * n.z, 0.0);
++  Box box(L);
++  Grid grid(box, n);
++  real3 h = L / make_real3(n);
++  auto kernel = std::make_shared<Peskin3pt>(h);
++  IBM<Peskin3pt, Grid> ibm(kernel, grid);
++
++  ibm.spread(pos.begin(), quantity.begin(), field.data().get(), pos.size());
++  real dV =
++      integrate([&](real r) { return pow(kernel->phiX(r), 2.0); }, 3.0 * h.x) *
++      integrate([&](real r) { return pow(kernel->phiY(r), 2.0); }, 3.0 * h.y) *
++      integrate([&](real r) { return pow(kernel->phiZ(r), 2.0); }, 3.0 * h.z);
++
++  thrust::device_vector<real> interp_result(1, 0.0);
++  ibm.gather(pos.data().get(), interp_result.data().get(), field.data().get(),
++             int(pos.size()));
++
++  thrust::host_vector<real> h_interp = interp_result;
++  real quantity_reconstructed = h_interp[0] / dV;
++  EXPECT_NEAR(quantity_reconstructed, 1.0, 1e-4);
++}
++
++// A 2D adjoint test by setting the z-component to 0,
++// L[2]=0 and n[2]=1. For example:
++TEST(SpreadInterp, PeskinKernelAdjoint2D) {
++  int n_val = 8;
++  int3 n = make_int3(n_val, n_val, 1);
++  real3 L = make_real3(16.0, 16.0, 0.0);
++  thrust::host_vector<real3> h_pos(1);
++  h_pos[0] = make_real3(0.0, 0.0, 0.0);
++  thrust::device_vector<real3> pos = h_pos;
++  thrust::host_vector<real> h_quantity(1, 1.0);
++  thrust::device_vector<real> quantity = h_quantity;
++  int fieldSize = n.x * n.y * n.z;
++  thrust::device_vector<real> field(fieldSize, 0.0);
++  Box box(L);
++  Grid grid(box, n);
++  real3 h = L / make_real3(n);
++  auto kernel = std::make_shared<Peskin3pt>(h);
++  IBM<Peskin3pt, Grid> ibm(kernel, grid);
++  ibm.spread(pos.begin(), quantity.begin(), field.data().get(), pos.size());
++  thrust::device_vector<real> interp_result(1, 0.0);
++  ibm.gather(pos.data().get(), interp_result.data().get(), field.data().get(),
++             int(pos.size()));
++  real dV =
++      integrate([&](real r) { return pow(kernel->phiX(r), 2.0); }, 3.0 * h.x) *
++      integrate([&](real r) { return pow(kernel->phiY(r), 2.0); }, 3.0 * h.y);
++  thrust::host_vector<real> h_interp = interp_result;
++  real quantity_reconstructed = h_interp[0] / dV;
++  EXPECT_NEAR(quantity_reconstructed, 1.0, 1e-4);
++}
++
++template <typename Container1, typename Container2>
++auto manual_interpolate(Container1 &pos, Container2 &field, int3 n, real3 L) {
++  std::vector<real> interp_result(pos.size(), 0.0);
++  real3 h = L / make_real3(n);
++  real qw = h.x * h.y * h.z;
++  for (int i = 0; i < pos.size(); ++i) {
++    real3 p = pos[i];
++    for (int iz = 0; iz < n.z; ++iz) {
++      real z = -L.z / 2.0 + (iz + 0.5) * h.z;
++      for (int iy = 0; iy < n.y; ++iy) {
++        real y = -L.y / 2.0 + (iy + 0.5) * h.y;
++        for (int ix = 0; ix < n.x; ++ix) {
++          real x = -L.x / 2.0 + (ix + 0.5) * h.x;
++          real weight = Peskin3pt(h).phiX(x - p.x) *
++                        Peskin3pt(h).phiY(y - p.y) * Peskin3pt(h).phiZ(z - p.z);
++          int idx = ix + iy * n.x + iz * n.x * n.y;
++          interp_result[i] += weight * field[idx] * qw;
++        }
++      }
++    }
++  }
++  return interp_result;
++}
++
++TEST(Interpolation, RandomField) {
++  int n_val = 32;
++  int3 n = make_int3(n_val);
++  real3 L = make_real3(16.0);
++  real3 h = L / make_real3(n);
++  int numberParticles = 128;
++  std::vector<real3> h_pos(numberParticles);
++  std::mt19937 gen(123);
++  // Keep the particles away from the boundary to not deal with PBC in the manual_interpolation function
++  std::uniform_real_distribution<real> dist(-L.x / 2.0 + 2*h.x, L.x / 2.0 - 2*h.x);
++  for (int i = 0; i < numberParticles; ++i) {
++    h_pos[i] = make_real3(dist(gen), dist(gen), dist(gen));
++  }
++  thrust::device_vector<real3> pos = h_pos;
++  int fieldSize = n.x * n.y * n.z;
++  thrust::host_vector<real> h_field(fieldSize, 0.0);
++  for(int i = 0; i < fieldSize; ++i) {
++    h_field[i] = dist(gen);
++  }
++  thrust::device_vector<real> field = h_field;
++  Box box(L);
++  Grid grid(box, n);
++  auto kernel = std::make_shared<Peskin3pt>(h);
++  IBM<Peskin3pt, Grid> ibm(kernel, grid);
++  thrust::device_vector<real> interp_result(numberParticles, 0.0);
++  ibm.gather(pos.data().get(), interp_result.data().get(), field.data().get(),
++	     int(pos.size()));
++  thrust::host_vector<real> h_interp = interp_result;
++  auto expected = manual_interpolate(h_pos, h_field, n, L);
++  for (int i = 0; i < numberParticles; ++i) {
++    EXPECT_NEAR(h_interp[i], expected[i], 1e-10);
++  }
++}

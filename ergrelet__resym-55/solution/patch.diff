@@ -1,0 +1,761 @@
+diff --git a/resym/src/resym_app.rs b/resym/src/resym_app.rs
+index ae1f6e3..eb9ccdb 100644
+--- a/resym/src/resym_app.rs
++++ b/resym/src/resym_app.rs
+@@ -3,7 +3,7 @@ use eframe::egui;
+ use memory_logger::blocking::MemoryLogger;
+ use resym_core::{
+     backend::{Backend, BackendCommand, PDBSlot},
+-    frontend::FrontendCommand,
++    frontend::{FrontendCommand, TypeIndex},
+ };
+ 
+ #[cfg(target_arch = "wasm32")]
+@@ -40,24 +40,38 @@ impl From<ResymPDBSlots> for PDBSlot {
+     }
+ }
+ 
++/// Tabs available for the left-side panel
+ #[derive(PartialEq)]
+-enum ExplorerTab {
++enum LeftPanelTab {
+     TypeSearch,
+     ModuleBrowsing,
+ }
+ 
++/// Tabs available for the bottom panel
++#[derive(PartialEq)]
++enum BottomPanelTab {
++    Console,
++    XRefs,
++}
++
+ /// Struct that represents our GUI application.
+ /// It contains the whole application's context at all time.
+ pub struct ResymApp {
+     current_mode: ResymAppMode,
+-    explorer_selected_tab: ExplorerTab,
++    // Components used in the left-side panel
++    left_panel_selected_tab: LeftPanelTab,
+     type_search: TextSearchComponent,
+     type_list: TypeListComponent,
+     module_search: TextSearchComponent,
+     module_tree: ModuleTreeComponent,
+     code_view: CodeViewComponent,
++    // Components used in the bottom panel
++    bottom_panel_selected_tab: BottomPanelTab,
+     console: ConsoleComponent,
++    xref_list: TypeListComponent,
++    // Other components
+     settings: SettingsComponent,
++    selected_type_index: Option<TypeIndex>,
+     #[cfg(feature = "http")]
+     open_url: OpenURLComponent,
+     frontend_controller: Arc<EguiFrontendController>,
+@@ -141,13 +155,16 @@ impl ResymApp {
+         log::info!("{} {}", PKG_NAME, PKG_VERSION);
+         Ok(Self {
+             current_mode: ResymAppMode::Idle,
+-            explorer_selected_tab: ExplorerTab::TypeSearch,
++            left_panel_selected_tab: LeftPanelTab::TypeSearch,
+             type_search: TextSearchComponent::new(),
+             type_list: TypeListComponent::new(),
+             module_search: TextSearchComponent::new(),
+             module_tree: ModuleTreeComponent::new(),
+             code_view: CodeViewComponent::new(),
++            bottom_panel_selected_tab: BottomPanelTab::Console,
+             console: ConsoleComponent::new(logger),
++            xref_list: TypeListComponent::new(),
++            selected_type_index: None,
+             settings: SettingsComponent::new(app_settings),
+             #[cfg(feature = "http")]
+             open_url: OpenURLComponent::new(),
+@@ -182,22 +199,23 @@ impl ResymApp {
+             .default_width(250.0)
+             .width_range(100.0..=f32::INFINITY)
+             .show(ctx, |ui| {
++                ui.add_space(2.0);
+                 ui.horizontal(|ui| {
+                     ui.selectable_value(
+-                        &mut self.explorer_selected_tab,
+-                        ExplorerTab::TypeSearch,
++                        &mut self.left_panel_selected_tab,
++                        LeftPanelTab::TypeSearch,
+                         "Search types",
+                     );
+                     ui.selectable_value(
+-                        &mut self.explorer_selected_tab,
+-                        ExplorerTab::ModuleBrowsing,
++                        &mut self.left_panel_selected_tab,
++                        LeftPanelTab::ModuleBrowsing,
+                         "Browse modules",
+                     );
+                 });
+                 ui.separator();
+ 
+-                match self.explorer_selected_tab {
+-                    ExplorerTab::TypeSearch => {
++                match self.left_panel_selected_tab {
++                    LeftPanelTab::TypeSearch => {
+                         // Callback run when the search query changes
+                         let on_query_update = |search_query: &str| {
+                             // Update filtered list if filter has changed
+@@ -231,15 +249,48 @@ impl ResymApp {
+                         ui.separator();
+                         ui.add_space(4.0);
+ 
++                        // Callback run when a type is selected in the list
++                        let mut on_type_selected = |type_name: &str, type_index: TypeIndex| {
++                            // Update currently selected type index
++                            self.selected_type_index = Some(type_index);
++
++                            match self.current_mode {
++                                ResymAppMode::Browsing(..) => {
++                                    if let Err(err) = self.backend.send_command(
++                                        BackendCommand::ReconstructTypeByIndex(
++                                            ResymPDBSlots::Main as usize,
++                                            type_index,
++                                            self.settings.app_settings.primitive_types_flavor,
++                                            self.settings.app_settings.print_header,
++                                            self.settings.app_settings.reconstruct_dependencies,
++                                            self.settings.app_settings.print_access_specifiers,
++                                        ),
++                                    ) {
++                                        log::error!("Failed to reconstruct type: {}", err);
++                                    }
++                                }
++                                ResymAppMode::Comparing(..) => {
++                                    if let Err(err) =
++                                        self.backend.send_command(BackendCommand::DiffTypeByName(
++                                            ResymPDBSlots::Main as usize,
++                                            ResymPDBSlots::Diff as usize,
++                                            type_name.to_string(),
++                                            self.settings.app_settings.primitive_types_flavor,
++                                            self.settings.app_settings.print_header,
++                                            self.settings.app_settings.reconstruct_dependencies,
++                                            self.settings.app_settings.print_access_specifiers,
++                                        ))
++                                    {
++                                        log::error!("Failed to reconstruct type diff: {}", err);
++                                    }
++                                }
++                                _ => log::error!("Invalid application state"),
++                            }
++                        };
+                         // Update the type list
+-                        self.type_list.update(
+-                            &self.settings.app_settings,
+-                            &self.current_mode,
+-                            &self.backend,
+-                            ui,
+-                        );
++                        self.type_list.update(ui, &mut on_type_selected);
+                     }
+-                    ExplorerTab::ModuleBrowsing => {
++                    LeftPanelTab::ModuleBrowsing => {
+                         // Callback run when the search query changes
+                         let on_query_update = |search_query: &str| match self.current_mode {
+                             ResymAppMode::Browsing(..) | ResymAppMode::Comparing(..) => {
+@@ -305,18 +356,60 @@ impl ResymApp {
+             });
+     }
+ 
++    /// Update/render the bottom panel component and its sub-components
+     fn update_bottom_panel(&mut self, ctx: &egui::Context) {
+         egui::TopBottomPanel::bottom("bottom_panel")
+             .min_height(100.0)
+             .resizable(true)
+             .show(ctx, |ui| {
+-                // Console panel
++                ui.add_space(4.0);
+                 ui.vertical(|ui| {
+-                    ui.label("Console");
+-                    ui.add_space(4.0);
++                    // Tab headers
++                    ui.horizontal(|ui| {
++                        ui.selectable_value(
++                            &mut self.bottom_panel_selected_tab,
++                            BottomPanelTab::Console,
++                            "Console",
++                        );
++                        ui.selectable_value(
++                            &mut self.bottom_panel_selected_tab,
++                            BottomPanelTab::XRefs,
++                            "XRefs to",
++                        );
++                    });
++                    ui.separator();
++
++                    // Tab body
++                    match self.bottom_panel_selected_tab {
++                        BottomPanelTab::Console => {
++                            // Console panel
++                            self.console.update(ui);
++                        }
++                        BottomPanelTab::XRefs => {
++                            let mut on_type_selected = |_: &str, type_index: TypeIndex| {
++                                // Update currently selected type index
++                                self.selected_type_index = Some(type_index);
+ 
+-                    // Update the console component
+-                    self.console.update(ui);
++                                // Note: only support "Browsing" mode
++                                if let ResymAppMode::Browsing(..) = self.current_mode {
++                                    if let Err(err) = self.backend.send_command(
++                                        BackendCommand::ReconstructTypeByIndex(
++                                            ResymPDBSlots::Main as usize,
++                                            type_index,
++                                            self.settings.app_settings.primitive_types_flavor,
++                                            self.settings.app_settings.print_header,
++                                            self.settings.app_settings.reconstruct_dependencies,
++                                            self.settings.app_settings.print_access_specifiers,
++                                        ),
++                                    ) {
++                                        log::error!("Failed to reconstruct type: {}", err);
++                                    }
++                                }
++                            };
++                            // Update xref list
++                            self.xref_list.update(ui, &mut on_type_selected);
++                        }
++                    }
+                 });
+             });
+     }
+@@ -335,13 +428,21 @@ impl ResymApp {
+                 // Start displaying buttons from the right
+                 #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
++                    // Fetures only available in "Browsing" mode
+                     if let ResymAppMode::Browsing(..) = self.current_mode {
+-                        // Save button handling
++                        // Save button
+                         // Note: not available on wasm32
+                         #[cfg(not(target_arch = "wasm32"))]
+                         if ui.button("💾  Save (Ctrl+S)").clicked() {
+                             self.start_save_reconstruted_content();
+                         }
++
++                        // Cross-references button
++                        if let Some(selected_type_index) = self.selected_type_index {
++                            if ui.button("🔍  Find XRefs to (Ctrl+R)").clicked() {
++                                self.list_xrefs_for_type(selected_type_index);
++                            }
++                        }
+                     }
+                 });
+             });
+@@ -365,7 +466,7 @@ impl ResymApp {
+             }
+         });
+ 
+-        /// Keyboard shortcut for opening URLs
++        // Keyboard shortcut for opening URLs
+         #[cfg(feature = "http")]
+         const CTRL_L_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut {
+             modifiers: egui::Modifiers::CTRL,
+@@ -378,7 +479,20 @@ impl ResymApp {
+             }
+         });
+ 
+-        /// Keyboard shortcut for saving reconstructed content
++        // Keyboard shortcut for finding cross-references
++        const CTRL_R_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut {
++            modifiers: egui::Modifiers::CTRL,
++            logical_key: egui::Key::R,
++        };
++        ui.input_mut(|input_state| {
++            if input_state.consume_shortcut(&CTRL_R_SHORTCUT) {
++                if let Some(selected_type_index) = self.selected_type_index {
++                    self.list_xrefs_for_type(selected_type_index);
++                }
++            }
++        });
++
++        // Keyboard shortcut for saving reconstructed content
+         #[cfg(not(target_arch = "wasm32"))]
+         const CTRL_S_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut {
+             modifiers: egui::Modifiers::CTRL,
+@@ -415,8 +529,14 @@ impl ResymApp {
+                                 }
+                             }
+ 
++                            // Reset current mode
+                             self.current_mode =
+                                 ResymAppMode::Browsing(String::default(), 0, String::default());
++                            // Reset selected type
++                            self.selected_type_index = None;
++                            // Reset xref list
++                            self.xref_list.update_type_list(vec![]);
++
+                             // Request a type list update
+                             if let Err(err) =
+                                 self.backend.send_command(BackendCommand::UpdateTypeFilter(
+@@ -440,6 +560,7 @@ impl ResymApp {
+                                 log::error!("Failed to update module list: {}", err);
+                             }
+                         } else if pdb_slot == ResymPDBSlots::Diff as usize {
++                            // Reset current mode
+                             self.current_mode = ResymAppMode::Comparing(
+                                 String::default(),
+                                 String::default(),
+@@ -447,6 +568,11 @@ impl ResymApp {
+                                 vec![],
+                                 String::default(),
+                             );
++                            // Reset selected type
++                            self.selected_type_index = None;
++                            // Reset xref list
++                            self.xref_list.update_type_list(vec![]);
++
+                             // Request a type list update
+                             if let Err(err) =
+                                 self.backend
+@@ -598,6 +724,23 @@ impl ResymApp {
+                 FrontendCommand::UpdateFilteredTypes(filtered_types) => {
+                     self.type_list.update_type_list(filtered_types);
+                 }
++
++                FrontendCommand::ListTypeCrossReferencesResult(xref_list_result) => {
++                    match xref_list_result {
++                        Err(err) => {
++                            log::error!("Failed to list cross-references: {err}");
++                        }
++                        Ok(xref_list) => {
++                            let xref_count = xref_list.len();
++                            log::info!("{xref_count} cross-references found!");
++
++                            // Update xref list component
++                            self.xref_list.update_type_list(xref_list);
++                            // Switch to xref tab
++                            self.bottom_panel_selected_tab = BottomPanelTab::XRefs;
++                        }
++                    }
++                }
+             }
+         }
+     }
+@@ -704,6 +847,26 @@ impl ResymApp {
+         }
+     }
+ 
++    /// Function invoked on 'Find XRefs to'
++    fn list_xrefs_for_type(&self, type_index: TypeIndex) {
++        log::info!(
++            "Looking for cross-references for type #0x{:x}...",
++            type_index.0
++        );
++        if let Err(err) = self
++            .backend
++            .send_command(BackendCommand::ListTypeCrossReferences(
++                ResymPDBSlots::Main as usize,
++                type_index,
++            ))
++        {
++            log::error!(
++                "Failed to list cross-references to type #0x{:x}: {err}",
++                type_index.0
++            );
++        }
++    }
++
+     /// Function invoked on 'Save' or when the Ctrl+S shortcut is used
+     #[cfg(not(target_arch = "wasm32"))]
+     fn start_save_reconstruted_content(&self) {
+diff --git a/resym/src/ui_components/console.rs b/resym/src/ui_components/console.rs
+index 386a6a1..8c1a780 100644
+--- a/resym/src/ui_components/console.rs
++++ b/resym/src/ui_components/console.rs
+@@ -32,7 +32,8 @@ impl ConsoleComponent {
+                     ui.add(
+                         egui::TextEdit::singleline(&mut self.content[row_index].as_str())
+                             .font(TEXT_STYLE)
+-                            .clip_text(false),
++                            .clip_text(false)
++                            .desired_width(f32::INFINITY),
+                     );
+                 }
+             },
+diff --git a/resym/src/ui_components/type_list.rs b/resym/src/ui_components/type_list.rs
+index 7633252..2954b3c 100644
+--- a/resym/src/ui_components/type_list.rs
++++ b/resym/src/ui_components/type_list.rs
+@@ -1,10 +1,5 @@
+ use eframe::egui::{self, ScrollArea, TextStyle};
+-use resym_core::{
+-    backend::{Backend, BackendCommand},
+-    frontend::TypeList,
+-};
+-
+-use crate::{mode::ResymAppMode, resym_app::ResymPDBSlots, settings::ResymAppSettings};
++use resym_core::frontend::{TypeIndex, TypeList};
+ 
+ pub struct TypeListComponent {
+     filtered_type_list: TypeList,
+@@ -24,12 +19,10 @@ impl TypeListComponent {
+         self.selected_row = usize::MAX;
+     }
+ 
+-    pub fn update(
++    pub fn update<CB: FnMut(&str, TypeIndex)>(
+         &mut self,
+-        app_settings: &ResymAppSettings,
+-        current_mode: &ResymAppMode,
+-        backend: &Backend,
+         ui: &mut egui::Ui,
++        on_type_selected: &mut CB,
+     ) {
+         let num_rows = self.filtered_type_list.len();
+         const TEXT_STYLE: TextStyle = TextStyle::Body;
+@@ -37,6 +30,12 @@ impl TypeListComponent {
+         ui.with_layout(
+             egui::Layout::top_down(egui::Align::Min).with_cross_justify(true),
+             |ui| {
++                if num_rows == 0 {
++                    // Display a default message to make it obvious the list is empty
++                    ui.label("No results");
++                    return;
++                }
++
+                 ScrollArea::vertical()
+                     .auto_shrink([false, false])
+                     .show_rows(ui, row_height, num_rows, |ui, row_range| {
+@@ -48,38 +47,7 @@ impl TypeListComponent {
+                                 .clicked()
+                             {
+                                 self.selected_row = row_index;
+-                                match current_mode {
+-                                    ResymAppMode::Browsing(..) => {
+-                                        if let Err(err) = backend.send_command(
+-                                            BackendCommand::ReconstructTypeByIndex(
+-                                                ResymPDBSlots::Main as usize,
+-                                                *type_index,
+-                                                app_settings.primitive_types_flavor,
+-                                                app_settings.print_header,
+-                                                app_settings.reconstruct_dependencies,
+-                                                app_settings.print_access_specifiers,
+-                                            ),
+-                                        ) {
+-                                            log::error!("Failed to reconstruct type: {}", err);
+-                                        }
+-                                    }
+-                                    ResymAppMode::Comparing(..) => {
+-                                        if let Err(err) =
+-                                            backend.send_command(BackendCommand::DiffTypeByName(
+-                                                ResymPDBSlots::Main as usize,
+-                                                ResymPDBSlots::Diff as usize,
+-                                                type_name.clone(),
+-                                                app_settings.primitive_types_flavor,
+-                                                app_settings.print_header,
+-                                                app_settings.reconstruct_dependencies,
+-                                                app_settings.print_access_specifiers,
+-                                            ))
+-                                        {
+-                                            log::error!("Failed to reconstruct type diff: {}", err);
+-                                        }
+-                                    }
+-                                    _ => log::error!("Invalid application state"),
+-                                }
++                                on_type_selected(type_name, *type_index);
+                             }
+                         }
+                     });
+diff --git a/resym_core/src/backend.rs b/resym_core/src/backend.rs
+index bf0ed7c..e6e14e0 100644
+--- a/resym_core/src/backend.rs
++++ b/resym_core/src/backend.rs
+@@ -95,6 +95,8 @@ pub enum BackendCommand {
+         PrimitiveReconstructionFlavor,
+         bool,
+     ),
++    /// Retrieve a list of all types that reference the given type
++    ListTypeCrossReferences(PDBSlot, pdb::TypeIndex),
+ }
+ 
+ /// Struct that represents the backend. The backend is responsible
+@@ -481,6 +483,14 @@ fn worker_thread_routine(
+                     }
+                 }
+             }
++
++            BackendCommand::ListTypeCrossReferences(pdb_slot, type_index) => {
++                if let Some(pdb_file) = pdb_files.get(&pdb_slot) {
++                    let xref_list = list_type_xrefs_command(&mut pdb_file.borrow_mut(), type_index);
++                    frontend_controller
++                        .send_command(FrontendCommand::ListTypeCrossReferencesResult(xref_list))?;
++                }
++            }
+         }
+     }
+ 
+@@ -757,3 +767,20 @@ fn filter_modules_regular(
+             .collect()
+     }
+ }
++
++fn list_type_xrefs_command<'p, T>(
++    pdb_file: &mut PdbFile<'p, T>,
++    type_index: pdb::TypeIndex,
++) -> Result<Vec<(String, pdb::TypeIndex)>>
++where
++    T: io::Seek + io::Read + std::fmt::Debug + 'p,
++{
++    let xref_start = Instant::now();
++    let xref_list = pdb_file.get_xrefs_for_type(type_index)?;
++    log::debug!(
++        "Xref resolution took {} ms",
++        xref_start.elapsed().as_millis()
++    );
++
++    Ok(xref_list)
++}
+diff --git a/resym_core/src/frontend.rs b/resym_core/src/frontend.rs
+index 0511f73..98ac462 100644
+--- a/resym_core/src/frontend.rs
++++ b/resym_core/src/frontend.rs
+@@ -1,6 +1,7 @@
+ use crate::{backend::PDBSlot, diffing::Diff, error::Result};
+ 
+-pub type TypeList = Vec<(String, pdb::TypeIndex)>;
++pub type TypeIndex = pdb::TypeIndex;
++pub type TypeList = Vec<(String, TypeIndex)>;
+ pub type ModuleList = Vec<(String, usize)>;
+ 
+ pub enum FrontendCommand {
+@@ -13,6 +14,7 @@ pub enum FrontendCommand {
+     ReconstructModuleResult(Result<String>),
+     UpdateModuleList(Result<ModuleList>),
+     DiffResult(Result<Diff>),
++    ListTypeCrossReferencesResult(Result<TypeList>),
+ }
+ 
+ pub trait FrontendController {
+diff --git a/resym_core/src/lib.rs b/resym_core/src/lib.rs
+index af1631f..23129e3 100644
+--- a/resym_core/src/lib.rs
++++ b/resym_core/src/lib.rs
+@@ -4,40 +4,9 @@ mod error;
+ pub mod frontend;
+ pub mod pdb_file;
+ pub mod pdb_types;
++pub mod rayon_utils;
+ pub mod syntax_highlighting;
+ 
+ pub use error::*;
+ 
+ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+-
+-/// Macro used to switch between iterators depending on rayon's availability
+-#[macro_export]
+-#[cfg(not(feature = "rayon"))]
+-macro_rules! par_iter_if_available {
+-    ($expression:expr) => {
+-        $expression.iter()
+-    };
+-}
+-#[macro_export]
+-#[cfg(feature = "rayon")]
+-macro_rules! par_iter_if_available {
+-    ($expression:expr) => {
+-        $expression.par_iter()
+-    };
+-}
+-
+-/// Macro used to switch between functions depending on rayon's availability
+-#[macro_export]
+-#[cfg(not(feature = "rayon"))]
+-macro_rules! par_sort_by_if_available {
+-    ($expression:expr, $($x:tt)*) => {
+-        $expression.sort_by($($x)*)
+-    };
+-}
+-#[macro_export]
+-#[cfg(feature = "rayon")]
+-macro_rules! par_sort_by_if_available {
+-    ($expression:expr, $($x:tt)*) => {
+-        $expression.par_sort_by($($x)*)
+-    };
+-}
+diff --git a/resym_core/src/pdb_file.rs b/resym_core/src/pdb_file.rs
+index 349303d..6873697 100644
+--- a/resym_core/src/pdb_file.rs
++++ b/resym_core/src/pdb_file.rs
+@@ -16,6 +16,7 @@ use std::{fs::File, path::Path, time::Instant};
+ 
+ use crate::{
+     error::{Result, ResymCoreError},
++    find_any_if_available,
+     frontend::ModuleList,
+     par_iter_if_available,
+     pdb_types::{
+@@ -61,6 +62,7 @@ where
+     pub type_information: pdb::TypeInformation<'p>,
+     pub debug_information: pdb::DebugInformation<'p>,
+     pub file_path: PathBuf,
++    pub xref_map: DashMap<pdb::TypeIndex, Vec<pdb::TypeIndex>>,
+     _pdb: pdb::PDB<'p, T>,
+ }
+ 
+@@ -81,6 +83,7 @@ impl<'p> PdbFile<'p, File> {
+             type_information,
+             debug_information,
+             file_path: pdb_file_path.to_owned(),
++            xref_map: DashMap::default(),
+             _pdb: pdb,
+         };
+         pdb_file.load_symbols()?;
+@@ -108,6 +111,7 @@ impl<'p> PdbFile<'p, PDBDataSource> {
+             type_information,
+             debug_information,
+             file_path: pdb_file_name.into(),
++            xref_map: DashMap::default(),
+             _pdb: pdb,
+         };
+         pdb_file.load_symbols()?;
+@@ -133,6 +137,7 @@ impl<'p> PdbFile<'p, PDBDataSource> {
+             type_information,
+             debug_information,
+             file_path: pdb_file_name.into(),
++            xref_map: DashMap::default(),
+             _pdb: pdb,
+         };
+         pdb_file.load_symbols()?;
+@@ -604,4 +609,72 @@ where
+         type_data.reconstruct(&fmt_configuration, &mut reconstruction_output)?;
+         Ok(reconstruction_output)
+     }
++
++    pub fn get_xrefs_for_type(
++        &mut self,
++        type_index: pdb::TypeIndex,
++    ) -> Result<Vec<(String, pdb::TypeIndex)>> {
++        // Generate xref cache if empty
++        if self.xref_map.is_empty() {
++            // Populate our `TypeFinder`
++            let mut type_finder = self.type_information.finder();
++            {
++                let mut type_iter = self.type_information.iter();
++                while (type_iter.next()?).is_some() {
++                    type_finder.update(&type_iter);
++                }
++            }
++
++            // Iterate through all types
++            let xref_map: DashMap<pdb::TypeIndex, Vec<pdb::TypeIndex>> = DashMap::default();
++            let mut type_iter = self.type_information.iter();
++            while let Some(type_item) = type_iter.next()? {
++                let current_type_index = type_item.index();
++                // Reconstruct type and retrieve referenced types
++                let mut type_data = pdb_types::Data::new();
++                let mut needed_types = pdb_types::TypeSet::new();
++                type_data.add(
++                    &type_finder,
++                    &self.forwarder_to_complete_type,
++                    current_type_index,
++                    &PrimitiveReconstructionFlavor::Raw,
++                    &mut needed_types,
++                )?;
++
++                par_iter_if_available!(needed_types).for_each(|t| {
++                    if let Some(mut xref_list) = xref_map.get_mut(t) {
++                        xref_list.push(current_type_index);
++                    } else {
++                        xref_map.insert(*t, vec![current_type_index]);
++                    }
++                });
++            }
++
++            // Update cache
++            self.xref_map = xref_map;
++        }
++
++        // Query xref cache
++        if let Some(xref_list) = self.xref_map.get(&type_index) {
++            // Convert the xref list into a proper Name+TypeIndex tuple list
++            let xref_type_list = xref_list
++                .iter()
++                .map(|xref_type_index| {
++                    // Look for the corresponding tuple (in parallel if possible)
++                    let tuple = find_any_if_available!(
++                        self.complete_type_list,
++                        |(_, type_index)| type_index == xref_type_index
++                    )
++                    .expect("`complete_type_list` should contain type index");
++
++                    tuple.clone()
++                })
++                .collect();
++
++            Ok(xref_type_list)
++        } else {
++            // No xrefs found for the given type
++            Ok(vec![])
++        }
++    }
+ }
+diff --git a/resym_core/src/pdb_types/mod.rs b/resym_core/src/pdb_types/mod.rs
+index c645407..460b393 100644
+--- a/resym_core/src/pdb_types/mod.rs
++++ b/resym_core/src/pdb_types/mod.rs
+@@ -639,7 +639,7 @@ impl<'p> Data<'p> {
+             }
+ 
+             // ignore
+-            other => log::warn!("don't know how to add {:?}", other),
++            other => log::debug!("don't know how to add {:?}", other),
+         }
+ 
+         Ok(())
+diff --git a/resym_core/src/rayon_utils.rs b/resym_core/src/rayon_utils.rs
+new file mode 100644
+index 0000000..827490b
+--- /dev/null
++++ b/resym_core/src/rayon_utils.rs
+@@ -0,0 +1,47 @@
++/// Macro used to switch between iterators depending on rayon's availability
++#[macro_export]
++#[cfg(not(feature = "rayon"))]
++macro_rules! par_iter_if_available {
++    ($expression:expr) => {
++        $expression.iter()
++    };
++}
++#[macro_export]
++#[cfg(feature = "rayon")]
++macro_rules! par_iter_if_available {
++    ($expression:expr) => {
++        $expression.par_iter()
++    };
++}
++
++/// Macro used to switch between functions depending on rayon's availability
++#[macro_export]
++#[cfg(not(feature = "rayon"))]
++macro_rules! par_sort_by_if_available {
++    ($expression:expr, $($x:tt)*) => {
++        $expression.sort_by($($x)*)
++    };
++}
++#[macro_export]
++#[cfg(feature = "rayon")]
++macro_rules! par_sort_by_if_available {
++    ($expression:expr, $($x:tt)*) => {
++        $expression.par_sort_by($($x)*)
++    };
++}
++
++/// Macro used to switch between `find_any` and `find` depending on rayon's availability
++#[macro_export]
++#[cfg(not(feature = "rayon"))]
++macro_rules! find_any_if_available {
++    ($expression:expr, $($x:tt)*) => {
++        $expression.iter().find($($x)*)
++    };
++}
++#[macro_export]
++#[cfg(feature = "rayon")]
++macro_rules! find_any_if_available {
++    ($expression:expr, $($x:tt)*) => {
++        $expression.par_iter().find_any($($x)*)
++    };
++}

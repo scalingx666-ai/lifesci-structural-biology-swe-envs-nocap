@@ -1,0 +1,120 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 16eb5ca..49298e0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -46,6 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ 
+ - Excluded the local weight cache (`aimnet/calculators/assets/`) from wheels and sdists explicitly, instead of relying on hatchling's `.gitignore` handling.
+ - Fixed embedded-LR models failing with `KeyError: nbmat_lr` on every flattened evaluation (molecules above `nb_threshold` on CUDA, any size on CPU, PBC, or Hessians): when metadata declared `has_embedded_lr` but neither dispersion nor Coulomb could be identified, the calculator built no long-range neighbor list at all despite resolving an all-pairs `cutoff_lr` for exactly that case. The shared LR list is now built with that cutoff (issue #118).
++- Detected embedded long-range modules from the module tree for pre-metadata artifacts: a model carrying a D3TS, DFTD3/D3BJ, or LRCoulomb submodule but no metadata dict previously had `lr=False`, so no LR neighbor list was built and flattened evaluations failed with `KeyError: nbmat_lr` (issue #118, reopened case).
+ - Trusted the `aimnet.modules.lr.D3TS` submodule spelling of the D3TS class in the default artifact allowlist, alongside the existing `aimnet.modules.D3TS` barrel spelling. The loader machinery that detects D3TS by class name matches the "D3TS" substring regardless of spelling, so an artifact using this spelling was recognized as D3TS by the export layer but rejected by the exact-match allowlist.
+ - Fixed `DataGroup.cv_split` corrupting cross-validation folds: building each fold's train split mutated the shared parts in place via `cat()`, so later folds contained duplicated samples and validation splits larger than the dataset. Folds are now built without mutating the shared parts.
+ - Fixed a crash when torch has CUDA but warp-lang does not (possible with conda-forge variant packages): the AEV kernel gate now checks warp CUDA availability and falls back to the pure-torch path with a one-time warning.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 2a4d174..9e49c33 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -11,6 +11,7 @@
+ 
+ from aimnet.models.artifact_validation import uses_default_model_import_settings, validate_runtime_model_metadata
+ from aimnet.models.base import load_legacy_jit
++from aimnet.models.utils import has_d3ts, has_externalizable_dftd3, has_lrcoulomb
+ from aimnet.modules import DFTD3, LRCoulomb
+ from aimnet.modules.lr import ExternalDerivativeTerms
+ 
+@@ -246,8 +247,14 @@ def __init__(
+             )
+             self.external_dftd3 = self.external_dftd3.to(self.device)
+ 
+-        # Determine if model has long-range modules (embedded or external)
+-        has_embedded_lr = metadata.get("has_embedded_lr", False) if metadata is not None else False
++        # Determine if model has long-range modules (embedded or external).
++        # Metadata is authoritative when present; pre-metadata artifacts fall
++        # back to module-tree inspection (issue #118: an embedded-D3TS model
++        # without a metadata dict must still get an LR neighbor list).
++        if metadata is not None:
++            has_embedded_lr = metadata.get("has_embedded_lr", False)
++        else:
++            has_embedded_lr = self._detect_embedded_lr_modules()
+         self.lr = (
+             hasattr(self.model, "cutoff_lr")
+             or self.external_coulomb is not None
+@@ -514,6 +521,16 @@ def dftd3_cutoff(self) -> float:
+         """
+         return self._dftd3_cutoff
+ 
++    def _detect_embedded_lr_modules(self) -> bool:
++        """Detect embedded long-range modules from the module tree.
++
++        Fallback for pre-metadata artifacts: a model carrying an LRCoulomb,
++        D3TS, or DFTD3/D3BJ submodule needs a long-range neighbor list even
++        though no metadata flag says so.
++        """
++        model = self.model
++        return has_lrcoulomb(model) or has_d3ts(model) or has_externalizable_dftd3(model)
++
+     def _has_embedded_dispersion(self) -> bool:
+         """Check if model has embedded dispersion (not externalized).
+ 
+@@ -529,7 +546,8 @@ def _has_embedded_dispersion(self) -> bool:
+         """
+         meta = self.metadata
+         if meta is None:
+-            return False  # Unknown, assume no embedded dispersion
++            # Pre-metadata artifact: fall back to module-tree inspection.
++            return has_d3ts(self.model) or has_externalizable_dftd3(self.model)
+ 
+         # Authoritative path (new conversions): explicit D3TS flag.
+         if "has_embedded_d3ts" in meta:
+@@ -551,7 +569,8 @@ def _has_embedded_coulomb(self) -> bool:
+         """
+         meta = self.metadata
+         if meta is None:
+-            return False  # Unknown, assume no embedded Coulomb
++            # Pre-metadata artifact: fall back to module-tree inspection.
++            return has_lrcoulomb(self.model)
+         # If needs_coulomb=False and coulomb_mode is not "none", Coulomb is embedded
+         # (legacy JIT models have full Coulomb embedded)
+         return not meta.get("needs_coulomb", False) and meta.get("coulomb_mode", "none") != "none"
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index af51ad4..c00ec8a 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -2402,3 +2402,37 @@ def test_unknown_embedded_lr_metadata_builds_all_pairs_nblist(monkeypatch):
+     data = calc.make_nbmat(data)
+     assert "nbmat_lr" in data
+     assert "nbmat_dftd3" in data
++
++
++def test_metadataless_embedded_dispersion_model_gets_lr_nblist():
++    """Issue #118 (reopened): a model with an embedded dispersion module but no
++    metadata dict at all must still be detected as long-range.
++
++    Detection previously keyed only on metadata flags or a model ``cutoff_lr``
++    attribute; a pre-metadata artifact with a D3TS submodule had ``lr=False``,
++    no LR neighbor list, and KeyError'd on ``nbmat_lr`` in every flattened
++    evaluation. Detection now falls back to the module tree.
++    """
++    donor = AIMNet2Calculator("aimnet2", device="cpu")
++    model = donor.model
++    model.d3ts = torch.nn.Identity()  # embedded dispersion module by name
++    if hasattr(model, "_metadata"):
++        del model._metadata  # pre-metadata artifact: no metadata dict
++    try:
++        calc = AIMNet2Calculator(model, device="cpu")
++        assert calc.metadata is None
++        assert calc._has_embedded_dispersion()
++        assert calc.lr
++        assert calc.cutoff_lr == calc._default_dftd3_cutoff
++        assert calc._nblist_lr is not None
++
++        n = 16
++        coord = torch.zeros(n, 3)
++        coord[:, 0] = torch.arange(n, dtype=torch.float32) * 1.5
++        data = {"coord": coord, "mol_idx": torch.zeros(n, dtype=torch.long)}
++        calc._max_mol_size = n
++        data = calc.make_nbmat(data)
++        assert "nbmat_lr" in data
++        assert "nbmat_dftd3" in data
++    finally:
++        delattr(model, "d3ts")

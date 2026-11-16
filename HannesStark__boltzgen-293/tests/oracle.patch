@@ -1,0 +1,146 @@
+diff --git a/src/boltzgen/cli/boltzgen.py b/src/boltzgen/cli/boltzgen.py
+index 38a25f0e..34e06fd4 100644
+--- a/src/boltzgen/cli/boltzgen.py
++++ b/src/boltzgen/cli/boltzgen.py
+@@ -1023,7 +1023,9 @@ def __init__(self, args: argparse.Namespace, moldir: Path):
+         use_solublempnn = _resolve_inverse_fold_model(args) == "solublempnn"
+ 
+         # Handle use_kernels argument
+-        device_capability = torch.cuda.get_device_capability()
++        device_capability = (
++            torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
++        )
+         use_kernels = None
+         if args.use_kernels == "auto":
+             use_kernels = device_capability[0] >= 8
+@@ -1044,7 +1046,7 @@ def __init__(self, args: argparse.Namespace, moldir: Path):
+         )
+ 
+         devices = (
+-            args.devices if args.devices is not None else torch.cuda.device_count()
++            args.devices if args.devices is not None else max(1, torch.cuda.device_count())
+         )
+         print(f"Using {devices} devices")
+ 
+diff --git a/tests/test_cpu_pipeline_selection.py b/tests/test_cpu_pipeline_selection.py
+new file mode 100644
+index 00000000..e69160ce
+--- /dev/null
++++ b/tests/test_cpu_pipeline_selection.py
+@@ -0,0 +1,116 @@
++"""CPU-only configuration regression tests; no model or input data are loaded."""
++# ruff: noqa: CPY001, INP001, PLR2004
++
++from argparse import Namespace
++from pathlib import Path
++
++import pytest
++
++from boltzgen.cli import boltzgen as cli
++
++
++def pipeline_args(tmp_path: Path, *extra: str) -> Namespace:
++    checkpoint = tmp_path / "unused-checkpoint.pt"
++    checkpoint.touch()
++    return cli.build_parser().parse_args(
++        [
++            "configure",
++            "unused-input.yaml",
++            "--output",
++            str(tmp_path / "output"),
++            "--protocol",
++            "peptide-anything",
++            "--skip_inverse_folding",
++            "--design_checkpoints",
++            str(checkpoint),
++            "--folding_checkpoint",
++            str(checkpoint),
++            "--config",
++            "design",
++            "trainer.accelerator=cpu",
++            "trainer.precision=32",
++            *extra,
++        ]
++    )
++
++
++@pytest.mark.parametrize("mode", ["auto", "false"])
++@pytest.mark.parametrize("failure", [AssertionError, RuntimeError])
++def test_cpu_configuration_does_not_initialize_cuda(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    mode: str,
++    failure: type[Exception],
++) -> None:
++    args = pipeline_args(tmp_path, "--use_kernels", mode)
++    monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: False)
++    monkeypatch.setattr(cli.torch.cuda, "device_count", lambda: 0)
++
++    def unavailable_capability() -> tuple[int, int]:
++        raise failure("CUDA is unavailable")
++
++    monkeypatch.setattr(cli.torch.cuda, "get_device_capability", unavailable_capability)
++    pipeline = cli.BinderDesignPipeline(args, tmp_path)
++    design = next(step for step in pipeline.steps if step.name == "design").get_config()
++    assert design.trainer.accelerator == "cpu"
++    assert design.trainer.devices == 1
++    assert design.override.use_kernels is False
++
++
++def test_default_cpu_device_count_is_positive(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A neutral capability result isolates the second, independent failure."""
++    args = pipeline_args(tmp_path)
++    monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: False)
++    monkeypatch.setattr(cli.torch.cuda, "device_count", lambda: 0)
++    monkeypatch.setattr(cli.torch.cuda, "get_device_capability", lambda: (0, 0))
++    pipeline = cli.BinderDesignPipeline(args, tmp_path)
++    design = next(step for step in pipeline.steps if step.name == "design").get_config()
++    assert design.trainer.devices == 1
++
++
++@pytest.mark.parametrize(
++    ("capability", "expected_kernels"), [((7, 5), False), ((8, 0), True)]
++)
++def test_cuda_configuration_preserves_auto_defaults(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    capability: tuple[int, int],
++    expected_kernels: bool,
++) -> None:
++    args = pipeline_args(tmp_path)
++    args.config = None
++    monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(cli.torch.cuda, "device_count", lambda: 2)
++    monkeypatch.setattr(cli.torch.cuda, "get_device_capability", lambda: capability)
++    pipeline = cli.BinderDesignPipeline(args, tmp_path)
++    design = next(step for step in pipeline.steps if step.name == "design").get_config()
++    assert design.trainer.accelerator == "gpu"
++    assert design.trainer.devices == 2
++    assert design.override.use_kernels is expected_kernels
++
++
++def test_cpu_explicit_device_count_is_preserved(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    args = pipeline_args(tmp_path, "--devices", "3")
++    monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: False)
++    monkeypatch.setattr(cli.torch.cuda, "device_count", lambda: 0)
++    monkeypatch.setattr(cli.torch.cuda, "get_device_capability", lambda: (0, 0))
++    pipeline = cli.BinderDesignPipeline(args, tmp_path)
++    design = next(step for step in pipeline.steps if step.name == "design").get_config()
++    assert design.trainer.devices == 3
++
++
++def test_cpu_step_device_override_is_preserved(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    args = pipeline_args(tmp_path)
++    args.config[0].append("trainer.devices=2")
++    monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: False)
++    monkeypatch.setattr(cli.torch.cuda, "device_count", lambda: 0)
++    monkeypatch.setattr(cli.torch.cuda, "get_device_capability", lambda: (0, 0))
++    pipeline = cli.BinderDesignPipeline(args, tmp_path)
++    design = next(step for step in pipeline.steps if step.name == "design").get_config()
++    assert design.trainer.devices == 2

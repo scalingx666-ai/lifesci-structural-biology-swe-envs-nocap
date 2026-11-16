@@ -1,0 +1,1594 @@
+diff --git a/.gitignore b/.gitignore
+index 1608f38..163697c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -187,3 +187,7 @@ PLANS.md
+ #  and can be added to the global gitignore or merged into this file.  For a more nuclear
+ #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+ .idea/
++
++# AIMNet Hessian/optimization run artifacts
++hess_calc_cyc_*.h5
++final_geometry.xyz
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 0039762..4169f40 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -1,3 +1,4 @@
++import copy
+ import math
+ import os
+ import re
+@@ -19,6 +20,9 @@
+ 
+ _WB97M_D3_PARAMS = {"s6": 1.0, "s8": 0.3908, "a1": 0.566, "a2": 3.128}
+ 
++# Sentinel for "attribute did not exist" when snapshotting/restoring instance state.
++_SENTINEL = object()
++
+ 
+ def _sum_optional_tensor(x: Tensor | None, y: Tensor | None) -> Tensor | None:
+     """Elementwise sum of two ``Optional[Tensor]`` operands."""
+@@ -48,6 +52,7 @@ def _combine_external_terms(
+     return ExternalDerivativeTerms(
+         forces=_sum_optional_tensor(a.forces, b.forces),
+         virial=_sum_optional_tensor(a.virial, b.virial),
++        hessian=_sum_optional_tensor(a.hessian, b.hessian),
+     )
+ 
+ 
+@@ -491,7 +496,7 @@ def __init__(
+ 
+         self._maybe_warn_family_mix((metadata or {}).get("family") if metadata else None)
+ 
+-    def __call__(self, *args, **kwargs):
++    def __call__(self, *args, **kwargs) -> dict[str, Any]:
+         return self.eval(*args, **kwargs)
+ 
+     @property
+@@ -763,6 +768,13 @@ def set_lrcoulomb_method(
+         ``"ewald"`` and ``"pme"`` both require periodic systems (``cell`` set);
+         invoking the calculator without a cell raises ``ValueError`` at
+         ``prepare_input``.
++
++        Hessian note: ``"ewald"``/``"pme"`` Hessians are computed at fixed charge
++        (finite-difference of the analytic forces; the charge-response coupling
++        ``d^2E/(dq.dr)`` through the model's predicted charges is omitted), while
++        ``"dsf"`` Hessians are relaxed-charge (fully autograd). Vibrational
++        frequencies / IR intensities are therefore not directly comparable across
++        these backends.
+         """
+         if method not in ("simple", "dsf", "ewald", "pme"):
+             raise ValueError(f"Invalid method: {method}")
+@@ -855,43 +867,63 @@ def set_dftd3_cutoff(self, cutoff: float | None = None, smoothing_fraction: floa
+             self.external_dftd3.set_smoothing(cutoff, smoothing_fraction)
+         self._update_lr_nblists()
+ 
++    def _validate_species_and_charge(self, data: dict[str, Any]) -> None:
++        """Validate input elements and net charge against model metadata.
++
++        Raises ``ValueError`` for atomic numbers outside the model's
++        ``implemented_species`` or for net-charged systems when the model
++        declares ``supports_charged_systems == False``. Silent no-op for models
++        that did not declare ``implemented_species`` (older ``.pt``, raw
++        ``nn.Module``). Shared by :meth:`eval` and
++        :meth:`hessian_vector_product` so both enforce the same contract.
++        """
++        if "numbers" not in data:
++            # Guarded so prepare_input still owns the missing-key error path with
++            # its descriptive "Missing key numbers" message.
++            return
++        impl = (self.metadata or {}).get("implemented_species") or []
++        if impl:
++            # data["numbers"] may be a raw list, ndarray, or tensor — normalize first.
++            seen = {int(z) for z in torch.as_tensor(data["numbers"]).flatten().tolist() if int(z) > 0}
++            unsupported = sorted(seen - set(impl))
++            if unsupported:
++                raise ValueError(
++                    f"Atomic numbers {unsupported} are not in this model's "
++                    f"implemented_species {sorted(impl)}. This model was trained on "
++                    f"a restricted element set; passing other elements yields undefined "
++                    f"output. For broader element coverage on equilibrium structures use "
++                    f"`isayevlab/aimnet2-wb97m-d3`; for radicals/open-shell systems use "
++                    f"`isayevlab/aimnet2-nse`. Pass validate_species=False to bypass."
++                )
++        meta = self.metadata or {}
++        if meta.get("supports_charged_systems") is False:
++            # torch.as_tensor handles scalars, lists, ndarrays, 0-d and N-d tensors
++            # uniformly so per-system charges in batched inputs (e.g. batched-NEB)
++            # don't raise the misleading "only one element tensors..." from float().
++            charge_t = torch.as_tensor(data.get("charge", 0.0))
++            if charge_t.numel() > 0 and float(charge_t.abs().max().item()) > 1e-6:
++                bad = charge_t[charge_t.abs() > 1e-6].flatten().tolist()
++                raise ValueError(
++                    f"This model does not support net-charged systems "
++                    f"(got non-zero charge(s) {bad}). Net-neutral zwitterions are supported. "
++                    f"For ions use `isayevlab/aimnet2-wb97m-d3`. "
++                    f"Pass validate_species=False to bypass."
++                )
++
+     def eval(
+         self, data: dict[str, Any], forces=False, stress=False, hessian=False, *, validate_species: bool = True
+-    ) -> dict[str, Tensor]:
++    ) -> dict[str, Any]:
++        """Run the model on ``data`` and return the output dict.
++
++        For a single structure each value is a ``Tensor``. For batched Hessian
++        requests the output is collected per structure: a 3D ``coord`` batch
++        (B, N, 3) yields values with a new leading batch dim (stacked), while a
++        multi-molecule ``mol_idx`` input yields a per-molecule ``list[Tensor]``
++        for each key (molecules are independent and generally ragged).
++        """
+         # Species validation — opt-out via validate_species=False.
+-        # Silent no-op for models that did not declare implemented_species (older .pt,
+-        # raw nn.Module).
+-        if validate_species and "numbers" in data:
+-            # Guarded by "numbers" in data so prepare_input still owns the missing-key
+-            # error path with its descriptive "Missing key numbers" message.
+-            impl = (self.metadata or {}).get("implemented_species") or []
+-            if impl:
+-                # data["numbers"] may be a raw list, ndarray, or tensor — normalize first.
+-                seen = {int(z) for z in torch.as_tensor(data["numbers"]).flatten().tolist() if int(z) > 0}
+-                unsupported = sorted(seen - set(impl))
+-                if unsupported:
+-                    raise ValueError(
+-                        f"Atomic numbers {unsupported} are not in this model's "
+-                        f"implemented_species {sorted(impl)}. This model was trained on "
+-                        f"a restricted element set; passing other elements yields undefined "
+-                        f"output. For broader element coverage on equilibrium structures use "
+-                        f"`isayevlab/aimnet2-wb97m-d3`; for radicals/open-shell systems use "
+-                        f"`isayevlab/aimnet2-nse`. Pass validate_species=False to bypass."
+-                    )
+-            meta = self.metadata or {}
+-            if meta.get("supports_charged_systems") is False:
+-                # torch.as_tensor handles scalars, lists, ndarrays, 0-d and N-d tensors
+-                # uniformly so per-system charges in batched inputs (e.g. batched-NEB)
+-                # don't raise the misleading "only one element tensors..." from float().
+-                charge_t = torch.as_tensor(data.get("charge", 0.0))
+-                if charge_t.numel() > 0 and float(charge_t.abs().max().item()) > 1e-6:
+-                    bad = charge_t[charge_t.abs() > 1e-6].flatten().tolist()
+-                    raise ValueError(
+-                        f"This model does not support net-charged systems "
+-                        f"(got non-zero charge(s) {bad}). Net-neutral zwitterions are supported. "
+-                        f"For ions use `isayevlab/aimnet2-wb97m-d3`. "
+-                        f"Pass validate_species=False to bypass."
+-                    )
++        if validate_species:
++            self._validate_species_and_charge(data)
+         # Hessian + torch.compile is known to hang on the double-backward
+         # path through GELU activations. Fail fast instead.
+         if hessian and getattr(self, "_was_compiled", False):
+@@ -901,26 +933,20 @@ def eval(
+                 "with compile_model=False."
+             )
+ 
++        if hessian:
++            subsystems = self._split_hessian_batch(data)
++            if subsystems is not None:
++                stack = torch.as_tensor(data["coord"]).ndim == 3
++                return self._eval_hessian_batched(
++                    subsystems, forces=forces, stress=stress, validate_species=validate_species, stack=stack
++                )
++
+         data = self.prepare_input(data, hessian=hessian)
+ 
+         if hessian and "mol_idx" in data and data["mol_idx"][-1] > 0:
+-            raise NotImplementedError("Hessian calculation is not supported for multiple molecules")
+-        if self._coulomb_method == "dsf":
+-            if hessian:
+-                raise NotImplementedError(
+-                    "DSF Coulomb uses nvalchemiops explicit coordinate/cell derivatives and does not support "
+-                    "Hessian calculations."
+-                )
+-            if self._train and (forces or stress):
+-                raise NotImplementedError(
+-                    "DSF Coulomb uses nvalchemiops explicit coordinate/cell derivatives and does not support "
+-                    "force/stress training. Use 'ewald' or 'pme' for force/stress training."
+-                )
+-        if hessian and self._coulomb_method in ("ewald", "pme"):
+-            # TODO: Add an explicit finite-difference Hessian API for PBC/LR if needed.
+             raise NotImplementedError(
+-                "Ewald/PME Coulomb uses nvalchemiops explicit first derivatives and does not support "
+-                "Hessian calculations."
++                "In-call Hessian for hand-flattened multi-molecule input is not supported; "
++                "pass a 3D batch or a mol_idx dict to get per-structure Hessians."
+             )
+         data = self.set_grad_tensors(data, forces=forces, stress=stress, hessian=hessian)
+         if isinstance(self.model, torch.jit.ScriptModule):
+@@ -950,8 +976,8 @@ def _run_external_modules(
+         """
+         coulomb_terms = None
+         if self.external_coulomb is not None:
+-            training_derivatives = hessian or (
+-                self.external_coulomb.method in ("ewald", "pme")
++            training_derivatives = (
++                self.external_coulomb.method in ("ewald", "pme", "dsf")
+                 and getattr(self, "_train", False)
+                 and (forces or stress)
+             )
+@@ -959,6 +985,7 @@ def _run_external_modules(
+                 "compute_forces": forces,
+                 "compute_virial": stress,
+                 "training_derivatives": training_derivatives,
++                "hessian": hessian,
+             }
+             if training_derivatives and stress and self.external_coulomb.method in ("ewald", "pme"):
+                 strain_inputs = getattr(self, "_external_strain_inputs", None)
+@@ -1017,6 +1044,160 @@ def process_output(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+         data = self.keep_only(data)
+         return data
+ 
++    def _split_hessian_batch(self, data: dict[str, Any]) -> list[dict[str, Any]] | None:
++        """Return per-structure sub-inputs for a batched Hessian request, or None
++        when the input is a single structure (handled by the normal path).
++
++        Recognized batched forms:
++          * 3D ``coord`` of shape (B, N, 3) with B > 1, and
++          * flat 2D ``coord`` with a ``mol_idx`` spanning more than one molecule.
++        """
++        coord = torch.as_tensor(data["coord"])
++        if coord.ndim == 3 and coord.shape[0] > 1:
++            return self._split_batch_dim(data, int(coord.shape[0]))
++        if coord.ndim == 2 and data.get("mol_idx") is not None:
++            mol_idx = torch.as_tensor(data["mol_idx"])
++            if mol_idx.numel() and int(mol_idx.max()) > 0:
++                return self._split_mol_idx(data, mol_idx)
++        return None
++
++    @staticmethod
++    def _select_for_structure(value: Any, index: int, n_struct: int) -> Any:
++        """Pick the per-structure slice when ``value`` is batched along structures,
++        else return it unchanged (shared across structures).
++
++        Note: the ``shape[0] == n_struct`` test is a heuristic valid only for
++        per-structure scalar quantities (charge/mult), not general per-atom tensors.
++        """
++        t = torch.as_tensor(value)
++        return t[index] if t.ndim >= 1 and t.shape[0] == n_struct else t
++
++    def _split_batch_dim(self, data: dict[str, Any], B: int) -> list[dict[str, Any]]:
++        """Slice a (B, ...) batched input into B single-structure dicts."""
++        subs: list[dict[str, Any]] = []
++        for b in range(B):
++            sub: dict[str, Any] = {}
++            for k, v in data.items():
++                if v is None:
++                    continue
++                if k in ("coord", "numbers"):
++                    sub[k] = torch.as_tensor(v)[b]
++                elif k in ("charge", "mult"):
++                    sub[k] = self._select_for_structure(v, b, B)
++                elif k == "cell":
++                    t = torch.as_tensor(v)
++                    sub[k] = t[b] if t.ndim == 3 else t
++                elif k.startswith(("nbmat", "shifts")) or k == "mol_idx":
++                    # Precomputed neighbor-list keys must not be shared unsliced
++                    # across subsystems (they'd be wrong per-structure); the
++                    # recursive eval rebuilds them.
++                    continue
++                else:
++                    sub[k] = v
++            subs.append(sub)
++        return subs
++
++    def _split_mol_idx(self, data: dict[str, Any], mol_idx: Tensor) -> list[dict[str, Any]]:
++        """Split a flat, ``mol_idx``-tagged input into one dict per molecule."""
++        coord = torch.as_tensor(data["coord"])
++        numbers = torch.as_tensor(data["numbers"])
++        cell = torch.as_tensor(data["cell"]) if data.get("cell") is not None else None
++        num_molecules = int(mol_idx.max()) + 1
++        subs: list[dict[str, Any]] = []
++        for m in range(num_molecules):
++            sel = mol_idx == m
++            sub: dict[str, Any] = {"coord": coord[sel], "numbers": numbers[sel]}
++            if data.get("charge") is not None:
++                sub["charge"] = self._select_for_structure(data["charge"], m, num_molecules)
++            if data.get("mult") is not None:
++                sub["mult"] = self._select_for_structure(data["mult"], m, num_molecules)
++            if cell is not None:
++                sub["cell"] = cell[m] if cell.ndim == 3 else cell
++            if data.get("pbc") is not None:
++                sub["pbc"] = data["pbc"]
++            subs.append(sub)
++        return subs
++
++    def _snapshot_eval_state(self) -> dict[str, Any]:
++        """Snapshot mutable calculator state touched by nested eval-style calls."""
++        shallow_attrs = (
++            "_batch",
++            "_max_mol_size",
++            "_saved_for_grad",
++            "_coulomb_method",
++            "_coulomb_cutoff",
++            "cutoff_lr",
++            "_external_strain_inputs",
++        )
++        copied_attrs = ("_nblist_lr", "_nblist_dftd3", "_nblist_coulomb")
++        state = {name: getattr(self, name, _SENTINEL) for name in shallow_attrs}
++        for name in copied_attrs:
++            val = getattr(self, name, _SENTINEL)
++            state[name] = _SENTINEL if val is _SENTINEL else copy.deepcopy(val)
++        if self.external_coulomb is not None:
++            state["_external_coulomb_attrs"] = {
++                name: getattr(self.external_coulomb, name, _SENTINEL)
++                for name in ("method", "dsf_alpha", "dsf_rc", "ewald_accuracy")
++            }
++        else:
++            state["_external_coulomb_attrs"] = _SENTINEL
++        return state
++
++    def _restore_eval_state(self, state: dict[str, Any]) -> None:
++        """Restore state captured by :meth:`_snapshot_eval_state`."""
++        external_attrs = state.pop("_external_coulomb_attrs", _SENTINEL)
++        for name, val in state.items():
++            if val is _SENTINEL:
++                if hasattr(self, name):
++                    delattr(self, name)
++            else:
++                setattr(self, name, val)
++        if external_attrs is not _SENTINEL and self.external_coulomb is not None:
++            for name, val in external_attrs.items():
++                if val is _SENTINEL:
++                    if hasattr(self.external_coulomb, name):
++                        delattr(self.external_coulomb, name)
++                else:
++                    setattr(self.external_coulomb, name, val)
++
++    def _eval_hessian_batched(
++        self,
++        subsystems: list[dict[str, Any]],
++        *,
++        forces: bool,
++        stress: bool,
++        validate_species: bool,
++        stack: bool = True,
++    ) -> dict[str, Any]:
++        """Run the single-structure Hessian path on each subsystem and collect.
++
++        When ``stack`` is True and every subsystem yields the same shape for a
++        key, that key is stacked along a new leading batch dim; otherwise (ragged
++        or ``stack=False``) the per-subsystem values are returned as a list.
++        Multi-molecule (``mol_idx``) inputs always use ``stack=False`` because the
++        molecules are independent and generally ragged.
++        """
++        # Recursive eval(...) mutates instance scratch state and can persistently
++        # flip Coulomb method/cutoff/list-builder state via prepare_input's
++        # simple->dsf PBC auto-switch. Snapshot and restore so a batched call
++        # leaves the calculator unmodified.
++        eval_state = self._snapshot_eval_state()
++        try:
++            results = [
++                self.eval(sub, forces=forces, stress=stress, hessian=True, validate_species=validate_species)
++                for sub in subsystems
++            ]
++        finally:
++            self._restore_eval_state(eval_state)
++        out: dict[str, Any] = {}
++        for k in results[0]:
++            vals = [r[k] for r in results]
++            if stack and all(isinstance(v, Tensor) for v in vals) and all(v.shape == vals[0].shape for v in vals):
++                out[k] = torch.stack(vals, dim=0)
++            else:
++                out[k] = vals
++        return out
++
+     def to_input_tensors(self, data: dict[str, Any]) -> dict[str, Tensor]:
+         ret = {}
+         for k in self.keys_in:
+@@ -1368,11 +1549,38 @@ def get_derivatives(
+                     volume = torch.linalg.det(cell).abs().unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+                 data["stress"] = dedc / volume
+         if hessian:
+-            data["hessian"] = self.calculate_hessian(data["forces"], self._saved_for_grad["coord"])
++            H = self.calculate_hessian(data["forces"], self._saved_for_grad["coord"])
++            if coulomb_terms is not None and getattr(coulomb_terms, "hessian", None) is not None:
++                # The LR coulomb hessian is computed in float64 via finite
++                # differences. Accumulate in that (higher) precision rather than
++                # downcasting it to H's dtype, which would discard the FD precision.
++                H = H.to(dtype=coulomb_terms.hessian.dtype, device=H.device) + coulomb_terms.hessian.to(device=H.device)
++            data["hessian"] = H
+         return data
+ 
+     @staticmethod
+     def calculate_hessian(forces: Tensor, coord: Tensor) -> Tensor:
++        """Dense ``(N, 3, N, 3)`` Hessian of the energy w.r.t. real-atom coordinates.
++
++        Autograd contract (IMPORTANT):
++        The returned dense Hessian is a **detached value**: it carries no
++        autograd graph back to the coordinates or model parameters. This is by
++        design (it is materialized via ``torch.func.vmap`` over a vjp of the
++        already-built force graph, and the periodic Ewald/PME block is a
++        fixed-charge finite-difference term that is non-differentiable). Forces
++        DO compose with an upstream coordinate-builder graph, but the Hessian
++        does not, so you cannot backpropagate through ``eval(..., hessian=True)``.
++
++        If you need the Hessian to *compose* (e.g. ``H @ v`` that scales with /
++        differentiates through an outer computation) or to avoid forming the
++        dense ``(N, 3, N, 3)`` tensor on large systems, use the matrix-free
++        :meth:`hessian_vector_product` instead. For a fully-differentiable
++        Hessian, build one externally with
++        ``torch.autograd.functional.hessian(energy_fn, coords)`` over a closure
++        that calls the model on differentiable coordinates (note that the
++        periodic Ewald/PME long-range block remains a fixed-charge FD term in
++        either case).
++        """
+         # Coord includes padding atom (shape N+1), forces only for real atoms (shape N).
+         # Hessian computed only for actual atoms: (N, 3, N, 3).
+         #
+@@ -1395,6 +1603,232 @@ def vjp(go: Tensor) -> Tensor:
+         hessian = -torch.func.vmap(vjp, 0)(eye)
+         return hessian.view(-1, 3, coord.shape[0], 3)[:-1, :, :-1, :]
+ 
++    @torch.inference_mode(False)
++    @torch.enable_grad()
++    def hessian_vector_product(
++        self,
++        data: dict[str, Any],
++        vectors: Tensor,
++        *,
++        eps: float = 5e-4,
++        validate_species: bool = True,
++        create_graph: bool = False,
++    ) -> Tensor:
++        """Matrix-free Hessian-vector product(s) ``H @ v`` for one structure.
++
++        Computes ``H @ v`` without forming the dense ``(N, 3, N, 3)`` Hessian,
++        enabling Lanczos/LOBPCG negative-curvature checks and CG-Newton
++        preconditioning on large systems.
++
++        Parameters
++        ----------
++        data : dict
++            Single-structure input (same keys as ``eval``). 3D batched or
++            multi-molecule ``mol_idx`` inputs are not supported.
++        vectors : Tensor
++            Direction(s), shape ``(N, 3)`` or ``(K, N, 3)`` over the real atoms.
++        eps : float
++            Central-difference step (Angstrom) for the periodic Ewald/PME
++            long-range term. Ignored for ``simple``/``dsf``.
++        create_graph : bool
++            If ``True``, keep the differentiable autograd block of the HVP in
++            the graph so it can compose with an outer loss. The Ewald/PME
++            fixed-position finite-difference block remains detached. Default
++            ``False`` preserves the numeric/detached operator-action behavior.
++
++        Returns
++        -------
++        Tensor
++            ``H @ v``, shape ``(N, 3)`` or ``(K, N, 3)``, matching ``vectors``.
++
++        Notes
++        -----
++        The autograd part (NN + short-range + ``simple``/``dsf`` Coulomb +
++        DFTD3) is an exact reverse-mode product. For ``ewald``/``pme`` the
++        long-range block is a fixed-charge directional finite difference (2
++        force evals per vector); the same charge-response and step caveats as
++        the dense Ewald/PME Hessian apply (see
++        :meth:`aimnet.modules.lr.LRCoulomb._coul_nvalchemi_fd_hessian`). This
++        mirrors the dense :meth:`calculate_hessian` assembly term-by-term, so
++        ``hessian_vector_product(v)`` equals ``H.reshape(3N, 3N) @ v`` to the
++        backend's tolerance. The default return is detached; set
++        ``create_graph=True`` when the differentiable autograd block must
++        compose with an outer computation. See :meth:`calculate_hessian` for
++        the detached-Hessian contract and the fully-differentiable recipe.
++
++        Integration note: the external modules run via
++        ``_run_external_modules(forces=False, hessian=(method == 'dsf'))`` --
++        ENERGY-GRAPH mode so every external term (DFTD3 + Coulomb) stays
++        differentiable w.r.t. ``coord`` and its curvature is captured by the
++        autograd vjp. ``forces=False`` (not ``True``) is required: with
++        ``forces=True`` the DFTD3 branch takes its detached explicit-force path
++        and its second-derivative curvature is silently dropped from ``H @ v``.
++        The ``hessian`` flag controls the dsf-vs-ewald/pme split: dsf passes
++        ``hessian=True`` so ``LRCoulomb.forward`` routes through its
++        differentiable closed-form torch path (``_coul_dsf_torch``), keeping the
++        dsf curvature in the autograd graph (dsf has no dense FD block, so this is
++        free); ewald/pme pass ``hessian=False`` so the dense O(2*3N) FD block is
++        NOT computed, while the periodic energy is still added
++        differentiable-through-charges (capturing the charge-response curvature).
++        The autograd vjp of the differentiable forces equals the dense autograd
++        Hessian block (NN + short-range + DFTD3 + Coulomb-charge-response), and
++        the directional FD helper adds the remaining full-periodic block --
++        matching the dense assembly term-by-term.
++
++        Dtype / differentiability / eigensolver caveats:
++
++        * Return dtype is the model dtype (typically float32) for ``simple`` and
++          ``dsf``, and **float64** for ``ewald``/``pme`` (the periodic
++          finite-difference block is accumulated in double precision, matching the
++          dense Ewald/PME Hessian).
++        * With ``create_graph=False`` the returned product is detached numeric
++          operator action. With ``create_graph=True`` the autograd block remains
++          differentiable w.r.t. graph-attached coordinates / model parameters;
++          vectors are still treated as numeric directions, and the periodic FD
++          block remains detached.
++        * For ``ewald``/``pme`` the operator is symmetric only to
++          finite-difference accuracy (O(eps^2)); for Lanczos/LOBPCG
++          smallest/most-negative-eigenvalue (transition-state) work, pass all
++          probe vectors together as a single ``(K, N, 3)`` batch so the charge
++          state is frozen across the iteration, and consider symmetrizing the
++          operator or tuning ``eps``.
++        * The fixed-charge periodic approximation (and the ``dsf`` relaxed-charge
++          vs ``ewald``/``pme`` fixed-charge asymmetry) is inherited from the dense
++          Ewald/PME Hessian and can shift near-zero/negative eigenvalues for
++          strongly polar periodic systems; see
++          :meth:`aimnet.modules.lr.LRCoulomb._coul_nvalchemi_fd_hessian`.
++        """
++        if getattr(self, "_was_compiled", False):
++            raise RuntimeError(
++                "hessian_vector_product is incompatible with compile_model=True "
++                "(Dynamo + double-backward through GELU hangs). Reconstruct with compile_model=False."
++            )
++        # Same species/charge validation contract as `eval` (opt-out via
++        # validate_species=False); otherwise unsupported elements / charged
++        # systems would yield undefined output silently.
++        if validate_species:
++            self._validate_species_and_charge(data)
++        coord_in = torch.as_tensor(data["coord"])
++        if coord_in.ndim == 3 and coord_in.shape[0] > 1:
++            raise NotImplementedError("hessian_vector_product supports a single structure only (got 3D batch).")
++        if coord_in.ndim == 2 and data.get("mol_idx") is not None:
++            mol_idx_t = torch.as_tensor(data["mol_idx"])
++            if mol_idx_t.numel() and int(mol_idx_t.max()) > 0:
++                raise NotImplementedError(
++                    "hessian_vector_product supports a single structure only (got mol_idx batch)."
++                )
++
++        # prepare_input / set_grad_tensors mutate instance scratch state and can
++        # persistently flip Coulomb method/cutoff/list-builder state via
++        # prepare_input's simple->dsf PBC auto-switch. Snapshot now and restore
++        # in the finally so a single HVP call leaves the calculator unmodified.
++        # The per-vector loop reads self._saved_for_grad and self.external_coulomb,
++        # so the result must be fully computed inside the try before state is
++        # restored.
++        eval_state = self._snapshot_eval_state()
++        try:
++            result = self._hessian_vector_product_impl(data, vectors, eps=eps, create_graph=create_graph)
++        finally:
++            self._restore_eval_state(eval_state)
++        return result
++
++    def _hessian_vector_product_impl(
++        self, data: dict[str, Any], vectors: Tensor, *, eps: float, create_graph: bool
++    ) -> Tensor:
++        """Core HVP computation; instance-state snapshot/restore is handled by
++        :meth:`hessian_vector_product`. See that method for the contract."""
++        # Deliberate parallel forward path: this mirrors `eval` +
++        # `_run_external_modules` but builds an autograd-differentiable energy
++        # WITHOUT the dense periodic FD Hessian. Keep it in sync if the main
++        # forward path changes.
++        prepared = self.prepare_input(data, hessian=True)
++        if "mol_idx" in prepared and prepared["mol_idx"][-1] > 0:
++            raise NotImplementedError("hessian_vector_product supports a single structure only.")
++        prepared = self.set_grad_tensors(prepared, forces=True, hessian=True)
++        if isinstance(self.model, torch.jit.ScriptModule):
++            with torch.jit.optimized_execution(False):  # type: ignore
++                prepared = self.model(prepared)
++        else:
++            prepared = self.model(prepared)
++
++        method = self._coulomb_method
++        # Run the external modules in ENERGY-GRAPH mode (forces=False) so every
++        # external contribution stays differentiable w.r.t. ``coord`` and its
++        # second-derivative curvature is captured by the autograd vjp below. The
++        # HVP does NOT use the explicit forces these modules can return -- it
++        # recomputes ``forces_diff = -autograd.grad(E, coord)`` itself -- so we
++        # only need the ENERGY in the graph, not the detached explicit-force path.
++        #
++        #   * DFTD3 (if attached -- the production default): with ``forces=False``
++        #     and ``coord.requires_grad=True``, ``_run_external_modules`` takes its
++        #     in-graph branch (``dftd3_energy_graph`` True), so the D3 energy is
++        #     differentiable and its curvature enters ``H @ v``. This matches the
++        #     dense path, which keeps D3 in-graph via ``hessian=True``. (With
++        #     ``forces=True`` D3 would take its DETACHED explicit-force path and its
++        #     curvature would be silently dropped from the product.)
++        #   * dsf: ``hessian=True`` routes ``LRCoulomb.forward`` through its
++        #     DIFFERENTIABLE closed-form torch path (``_coul_dsf_torch``), so the
++        #     dsf curvature is in the autograd graph. dsf has no dense FD block, so
++        #     ``hessian=True`` adds no wasteful work, and this guarantees correct
++        #     routing regardless of how the (process-wide cached) model's embedded
++        #     Coulomb method was last set by another caller.
++        #   * ewald/pme/simple: ``hessian=False`` and ``forces=False`` so the dense
++        #     O(2*3N) Ewald/PME FD block is NOT computed; the periodic energy is
++        #     still added differentiable-through-charges (capturing the
++        #     charge-response curvature d^2E/(dq.dr)). The full-periodic
++        #     fixed-position curvature is supplied per-vector by the directional FD
++        #     helper below. The Coulomb branch returns just ``data`` (no terms) for
++        #     forces=False, but ``_run_external_modules`` always returns the
++        #     ``(data, terms)`` 2-tuple, so the unpacking below is safe.
++        # The autograd vjp therefore captures NN + short-range + DFTD3 +
++        # Coulomb-charge-response, matching the dense assembly term-by-term.
++        external_hessian = method == "dsf"
++        prepared, _coulomb_terms = self._run_external_modules(
++            prepared, forces=False, stress=False, hessian=external_hessian
++        )
++
++        coord = self._saved_for_grad["coord"]  # (N+1, 3), requires_grad
++        tot_energy = prepared["energy"].sum()
++        # Differentiable part of the forces only. The detached ``coulomb_terms``
++        # forces are a constant w.r.t. coord (zero second derivative), so they are
++        # intentionally excluded from the vjp; the periodic curvature they would
++        # have carried is supplied by the directional FD helper instead.
++        forces_diff = -torch.autograd.grad(tot_energy, coord, create_graph=True)[0]  # (N+1, 3)
++        N = coord.shape[0] - 1
++
++        device = coord.device
++        vecs = torch.as_tensor(vectors, device=device)
++        single = vecs.ndim == 2
++        if single:
++            vecs = vecs.unsqueeze(0)
++        if vecs.shape[-2:] != (N, 3):
++            raise ValueError(f"vectors must have trailing shape ({N}, 3); got {tuple(vecs.shape)}")
++
++        outs = []
++        for k in range(vecs.shape[0]):
++            v = vecs[k].to(forces_diff.dtype)
++            v_full = torch.zeros_like(coord)
++            v_full[:N] = v
++            # autograd Hv = -d(forces . v)/dcoord = d^2E/dr^2 . v
++            # (NN + short-range + dsf/simple charge-response + dftd3)
++            hv_full = -torch.autograd.grad(
++                forces_diff.flatten(),
++                coord,
++                grad_outputs=v_full.flatten(),
++                retain_graph=True,
++                create_graph=create_graph,
++                allow_unused=True,
++            )[0]
++            hv = hv_full[:N]
++            if method in ("ewald", "pme") and self.external_coulomb is not None:
++                # Full-periodic fixed-position curvature (directional FD).
++                hv = hv.to(torch.float64) + self.external_coulomb._coul_nvalchemi_fd_hvp(
++                    prepared, backend=method, vec=v, step=eps
++                )
++            outs.append(hv)
++        result = torch.stack(outs, 0)
++        return result[0] if single else result
++
+ 
+ def _add_padding_row(
+     nbmat: Tensor,
+diff --git a/aimnet/modules/lr.py b/aimnet/modules/lr.py
+index d7f2abf..544f3dd 100644
+--- a/aimnet/modules/lr.py
++++ b/aimnet/modules/lr.py
+@@ -68,6 +68,7 @@ class ExternalDerivativeTerms:
+ 
+     forces: Tensor | None = None
+     virial: Tensor | None = None
++    hessian: Tensor | None = None
+ 
+ 
+ def _periodic_coulomb_hybrid(
+@@ -249,19 +250,26 @@ class LRCoulomb(nn.Module):
+     for module-specific keys (e.g., nbmat_coulomb, shifts_coulomb), falling
+     back to shared _lr suffix (nbmat_lr, shifts_lr) if not found.
+ 
+-    DSF uses ``nvalchemiops.torch.interactions.electrostatics.dsf_coulomb``.
+-    Its energy is differentiable through charges, but not through positions
+-    or cell; the calculator consumes explicit DSF forces/virial for inference
+-    and rejects DSF force/stress training and Hessian requests.
++    DSF uses ``nvalchemiops.torch.interactions.electrostatics.dsf_coulomb``
++    for plain inference. DSF Hessian and force/stress training instead go
++    through a closed-form pure-PyTorch path (:meth:`_coul_dsf_torch`), which is
++    twice-differentiable by autograd and RELAXED-CHARGE: it differentiates
++    through the model-predicted charges, so its Hessian includes the
++    charge-response (the d^2E / (dq . dr) coupling).
+ 
+     Ewald/PME call ``nvalchemiops`` directly. Inference uses
+     ``hybrid_forces=True`` so energy remains differentiable through charges
+     and fixed-charge geometry derivatives are returned as explicit terms.
+     Training derivative paths use a small local ``autograd.Function`` wrapper
+     because the installed nvalchemiops coordinate backward kernels do not
+-    currently provide a registered backward-of-backward. Calculator Hessian
+-    requests are rejected for Ewald/PME because complete Hessians require true
+-    second coordinate derivatives.
++    currently provide a registered backward-of-backward. Ewald/PME Hessians are
++    provided by finite-difference of the analytic nvalchemiops forces
++    (:meth:`_coul_nvalchemi_fd_hessian`) and are FIXED-CHARGE: they omit the
++    d^2E / (dq . dr) charge-response coupling.
++
++    Because of this, DSF (relaxed-charge) and Ewald/PME (fixed-charge) Hessians
++    differ slightly for an otherwise-equivalent system, which matters when
++    comparing vibrational frequencies / IR across backends.
+     """
+ 
+     def __init__(
+@@ -544,6 +552,64 @@ def coul_dsf(self, data: dict[str, Tensor]) -> Tensor:
+         energy, _terms = self._coul_dsf_nvalchemi(data)
+         return energy
+ 
++    def _coul_dsf_torch(self, data: dict[str, Tensor]) -> Tensor:
++        """Closed-form damped-shifted-force Coulomb in pure PyTorch.
++
++        Twice differentiable by autograd, so it supports Hessians and
++        force/stress training where the nvalchemiops DSF kernel (which detaches
++        geometry) cannot. Uses the same ordered-pair neighbor matrix and
++        half-pair ``self._factor`` convention as :meth:`coul_simple`, so the two
++        share a unit system. The hard cutoff matches the kernel's ``dsf_rc``.
++
++        Because the pair term is force-shifted, energy and force are continuous
++        at ``rc`` but the second derivative is not, so the energy is only C^1
++        there; the Hessian therefore has a small discontinuity for pairs sitting
++        exactly at ``rc``. For vibrational / IR work a large ``dsf_rc`` is
++        advisable so that no chemically relevant pair sits near the cutoff where
++        this Hessian discontinuity occurs.
++
++        RELAXED-CHARGE Hessian: unlike the Ewald/PME finite-difference Hessian,
++        this DSF torch energy is fully autograd-differentiable through the
++        model-predicted charges, so its Hessian INCLUDES the charge-response
++        (the d^2E / (dq . dr) coupling). Consequently the DSF (relaxed-charge)
++        and Ewald/PME (fixed-charge long-range) Hessians differ slightly even
++        for an otherwise-equivalent system; this is relevant when comparing
++        vibrational frequencies / IR across LR backends.
++        """
++        suffix = nbops.resolve_suffix(data, ["_coulomb", "_lr"])
++        data = ops.lazy_calc_dij(data, suffix)
++        d_ij = data[f"d_ij{suffix}"]
++        q = data[self.key_in]
++        q_i, q_j = nbops.get_ij(q, data, suffix=suffix)
++        q_ij = q_i * q_j
++
++        alpha = d_ij.new_tensor(self.dsf_alpha)
++        rc = d_ij.new_tensor(self.dsf_rc)
++        two_alpha_over_sqrt_pi = d_ij.new_tensor(2.0 * float(self.dsf_alpha) / math.sqrt(math.pi))
++        alpha_over_sqrt_pi = d_ij.new_tensor(float(self.dsf_alpha) / math.sqrt(math.pi))
++        erfc_rc = torch.erfc(alpha * rc)
++        shift_val = erfc_rc / rc
++        # Fennell-Gezelter force-shift slope evaluated at rc.
++        shift_slope = erfc_rc / rc.pow(2) + two_alpha_over_sqrt_pi * torch.exp(-(alpha**2) * rc**2) / rc
++        e_pair = torch.erfc(alpha * d_ij) / d_ij - shift_val + (d_ij - rc) * shift_slope
++        within = (d_ij < rc).to(e_pair.dtype)
++        e_ij = q_ij * e_pair * within
++        e_ij = nbops.mask_ij_(e_ij, data, 0.0, suffix=suffix)
++        e_i = e_ij.sum(-1, dtype=torch.float64)
++        e = self._factor * nbops.mol_sum(e_i, data)
++        # DSF self-energy term: U_self_i = -(erfc(alpha*rc)/(2*rc) + alpha/sqrt(pi)) * q_i^2.
++        # The 0.5 is already inside self_coeff, so this uses the full k_e = 2 * self._factor.
++        self_coeff = -(shift_val / 2.0 + alpha_over_sqrt_pi)
++        # Mask the trailing padding atom locally so it contributes zero to the
++        # self-energy, mirroring how _dsf_inputs_mode0 / coul_simple mask
++        # (instead of relying on the upstream invariant that padding q is ~0).
++        q_self = nbops.mask_i_(q, data, 0.0, inplace=False)
++        e_self_i = (self_coeff * q_self.pow(2)).to(torch.float64)
++        e = e + 2.0 * self._factor * nbops.mol_sum(e_self_i, data)
++        if self.subtract_sr:
++            e = e - self.coul_simple_sr(data)
++        return e
++
+     def _coul_nvalchemi(
+         self,
+         data: dict[str, Tensor],
+@@ -703,6 +769,125 @@ def _coul_nvalchemi(
+             e_periodic = e_periodic - self.coul_simple_sr(data)
+         return e_periodic, terms
+ 
++    def _periodic_fd_setup(self, data: dict[str, Tensor], backend: str):
++        """Shared marshalling for the periodic-Coulomb finite-difference Hessian
++        and Hessian-vector-product paths. Returns ``(forces_at, coord_real, N)``
++        where ``forces_at(positions)`` evaluates the analytic full-periodic
++        Coulomb forces (N, 3) in eV/Ang at float64, with neighbor list, cell, and
++        (detached) charges held fixed."""
++        suffix = nbops.resolve_suffix(data, ["_coulomb", "_lr"])
++        coord = data["coord"]
++        cell = data["cell"]
++        if cell is None:
++            raise ValueError("nvalchemi Coulomb requires periodic cell data")
++        if backend not in ("ewald", "pme"):
++            raise ValueError(f"backend must be 'ewald' or 'pme', got {backend!r}")
++        N = coord.shape[0] - 1
++        coord_real = coord[:-1].detach().double()
++        charges_real = data[self.key_in][:-1].detach().double()
++        mol_idx_real = data["mol_idx"][:-1].to(torch.int32)
++        nbmat_real = data[f"nbmat{suffix}"][:-1].to(torch.int32)
++        shifts_real = data[f"shifts{suffix}"][:-1].to(torch.int32)
++        cell_det = cell.detach().double()
++        num_systems = int(mol_idx_real.max().item()) + 1
++        is_pme = backend == "pme"
++
++        def forces_at(positions: Tensor) -> Tensor:
++            _e, f, _cg, _v = _periodic_coulomb_hybrid(
++                coord=positions,
++                cell=cell_det,
++                charges=charges_real,
++                batch_idx=mol_idx_real,
++                neighbor_matrix=nbmat_real,
++                shifts=shifts_real,
++                mask_value=N,
++                num_systems=num_systems,
++                accuracy=float(self.ewald_accuracy),
++                compute_virial=False,
++                is_pme=is_pme,
++            )
++            return f  # (N, 3) eV/Ang (already scaled by k_e in the helper)
++
++        return forces_at, coord_real, N
++
++    def _coul_nvalchemi_fd_hessian(self, data: dict[str, Tensor], backend: str, *, step: float = 5e-4) -> Tensor:
++        """Central finite-difference Hessian of the FULL periodic Coulomb energy.
++
++        Differences the analytic nvalchemiops forces with the neighbor list and
++        cell held fixed and coordinates detached. Returns the (N, 3, N, 3)
++        full-periodic block in eV/Ang^2 for the real atoms. The short-range
++        subtraction (if any) is differentiated by autograd in the calculator, so
++        only the full-periodic block is built here.
++
++        FIXED-CHARGE Hessian: the charges are detached before differencing, so
++        this long-range block does NOT include the charge-response coupling
++        (the d^2E / (dq . dr) term through the model's predicted charges). Only
++        the short-range subtraction (handled by autograd in the calculator)
++        carries any charge-response. Consequently the Ewald/PME (fixed-charge
++        long-range) Hessian differs slightly from the DSF torch (relaxed-charge,
++        fully-autograd) Hessian even for an otherwise-equivalent system; this is
++        relevant when comparing vibrational frequencies / IR across LR backends.
++
++        The finite difference is performed in float64: the detached positions,
++        cell, and charges are upcast to double so the kernel returns float64
++        forces and the ``(F(+h) - F(-h))`` cancellation happens in float64,
++        avoiding the ~3-4 digit accuracy cap of float32 subtraction.
++
++        The displacement ``step`` (default 5e-4 Ang) is fixed, so the resulting
++        Hessian accuracy is truncation-limited (the central-difference O(step^2)
++        error) and additionally coupled to ``ewald_accuracy`` through the
++        kernel-force accuracy; neither error is reduced below those limits.
++
++        The Coulomb neighbor list is built at the Ewald real-space cutoff with no
++        geometric skin, so a pair within ``step`` of the cutoff could cross during
++        the +-step displacement. This is numerically negligible because the Ewald
++        real-space term is erfc-damped to ~``ewald_accuracy`` (default 1e-6) at the
++        cutoff, bounding any discontinuity introduced by such a crossing. This
++        bound scales with ``ewald_accuracy``: loosening ``ewald_accuracy``
++        raises the erfc residual at the cutoff and weakens the guarantee.
++        """
++        forces_at, coord_real, N = self._periodic_fd_setup(data, backend)
++        hessian = coord_real.new_zeros((N, 3, N, 3), dtype=torch.float64)
++        with torch.no_grad():
++            scratch = coord_real.clone()
++            for j in range(N):
++                for b in range(3):
++                    orig = scratch[j, b].item()
++                    scratch[j, b] = orig + step
++                    fp = forces_at(scratch)
++                    scratch[j, b] = orig - step
++                    fm = forces_at(scratch)
++                    scratch[j, b] = orig
++                    # H_{ia,jb} = d^2E/dr_ia dr_jb = -dF_ia/dr_jb
++                    dF = (fp - fm) / (2.0 * step)
++                    hessian[:, :, j, b] = (-dF).double()
++        return hessian
++
++    def _coul_nvalchemi_fd_hvp(
++        self, data: dict[str, Tensor], backend: str, vec: Tensor, *, step: float = 5e-4
++    ) -> Tensor:
++        """Directional finite-difference of the FULL periodic Coulomb forces.
++
++        Returns ``H_LR @ vec`` for the real atoms, shape ``(N, 3)`` in
++        eV/Ang^2, where ``H_LR`` is the full-periodic Coulomb Hessian block.
++        This is the matrix-free, single-direction analogue of
++        :meth:`_coul_nvalchemi_fd_hessian`: it costs 2 force evaluations
++        instead of 2*3N. ``vec`` is the displacement direction over the real
++        atoms, shape ``(N, 3)``.
++
++        Like the dense version this is a FIXED-CHARGE term (charges detached);
++        see :meth:`_coul_nvalchemi_fd_hessian` for the charge-response and
++        step/``ewald_accuracy`` caveats, which apply identically here.
++        """
++        forces_at, coord_real, _N = self._periodic_fd_setup(data, backend)
++        vec_real = vec.detach().double()
++        with torch.no_grad():
++            fp = forces_at(coord_real + step * vec_real)
++            fm = forces_at(coord_real - step * vec_real)
++            # H_LR @ vec = d^2E/dr dr . vec = -dF/dr . vec  (directional)
++            hv = -(fp - fm) / (2.0 * step)
++        return hv  # (N, 3), float64
++
+     def coul_ewald(self, data: dict[str, Tensor]) -> Tensor:
+         """Per-system Ewald energy in eV. Requires ``cell`` and ``nbmat_lr``/``shifts_lr``."""
+         energy, _terms = self._coul_nvalchemi(data, backend="ewald")
+@@ -720,6 +905,7 @@ def forward(
+         compute_forces: bool = False,
+         compute_virial: bool = False,
+         training_derivatives: bool = False,
++        hessian: bool = False,
+         scaling: Tensor | None = None,
+         coord_unstrained: Tensor | None = None,
+         cell_unstrained: Tensor | None = None,
+@@ -728,35 +914,47 @@ def forward(
+             e = self.coul_simple(data)
+             terms = None
+         elif self.method == "dsf":
+-            if training_derivatives:
+-                raise ValueError("DSF Coulomb does not support training derivatives")
+-            e, terms = self._coul_dsf_nvalchemi(
+-                data,
+-                compute_forces=compute_forces,
+-                compute_virial=compute_virial,
+-            )
++            if hessian or training_derivatives:
++                # Differentiable closed-form path: energy stays in the autograd
++                # graph so the calculator computes forces/stress/Hessian from it.
++                e = self._coul_dsf_torch(data)
++                terms = None
++            else:
++                e, terms = self._coul_dsf_nvalchemi(
++                    data,
++                    compute_forces=compute_forces,
++                    compute_virial=compute_virial,
++                )
+         elif self.method == "ewald":
+             e, terms = self._coul_nvalchemi(
+                 data,
+                 backend="ewald",
+-                compute_forces=compute_forces,
++                compute_forces=compute_forces or hessian,
+                 compute_virial=compute_virial,
+                 training_derivatives=training_derivatives,
+                 scaling=scaling,
+                 coord_unstrained=coord_unstrained,
+                 cell_unstrained=cell_unstrained,
+             )
++            if hessian:
++                if terms is None:
++                    terms = ExternalDerivativeTerms()
++                terms.hessian = self._coul_nvalchemi_fd_hessian(data, backend="ewald")
+         elif self.method == "pme":
+             e, terms = self._coul_nvalchemi(
+                 data,
+                 backend="pme",
+-                compute_forces=compute_forces,
++                compute_forces=compute_forces or hessian,
+                 compute_virial=compute_virial,
+                 training_derivatives=training_derivatives,
+                 scaling=scaling,
+                 coord_unstrained=coord_unstrained,
+                 cell_unstrained=cell_unstrained,
+             )
++            if hessian:
++                if terms is None:
++                    terms = ExternalDerivativeTerms()
++                terms.hessian = self._coul_nvalchemi_fd_hessian(data, backend="pme")
+         else:
+             raise ValueError(f"Unknown method {self.method}")
+ 
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index a85bb9e..64cd176 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -213,54 +213,102 @@ def test_ewald_pme_without_cell_raises(self, method):
+         with pytest.raises(ValueError, match="requires a periodic 'cell'"):
+             calc(data)
+ 
+-    @pytest.mark.parametrize("kwargs", [{"forces": True}, {"stress": True}])
+-    def test_dsf_train_derivative_modes_raise(self, kwargs):
+-        """DSF uses explicit nvalchemiops derivatives and does not support force/stress training."""
+-        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True, train=True)
++    def test_dsf_hessian_finite_and_symmetric(self):
++        """DSF Hessian is finite, correctly shaped, and symmetric via the torch path."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
+         with warnings.catch_warnings():
+             warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
+             calc.set_lrcoulomb_method("dsf", cutoff=8.0)
+-
+         data = {
+             "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
+             "numbers": np.array([8, 1, 1]),
+             "charge": 0.0,
+-            "cell": np.eye(3) * 8.0,
+         }
+-        with pytest.raises(NotImplementedError, match="DSF Coulomb"):
+-            calc(data, **kwargs)
+-
+-    def test_dsf_hessian_raises(self):
+-        """DSF Hessians are unsupported because nvalchemiops DSF has no coordinate autograd."""
++        res = calc(data, hessian=True)
++        H = res["hessian"]
++        assert H.shape == (3, 3, 3, 3)
++        assert torch.isfinite(H).all()
++        assert H.abs().sum() > 0
++        H_flat = H.reshape(9, 9)
++        assert (H_flat - H_flat.T).abs().max().item() < 1e-3
++
++    def test_dsf_train_forces_match_inference(self):
++        """DSF forces from the torch (train) path match the kernel (inference) path."""
+         calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
+         with warnings.catch_warnings():
+             warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
+             calc.set_lrcoulomb_method("dsf", cutoff=8.0)
++        data = {
++            "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++            "numbers": np.array([8, 1, 1]),
++            "charge": 0.0,
++        }
++        calc._train = False
++        f_kernel = calc(data, forces=True)["forces"]
++        calc._train = True
++        f_torch = calc(data, forces=True)["forces"]
++        calc._train = False
++        torch.testing.assert_close(f_kernel, f_torch, rtol=1e-3, atol=1e-3)
++
++    def test_dsf_periodic_torch_forces_match_kernel(self):
++        """Periodic DSF torch path (train) matches the kernel forces, validating shift handling."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++            calc.set_lrcoulomb_method("dsf", cutoff=3.0)
++        # Atoms are spread along x so the molecule spans more than L/2; this places
++        # periodic images of atoms 0 and 2 within the 3.0 A DSF cutoff (image pair
++        # distance L - span = 3.0 A), genuinely exercising the shifts @ cell handling.
++        # cutoff (3.0) == L/2 (6.0/2), satisfying the DSF minimum-image requirement.
++        data = {
++            "coord": np.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [3.0, 0.0, 0.0]]),
++            "numbers": np.array([8, 1, 1]),
++            "charge": 0.0,
++            "cell": np.eye(3) * 6.0,
++        }
++        calc._train = False
++        f_kernel = calc(data, forces=True)["forces"]
++        calc._train = True
++        f_torch = calc(data, forces=True)["forces"]
++        calc._train = False
++        torch.testing.assert_close(f_kernel, f_torch, rtol=1e-3, atol=1e-3)
+ 
++    def test_dsf_torch_energy_matches_kernel(self):
++        """Pure-torch DSF energy (Hessian path) matches the nvalchemiops kernel energy."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++            calc.set_lrcoulomb_method("dsf", cutoff=8.0)
+         data = {
+             "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
+             "numbers": np.array([8, 1, 1]),
+             "charge": 0.0,
+         }
+-        with pytest.raises(NotImplementedError, match="DSF Coulomb"):
+-            calc(data, hessian=True)
++        e_kernel = calc(data, forces=True)["energy"]
++        e_torch = calc(data, hessian=True)["energy"]
++        torch.testing.assert_close(e_kernel, e_torch, rtol=1e-4, atol=1e-5)
+ 
+     @pytest.mark.parametrize("method", ["ewald", "pme"])
+-    def test_ewald_pme_hessian_raises(self, method):
+-        """Ewald/PME Hessians need second coordinate derivatives that nvalchemiops does not expose."""
++    def test_ewald_pme_hessian_finite_symmetric_sumrule(self, method):
++        """Ewald/PME Hessian is finite, symmetric, and obeys the acoustic sum rule."""
+         calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
+         with warnings.catch_warnings():
+             warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
+             calc.set_lrcoulomb_method(method)
+-
+         data = {
+             "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
+             "numbers": np.array([8, 1, 1]),
+             "charge": 0.0,
+             "cell": np.eye(3) * 8.0,
+         }
+-        with pytest.raises(NotImplementedError, match="Ewald/PME Coulomb"):
+-            calc(data, hessian=True)
++        H = calc(data, hessian=True)["hessian"]
++        n = 3
++        assert H.shape == (n, 3, n, 3)
++        assert torch.isfinite(H).all()
++        assert H.abs().sum() > 0
++        H_flat = H.reshape(3 * n, 3 * n)
++        assert (H_flat - H_flat.T).abs().max().item() < 5e-3
++        assert H.sum(dim=2).abs().max().item() < 5e-3
+ 
+     def test_dftd3_hessian_is_finite(self):
+         """External DFT-D3 uses its differentiable fallback for Hessian calls."""
+@@ -647,15 +695,72 @@ def test_hessian_singleton_batch_is_force_flattened(self):
+         res = calc(data, hessian=True)
+         assert res["hessian"].shape == (2, 3, 2, 3)
+ 
+-    def test_hessian_batched_input_raises(self):
++    def test_hessian_batched_input_stacks(self):
++        """A B>1 3D batch returns a per-structure stacked Hessian (B, N, 3, N, 3)."""
+         calc = AIMNet2Calculator("aimnet2", nb_threshold=1000)
++        calc.external_dftd3 = None
+         data = {
+-            "coord": torch.zeros(2, 2, 3),
+-            "numbers": torch.tensor([[8, 1], [8, 1]]),
+-            "charge": torch.zeros(2),
++            "coord": torch.tensor(
++                [
++                    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
++                    [[0.0, 0.0, 0.0], [1.1, 0.0, 0.0], [0.0, 0.9, 0.0]],
++                ],
++                dtype=torch.float32,
++            ),
++            "numbers": torch.tensor([[8, 1, 1], [8, 1, 1]]),
++            "charge": torch.tensor([0.0, 0.0]),
+         }
+-        with pytest.raises(NotImplementedError, match="batched inputs with B > 1"):
+-            calc(data, hessian=True)
++        res = calc(data, forces=True, hessian=True)
++        assert res["hessian"].shape == (2, 3, 3, 3, 3)
++        # Other requested per-structure quantities stack along the same batch dim.
++        assert res["forces"].shape == (2, 3, 3)
++
++    def test_hessian_batched_matches_per_structure(self):
++        """Each batched Hessian block equals the standalone single-structure Hessian."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=1000)
++        calc.external_dftd3 = None
++        c0 = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
++        c1 = [[0.0, 0.0, 0.0], [1.1, 0.0, 0.0], [0.0, 0.9, 0.0]]
++        batch = {
++            "coord": torch.tensor([c0, c1], dtype=torch.float32),
++            "numbers": torch.tensor([[8, 1, 1], [8, 1, 1]]),
++            "charge": torch.tensor([0.0, 0.0]),
++        }
++        H_batched = calc(batch, hessian=True)["hessian"]
++        H0 = calc(
++            {"coord": torch.tensor(c0, dtype=torch.float32), "numbers": torch.tensor([8, 1, 1]), "charge": 0.0},
++            hessian=True,
++        )["hessian"]
++        H1 = calc(
++            {"coord": torch.tensor(c1, dtype=torch.float32), "numbers": torch.tensor([8, 1, 1]), "charge": 0.0},
++            hessian=True,
++        )["hessian"]
++        torch.testing.assert_close(H_batched[0], H0, rtol=1e-4, atol=1e-4)
++        torch.testing.assert_close(H_batched[1], H1, rtol=1e-4, atol=1e-4)
++
++    def test_hessian_batched_pbc_ewald_stacks(self):
++        """Batched Hessian composes with the periodic Ewald FD-Hessian path: a 3D
++        batch with a cell + Ewald Coulomb runs per-structure and stacks the
++        per-structure (N,3,N,3) Hessians into (B,N,3,N,3)."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++            calc.set_lrcoulomb_method("ewald")
++        data = {
++            "coord": torch.tensor(
++                [
++                    [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
++                    [[0.0, 0.0, 0.0], [0.97, 0.0, 0.0], [-0.25, 0.94, 0.0]],
++                ],
++                dtype=torch.float32,
++            ),
++            "numbers": torch.tensor([[8, 1, 1], [8, 1, 1]]),
++            "charge": torch.tensor([0.0, 0.0]),
++            "cell": torch.eye(3) * 8.0,
++        }
++        H = calc(data, hessian=True)["hessian"]
++        assert H.shape == (2, 3, 3, 3, 3)
++        assert torch.isfinite(H).all()
+ 
+     def test_requires_grad_false_still_works(self):
+         """Backward-compat: forces=True still works when coord has no requires_grad."""
+@@ -668,8 +773,8 @@ def test_requires_grad_false_still_works(self):
+         res = calc(data, forces=True)
+         assert "forces" in res and res["forces"].shape[-2:] == torch.Size([3, 3])
+ 
+-    def test_hessian_multiple_molecules_raises(self):
+-        """Test that Hessian with multiple molecules raises NotImplementedError."""
++    def test_hessian_multiple_molecules_returns_list(self):
++        """A flat mol_idx batch returns one Hessian per molecule (list, even when equal-size)."""
+         calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
+         calc.external_dftd3 = None
+         data = {
+@@ -681,8 +786,30 @@ def test_hessian_multiple_molecules_raises(self):
+             "mol_idx": torch.tensor([0, 0, 1, 1]),
+             "charge": torch.tensor([0.0, 0.0]),
+         }
+-        with pytest.raises(NotImplementedError, match="Hessian calculation is not supported for multiple molecules"):
+-            calc(data, hessian=True)
++        res = calc(data, hessian=True)
++        assert isinstance(res["hessian"], list)
++        assert len(res["hessian"]) == 2
++        assert res["hessian"][0].shape == (2, 3, 2, 3)
++        assert res["hessian"][1].shape == (2, 3, 2, 3)
++
++    def test_hessian_ragged_molecules_returns_list(self):
++        """Different-size molecules return a list with correct per-molecule Hessian shapes."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        calc.external_dftd3 = None
++        data = {
++            "coord": torch.tensor(
++                [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0], [8.0, 0.0, 0.0], [8.96, 0.0, 0.0]],
++                dtype=torch.float32,
++            ),
++            "numbers": torch.tensor([8, 1, 1, 8, 1]),
++            "mol_idx": torch.tensor([0, 0, 0, 1, 1]),
++            "charge": torch.tensor([0.0, 0.0]),
++        }
++        res = calc(data, hessian=True)
++        assert isinstance(res["hessian"], list)
++        assert len(res["hessian"]) == 2
++        assert res["hessian"][0].shape == (3, 3, 3, 3)
++        assert res["hessian"][1].shape == (2, 3, 2, 3)
+ 
+ 
+ class TestEnergyConsistency:
+diff --git a/tests/test_hvp.py b/tests/test_hvp.py
+new file mode 100644
+index 0000000..ceaf489
+--- /dev/null
++++ b/tests/test_hvp.py
+@@ -0,0 +1,249 @@
++import warnings
++
++import numpy as np
++import pytest
++import torch
++
++from aimnet.calculators import AIMNet2Calculator
++
++
++def _set_method(calc, method):
++    with warnings.catch_warnings():
++        warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++        if method == "dsf":
++            calc.set_lrcoulomb_method("dsf", cutoff=8.0)
++        elif method in ("ewald", "pme"):
++            calc.set_lrcoulomb_method(method)
++
++
++def _dense_hessian_matmul(calc, data, v):
++    H = calc({k: (val.clone() if isinstance(val, torch.Tensor) else val) for k, val in data.items()}, hessian=True)[
++        "hessian"
++    ]
++    n = H.shape[0]
++    Hmat = H.reshape(3 * n, 3 * n).double()
++    # The calculator auto-selects its device (CPU or CUDA); align v with the
++    # dense Hessian so the reference matmul runs regardless of placement.
++    v = v.to(Hmat.device)
++    return (Hmat @ v.reshape(-1).double()).reshape(n, 3)
++
++
++def _nblist_state(nblist):
++    if nblist is None:
++        return None
++    return (nblist.cutoff, nblist.max_neighbors)
++
++
++def _coulomb_state(calc):
++    ext = None
++    if calc.external_coulomb is not None:
++        ext = (
++            calc.external_coulomb.method,
++            calc.external_coulomb.dsf_alpha,
++            calc.external_coulomb.dsf_rc,
++            calc.external_coulomb.ewald_accuracy,
++        )
++    return (
++        calc._coulomb_method,
++        calc._coulomb_cutoff,
++        calc.cutoff_lr,
++        _nblist_state(calc._nblist_lr),
++        _nblist_state(calc._nblist_dftd3),
++        _nblist_state(calc._nblist_coulomb),
++        ext,
++    )
++
++
++@pytest.mark.parametrize("method", ["simple", "dsf"])
++def test_hvp_matches_dense_nonperiodic(method):
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=(method != "simple"))
++    calc.external_dftd3 = None
++    if method != "simple":
++        _set_method(calc, method)
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++    }
++    torch.manual_seed(0)
++    v = torch.randn(3, 3, dtype=torch.float64)
++    hv = calc.hessian_vector_product(data, v)
++    ref = _dense_hessian_matmul(calc, data, v)
++    torch.testing.assert_close(hv.double().cpu(), ref.cpu(), rtol=1e-3, atol=1e-3)
++
++
++@pytest.mark.parametrize("method", ["ewald", "pme"])
++def test_hvp_matches_dense_periodic(method):
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++    calc.external_dftd3 = None
++    _set_method(calc, method)
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++        "cell": np.eye(3) * 8.0,
++    }
++    torch.manual_seed(0)
++    v = torch.randn(3, 3, dtype=torch.float64)
++    hv = calc.hessian_vector_product(data, v)
++    ref = _dense_hessian_matmul(calc, data, v)
++    torch.testing.assert_close(hv.double().cpu(), ref.cpu(), rtol=5e-2, atol=5e-3)
++
++
++def test_hvp_multiple_vectors_shape():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++    calc.external_dftd3 = None
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++    }
++    torch.manual_seed(1)
++    V = torch.randn(4, 3, 3, dtype=torch.float64)
++    HV = calc.hessian_vector_product(data, V)
++    assert HV.shape == (4, 3, 3)
++    ref = torch.stack([_dense_hessian_matmul(calc, data, V[k]) for k in range(4)], 0)
++    torch.testing.assert_close(HV.double().cpu(), ref.cpu(), rtol=1e-3, atol=1e-3)
++
++
++def test_hvp_batched_input_raises():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=1000)
++    data = {
++        "coord": torch.zeros(2, 3, 3),
++        "numbers": torch.tensor([[8, 1, 1], [8, 1, 1]]),
++        "charge": torch.zeros(2),
++    }
++    v = torch.zeros(3, 3)
++    with pytest.raises((NotImplementedError, ValueError)):
++        calc.hessian_vector_product(data, v)
++
++
++def test_hvp_wrong_vector_shape_raises():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++    calc.external_dftd3 = None
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++    }
++    with pytest.raises(ValueError):
++        calc.hessian_vector_product(data, torch.zeros(5, 3))  # wrong N
++
++
++@pytest.mark.parametrize("method", ["simple", "ewald"])
++def test_hvp_matches_dense_with_dftd3(method):
++    """HVP must include DFTD3 curvature (regression for dropped-D3 bug)."""
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=(method != "simple"))
++    # NOTE: external_dftd3 is deliberately LEFT ATTACHED (the default).
++    assert calc.external_dftd3 is not None, "expected default DFTD3 attached"
++    if method != "simple":
++        _set_method(calc, method)
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++    }
++    if method != "simple":
++        data["cell"] = np.eye(3) * 8.0
++    torch.manual_seed(0)
++    v = torch.randn(3, 3, dtype=torch.float64)
++    hv = calc.hessian_vector_product(data, v)
++    ref = _dense_hessian_matmul(calc, data, v)
++    tol = {"rtol": 1e-3, "atol": 1e-3} if method == "simple" else {"rtol": 5e-2, "atol": 5e-3}
++    torch.testing.assert_close(hv.double().cpu(), ref.cpu(), **tol)
++
++
++def test_hvp_validates_unsupported_element():
++    """HVP enforces the same species validation as eval (FIX 3)."""
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++    impl = (calc.metadata or {}).get("implemented_species") or []
++    if not impl:
++        pytest.skip("model did not declare implemented_species")
++    bad_z = next(z for z in range(1, 119) if z not in impl)
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0]]),
++        "numbers": np.array([bad_z, 1]),
++        "charge": 0.0,
++    }
++    v = torch.zeros(2, 3, dtype=torch.float64)
++    with pytest.raises(ValueError):
++        calc.hessian_vector_product(data, v)
++    # Bypass must not raise on the validation path.
++    calc.hessian_vector_product(data, v, validate_species=False)
++
++
++def test_hvp_periodic_returns_float64():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++    calc.external_dftd3 = None
++    with warnings.catch_warnings():
++        warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++        calc.set_lrcoulomb_method("ewald")
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++        "cell": np.eye(3) * 8.0,
++    }
++    hv = calc.hessian_vector_product(data, torch.randn(3, 3, dtype=torch.float64))
++    assert hv.dtype == torch.float64
++
++
++def test_hvp_pbc_auto_switch_restores_full_coulomb_state():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++    calc.external_dftd3 = None
++    calc.set_lrcoulomb_method("simple")
++    before = _coulomb_state(calc)
++    data = {
++        "coord": np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]),
++        "numbers": np.array([8, 1, 1]),
++        "charge": 0.0,
++        "cell": np.eye(3) * 8.0,
++    }
++    with pytest.warns(UserWarning, match="Switching to DSF Coulomb for PBC"):
++        calc.hessian_vector_product(data, torch.randn(3, 3, dtype=torch.float64))
++    assert _coulomb_state(calc) == before
++
++
++def test_batched_hessian_pbc_auto_switch_restores_full_coulomb_state():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True)
++    calc.external_dftd3 = None
++    calc.set_lrcoulomb_method("simple")
++    before = _coulomb_state(calc)
++    data = {
++        "coord": torch.tensor(
++            [
++                [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
++                [[0.0, 0.0, 0.0], [0.97, 0.0, 0.0], [-0.25, 0.94, 0.0]],
++            ],
++            dtype=torch.float32,
++        ),
++        "numbers": torch.tensor([[8, 1, 1], [8, 1, 1]]),
++        "charge": torch.tensor([0.0, 0.0]),
++        "cell": torch.eye(3) * 8.0,
++    }
++    with pytest.warns(UserWarning, match="Switching to DSF Coulomb for PBC"):
++        H = calc(data, hessian=True)["hessian"]
++    assert H.shape == (2, 3, 3, 3, 3)
++    assert _coulomb_state(calc) == before
++
++
++def test_hvp_create_graph_contract():
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++    calc.external_dftd3 = None
++    data = {
++        "coord": torch.tensor(
++            [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
++            dtype=torch.float32,
++            requires_grad=True,
++        ),
++        "numbers": torch.tensor([8, 1, 1]),
++        "charge": 0.0,
++    }
++    v = torch.randn(3, 3)
++
++    hv_detached = calc.hessian_vector_product(data, v)
++    assert not hv_detached.requires_grad
++
++    hv_graph = calc.hessian_vector_product(data, v, create_graph=True)
++    assert hv_graph.requires_grad
++    assert hv_graph.grad_fn is not None
+diff --git a/tests/test_pbc.py b/tests/test_pbc.py
+index 720efcf..69dc2cd 100644
+--- a/tests/test_pbc.py
++++ b/tests/test_pbc.py
+@@ -1127,17 +1127,129 @@ def test_train_mode_force_stress_loss_backpropagates(self, pbc_crystal_small, de
+         assert any(torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads)
+ 
+     @pytest.mark.parametrize("method", ["ewald", "pme"])
+-    def test_hessian_raises(self, pbc_crystal_small, device, method):
+-        """Ewald/PME Hessians require second coordinate derivatives not exposed by nvalchemiops."""
+-        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, train=False)
++    def test_hessian_finite(self, pbc_crystal_small, device, method):
++        """Ewald/PME Hessians are now provided via FD over analytic forces."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True, device=device)
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
++            calc.set_lrcoulomb_method(method)
++        data_calc = {
++            "coord": pbc_crystal_small["coord"].to(device),
++            "numbers": pbc_crystal_small["numbers"].to(device),
++            "cell": pbc_crystal_small["cell"].to(device),
++            "charge": 0.0,
++        }
++        res = calc(data_calc, hessian=True)
++        assert torch.isfinite(res["hessian"]).all()
++        assert res["hessian"].abs().sum() > 0
++
++    @pytest.mark.parametrize("method", ["ewald", "pme"])
++    def test_fd_hessian_matches_energy_fd(self, pbc_crystal_small, device, method):
++        """The FD-of-forces full-periodic block equals the central-FD-of-energy Hessian.
++
++        Captures the prepared PBC data (with the coulomb neighbor list/shifts) by
++        monkeypatching the module's FD-Hessian method during a calculator Hessian
++        run, then compares the analytic-force FD block against a central-difference
++        Hessian of the full periodic kernel energy over the same fixed neighbor
++        list/cell/charges. This is the core sign/assembly gate.
++        """
++        from aimnet.modules.lr import _periodic_coulomb_hybrid
++
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, needs_coulomb=True, device=device)
+         with warnings.catch_warnings():
+             warnings.filterwarnings("ignore", message="Model has embedded Coulomb module", category=UserWarning)
+             calc.set_lrcoulomb_method(method)
+         calc.external_dftd3 = None
+ 
+-        data_calc = _data_calc_from_fixture(pbc_crystal_small)
+-        with pytest.raises(NotImplementedError, match="Ewald/PME Coulomb"):
++        data_calc = {
++            "coord": pbc_crystal_small["coord"].to(device).double(),
++            "numbers": pbc_crystal_small["numbers"].to(device),
++            "cell": pbc_crystal_small["cell"].to(device).double(),
++            "charge": 0.0,
++        }
++
++        captured = {}
++        module = calc.external_coulomb
++        orig = module._coul_nvalchemi_fd_hessian
++
++        def capture(prepared, backend, **kw):
++            # Compute the analytic-force FD block and snapshot the fixed real-atom
++            # inputs WHILE the data dict is still fully padded/consistent (the
++            # calculator later unpads coord/charges in place).
++            result = orig(prepared, backend, **kw)
++            suffix = nbops.resolve_suffix(prepared, ["_coulomb", "_lr"])
++            captured["backend"] = backend
++            captured["H_force_fd"] = result.detach().clone()
++            captured["coord_real"] = prepared["coord"][:-1].detach().clone()
++            captured["cell"] = prepared["cell"].detach().clone()
++            captured["charges_real"] = prepared[module.key_in][:-1].detach().clone()
++            captured["mol_idx_real"] = prepared["mol_idx"][:-1].clone().to(torch.int32)
++            captured["nbmat_real"] = prepared[f"nbmat{suffix}"][:-1].clone().to(torch.int32)
++            captured["shifts_real"] = prepared[f"shifts{suffix}"][:-1].clone().to(torch.int32)
++            return result
++
++        module._coul_nvalchemi_fd_hessian = capture  # type: ignore[method-assign]
++        try:
+             calc(data_calc, hessian=True)
++        finally:
++            module._coul_nvalchemi_fd_hessian = orig  # type: ignore[method-assign]
++
++        backend = captured["backend"]
++        H_force_fd = captured["H_force_fd"].double()
++        N = H_force_fd.shape[0]
++        H_force_fd = H_force_fd.reshape(3 * N, 3 * N)
++
++        coord_real = captured["coord_real"].double()
++        cell_det = captured["cell"].double()
++        charges_real = captured["charges_real"].double()
++        mol_idx_real = captured["mol_idx_real"]
++        nbmat_real = captured["nbmat_real"]
++        shifts_real = captured["shifts_real"]
++        num_systems = int(mol_idx_real.max().item()) + 1
++        is_pme = backend == "pme"
++
++        def energy_fn(coord_flat: torch.Tensor) -> torch.Tensor:
++            positions = coord_flat.reshape(N, 3)
++            energies, _f, _cg, _v = _periodic_coulomb_hybrid(
++                coord=positions,
++                cell=cell_det,
++                charges=charges_real,
++                batch_idx=mol_idx_real,
++                neighbor_matrix=nbmat_real,
++                shifts=shifts_real,
++                mask_value=N,
++                num_systems=num_systems,
++                accuracy=float(module.ewald_accuracy),
++                compute_virial=False,
++                is_pme=is_pme,
++            )
++            return energies.sum()
++
++        # Building the full (3N, 3N) energy-FD Hessian for the whole crystal is
++        # prohibitively slow, so validate the sign/assembly by probing a few
++        # coordinate columns: H[:, j] = d(grad_j E)/dr, with grad obtained by an
++        # independent energy FD (no kernel forces involved). Compare against the
++        # analytic-force FD block over the same columns.
++        coord0 = coord_real.reshape(-1)
++        ndim = coord0.numel()
++        step = 5e-3
++        eye = torch.eye(ndim, dtype=coord0.dtype, device=coord0.device)
++
++        def energy_grad(coord_flat: torch.Tensor) -> torch.Tensor:
++            grad = torch.empty(ndim, dtype=coord0.dtype, device=coord0.device)
++            for i in range(ndim):
++                ep = energy_fn(coord_flat + step * eye[i])
++                em = energy_fn(coord_flat - step * eye[i])
++                grad[i] = (ep - em) / (2.0 * step)
++            return grad
++
++        n_probe = min(2 * 3, ndim)  # first two atoms (6 dofs)
++        for j in range(n_probe):
++            gp = energy_grad(coord0 + step * eye[j])
++            gm = energy_grad(coord0 - step * eye[j])
++            col_energy = (gp - gm) / (2.0 * step)
++            col_force = H_force_fd[:, j]
++            torch.testing.assert_close(col_force, col_energy, rtol=5e-2, atol=5e-3)
+ 
+     @pytest.mark.parametrize("method", ["ewald", "pme"])
+     def test_calculator_pbc_batched(self, pbc_crystal_small, device, method):

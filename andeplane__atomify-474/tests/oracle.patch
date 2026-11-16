@@ -1,0 +1,212 @@
+diff --git a/overrides.json b/overrides.json
+new file mode 100644
+index 00000000..3d39e80e
+--- /dev/null
++++ b/overrides.json
+@@ -0,0 +1,5 @@
++{
++  "@jupyterlab/apputils-extension:themes": {
++    "theme": "JupyterLab Dark"
++  }
++}
+diff --git a/src/shell/NotebookTab.tsx b/src/shell/NotebookTab.tsx
+index e9041d57..84ba247f 100644
+--- a/src/shell/NotebookTab.tsx
++++ b/src/shell/NotebookTab.tsx
+@@ -3,41 +3,79 @@
+  * notebook. JupyterLite mounts the same contents store the project lives in,
+  * so runs/ outputs are readable directly — no sync. Hidden for quick
+  * projects (scratch storage is invisible to Jupyter).
++ *
++ * The iframe is kept alive: the Shell renders this host for the whole
++ * session, and once a project's notebook has been opened it stays mounted
++ * (hidden) while the user is on other tabs or screens. Coming back shows the
++ * same JupyterLab session, with its kernel and cell outputs intact, instead
++ * of booting JupyterLite again. Opening another project's notebook replaces
++ * it.
+  */
+ 
+-import { useEffect, useMemo } from "react";
++import { useEffect, useState } from "react";
+ import { useStoreState } from "../hooks";
+ import { findProjectNotebook, notebookUrlFor } from "./notebookUrl";
+ import { track } from "../utils/metrics";
+ import { ExternalIcon } from "./icons";
+ import { GhostButton, MONO } from "./ui";
+ 
++interface LoadedNotebook {
++  dirName: string;
++  url: string;
++}
++
+ const NotebookTab = () => {
++  const screen = useStoreState((state) => state.projects.screen);
+   const active = useStoreState((state) => state.projects.active);
+ 
+-  // UI-only event (the store never learns the tab was opened).
++  const wanted =
++    screen.name === "project" &&
++    screen.tab === "notebook" &&
++    active &&
++    !active.quick &&
++    active.meta.dirName === screen.dirName
++      ? active
++      : null;
++
++  const [loaded, setLoaded] = useState<LoadedNotebook | null>(null);
++
++  // Load (or switch to) the notebook of the project being shown. The URL is
++  // only computed when the notebook is opened, so later file-list refreshes
++  // never change the iframe src and never reload it.
+   useEffect(() => {
+-    track("Notebook.Open", {});
+-  }, []);
++    if (!wanted) {
++      return;
++    }
++    const dirName = wanted.meta.dirName;
++    setLoaded((current) => {
++      if (current?.dirName === dirName) {
++        return current;
++      }
++      const notebook = findProjectNotebook(wanted.files);
++      return { dirName, url: notebookUrlFor(dirName, notebook?.path) };
++    });
++  }, [wanted]);
++
++  const visible = wanted !== null && loaded?.dirName === wanted.meta.dirName;
+ 
+-  const url = useMemo(() => {
+-    if (!active) {
+-      return notebookUrlFor(undefined, undefined);
++  // UI-only event (the store never learns the tab was opened).
++  useEffect(() => {
++    if (visible) {
++      track("Notebook.Open", {});
+     }
+-    const notebook = findProjectNotebook(active.files);
+-    return notebookUrlFor(active.meta.dirName, notebook?.path);
+-  }, [active]);
++  }, [visible]);
+ 
+-  if (!active || active.quick) {
++  if (!loaded) {
+     return null;
+   }
+ 
+   return (
+     <div
+       data-testid="notebook-tab"
++      aria-hidden={!visible}
+       style={{
+         flex: 1,
+-        display: "flex",
++        display: visible ? "flex" : "none",
+         flexDirection: "column",
+         overflow: "hidden",
+       }}
+@@ -64,15 +102,16 @@ const NotebookTab = () => {
+         <GhostButton
+           data-testid="notebook-open-new-tab"
+           style={{ padding: "7px 13px", borderRadius: 9, fontSize: 12.5 }}
+-          onClick={() => window.open(url, "_blank", "noopener")}
++          onClick={() => window.open(loaded.url, "_blank", "noopener")}
+         >
+           <ExternalIcon />
+           Open in new tab
+         </GhostButton>
+       </div>
+       <iframe
++        key={loaded.dirName}
+         title="Notebook"
+-        src={url}
++        src={loaded.url}
+         data-testid="notebook-iframe"
+         style={{
+           flex: 1,
+diff --git a/src/shell/ProjectWorkspace.tsx b/src/shell/ProjectWorkspace.tsx
+index 176f3231..000e7f3d 100644
+--- a/src/shell/ProjectWorkspace.tsx
++++ b/src/shell/ProjectWorkspace.tsx
+@@ -15,7 +15,6 @@ import FilesTab from "./FilesTab";
+ import EditorScreen from "./EditorScreen";
+ import RunsTab from "./RunsTab";
+ import RunDetail from "./RunDetail";
+-import NotebookTab from "./NotebookTab";
+ import { ChevronDownIcon, DotsIcon, InfoIcon, PlayIcon } from "./icons";
+ import { MenuDivider, MenuItem, MONO, Popover, RunningPill } from "./ui";
+ 
+@@ -135,9 +134,7 @@ const ProjectWorkspace = ({
+       <RunDetail runId={screen.runId} />
+     ) : screen.tab === "runs" ? (
+       <RunsTab />
+-    ) : (
+-      <NotebookTab />
+-    );
++    ) : null; // Notebook: rendered by the Shell so it survives tab switches.
+ 
+   return (
+     <>
+diff --git a/src/shell/Shell.test.tsx b/src/shell/Shell.test.tsx
+index 54321c0f..06b40cb0 100644
+--- a/src/shell/Shell.test.tsx
++++ b/src/shell/Shell.test.tsx
+@@ -218,6 +218,37 @@ describe("Shell", () => {
+     );
+   });
+ 
++  it("keeps the notebook iframe alive across tab switches", async () => {
++    await store.getActions().projects.createProject({
++      displayName: "Notebook keep",
++      files: [{ fileName: "in.demo", content: "units lj\n" }],
++    });
++    renderShell();
++    await userEvent.click(
++      await screen.findByTestId("sidebar-project-notebook-keep"),
++    );
++
++    await userEvent.click(await screen.findByTestId("tab-notebook"));
++    const iframe = await screen.findByTestId("notebook-iframe");
++    expect(iframe.getAttribute("src")).toMatch(
++      /jupyter\/lab\/index\.html\?path=notebook-keep%2F/,
++    );
++    expect(screen.getByTestId("notebook-tab")).toBeVisible();
++
++    // Leaving the tab hides the iframe but keeps the same element mounted.
++    await userEvent.click(screen.getByTestId("tab-files"));
++    await waitFor(() =>
++      expect(screen.getByTestId("notebook-tab")).not.toBeVisible(),
++    );
++    expect(screen.getByTestId("notebook-iframe")).toBe(iframe);
++
++    await userEvent.click(screen.getByTestId("tab-notebook"));
++    await waitFor(() =>
++      expect(screen.getByTestId("notebook-tab")).toBeVisible(),
++    );
++    expect(screen.getByTestId("notebook-iframe")).toBe(iframe);
++  });
++
+   it("restores a project from a deep link", async () => {
+     // Seed the library through a first store session.
+     await store.getActions().projects.createProject({
+diff --git a/src/shell/Shell.tsx b/src/shell/Shell.tsx
+index 8eb08662..2f6044d1 100644
+--- a/src/shell/Shell.tsx
++++ b/src/shell/Shell.tsx
+@@ -29,6 +29,7 @@ import Sidebar from "./Sidebar";
+ import HomeScreen from "./HomeScreen";
+ import ExamplesScreen from "./ExamplesScreen";
+ import ProjectWorkspace from "./ProjectWorkspace";
++import NotebookTab from "./NotebookTab";
+ import NewRunModal from "./modals/NewRunModal";
+ import NewProjectModal from "./modals/NewProjectModal";
+ import SettingsModal from "./modals/SettingsModal";
+@@ -388,6 +389,8 @@ const Shell = () => {
+             {screen.name === "home" && <HomeScreen />}
+             {screen.name === "examples" && <ExamplesScreen />}
+             {screen.name === "project" && <ProjectWorkspace screen={screen} />}
++            {/* Kept mounted across tabs/screens so JupyterLite never reloads. */}
++            <NotebookTab />
+           </main>
+         </div>
+ 

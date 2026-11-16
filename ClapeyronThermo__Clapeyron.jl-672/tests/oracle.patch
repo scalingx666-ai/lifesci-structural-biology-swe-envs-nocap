@@ -1,0 +1,222 @@
+diff --git a/NEWS.md b/NEWS.md
+index dd480cac4..f5202c4c6 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -39,4 +39,5 @@
+ - `MSAID`: fixed evaluation
+ - `debye_length`: fixed derivative propagation on zero partials
+ - `SingleFluid`: fixed scaling of `lb_volume` and calls to saturation pressure at low temperatures.
+-- `x0_volume_gas`: specific model gas constant was not being considered during the virial volume solving.
+\ No newline at end of file
++- `x0_volume_gas`: specific model gas constant was not being considered during the virial volume solving.
++- `GlennJL`: compatible with `Glenn.jl` 0.5 (`0.4` is still supported), including the new `Glenn.calculate_properties_range` integration. `GlennJL` now accepts a `Glenn.ThermoDB` as database input, and `∂²f∂T²` returns `NaN` instead of throwing when the temperature is outside the fitted ranges.
+\ No newline at end of file
+diff --git a/Project.toml b/Project.toml
+index d1da58941..367ce2a45 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -67,7 +67,7 @@ EoSSuperancillaries = "1.2.3"
+ FillArrays = "^0.12, 0.13, 1"
+ ForwardDiff = "0.10.36,1"
+ IFTDuals = "0.2"
+-Glenn = "0.4"
++Glenn = "0.4, 0.5"
+ JSON = "0.21, 1"
+ JutulDarcy = "0.2, 0.3, 0.4"
+ LinearAlgebra = "1"
+diff --git a/ext/ClapeyronGlennExt.jl b/ext/ClapeyronGlennExt.jl
+index 48c99346b..ee7f2db4d 100644
+--- a/ext/ClapeyronGlennExt.jl
++++ b/ext/ClapeyronGlennExt.jl
+@@ -3,18 +3,23 @@ module ClapeyronGlennExt
+ using Clapeyron
+ using Glenn
+ 
+-const R0 = Glenn.ThermoDatabase.R_UNIVERSAL
++const R0 = Glenn.R_UNIVERSAL
+ 
+ _vec(x::AbstractVector) = x
+ _vec(x) = [x]
+ tdb(calc::Glenn.Calculator) = calc.db
+ tdb(db::Glenn.ThermoDB) = db
++# `Calculator` stores the reference gas constant of the dataset,
++# a bare `ThermoDB` has to query it.
++r_ref(calc::Glenn.Calculator) = calc.R_ref
++r_ref(db::Glenn.ThermoDB) = Glenn.get_gas_constant_ref(tdb(db))
+ 
+ function glenn_sp_info_from_input(calc::Glenn.Calculator,input)
+     return glenn_sp_info_from_input(calc.db,_vec(input))
+ end
+ 
+ function glenn_sp_info_from_input(calc::Glenn.ThermoDB,input)
++    input = _vec(input)
+     nc = length(input)
+     sp_info = Vector{SpeciesInfo}(undef,nc)
+ 
+@@ -37,7 +42,7 @@ end
+ 
+ function Clapeyron.__glenn_jl(calc, input;
+                         Rgas = Clapeyron.Rgas(),
+-                        R0 = calc.R_ref,
++                        R0 = r_ref(calc),
+                         reference_state = nothing,
+                         verbose = false,
+                         strict = true)
+@@ -176,9 +181,9 @@ end
+ 
+ function __thermocalcerror(T,name,id)
+         throw(
+-            Glenn.ThermoCalcError(
+-                "Temperature $T K is out of valid range for '$(name)'. " *
+-                "Use get_species_data(model, $id) to check available intervals.",
++            Glenn.TemperatureOutOfRangeError(
++                Float64(Clapeyron.primalval(T)),
++                name,
+             ),
+         )
+ end
+@@ -216,7 +221,7 @@ function Clapeyron.∂²f∂T²(model::Clapeyron.GlennJL,V,T,z)
+     for i in 1:length(model)
+         interval_i = intervals[i]
+         k = get_interval(interval_i,T)
+-        iszero(k) && return oftype(res,NaN)
++        iszero(k) && return oftype(cpr,NaN)
+         coeff = interval_i[k].coefficients
+         cpi = _calculate_cp(coeff,T,Tinv)*f[i]
+         cpr += z[i]*cpi
+@@ -293,8 +298,18 @@ function Glenn.calculate_enthalpy_change(model::GlennJL, T1, T2, z = Clapeyron.S
+     return (h2  - h1)*Rgas(model)
+ end
+ 
+-function Glenn.get_properties_range(model::GlennJL, T, z = Clapeyron.SA[1.0])
+-    return map(Ti -> Glenn.calculate_properties(model,Ti,z),T)
++_properties_range(model::GlennJL, T, z) = map(Ti -> Glenn.calculate_properties(model,Ti,z),T)
++
++#`get_properties_range` is the Glenn.jl 0.4 name of this function, deprecated in Glenn.jl 0.5 in favour of
++#`calculate_properties_range`. define the method on every name that Glenn.jl provides.
++if isdefined(Glenn,:get_properties_range)
++    Glenn.get_properties_range(model::GlennJL, T, z = Clapeyron.SA[1.0]) =
++        _properties_range(model,T,z)
++end
++
++if isdefined(Glenn,:calculate_properties_range)
++    Glenn.calculate_properties_range(model::GlennJL, T, z = Clapeyron.SA[1.0]) =
++        _properties_range(model,T,z)
+ end
+ 
+ end #module
+\ No newline at end of file
+diff --git a/src/models/ideal/GlennJL.jl b/src/models/ideal/GlennJL.jl
+index 017c25ad7..0216a92c6 100644
+--- a/src/models/ideal/GlennJL.jl
++++ b/src/models/ideal/GlennJL.jl
+@@ -40,6 +40,8 @@ Ideal model using the NASA-7 polynomial coefficients provided by the `Glenn.jl`
+ 
+     `Clapeyron.GlennJL` requires the package [`Glenn.jl`](https://github.com/ProfLeao/Glenn.jl) to be loaded in the environment.
+ 
++    the integer identifiers of `Glenn.jl` are not stable between database rebuilds, so it is recommended to identify the species by name.
++
+ ## Model Construction Examples
+ ```
+ # Using the default database
+@@ -69,9 +71,10 @@ the model `GlennJL` has the following integrations with `Glenn.jl` package:
+ - `Glenn.calculate_formation_enthalpy(model::GlennJL,T,z = [1.0])`
+ - `Glenn.calculate_enthalpy_change(model::GlennJL,T1,T2,z = [1.0])`
+ - `Glenn.calculate_properties(model::GlennJL,T,z = [1.0])`
+-- `Glenn.get_properties_range(model::GlennJL,T,z = [1.0])`
++- `Glenn.calculate_properties_range(model::GlennJL,T,z = [1.0])` (`Glenn.jl` 0.5 or later)
++- `Glenn.get_properties_range(model::GlennJL,T,z = [1.0])` (the `Glenn.jl` 0.4 name, deprecated in `Glenn.jl` 0.5)
+ 
+-`get_properties` and `get_properties_range` will return NaN for properties outside their ranges. in particular, `get_properties_range` will return a vector of the same size as the input, with `NaN` on invalid inputs.
++`calculate_properties` will return NaN for properties outside their ranges. in particular, `calculate_properties_range` (and its deprecated `get_properties_range` alias) will return a vector of the same size as the input, with `NaN` on invalid inputs.
+ 
+ ## References
+ 
+diff --git a/test/extensions/Project.toml b/test/extensions/Project.toml
+index 33465db1b..3e56d5dcd 100644
+--- a/test/extensions/Project.toml
++++ b/test/extensions/Project.toml
+@@ -20,7 +20,7 @@ Carnot = "0.3"
+ Clapeyron = "0.6"
+ CoolProp = "0.2"
+ EoSSuperancillaries = "1.2.3"
+-Glenn = "0.4"
++Glenn = "0.4, 0.5"
+ # JutulDarcy = "0.2, 0.3"
+ Metaheuristics = "2, 3"
+ MultiComponentFlash = "2"
+diff --git a/test/extensions/test/extensions.jl b/test/extensions/test/extensions.jl
+index cc7229597..b7ea546ff 100644
+--- a/test/extensions/test/extensions.jl
++++ b/test/extensions/test/extensions.jl
+@@ -78,9 +78,24 @@ tdb(db::Glenn.ThermoDB) = db
+         model_info = Clapeyron.GlennJL(calc, [spN2, spO2])
+         @test model_info.components == ["N2", "O2"]
+ 
++        db = Glenn.ThermoDB(Glenn.default_db_path())
++        model_db = Clapeyron.GlennJL(db, "O2")
++        @test model_db.components == ["O2"]
++        @test model_db.R0[1] ≈ Glenn.get_gas_constant_ref(tdb(db))/Rgas(model_db)
++
+         @test_throws ErrorException Clapeyron.GlennJL(calc, [1.0, 2.0])
+     end
+ 
++    @testset "Species data from Glenn" begin
++        #`Glenn.get_species_data` returns a `Dict` in Glenn 0.4 and a `SpeciesData` in Glenn 0.5.
++        model_O2 = Clapeyron.GlennJL(calc, "O2")
++        sp_data = Glenn.get_species_data(calc.db, model_O2.species_info[1].id)
++        @test length(model_O2.intervals[1]) == length(sp_data["intervals"])
++        @test model_O2.intervals[1][1].temp_min == sp_data["intervals"][1].temp_min
++        @test model_O2.intervals[1][end].temp_max == sp_data["intervals"][end].temp_max
++        @test model_O2.references[1] == coalesce(sp_data["comments"], "")
++    end
++
+     @testset "Molecular weight" begin
+         model_O2 = Clapeyron.GlennJL(calc, "O2")
+         @test Clapeyron.molecular_weight(model_O2, [1.0]) ≈ 0.0319988
+@@ -100,7 +115,7 @@ tdb(db::Glenn.ThermoDB) = db
+         coeff = interval.coefficients
+ 
+         cp_glenn = Glenn.calculate_cp(model_O2, T)
+-        cp_direct = Glenn.ThermoDatabase.calculate_cp(coeff, T) * model_O2.R0[1]
++        cp_direct = Glenn.calculate_cp(coeff, T) * model_O2.R0[1]
+         @test cp_glenn ≈ cp_direct atol=1e-9
+ 
+         h_glenn = Glenn.calculate_h(model_O2, T)
+@@ -177,7 +192,22 @@ tdb(db::Glenn.ThermoDB) = db
+         @test d2f_mix < 0
+     end
+ 
+-    @testset "get_properties_range" begin
++    @testset "Temperature range of the polynomials" begin
++        model_O2 = Clapeyron.GlennJL(calc, "O2")
++        V = 1.0
++        z = [1.0]
++        #both endpoints of a Glenn interval are inclusive
++        Tmin = model_O2.intervals[1][begin].temp_min
++        Tmax = model_O2.intervals[1][end].temp_max
++        @test !isnan(Clapeyron.a_ideal(model_O2, V, Tmin, z))
++        @test !isnan(Clapeyron.a_ideal(model_O2, V, Tmax, z))
++        #outside of every interval, the polynomial is undefined
++        T_out = Tmin - 1.0
++        @test isnan(Clapeyron.a_ideal(model_O2, V, T_out, z))
++        @test isnan(Clapeyron.∂²f∂T²(model_O2, V, T_out, z))
++    end
++
++    @testset "Properties range" begin
+         model_O2 = Clapeyron.GlennJL(calc, "O2")
+         T_range = [300.0, 400.0, 500.0]
+         props = Glenn.get_properties_range(model_O2, T_range)
+@@ -185,5 +215,11 @@ tdb(db::Glenn.ThermoDB) = db
+         for prop in props
+             @test prop isa ThermoProperties
+         end
++        #`calculate_properties_range` is the Glenn.jl 0.5 name of `get_properties_range`
++        if isdefined(Glenn, :calculate_properties_range)
++            props_range = Glenn.calculate_properties_range(model_O2, T_range)
++            @test props_range == props
++            @test length(Glenn.calculate_properties_range(model_O2, T_range, [1.0])) == 3
++        end
+     end
+ end
+\ No newline at end of file

@@ -1,0 +1,199 @@
+diff --git a/deepblast/alignment.py b/deepblast/alignment.py
+index f83bc2c..d9b3661 100644
+--- a/deepblast/alignment.py
++++ b/deepblast/alignment.py
+@@ -1,16 +1,18 @@
+ import torch
+ import torch.nn as nn
+ from deepblast.nw_cuda import NeedlemanWunschDecoder as NWDecoderCUDA
++from deepblast.nw import NeedlemanWunschDecoder as NWDecoderNumba
+ from deepblast.embedding import StackedRNN, StackedCNN
+ from deepblast.dataset.utils import unpack_sequences
+ 
+ import torch.nn.functional as F
+ 
+ 
++
+ class NeedlemanWunschAligner(nn.Module):
+ 
+     def __init__(self, n_alpha, n_input, n_units, n_embed,
+-                 n_layers=2, dropout=0, lm=None, layer_type='cnn'):
++                 n_layers=2, dropout=0, lm=None, layer_type='cnn', device='gpu'):
+         """ NeedlemanWunsch Alignment model
+ 
+         Parameters
+@@ -60,7 +62,10 @@ def __init__(self, n_alpha, n_input, n_units, n_embed,
+             self.match_embedding = nn.Linear(n_embed, n_embed)
+             self.gap_embedding = nn.Linear(n_embed, n_embed)
+ 
+-        self.nw = NWDecoderCUDA(operator='softmax')
++        if device == 'gpu':
++            self.nw = NWDecoderCUDA(operator='softmax')
++        else:
++            self.nw = NWDecoderNumba(operator='softmax')
+ 
+     def blosum_factor(self, x):
+         """ Computes factors for blosum parameters using a single sequence
+diff --git a/deepblast/nw.py b/deepblast/nw.py
+index c332fae..2af8c0d 100644
+--- a/deepblast/nw.py
++++ b/deepblast/nw.py
+@@ -101,11 +101,18 @@ def _forward_pass(theta, A, operator='softmax'):
+ 
+         Vt = V[N, M]
+     else:
+-        Vt, Q = _forward_pass_numba(
+-            theta.detach().cpu().numpy(),
+-            A.detach().cpu().numpy())
+-        Vt = torch.tensor(Vt, dtype=theta.dtype)
+-        Q = torch.from_numpy(Q)
++        B, N, M = theta.shape
++        Q = torch.zeros((B, N + 2, M + 2, 3),
++                        dtype=theta.dtype,
++                        device=theta.device)
++        Vt = torch.zeros((B), dtype=theta.dtype, device=theta.device)
++
++        for b in range(B):
++            Vt_tmp, Q_tmp = _forward_pass_numba(
++                theta.detach().cpu().numpy()[b],
++                A.detach().cpu().numpy()[b])
++            Vt[b] = torch.tensor(Vt_tmp, dtype=theta.dtype)
++            Q[b] = torch.from_numpy(Q_tmp)
+ 
+     return Vt, Q
+ 
+@@ -329,14 +336,20 @@ def backward(ctx, Et):
+         operator = ctx.others
+         E, A = NeedlemanWunschFunctionBackward.apply(
+             theta, A, Et, Q, operator)
+-        return E[1:-1, 1:-1], A, None, None, None
++        return E[:, 1:-1, 1:-1], A, None, None, None
+ 
+ 
+ class NeedlemanWunschFunctionBackward(torch.autograd.Function):
+ 
+     @staticmethod
+     def forward(ctx, theta, A, Et, Q, operator):
+-        E = _backward_pass(Et, Q)
++        B, N, M = theta.shape
++        E = torch.zeros((B, N + 2, M + 2),
++                        dtype=theta.dtype,
++                        device=theta.device)
++
++        for b in range(B):
++            E[b] = _backward_pass(Et[b], Q[b])
+         ctx.save_for_backward(E, Q)
+         ctx.others = operator
+         return E, A
+@@ -355,9 +368,21 @@ def backward(ctx, Ztheta, ZA):
+         """
+         E, Q = ctx.saved_tensors
+         operator = ctx.others
+-        Vtd, Qd = _adjoint_forward_pass(Q, Ztheta, ZA, operator)
+-        Ed = _adjoint_backward_pass(E, Q, Qd)
+-        Ed = Ed[1:-1, 1:-1]
++
++        B, ZN, ZM = Ztheta.shape
++
++        Qd = torch.zeros((B, ZN, ZM, 3),
++                         dtype=Ztheta.dtype,
++                         device=Ztheta.device)
++
++        Vtd = torch.zeros(B, dtype=Ztheta.dtype, device=Ztheta.device)
++        Ed = torch.zeros((B, ZN, ZM), dtype=Ztheta.dtype, device=Ztheta.device)
++
++        for b in range(B):
++            Vtd[b], Qd[b] = _adjoint_forward_pass(Q[b], Ztheta[b], ZA[b], operator)
++            Ed[b] = _adjoint_backward_pass(E[b], Q[b], Qd[b])
++        Ed = Ed[:, 1:-1, 1:-1]
++
+         return Ed, None, Vtd, None, None, None
+ 
+ 
+diff --git a/deepblast/tests/test_nw.py b/deepblast/tests/test_nw.py
+index c14c851..9493fc7 100644
+--- a/deepblast/tests/test_nw.py
++++ b/deepblast/tests/test_nw.py
+@@ -28,12 +28,12 @@ def setUp(self):
+                                 N,
+                                 M,
+                                 requires_grad=True,
+-                                dtype=torch.float32).squeeze()
++                                dtype=torch.float32)
+         self.Ztheta = torch.rand(B,
+                                  N,
+                                  M,
+                                  requires_grad=True,
+-                                 dtype=torch.float32).squeeze()
++                                 dtype=torch.float32)
+         self.Et = torch.Tensor([1., 1.])
+         self.A = torch.ones_like(self.theta) * -1
+         self.B, self.S, self.N, self.M = B, S, N, M
+@@ -41,14 +41,14 @@ def setUp(self):
+         self.operator = 'softmax'
+ 
+     def test_decoding(self):
+-        theta = torch.from_numpy(make_data())
++        theta = torch.from_numpy(make_data()).unsqueeze(0)
+         theta.requires_grad_()
+         A = torch.ones_like(theta) * 0.1
+         A.requires_grad_()
+         needle = NeedlemanWunschDecoder(self.operator)
+         v = needle(theta, A)
+         v.backward()
+-        decoded = needle.traceback(theta.grad)
++        decoded = needle.traceback(theta.grad.squeeze())
+         states = [(0, 0, 0), (1, 0, 0), (2, 0, 1), (3, 1, 1), (4, 2, 2),
+                   (4, 3, 1)]
+         self.assertListEqual(states, decoded)
+diff --git a/deepblast/trainer.py b/deepblast/trainer.py
+index 7cfd8a7..e519d39 100644
+--- a/deepblast/trainer.py
++++ b/deepblast/trainer.py
+@@ -43,7 +43,9 @@ def __init__(self, batch_size=20,
+                  test_pairs=None,
+                  train_pairs=None,
+                  valid_pairs=None,
+-                 visualization_fraction=1.0):
++                 visualization_fraction=1.0,
++                 device='gpu'
++      ):
+         super(DeepBLAST, self).__init__()
+         self.save_hyperparameters(ignore=['lm'])
+         assert tokenizer is not None
+@@ -67,7 +69,8 @@ def __init__(self, batch_size=20,
+         dropout = self.hparams.dropout
+ 
+         self.aligner = NeedlemanWunschAligner(
+-            n_input, n_units, n_embed, n_layers, dropout=dropout, lm=lm)
++            n_input, n_units, n_embed, n_layers, dropout=dropout, lm=lm,
++            device=device)
+ 
+     def align(self, x, y):
+         x_code = get_sequence(x, self.tokenizer)[0].to(self.device)
+diff --git a/scripts/deepblast-train b/scripts/deepblast-train
+index 404c244..3821efd 100644
+--- a/scripts/deepblast-train
++++ b/scripts/deepblast-train
+@@ -20,7 +20,8 @@ def main(args):
+     lm = T5EncoderModel.from_pretrained(args.pretrain_path)
+     if args.load_from_checkpoint is not None:
+         model = DeepBLAST.load_from_checkpoint(
+-            args.load_from_checkpoint, lm=lm, tokenizer=tokenizer)
++            args.load_from_checkpoint, lm=lm, tokenizer=tokenizer,
++            device=args.accelerator)
+     else:
+         model_args = vars(args)
+         model_args['lm'] = lm
+@@ -44,8 +45,10 @@ def main(args):
+                 'test_pairs',
+                 'train_pairs',
+                 'valid_pairs',
+-                'visualization_fraction']
++                'visualization_fraction',
++                'device']
+         model_args = {k: model_args[k] for k in keys}
++        model_args['device'] = args.accelerator
+         model = DeepBLAST(**model_args)
+     # profiler = AdvancedProfiler()
+ 

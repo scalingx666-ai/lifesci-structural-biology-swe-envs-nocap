@@ -1,0 +1,264 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7bc54ff9..72cc9698 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,7 +1,8 @@
+-### Unreleased
++### 1.7.9 - UNRELEASED
+ 
+ #### Misc
+ 
++* Speed up `graphein.protein.tensor` helpers by replacing per-atom and per-residue tensor loops with single `.tolist()` calls and dict lookups: `to_dataframe` (~6x on 4hhb), `infer_residue_types` and `is_complete_structure` (~7x), `protein_df_to_tensor`, and the sidechain torsion atom indexing used by `sidechain_torsion`. Output is unchanged. Adds tests for `is_complete_structure` and `has_complete_residue`. [#472](https://github.com/a-r-j/graphein/pull/472)
+ * Drop support for Python 3.10, which has reached end of life. Minimum supported version is now Python 3.11.
+ 
+ ### 1.7.8 - 24/01/2026
+diff --git a/graphein/protein/tensor/angles.py b/graphein/protein/tensor/angles.py
+index e587cfb4..161d1261 100644
+--- a/graphein/protein/tensor/angles.py
++++ b/graphein/protein/tensor/angles.py
+@@ -76,8 +76,6 @@ def _extract_torsion_coords(
+ 
+     # Iterate over residues and grab indices of the atoms for each Chi angle
+     for i, res in enumerate(res_types):
+-        res_coords = []
+-
+         try:
+             angle_groups = CHI_ANGLES_ATOMS[res]
+         except KeyError:
+@@ -89,12 +87,11 @@ def _extract_torsion_coords(
+             angle_groups = []
+ 
+         for angle_coord_set in angle_groups:
+-            res_coords.append([ATOM_NUMBERING[i] for i in angle_coord_set])
++            res_atoms.append([ATOM_NUMBERING[a] for a in angle_coord_set])
+             idxs.append(i)
+-        res_atoms.append(torch.tensor(res_coords, device=coords.device))
+ 
+     idxs = torch.tensor(idxs, device=coords.device).long()
+-    res_atoms = torch.cat(res_atoms).long()  # TODO torch.stack instead of cat
++    res_atoms = torch.tensor(res_atoms, device=coords.device).long()
+ 
+     # Select the coordinates for each chi angle
+     coords = torch.take_along_dim(
+diff --git a/graphein/protein/tensor/io.py b/graphein/protein/tensor/io.py
+index aa5a26fd..c4c5b5fb 100644
+--- a/graphein/protein/tensor/io.py
++++ b/graphein/protein/tensor/io.py
+@@ -369,7 +369,8 @@ def protein_df_to_tensor(
+     residue_indices = pd.factorize(
+         pd.Series(get_residue_id(df, unique=False))
+     )[0]
+-    atom_indices = df["atom_name"].map(lambda x: atoms_to_keep.index(x)).values
++    atom_index_map = {a: i for i, a in enumerate(atoms_to_keep)}
++    atom_indices = df["atom_name"].map(atom_index_map).values
+ 
+     positions: AtomTensor = (
+         torch.zeros((num_residues, len(atoms_to_keep), 3)) + fill_value
+@@ -457,8 +458,8 @@ def to_dataframe(
+ 
+     atom_number = np.arange(1, len(res_nums) + 1)
+     numbering_map = {v: k for k, v in ATOM_NUMBERING.items()}
+-    atom_type = nz[:, 1]
+-    atom_type = [numbering_map[a.item()] for a in atom_type]
++    atom_indices = nz[:, 1].tolist()
++    atom_type = [numbering_map[a] for a in atom_indices]
+ 
+     if residue_types is None:
+         residue_types = infer_residue_types(
+@@ -467,9 +468,9 @@ def to_dataframe(
+     if isinstance(residue_types, torch.Tensor):
+         residue_types = [
+             STANDARD_AMINO_ACID_MAPPING_1_TO_3[STANDARD_AMINO_ACIDS[a]]
+-            for a in residue_types
++            for a in residue_types.tolist()
+         ]
+-    residue_types = [residue_types[a - 1] for a in res_nums]
++    residue_types = [residue_types[a - 1] for a in res_nums.tolist()]
+     element_symbols = [ELEMENT_SYMBOL_MAP[a] for a in atom_type]
+ 
+     chains = ["A"] * len(res_nums) if chains is None else chains[res_nums - 1]
+@@ -505,7 +506,7 @@ def to_dataframe(
+     blank_4 = [""] * len(res_nums)
+ 
+     # NB brittle, bad assumption; may break
+-    record_names = ["ATOM" if i < 37 else "HETATM" for i in nz[:, 1]]
++    record_names = ["ATOM" if i < 37 else "HETATM" for i in atom_indices]
+     coords = get_full_atom_coords(x)[0]
+ 
+     out = {
+diff --git a/graphein/protein/tensor/sequence.py b/graphein/protein/tensor/sequence.py
+index 8231a04e..8a67809d 100644
+--- a/graphein/protein/tensor/sequence.py
++++ b/graphein/protein/tensor/sequence.py
+@@ -213,6 +213,25 @@ def get_atom_indices(
+     return index_map
+ 
+ 
++def _present_atom_indices(
++    x: AtomTensor, fill_value: float = 1e-5
++) -> List[Tuple[int, ...]]:
++    """Returns the indices of the atoms present in each residue, excluding OXT.
++
++    An atom is present if any of its coordinates differs from ``fill_value``.
++    """
++    present = (x != fill_value).any(dim=2)
++    oxt_index = ATOM_NUMBERING_MODIFIED["OXT"]
++    return [
++        tuple(
++            i
++            for i, is_present in enumerate(row)
++            if is_present and i != oxt_index
++        )
++        for row in present.tolist()
++    ]
++
++
+ def infer_residue_types(
+     x: AtomTensor, fill_value: float = 1e-5, return_sequence: bool = True
+ ) -> Union[str, List[str]]:
+@@ -236,23 +255,10 @@ def infer_residue_types(
+     :rtype: Union[str, List[str]]
+     """
+     rmap: Dict[Tuple[int, ...], str] = get_atom_indices(invert=True)
+-
+-    def _get_index(y: torch.Tensor) -> str:
+-        indices = (
+-            torch.nonzero(torch.sum(y != fill_value, dim=1))
+-            .squeeze(1)
+-            .tolist()
+-        )
+-        # remove oxt if present
+-        oxt_index = ATOM_NUMBERING_MODIFIED["OXT"]
+-        indices = tuple(i for i in indices if i != oxt_index)
+-        try:
+-            identity = rmap[indices]
+-        except KeyError:
+-            identity = "UNK"
+-        return identity
+-
+-    seq = [_get_index(x[i, :, :]) for i in range(x.shape[0])]
++    seq = [
++        rmap.get(indices, "UNK")
++        for indices in _present_atom_indices(x, fill_value)
++    ]
+ 
+     if return_sequence:
+         seq = "".join([RESI_THREE_TO_1[res] for res in seq])
+diff --git a/graphein/protein/tensor/testing.py b/graphein/protein/tensor/testing.py
+index 9bb62f73..79c682ef 100644
+--- a/graphein/protein/tensor/testing.py
++++ b/graphein/protein/tensor/testing.py
+@@ -1,17 +1,14 @@
+ """Utilities for sanity checking protein tensors."""
+ 
+ from functools import partial
+-from typing import List, Tuple, Union
++from typing import List, Union
+ 
+ from loguru import logger as log
+ 
+ from graphein.utils.dependencies import import_message
+ 
+-from ..resi_atoms import (
+-    ATOM_NUMBERING_MODIFIED,
+-    STANDARD_AMINO_ACID_MAPPING_1_TO_3,
+-)
+-from .sequence import get_atom_indices
++from ..resi_atoms import STANDARD_AMINO_ACID_MAPPING_1_TO_3
++from .sequence import _present_atom_indices, get_atom_indices
+ from .types import AtomTensor, BackboneTensor, CoordTensor, ResidueTensor
+ 
+ try:
+@@ -100,19 +97,7 @@ def has_complete_residue(
+     if len(residue_type) == 1:
+         residue_type = STANDARD_AMINO_ACID_MAPPING_1_TO_3[residue_type]
+     true_residue_indices = get_atom_indices()[residue_type]
+-
+-    def _get_index(y: torch.Tensor) -> Tuple[int, ...]:
+-        indices = (
+-            torch.nonzero(torch.sum(y != fill_value, dim=1))
+-            .squeeze(1)
+-            .tolist()
+-        )
+-        # remove oxt if present
+-        oxt_index = ATOM_NUMBERING_MODIFIED["OXT"]
+-        indices = tuple(i for i in indices if i != oxt_index)
+-        return indices
+-
+-    present_indices = _get_index(x)
++    present_indices = _present_atom_indices(x.unsqueeze(0), fill_value)[0]
+     return present_indices == true_residue_indices
+ 
+ 
+@@ -144,9 +129,14 @@ def is_complete_structure(
+     if isinstance(residues, str):
+         residues = list(residues)
+ 
++    true_indices = get_atom_indices()
++    present_indices = _present_atom_indices(x, fill_value)
+     return all(
+-        has_complete_residue(x[i], residues[i], fill_value=fill_value)
+-        for i in range(length)
++        present
++        == true_indices[
++            STANDARD_AMINO_ACID_MAPPING_1_TO_3[res] if len(res) == 1 else res
++        ]
++        for present, res in zip(present_indices, residues)
+     )
+ 
+ 
+diff --git a/tests/protein/tensor/test_testing.py b/tests/protein/tensor/test_testing.py
+new file mode 100644
+index 00000000..dcbf5682
+--- /dev/null
++++ b/tests/protein/tensor/test_testing.py
+@@ -0,0 +1,49 @@
++"""Tests for graphein.protein.tensor.testing."""
++
++# Graphein
++# Author: Arian Jamasb <arian@jamasb.io>
++# License: MIT
++# Project Website: https://github.com/a-r-j/graphein
++# Code Repository: https://github.com/a-r-j/graphein
++
++from pathlib import Path
++
++import pytest
++
++from graphein.protein.graphs import read_pdb_to_dataframe
++from graphein.protein.resi_atoms import ATOM_NUMBERING
++from graphein.protein.tensor.io import protein_df_to_tensor
++from graphein.protein.tensor.sequence import infer_residue_types
++from graphein.protein.tensor.testing import (
++    has_complete_residue,
++    is_complete_structure,
++)
++
++try:
++    import torch  # noqa: F401
++
++    TORCH_AVAIL = True
++except ImportError:
++    TORCH_AVAIL = False
++
++PDB_PATH = Path(__file__).resolve().parent.parent / "test_data" / "1lds.pdb"
++
++
++@pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
++def test_complete_structure_and_residue():
++    df = read_pdb_to_dataframe(PDB_PATH)
++    x = protein_df_to_tensor(df[df["record_name"] == "ATOM"])
++    sequence = infer_residue_types(x)
++    residues = infer_residue_types(x, return_sequence=False)
++
++    assert is_complete_structure(x, sequence)
++    assert is_complete_structure(x, residues)
++    assert all(
++        has_complete_residue(x[i], res) for i, res in enumerate(sequence)
++    )
++
++    # Remove the CA atom of residue 3
++    x[3, ATOM_NUMBERING["CA"]] = 1e-5
++    assert not has_complete_residue(x[3], sequence[3])
++    assert has_complete_residue(x[4], residues[4])
++    assert not is_complete_structure(x, sequence)

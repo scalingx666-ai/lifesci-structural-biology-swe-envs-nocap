@@ -1,0 +1,931 @@
+diff --git a/e2e/periodic-images.spec.ts b/e2e/periodic-images.spec.ts
+new file mode 100644
+index 00000000..072fb30d
+--- /dev/null
++++ b/e2e/periodic-images.spec.ts
+@@ -0,0 +1,88 @@
++import { expect, test, type Page } from "@playwright/test";
++import { createBlankProject, gotoApp, waitForEngine } from "./helpers";
++
++// Tilted (triclinic) fcc crystal with two types so image colors are checked.
++const script = `units lj
++lattice fcc 0.8442
++region box prism 0 4 0 4 0 4 2 0 0
++create_box 2 box
++create_atoms 1 box
++set type 1 type/fraction 2 0.3 1234
++mass * 1.0
++velocity all create 0.05 87287
++pair_style lj/cut 2.5
++pair_coeff * * 1.0 1.0 2.5
++fix 1 all nve
++run 1000000
++`;
++
++const rendered = (page: Page) =>
++  page.evaluate(async () => {
++    const path = "/atomify/src/store/index.ts";
++    const { default: store, engine } = await import(path);
++    const s = store.getState();
++    const p = engine.particles;
++    const color = p?.geometry?.getAttribute("atomColor");
++    const n = s.simulationStatus.numAtoms;
++    // The status box arrives with the first synced frame.
++    if (!color || !s.simulationStatus.box)
++      return { count: 0, numAtoms: n, timesteps: 0 };
++    let imagesMatch = true;
++    for (let i = n; i < p.count; i++) {
++      const j = i % n;
++      imagesMatch &&=
++        p.indices[i] === p.indices[j] && color.getZ(i) === color.getZ(j);
++    }
++    // THREE stores the cell column-major: b = (e[1], e[4], e[7]).
++    const e = s.simulationStatus.box.elements;
++    const shiftB = [0, 1, 2].map(
++      (d) => p.positions[6 * n + d] - p.positions[d] - e[1 + 3 * d],
++    );
++    return {
++      count: p.count,
++      numAtoms: n,
++      timesteps: s.simulationStatus.timesteps,
++      imagesMatch,
++      shiftBError: Math.max(...shiftB.map(Math.abs)),
++    };
++  });
++
++test("periodic images replicate a triclinic crystal along the box vectors", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  await createBlankProject(page, "Periodic images", "periodic-images");
++  await page.getByTestId("upload-input").setInputFiles({
++    name: "in.crystal",
++    mimeType: "text/plain",
++    buffer: Buffer.from(script),
++  });
++  await waitForEngine(page);
++  await page.getByTestId("run-file-in.crystal").click();
++  await expect
++    .poll(async () => (await rendered(page)).timesteps, { timeout: 120_000 })
++    .toBeGreaterThan(10);
++  const { numAtoms } = await rendered(page);
++  expect((await rendered(page)).count).toBe(numAtoms);
++
++  await page.getByTestId("periodic-images").click();
++  await page.getByLabel("Images along x").fill("2");
++  await page.getByLabel("Images along y").fill("2");
++  await expect
++    .poll(async () => (await rendered(page)).count, { timeout: 30_000 })
++    .toBe(4 * numAtoms);
++  const replicated = await rendered(page);
++  expect(replicated.imagesMatch).toBe(true);
++  expect(replicated.shiftBError).toBeLessThan(1e-3);
++
++  // Images follow the running simulation, and 1×1×1 restores the original.
++  await expect
++    .poll(async () => (await rendered(page)).timesteps, { timeout: 30_000 })
++    .toBeGreaterThan(replicated.timesteps);
++  await page.getByLabel("Images along x").fill("1");
++  await page.getByLabel("Images along y").fill("1");
++  await expect
++    .poll(async () => (await rendered(page)).count, { timeout: 30_000 })
++    .toBe(numAtoms);
++  await page.getByRole("button", { name: "Stop", exact: true }).click();
++});
+diff --git a/src/components/SelectedAtomsInfo.tsx b/src/components/SelectedAtomsInfo.tsx
+index aff142fb..81898aa0 100644
+--- a/src/components/SelectedAtomsInfo.tsx
++++ b/src/components/SelectedAtomsInfo.tsx
+@@ -186,7 +186,8 @@ const SelectedAtomsInfo = ({
+     if (!particles) return new Map<number, number>();
+     const map = new Map<number, number>();
+     particles.indices.forEach((atomId: number, arrayIndex: number) => {
+-      map.set(atomId, arrayIndex);
++      // Keep the first slot: periodic images repeat IDs after the real atoms.
++      if (!map.has(atomId)) map.set(atomId, arrayIndex);
+     });
+     return map;
+   }, [particles]);
+diff --git a/src/modifiers/colormodifier.ts b/src/modifiers/colormodifier.ts
+index 8f076478..213ab3e5 100644
+--- a/src/modifiers/colormodifier.ts
++++ b/src/modifiers/colormodifier.ts
+@@ -5,6 +5,7 @@ import { perAtomValues } from "../wasm/engineFrame";
+ import colormap from "colormap";
+ import { AtomType } from "../utils/atomtypes";
+ import * as THREE from "three";
++import { realParticleCount } from "./periodicImages";
+ 
+ const defaultAtomTypes: AtomType[] = [
+   {
+@@ -193,7 +194,7 @@ class ColorModifier extends Modifier {
+     // empty until the worker has streamed a newly selected compute.
+     const perAtomArray = perAtomValues(input.frame, computeName).subarray(
+       0,
+-      particles.count,
++      realParticleCount(particles.count, output.imageShifts),
+     );
+ 
+     // Reset global min/max if requested
+@@ -265,7 +266,10 @@ class ColorModifier extends Modifier {
+     const visualizer = input.renderState.visualizer;
+     const nativeRadii = input.frame.radii;
+ 
+-    for (let i = 0; i < particles.count; i++) {
++    // Periodic images share their atom's ID, so styling the real particles
++    // styles every image too.
++    const count = realParticleCount(particles.count, output.imageShifts);
++    for (let i = 0; i < count; i++) {
+       const realIndex = particles.indices[i];
+       const type = particles.types[i];
+       let atomType = particleStyles[type];
+diff --git a/src/modifiers/periodicImages.test.ts b/src/modifiers/periodicImages.test.ts
+new file mode 100644
+index 00000000..552a34c2
+--- /dev/null
++++ b/src/modifiers/periodicImages.test.ts
+@@ -0,0 +1,95 @@
++import { describe, expect, it } from "vitest";
++import {
++  clampImageCounts,
++  imageShifts,
++  realParticleCount,
++  replicatePositions,
++  replicateValues,
++} from "./periodicImages";
++
++// Row-major cell matrices: rows are the box vectors a, b, c.
++const orthogonal = [10, 0, 0, 0, 20, 0, 0, 0, 30];
++// LAMMPS triclinic: a = (lx,0,0), b = (xy,ly,0), c = (xz,yz,lz).
++const triclinic = [10, 0, 0, 2, 20, 0, 3, 4, 30];
++
++const triples = (values: ArrayLike<number>) =>
++  Array.from({ length: values.length / 3 }, (_, i) =>
++    Array.from(values).slice(3 * i, 3 * i + 3),
++  );
++
++describe("imageShifts", () => {
++  it("is a single zero shift for 1×1×1", () => {
++    expect(imageShifts(orthogonal, [1, 1, 1])).toEqual([0, 0, 0]);
++  });
++
++  it("places 2×2×1 images at the orthogonal box corners, original first", () => {
++    expect(triples(imageShifts(orthogonal, [2, 2, 1]))).toEqual([
++      [0, 0, 0],
++      [10, 0, 0],
++      [0, 20, 0],
++      [10, 20, 0],
++    ]);
++  });
++
++  it("follows the tilted box vectors of a triclinic cell", () => {
++    expect(triples(imageShifts(triclinic, [2, 2, 2]))).toEqual([
++      [0, 0, 0],
++      [10, 0, 0],
++      [2, 20, 0],
++      [12, 20, 0],
++      [3, 4, 30],
++      [13, 4, 30],
++      [5, 24, 30],
++      [15, 24, 30],
++    ]);
++  });
++});
++
++describe("replication", () => {
++  it("copies positions into image blocks shifted by each translation", () => {
++    // Arrange: two atoms, room for a 2×1×1 triclinic replication along b.
++    const positions = new Float32Array(12);
++    positions.set([1, 2, 3, 4, 5, 6]);
++
++    // Act
++    replicatePositions(positions, 2, imageShifts(triclinic, [1, 2, 1]));
++
++    // Assert
++    expect(triples(positions)).toEqual([
++      [1, 2, 3],
++      [4, 5, 6],
++      [3, 22, 3],
++      [6, 25, 6],
++    ]);
++  });
++
++  it("repeats per-particle values (types, IDs) in every image block", () => {
++    const ids = new Float32Array([42, 7, 0, 0, 0, 0]);
++    replicateValues(ids, 2, 3);
++    expect(Array.from(ids)).toEqual([42, 7, 42, 7, 42, 7]);
++  });
++
++  it("recovers the real particle count from the rendered count", () => {
++    expect(realParticleCount(12, imageShifts(orthogonal, [2, 2, 1]))).toBe(3);
++    expect(realParticleCount(5, undefined)).toBe(5);
++  });
++});
++
++describe("clampImageCounts", () => {
++  it("keeps requests under the cap unchanged", () => {
++    expect(clampImageCounts([2, 2, 1], 1000, 4000)).toEqual([2, 2, 1]);
++  });
++
++  it("shrinks the largest axis until the total fits", () => {
++    expect(clampImageCounts([4, 2, 1], 1000, 4000)).toEqual([2, 2, 1]);
++  });
++
++  it("always keeps the original box", () => {
++    expect(clampImageCounts([3, 3, 3], 10_000, 4000)).toEqual([1, 1, 1]);
++  });
++
++  it("sanitizes invalid and oversized counts", () => {
++    expect(clampImageCounts([0, Number.NaN, 2.7], 1)).toEqual([1, 1, 2]);
++    expect(clampImageCounts([1000, 1, 1], 1)[0]).toBe(10);
++  });
++});
+diff --git a/src/modifiers/periodicImages.ts b/src/modifiers/periodicImages.ts
+new file mode 100644
+index 00000000..293f45a0
+--- /dev/null
++++ b/src/modifiers/periodicImages.ts
+@@ -0,0 +1,102 @@
++/**
++ * Periodic images (OVITO's "Replicate"): draw extra copies of the system
++ * shifted by the box vectors. Visual only; the simulation is untouched.
++ *
++ * Rendered arrays are laid out as consecutive image blocks of the real
++ * particles, the original (zero shift) block first, so index i < count is
++ * always a real particle and every image keeps its atom's ID.
++ */
++
++export type ImageCounts = [number, number, number];
++
++/** Total rendered particles (originals plus images) we allow. */
++export const MAX_RENDERED_PARTICLES = 500_000;
++/** Largest image count accepted per axis. */
++export const MAX_IMAGES_PER_AXIS = 10;
++
++const sanitize = (n: number) =>
++  Math.min(MAX_IMAGES_PER_AXIS, Math.max(1, Math.floor(n) || 1));
++
++/**
++ * Clamp requested image counts so that numParticles * nx * ny * nz stays
++ * within maxParticles, shrinking the largest axis first. The original box
++ * is always kept, even when it alone exceeds the cap.
++ */
++export function clampImageCounts(
++  counts: ImageCounts,
++  numParticles: number,
++  maxParticles: number = MAX_RENDERED_PARTICLES,
++): ImageCounts {
++  const clamped = counts.map(sanitize) as ImageCounts;
++  while (
++    numParticles * clamped[0] * clamped[1] * clamped[2] > maxParticles &&
++    Math.max(...clamped) > 1
++  ) {
++    clamped[clamped.indexOf(Math.max(...clamped))]--;
++  }
++  return clamped;
++}
++
++/**
++ * Translation of every image as flat xyz triples: i*a + j*b + k*c for
++ * i < nx, j < ny, k < nz, starting with the zero shift. `cell` is the LAMMPS
++ * cell matrix in row-major order, its rows being the box vectors a, b, c,
++ * so triclinic tilts are carried along.
++ */
++export function imageShifts(
++  cell: ArrayLike<number>,
++  counts: ImageCounts,
++): number[] {
++  const [nx, ny, nz] = counts;
++  const shifts: number[] = [];
++  for (let k = 0; k < nz; k++) {
++    for (let j = 0; j < ny; j++) {
++      for (let i = 0; i < nx; i++) {
++        for (let d = 0; d < 3; d++) {
++          shifts.push(i * cell[d] + j * cell[3 + d] + k * cell[6 + d]);
++        }
++      }
++    }
++  }
++  return shifts;
++}
++
++/** Fill image blocks 1.. of an xyz array from the first `count` entries. */
++export function replicatePositions(
++  positions: Float32Array,
++  count: number,
++  shifts: ArrayLike<number>,
++): void {
++  const numImages = shifts.length / 3;
++  for (let image = 1; image < numImages; image++) {
++    const offset = 3 * image * count;
++    const sx = shifts[3 * image];
++    const sy = shifts[3 * image + 1];
++    const sz = shifts[3 * image + 2];
++    for (let i = 0; i < 3 * count; i += 3) {
++      positions[offset + i] = positions[i] + sx;
++      positions[offset + i + 1] = positions[i + 1] + sy;
++      positions[offset + i + 2] = positions[i + 2] + sz;
++    }
++  }
++}
++
++/** Copy the first `count` per-particle values into image blocks 1.. */
++export function replicateValues(
++  values: Float32Array | Int32Array,
++  count: number,
++  numImages: number,
++): void {
++  for (let image = 1; image < numImages; image++) {
++    values.copyWithin(image * count, 0, count);
++  }
++}
++
++/** Number of real (non-image) particles in a rendered particle count. */
++export function realParticleCount(
++  renderedCount: number,
++  shifts: ArrayLike<number> | undefined,
++): number {
++  const numImages = shifts ? shifts.length / 3 : 1;
++  return numImages > 1 ? renderedCount / numImages : renderedCount;
++}
+diff --git a/src/modifiers/syncbondsmodifier.ts b/src/modifiers/syncbondsmodifier.ts
+index 65abd208..a5647011 100644
+--- a/src/modifiers/syncbondsmodifier.ts
++++ b/src/modifiers/syncbondsmodifier.ts
+@@ -1,6 +1,7 @@
+ import Modifier, { ModifierProps } from "./modifier";
+ import { ModifierInput, ModifierOutput } from "./types";
+ import { Bonds } from "omovi";
++import { replicatePositions } from "./periodicImages";
+ 
+ class SyncBondsModifier extends Modifier {
+   constructor({ name, active }: ModifierProps) {
+@@ -20,10 +21,13 @@ class SyncBondsModifier extends Modifier {
+ 
+     const frame = input.frame;
+     const numBonds = frame.bondCount;
++    const shifts = output.imageShifts ?? [0, 0, 0];
++    const numImages = shifts.length / 3;
++    const numRendered = numBonds * numImages;
+     const bondRadius = input.renderState.bondRadius;
+     let newBonds = output.bonds;
+-    if (!newBonds || newBonds.capacity < numBonds) {
+-      const newCapacity = numBonds;
++    if (!newBonds || newBonds.capacity < numRendered) {
++      const newCapacity = numRendered;
+       if (newBonds) {
+         newBonds.dispose();
+       }
+@@ -44,10 +48,13 @@ class SyncBondsModifier extends Modifier {
+ 
+     newBonds.positions1.set(frame.bondFirst.subarray(0, 3 * numBonds));
+     newBonds.positions2.set(frame.bondSecond.subarray(0, 3 * numBonds));
++    // Shift both ends by the same image translation as the particles.
++    replicatePositions(newBonds.positions1, numBonds, shifts);
++    replicatePositions(newBonds.positions2, numBonds, shifts);
+ 
+-    newBonds.count = numBonds;
++    newBonds.count = numRendered;
+     if (newBonds.mesh) {
+-      newBonds.mesh.count = numBonds;
++      newBonds.mesh.count = numRendered;
+     }
+     newBonds.markNeedsUpdate();
+   };
+diff --git a/src/modifiers/syncparticlesmodifier.test.ts b/src/modifiers/syncparticlesmodifier.test.ts
+index 32bb4e1d..ed0fafab 100644
+--- a/src/modifiers/syncparticlesmodifier.test.ts
++++ b/src/modifiers/syncparticlesmodifier.test.ts
+@@ -60,3 +60,47 @@ describe("persistent LAMMPS atom tags", () => {
+     expect(Array.from(output.particles!.indices)).not.toEqual([0, 1, 2]);
+   });
+ });
++
++describe("periodic images", () => {
++  it("appends shifted copies that keep each atom's tag and type", () => {
++    // Arrange: two atoms in a triclinic cell (rows a, b, c).
++    const input = {
++      lammps: {},
++      frame: {
++        ...emptyEngineFrame(),
++        count: 2,
++        positions: new Float32Array([1, 2, 3, 4, 5, 6]),
++        types: new Int32Array([1, 2]),
++        ids: new Int32Array([42, 7]),
++        boxMatrix: new Float32Array([10, 0, 0, 2, 20, 0, 3, 4, 30]),
++      },
++    } as unknown as ModifierInput;
++    const output = {} as ModifierOutput;
++    const modifier = new SyncParticlesModifier({
++      name: "Particles",
++      active: true,
++    });
++    modifier.periodicImages = [1, 2, 1];
++
++    // Act
++    modifier.run(input, output);
++
++    // Assert
++    const particles = output.particles!;
++    expect(particles.count).toBe(4);
++    expect(Array.from(particles.indices.subarray(0, 4))).toEqual([
++      42, 7, 42, 7,
++    ]);
++    expect(Array.from(particles.types.subarray(0, 4))).toEqual([1, 2, 1, 2]);
++    expect(Array.from(particles.positions.subarray(6, 12))).toEqual([
++      3, 22, 3, 6, 25, 6,
++    ]);
++    expect(output.imageShifts).toEqual([0, 0, 0, 2, 20, 0]);
++
++    // Back to 1×1×1 renders only the real atoms again.
++    modifier.periodicImages = [1, 1, 1];
++    modifier.run(input, output);
++    expect(output.particles!.count).toBe(2);
++    expect(output.imageShifts).toEqual([0, 0, 0]);
++  });
++});
+diff --git a/src/modifiers/syncparticlesmodifier.ts b/src/modifiers/syncparticlesmodifier.ts
+index 226928c8..703c15c4 100644
+--- a/src/modifiers/syncparticlesmodifier.ts
++++ b/src/modifiers/syncparticlesmodifier.ts
+@@ -2,8 +2,19 @@ import { syncParticleAttributes } from "../rendering/particleAttributes";
+ import Modifier, { ModifierProps } from "./modifier";
+ import { ModifierInput, ModifierOutput } from "./types";
+ import { Particles } from "omovi";
++import type { EngineFrame } from "../wasm/engineFrame";
++import {
++  clampImageCounts,
++  ImageCounts,
++  imageShifts,
++  replicatePositions,
++  replicateValues,
++} from "./periodicImages";
+ 
+ class SyncParticlesModifier extends Modifier {
++  /** Periodic images per axis (visual only); 1×1×1 draws the box once. */
++  public periodicImages: ImageCounts = [1, 1, 1];
++
+   constructor({ name, active }: ModifierProps) {
+     super({ name, active });
+   }
+@@ -25,11 +36,15 @@ class SyncParticlesModifier extends Modifier {
+ 
+     const frame = input.frame;
+     const numParticles = frame.count;
++    const shifts = this.currentImageShifts(frame, numParticles);
++    output.imageShifts = shifts;
++    const numImages = shifts.length / 3;
++    const numRendered = numParticles * numImages;
+     let newParticles = output.particles;
+-    if (!newParticles || newParticles.capacity < numParticles) {
+-      let newCapacity = numParticles;
++    if (!newParticles || newParticles.capacity < numRendered) {
++      let newCapacity = numRendered;
+       if (newParticles) {
+-        newCapacity = Math.max(numParticles, 2 * newParticles.capacity);
++        newCapacity = Math.max(numRendered, 2 * newParticles.capacity);
+         newParticles.dispose();
+       }
+ 
+@@ -37,7 +52,7 @@ class SyncParticlesModifier extends Modifier {
+       output.particles = newParticles;
+       output.colorsDirty = true;
+     } else {
+-      if (numParticles !== newParticles.count) {
++      if (numRendered !== newParticles.count) {
+         // Need to update colors and radius
+         output.colorsDirty = true;
+       }
+@@ -49,13 +64,19 @@ class SyncParticlesModifier extends Modifier {
+     newParticles.positions.set(frame.positions.subarray(0, 3 * numParticles));
+     newParticles.types.set(frame.types.subarray(0, numParticles));
+     newParticles.indices.set(ids);
+-    if (newParticles.count !== numParticles) {
++    if (numImages > 1) {
++      // Images share their atom's ID, so styles set per ID apply to all.
++      replicatePositions(newParticles.positions, numParticles, shifts);
++      replicateValues(newParticles.types, numParticles, numImages);
++      replicateValues(newParticles.indices, numParticles, numImages);
++    }
++    if (newParticles.count !== numRendered) {
+       output.colorsDirty = true;
+     }
+-    newParticles.count = numParticles;
++    newParticles.count = numRendered;
+ 
+     if (newParticles.mesh) {
+-      newParticles.mesh.count = numParticles;
++      newParticles.mesh.count = numRendered;
+     }
+ 
+     syncParticleAttributes(input.renderState?.visualizer, newParticles);
+@@ -76,6 +97,15 @@ class SyncParticlesModifier extends Modifier {
+       }
+     }
+   };
++
++  private currentImageShifts = (frame: EngineFrame, numParticles: number) => {
++    const counts = clampImageCounts(this.periodicImages, numParticles);
++    if (counts[0] * counts[1] * counts[2] === 1) {
++      return [0, 0, 0];
++    }
++    // The frame's row-major cell matrix, whose rows are the box vectors a, b, c.
++    return imageShifts(frame.boxMatrix, counts);
++  };
+ }
+ 
+ export default SyncParticlesModifier;
+diff --git a/src/modifiers/types.ts b/src/modifiers/types.ts
+index ccd51c14..8daf4abe 100644
+--- a/src/modifiers/types.ts
++++ b/src/modifiers/types.ts
+@@ -26,6 +26,9 @@ export type ModifierInput = {
+ export type ModifierOutput = {
+   particles?: Particles;
+   bonds?: Bonds;
++  // Periodic image translations (xyz triples, zero shift first) applied by
++  // SyncParticlesModifier; later modifiers replicate or skip images with it.
++  imageShifts?: number[];
+   colorsDirty: boolean;
+   computes: { [key: string]: Compute };
+   fixes: { [key: string]: Fix };
+diff --git a/src/rendering/particleAttributes.test.ts b/src/rendering/particleAttributes.test.ts
+index cfe467a0..9a155ea4 100644
+--- a/src/rendering/particleAttributes.test.ts
++++ b/src/rendering/particleAttributes.test.ts
+@@ -60,6 +60,18 @@ describe("instance styles", () => {
+     expect(oldColor).not.toHaveBeenCalled();
+     expect(oldRadius).not.toHaveBeenCalled();
+   });
++  it("styles every periodic image that shares an atom's ID", () => {
++    const { visualizer: v, particles: p, geometry: g } = fixture();
++    p.indices.set([42, 42, 42]);
++    p.count = 3;
++    syncParticleAttributes(v, p);
++    v.setColor(42, { r: 0, g: 0, b: 255 });
++    v.setRadius(42, 2);
++    expect(Array.from(g.getAttribute("atomColor").array)).toEqual([
++      0, 0, 1, 0, 0, 1, 0, 0, 1,
++    ]);
++    expect(Array.from(g.getAttribute("atomRadius").array)).toEqual([2, 2, 2]);
++  });
+   it("does not dirty style buffers when only positions change", () => {
+     const { visualizer: v, particles: p, geometry: g } = fixture();
+     syncParticleAttributes(v, p);
+diff --git a/src/rendering/particleAttributes.ts b/src/rendering/particleAttributes.ts
+index 8017f689..2a81defd 100644
+--- a/src/rendering/particleAttributes.ts
++++ b/src/rendering/particleAttributes.ts
+@@ -9,7 +9,10 @@ type Color = { r: number; g: number; b: number };
+ type Style = { color: Color; radius: number };
+ type AttributeState = {
+   styles: Map<number, Style>;
++  // First instance slot per ID; nextSlot chains further instances of the
++  // same ID (periodic images), ending in -1.
+   slots: Map<number, number>;
++  nextSlot?: Int32Array;
+   particles?: Particles;
+   ids?: Float32Array;
+   count?: number;
+@@ -102,18 +105,20 @@ export function installParticleAttributes(visualizer: Visualizer): void {
+   };
+   visualizer.setColor = (id, color) => {
+     styleFor(id).color = color;
+-    const slot = state.slots.get(id);
+-    if (slot !== undefined && state.color) {
+-      state.color.setXYZ(slot, color.r / 255, color.g / 255, color.b / 255);
++    let slot = state.slots.get(id) ?? -1;
++    if (slot >= 0 && state.color) {
++      for (; slot >= 0; slot = state.nextSlot![slot])
++        state.color.setXYZ(slot, color.r / 255, color.g / 255, color.b / 255);
+       state.color.needsUpdate = true;
+     }
+     visualizer.forceRender = true;
+   };
+   visualizer.setRadius = (id, radius) => {
+     styleFor(id).radius = radius;
+-    const slot = state.slots.get(id);
+-    if (slot !== undefined && state.radius) {
+-      state.radius.setX(slot, radius);
++    let slot = state.slots.get(id) ?? -1;
++    if (slot >= 0 && state.radius) {
++      for (; slot >= 0; slot = state.nextSlot![slot])
++        state.radius.setX(slot, radius);
+       state.radius.needsUpdate = true;
+     }
+     visualizer.forceRender = true;
+@@ -130,6 +135,7 @@ export function syncParticleAttributes(
+   if (state.particles !== particles) {
+     state.particles = particles;
+     state.ids = new Float32Array(particles.capacity);
++    state.nextSlot = new Int32Array(particles.capacity);
+     state.count = -1;
+     state.color = new InstancedBufferAttribute(
+       new Float32Array(particles.capacity * 3),
+@@ -153,8 +159,10 @@ export function syncParticleAttributes(
+   state.ids!.set(particles.indices.subarray(0, particles.count));
+   state.count = particles.count;
+   state.slots.clear();
+-  for (let i = 0; i < particles.count; i++) {
++  // Walk backwards so each ID's chain starts at its lowest slot.
++  for (let i = particles.count - 1; i >= 0; i--) {
+     const id = particles.indices[i];
++    state.nextSlot![i] = state.slots.get(id) ?? -1;
+     state.slots.set(id, i);
+     const style = state.styles.get(id);
+     const color = style?.color ?? { r: 255, g: 255, b: 255 };
+diff --git a/src/shell/PeriodicImagesControl.test.tsx b/src/shell/PeriodicImagesControl.test.tsx
+new file mode 100644
+index 00000000..c9f5b840
+--- /dev/null
++++ b/src/shell/PeriodicImagesControl.test.tsx
+@@ -0,0 +1,73 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++import { render, screen } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import PeriodicImagesControl from "./PeriodicImagesControl";
++import SyncParticlesModifier from "../modifiers/syncparticlesmodifier";
++import type { ImageCounts } from "../modifiers/periodicImages";
++
++vi.mock("../modifiers/syncparticlesmodifier", () => ({
++  default: class {
++    periodicImages: ImageCounts = [1, 1, 1];
++  },
++}));
++
++const engine = vi.hoisted(() => ({ modifiers: [] as unknown[] }));
++const runPostTimestepRendering = vi.hoisted(() => vi.fn());
++
++vi.mock("../hooks", () => ({
++  useEngine: () => engine,
++  useStoreState: (selector: (state: unknown) => unknown) =>
++    selector({ simulationStatus: { numAtoms: 10 } }),
++  useStoreActions: (selector: (actions: unknown) => unknown) =>
++    selector({
++      processing: { runPostTimestepRendering, runPostTimestep: vi.fn() },
++    }),
++}));
++
++describe("PeriodicImagesControl", () => {
++  let modifier: SyncParticlesModifier;
++
++  beforeEach(() => {
++    runPostTimestepRendering.mockClear();
++    modifier = new SyncParticlesModifier({ name: "Particles", active: true });
++    modifier.periodicImages = [2, 1, 1];
++    engine.modifiers = [modifier];
++  });
++
++  const openAxisX = async () => {
++    const user = userEvent.setup();
++    render(<PeriodicImagesControl live />);
++    await user.click(screen.getByTestId("periodic-images"));
++    return { user, input: screen.getByLabelText("Images along x") };
++  };
++
++  it("replaces a count by backspacing and typing a new digit", async () => {
++    // Arrange
++    const { user, input } = await openAxisX();
++
++    // Act
++    await user.type(input, "{Backspace}3");
++
++    // Assert: the cleared field never committed a 1, so no "13"
++    expect(input).toHaveValue(3);
++    expect(modifier.periodicImages).toEqual([3, 1, 1]);
++    expect(screen.getByTestId("periodic-images")).toHaveTextContent(
++      "Images 3×1×1",
++    );
++  });
++
++  it("reverts an emptied field to the current count on blur", async () => {
++    // Arrange
++    const { user, input } = await openAxisX();
++
++    // Act
++    await user.type(input, "{Backspace}");
++    expect(input).toHaveValue(null);
++    await user.tab();
++
++    // Assert
++    expect(input).toHaveValue(2);
++    expect(modifier.periodicImages).toEqual([2, 1, 1]);
++    expect(runPostTimestepRendering).not.toHaveBeenCalled();
++  });
++});
+diff --git a/src/shell/PeriodicImagesControl.tsx b/src/shell/PeriodicImagesControl.tsx
+new file mode 100644
+index 00000000..6643eab7
+--- /dev/null
++++ b/src/shell/PeriodicImagesControl.tsx
+@@ -0,0 +1,159 @@
++/**
++ * Periodic images control for the run viewport: per-axis copy counts for
++ * SyncParticlesModifier.periodicImages. Visual only.
++ */
++
++import { useState } from "react";
++import { useEngine, useStoreActions, useStoreState } from "../hooks";
++import SyncParticlesModifier from "../modifiers/syncparticlesmodifier";
++import {
++  clampImageCounts,
++  ImageCounts,
++  MAX_IMAGES_PER_AXIS,
++  MAX_RENDERED_PARTICLES,
++} from "../modifiers/periodicImages";
++import { GhostButton, Popover, SectionLabel } from "./ui";
++
++const AXES = ["x", "y", "z"] as const;
++
++/** The draft as a copy count, or undefined while it is not a valid one. */
++const parseCount = (draft: string): number | undefined => {
++  const value = Number(draft);
++  return draft.trim() !== "" &&
++    Number.isInteger(value) &&
++    value >= 1 &&
++    value <= MAX_IMAGES_PER_AXIS
++    ? value
++    : undefined;
++};
++
++/**
++ * One axis' count. Keeps the typed text as a draft so clearing the field
++ * mid-edit doesn't snap it to 1; only a valid count is committed, and on
++ * blur or Enter an unfinished draft reverts to the current count.
++ */
++const AxisInput = ({
++  label,
++  value,
++  onCommit,
++}: {
++  label: string;
++  value: number;
++  onCommit: (value: number) => void;
++}) => {
++  const [draft, setDraft] = useState(String(value));
++  const [shown, setShown] = useState(value);
++  if (shown !== value) {
++    setShown(value);
++    setDraft(String(value));
++  }
++
++  const finish = () => {
++    if (parseCount(draft) === undefined) setDraft(String(value));
++  };
++
++  return (
++    <input
++      className="shell-input"
++      aria-label={`Images along ${label}`}
++      type="number"
++      min={1}
++      max={MAX_IMAGES_PER_AXIS}
++      step={1}
++      value={draft}
++      onChange={(e) => {
++        setDraft(e.target.value);
++        const next = parseCount(e.target.value);
++        if (next !== undefined && next !== value) onCommit(next);
++      }}
++      onBlur={finish}
++      onKeyDown={(e) => {
++        if (e.key === "Enter") finish();
++      }}
++      style={{ width: 64, padding: "8px 10px" }}
++    />
++  );
++};
++
++const PeriodicImagesControl = ({ live }: { live: boolean }) => {
++  const modifier = useEngine().modifiers.find(
++    (m): m is SyncParticlesModifier => m instanceof SyncParticlesModifier,
++  );
++  const numAtoms = useStoreState((state) => state.simulationStatus.numAtoms);
++  const refreshRendering = useStoreActions(
++    (actions) => actions.processing.runPostTimestepRendering,
++  );
++  const runPostTimestep = useStoreActions(
++    (actions) => actions.processing.runPostTimestep,
++  );
++  const [open, setOpen] = useState(false);
++  const [counts, setCounts] = useState<ImageCounts>(
++    () => modifier?.periodicImages ?? [1, 1, 1],
++  );
++  if (!modifier) return null;
++
++  const setAxis = (axis: number, value: number) => {
++    const next = [...counts] as ImageCounts;
++    next[axis] = value;
++    setCounts(next);
++    modifier.periodicImages = next;
++    // A live run pushes particles to the view; a finished one needs the full
++    // pass so the (possibly reallocated) particles reach the render store.
++    const refresh = live ? refreshRendering() : runPostTimestep(true);
++    void Promise.resolve(refresh).catch((error) =>
++      console.error("Periodic images refresh failed:", error),
++    );
++  };
++
++  const effective = clampImageCounts(counts, numAtoms);
++  const capped = effective.some((n, axis) => n !== counts[axis]);
++
++  return (
++    <div style={{ position: "relative" }}>
++      <GhostButton
++        data-testid="periodic-images"
++        aria-expanded={open}
++        onClick={() => setOpen((previous) => !previous)}
++      >
++        Images {counts.join("×")}
++      </GhostButton>
++      <Popover
++        open={open}
++        onClose={() => setOpen(false)}
++        minWidth={236}
++        testId="periodic-images-menu"
++      >
++        <div style={{ padding: 8, display: "grid", gap: 10 }}>
++          <SectionLabel>Periodic images</SectionLabel>
++          <div style={{ display: "flex", gap: 8 }}>
++            {AXES.map((label, axis) => (
++              <label
++                key={label}
++                style={{
++                  display: "grid",
++                  gap: 4,
++                  fontSize: 12,
++                  color: "var(--text-2)",
++                }}
++              >
++                {label}
++                <AxisInput
++                  label={label}
++                  value={counts[axis]}
++                  onCommit={(value) => setAxis(axis, value)}
++                />
++              </label>
++            ))}
++          </div>
++          <span style={{ fontSize: 12, color: "var(--text-3)" }}>
++            {capped
++              ? `Showing ${effective.join("×")}: at most ${MAX_RENDERED_PARTICLES.toLocaleString()} atoms are drawn.`
++              : "Copies shifted by the box vectors. Display only."}
++          </span>
++        </div>
++      </Popover>
++    </div>
++  );
++};
++
++export default PeriodicImagesControl;
+diff --git a/src/shell/RunDetailHeader.tsx b/src/shell/RunDetailHeader.tsx
+index 324d81da..9c42370d 100644
+--- a/src/shell/RunDetailHeader.tsx
++++ b/src/shell/RunDetailHeader.tsx
+@@ -1,11 +1,12 @@
+ /**
+  * The run detail sub-header: back to Runs, the run's number, status and
+- * parameters, and its actions (color atoms, continue, replay, stop, analyze
+- * in notebook).
++ * parameters, and its actions (color atoms, periodic images, continue,
++ * replay, stop, analyze in notebook).
+  */
+ 
+ import { useStoreActions, useStoreState } from "../hooks";
+ import type { RunMeta } from "../storage";
++import PeriodicImagesControl from "./PeriodicImagesControl";
+ import { useShellUI } from "./ShellContext";
+ import { runNumber } from "./format";
+ import { BackIcon, ChartIcon, StopIcon } from "./icons";
+@@ -118,6 +119,7 @@ const RunDetailHeader = ({
+           Color atoms
+         </GhostButton>
+       )}
++      {(live || viewStructure) && <PeriodicImagesControl live={live} />}
+       {meta?.continuationOf && (
+         <Chip>Continued from #{runNumber(meta.continuationOf)}</Chip>
+       )}
+diff --git a/src/store/processing.ts b/src/store/processing.ts
+index e9be2e5c..1cbab132 100644
+--- a/src/store/processing.ts
++++ b/src/store/processing.ts
+@@ -8,6 +8,7 @@ import { Wall } from "../types";
+ import * as THREE from "three";
+ import type { EngineRegistry } from "../engine/EngineRegistry";
+ import { StoreModel } from "./model";
++import { realParticleCount } from "../modifiers/periodicImages";
+ import type { StoreInjections } from "./projects";
+ import type { SimulationStatusData } from "./simulationstatus";
+ 
+@@ -184,7 +185,10 @@ export const processingModel: ProcessingModel = {
+         computes: modifierOutput.computes,
+         fixes: modifierOutput.fixes,
+         variables: modifierOutput.variables,
+-        numBonds: modifierOutput.bonds?.count ?? 0,
++        numBonds: realParticleCount(
++          modifierOutput.bonds?.count ?? 0,
++          modifierOutput.imageShifts,
++        ),
+         box: getSimulationBox(frame.boxMatrix, currentStatus.box),
+         origo: getSimulationOrigo(frame.origin, currentStatus.origo),
+         dimension: frame.dimension,

@@ -1,0 +1,199 @@
+diff --git a/modules/algebra/src/Rotation3D.cpp b/modules/algebra/src/Rotation3D.cpp
+index 885d6d5376..a507d1de2d 100644
+--- a/modules/algebra/src/Rotation3D.cpp
++++ b/modules/algebra/src/Rotation3D.cpp
+@@ -218,7 +218,7 @@ Rotation3Ds get_uniform_cover_rotations_3d(unsigned int n) {
+   // "surface area" is 2 pi^2 r^3= 2pi^2.
+   // each rotation has an area of approximately 4/3 pi distance^3
+   Vector<VectorD<4>> vs =
+-      internal::uniform_cover_sphere<4>(n, get_zero_vector_d<4>(), 1, false);
++      internal::uniform_cover_sphere(n, get_zero_vector_d<4>(), 1, false);
+   Rotation3Ds ret;
+   for (unsigned int i = 0; i < vs.size(); ++i) {
+     if (vs[i][0] <= 0) {
+diff --git a/modules/algebra/test/test_sphere_cover_4d.cpp b/modules/algebra/test/test_sphere_cover_4d.cpp
+new file mode 100644
+index 0000000000..4e585d5017
+--- /dev/null
++++ b/modules/algebra/test/test_sphere_cover_4d.cpp
+@@ -0,0 +1,72 @@
++/**
++ *  \file test_sphere_cover_4d.cpp
++ *  \brief Test uniform covers of 4D spheres (refined with IMP.cgal, if
++ *         available)
++ *
++ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
++ *
++ */
++
++#include <IMP/algebra/vector_generators.h>
++#include <IMP/algebra/SphereD.h>
++#include <IMP/check_macros.h>
++#include <IMP/flags.h>
++#include <IMP/random.h>
++#include <cmath>
++
++namespace {
++
++using IMP::algebra::VectorD;
++typedef IMP::Vector<VectorD<4> > Vector4Ds;
++
++// All points are on the sphere, and (for a hemisphere cover) on its upper
++// half; and no two points coincide
++void check_cover(const Vector4Ds &vs, const IMP::algebra::SphereD<4> &s,
++                 unsigned int n, bool upper) {
++  IMP_ALWAYS_CHECK(vs.size() == n, "Wrong number of points: " << vs.size(),
++                   IMP::ValueException);
++  for (const VectorD<4> &v : vs) {
++    VectorD<4> d = v - s.get_center();
++    IMP_ALWAYS_CHECK(std::abs(d.get_magnitude() - s.get_radius()) < 1e-6,
++                     "Point not on the sphere: " << v, IMP::ValueException);
++    if (upper) {
++      IMP_ALWAYS_CHECK(d[3] >= -1e-6, "Point not on the upper hemisphere: "
++                       << v, IMP::ValueException);
++    }
++  }
++  for (unsigned int i = 0; i < vs.size(); ++i) {
++    for (unsigned int j = i + 1; j < vs.size(); ++j) {
++      IMP_ALWAYS_CHECK((vs[i] - vs[j]).get_magnitude() > 1e-6,
++                       "Coincident points " << i << " and " << j,
++                       IMP::ValueException);
++    }
++  }
++}
++}  // namespace
++
++int main(int argc, char *argv[]) {
++  IMP::setup_from_argv(argc, argv, "Test uniform covers of 4D spheres");
++  IMP::random_number_generator.seed(42);
++  IMP::algebra::SphereD<4> unit(IMP::algebra::get_zero_vector_d<4>(), 1.0);
++  IMP::algebra::SphereD<4> other(VectorD<4>(1.0, -2.0, 0.5, 3.0), 2.5);
++  // Hemisphere covers need at least 4 points (the basis vectors), and
++  // full sphere covers at least 8 (the basis vectors and their opposites),
++  // or an even number of points
++  for (unsigned int n : {4, 5, 10, 30, 60}) {
++    for (const IMP::algebra::SphereD<4> &s : {unit, other}) {
++      check_cover(IMP::algebra::get_uniform_upper_hemisphere_cover(s, n), s, n,
++                  true);
++      if (n >= 8) {
++        check_cover(IMP::algebra::get_uniform_surface_cover(s, n), s, n,
++                    false);
++      }
++    }
++  }
++  // Full sphere covers with fewer points than the basis vectors and their
++  // opposites
++  for (unsigned int n : {2, 4, 6}) {
++    check_cover(IMP::algebra::get_uniform_surface_cover(unit, n), unit, n,
++                false);
++  }
++  return 0;
++}
+diff --git a/modules/cgal/src/internal/sphere_cover.cpp b/modules/cgal/src/internal/sphere_cover.cpp
+index 3b865b934a..8da0a35f9f 100644
+--- a/modules/cgal/src/internal/sphere_cover.cpp
++++ b/modules/cgal/src/internal/sphere_cover.cpp
+@@ -16,59 +16,67 @@
+ 
+ IMP_GCC_PRAGMA(diagnostic ignored "-Wuninitialized")
+ #include <IMP/algebra/vector_generators.h>
+-#include <CGAL/Cartesian_d.h>
+-#include <CGAL/Convex_hull_d.h>
+-#include <CGAL/Gmpq.h>
+-#include <CGAL/Optimisation_d_traits_d.h>
+-#include <CGAL/Min_sphere_d.h>
+-#include <CGAL/K_neighbor_search.h>
+-#include <CGAL/Lazy_exact_nt.h>
+-#include <CGAL/Search_traits_2.h>
++#include <CGAL/Epick_d.h>
++#include <CGAL/Triangulation.h>
++#include <algorithm>
++#include <vector>
+ 
+ IMPCGAL_BEGIN_INTERNAL_NAMESPACE
+ template <int D>
+ void refine_unit_sphere_cover_d(IMP::Vector<algebra::VectorD<D>> &ret,
+                                 bool ALL) {
+   unsigned int n = ret.size();
+-  typedef ::CGAL::Cartesian_d< ::CGAL::Lazy_exact_nt< ::CGAL::Gmpq>> K;
+-  typedef typename K::Point_d P;
+-  typedef ::CGAL::Convex_hull_d<K> CH;
+-  typedef CH::Vertex_handle VertexHandle;
++  // The convex hull is computed from a triangulation of the points; only
++  // predicates are needed, which Epick_d evaluates exactly
++  typedef ::CGAL::Epick_d< ::CGAL::Dimension_tag<D>> K;
++  typedef ::CGAL::Triangulation<K> T;
++  typedef typename T::Point P;
++  typedef typename T::Vertex_handle VertexHandle;
++  typedef typename T::Full_cell_iterator FullCellIterator;
+ 
+-  std::map<VertexHandle, int> indexes;
+   for (unsigned int rep = 0; rep < 10 * D; ++rep) {
+-    CH ch(D);
++    T t(D);
++    std::map<VertexHandle, int> indexes;
+     for (unsigned int i = 0; i < ret.size(); ++i) {
+-      P p(D, ret[i].begin(), ret[i].end());
+-      VertexHandle vh = ch.insert(p);
++      P p(ret[i].begin(), ret[i].end());
++      VertexHandle vh = t.insert(p);
+       indexes[vh] = i + 1;
+       if (!ALL) {
+         algebra::VectorD<D> nr = -ret[i];
+-        P opp_p(D, nr.begin(), nr.end());
+-        VertexHandle opp_vh = ch.insert(opp_p);
++        P opp_p(nr.begin(), nr.end());
++        VertexHandle opp_vh = t.insert(opp_p);
+         indexes[opp_vh] = -static_cast<int>(i) - 1;
+       }
+     }
+     IMP::Vector<algebra::VectorD<D>> sums(n, algebra::get_zero_vector_d<D>());
+     Floats counts(n, 0);
+-    for (CH::Facet_iterator it = ch.facets_begin(); it != ch.facets_end();
+-         ++it) {
++    // Each facet of the convex hull is the finite part of an infinite full
++    // cell of the triangulation (if the points span all D dimensions)
++    std::vector<VertexHandle> facet;
++    for (FullCellIterator it = t.full_cells_begin();
++         t.current_dimension() == D && it != t.full_cells_end(); ++it) {
++      if (!t.is_infinite(it)) continue;
++      facet.clear();
++      for (int k = 0; k <= D; ++k) {
++        if (!t.is_infinite(it->vertex(k))) facet.push_back(it->vertex(k));
++      }
+       for (unsigned int i = 0; i < D; ++i) {
+-        int vi = indexes[ch.vertex_of_facet(it, i)];
++        int vi = indexes[facet[i]];
+         algebra::VectorD<D> pi;
+         if (vi > 0) {
+           pi = ret[vi - 1];
+         } else {
+           continue;
+         }
+-        for (unsigned int j = 0; i < D; ++i) {
++        for (unsigned int j = 0; j < D; ++j) {
+           if (i == j) continue;
+-          int vj = indexes[ch.vertex_of_facet(it, j)];
++          int vj = indexes[facet[j]];
+           algebra::VectorD<D> pj;
+           if (vj > 0) {
+             pj = ret[vj - 1];
+           } else {
+-            pj = ret[-vj - 1];
++            // the opposite of a point
++            pj = -ret[-vj - 1];
+           }
+           double d = (pj - pi).get_magnitude();
+           if (counts[vi - 1] < d) {
+@@ -78,7 +86,10 @@ void refine_unit_sphere_cover_d(IMP::Vector<algebra::VectorD<D>> &ret,
+         }
+       }
+     }
+-    for (unsigned int i = 0; i < (ALL ? 2 * D : D); ++i) {
++    // The first points (the basis vectors, and their opposites for a full
++    // sphere) are kept fixed; there may be fewer points than this
++    for (unsigned int i = 0; i < std::min<unsigned int>(n, ALL ? 2 * D : D);
++         ++i) {
+       sums[i] = ret[i];
+     }
+     for (unsigned int i = (ALL ? 2 * D : D); i < ret.size(); ++i) {

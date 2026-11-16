@@ -1,0 +1,636 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6cd0a8a1..9e08c4f8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
+ ## [0.12.1]
+ ### Fixed
+ - FlashTP with LAMMPS parallel in torch
++- Single-atom inference failure with ASE+flashTP, LAMMPS-Torch and LAMMPS ML-IAP
+ - CI/CD bugs
+ - inconsistent argument namings of flashTP
+ 
+diff --git a/docs/source/user_guide/lammps_mliap.md b/docs/source/user_guide/lammps_mliap.md
+index b8c84df8..d1b4b743 100644
+--- a/docs/source/user_guide/lammps_mliap.md
++++ b/docs/source/user_guide/lammps_mliap.md
+@@ -53,7 +53,7 @@ make install-python
+ ```
+ :::{note}
+ If the compilation fails, consider specifying the GPU architecture of the node you are building on in KOKKOS.
+-For example, add the following flag to your `cmake` command: `-D KOKKOS_ARCH_AMPERE86=ON` when you are using GPU with Ampere 86 architecture like RTX A5000.
++For example, add the following flag to your `cmake` command: `-D Kokkos_ARCH_AMPERE86=ON` when you are using GPU with Ampere 86 architecture like RTX A5000.
+ :::
+ 
+ ### (Optional) Build with GPU-D3 pair style
+diff --git a/sevenn/mliap.py b/sevenn/mliap.py
+index a9b4df97..29bff117 100644
+--- a/sevenn/mliap.py
++++ b/sevenn/mliap.py
+@@ -175,29 +175,36 @@ def _ensure_model_initialized(self):
+     def compute_forces(self, lmp_data):
+         self._ensure_model_initialized()  # lazy init
+         assert self.model, 'Model must be initialized'
+-        if lmp_data.nlocal == 0 or lmp_data.npairs <= 1:
+-            # what about a single atom with 0 pairs?
++        if lmp_data.nlocal == 0:
+             return
+ 
+         nlocal = lmp_data.nlocal
+         ntotal = lmp_data.ntotal
++        no_pairs = lmp_data.npairs <= 1
+ 
+         # edge_vectors should be f32 in 7net
+-        edge_vectors = torch.as_tensor(
+-            lmp_data.rij, dtype=torch.float32, device=self.device
+-        )
++        if no_pairs:
++            edge_vectors = torch.zeros(
++                (0, 3), dtype=torch.float32, device=self.device
++            )
++            edge_index = torch.zeros(
++                (2, 0), dtype=torch.int64, device=self.device
++            )
++        else:
++            edge_vectors = torch.as_tensor(
++                lmp_data.rij, dtype=torch.float32, device=self.device
++            )
++            edge_index = torch.vstack(
++                [
++                    torch.as_tensor(
++                        lmp_data.pair_i, dtype=torch.int64, device=self.device
++                    ),
++                    torch.as_tensor(
++                        lmp_data.pair_j, dtype=torch.int64, device=self.device
++                    ),
++                ]
++            )
+         edge_vectors.requires_grad_(True)
+-
+-        edge_index = torch.vstack(
+-            [
+-                torch.as_tensor(
+-                    lmp_data.pair_i, dtype=torch.int64, device=self.device
+-                ),
+-                torch.as_tensor(
+-                    lmp_data.pair_j, dtype=torch.int64, device=self.device
+-                ),
+-            ]
+-        )
+         elems = torch.as_tensor(
+             lmp_data.elems, dtype=torch.int64, device=self.device
+         )
+@@ -223,7 +230,10 @@ def compute_forces(self, lmp_data):
+         edge_forces = torch.autograd.grad(
+             torch.sum(pred_atomic_energies),
+             [edge_vectors],
++            allow_unused=True,
+         )[0]
++        if edge_forces is None:
++            edge_forces = torch.zeros_like(edge_vectors)
+         if pred_atomic_energies.size(0) != nlocal:  # why this check is necessary?
+             pred_atomic_energies = torch.narrow(pred_atomic_energies, 0, 0, nlocal)
+         pred_total_energy = torch.sum(pred_atomic_energies)
+diff --git a/sevenn/nn/convolution.py b/sevenn/nn/convolution.py
+index e18094a5..c6c83249 100644
+--- a/sevenn/nn/convolution.py
++++ b/sevenn/nn/convolution.py
+@@ -219,6 +219,7 @@ def __init__(
+             self.instantiate()
+ 
+         self._comm_size = irreps_x.dim  # used in parallel
++        self._out_dim: int = irreps_mid.dim
+ 
+     @classmethod
+     def from_irreps_convolution(cls, src: IrrepsConvolution):
+@@ -230,6 +231,7 @@ def from_irreps_convolution(cls, src: IrrepsConvolution):
+             irreps_x, irreps_x, irreps_x, weight_layer_input_to_hidden=[1],
+         )
+         ret.__dict__ = deepcopy(src.__dict__)
++        ret._out_dim = src.convolution_kwargs['irreps_out'].dim
+         return ret
+ 
+     def instantiate(self) -> None:
+@@ -260,13 +262,18 @@ def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+         edge_dst = data[self.key_edge_idx][0]
+         edge_filter = data[self.key_filter]
+ 
+-        x = self.convolution(
+-            x,
+-            edge_filter,
+-            weight,
+-            edge_src.to(torch.int32),  # trivial?
+-            edge_dst.to(torch.int32),
+-        )
++        # No edges (e.g., single isolated atom): skip the uvu_TP CUDA kernel
++        if edge_src.numel() == 0:
++            x = x.new_zeros(x.shape[0], self._out_dim)
++            x = x + (edge_filter.sum() + weight.sum()) * 0  # keep in autograd graph
++        else:
++            x = self.convolution(
++                x,
++                edge_filter,
++                weight,
++                edge_src.to(torch.int32),
++                edge_dst.to(torch.int32),
++            )
+ 
+         x = x.div(self.denominator)
+ 
+diff --git a/sevenn/nn/cue_helper.py b/sevenn/nn/cue_helper.py
+index 7925f03c..a4f6376c 100644
+--- a/sevenn/nn/cue_helper.py
++++ b/sevenn/nn/cue_helper.py
+@@ -4,6 +4,7 @@
+ 
+ import e3nn.o3 as o3
+ import numpy as np
++import torch.cuda
+ import torch.nn
+ 
+ from .convolution import IrrepsConvolution, IrrepsScatterGatterFusedConvolution
+@@ -128,7 +129,7 @@ def forward(
+ 
+ 
+ def is_cue_available() -> bool:
+-    return _CUE_AVAILABLE
++    return _CUE_AVAILABLE and torch.cuda.is_available()
+ 
+ 
+ def cue_needed(func: Callable) -> Callable:
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn.cpp b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+index b7d49b18..3a4396dc 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+@@ -256,7 +256,7 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   if (eflag_atom) {
+     torch::Tensor atomic_energy_tensor =
+-        output.at("atomic_energy").toTensor().cpu().squeeze();
++        output.at("atomic_energy").toTensor().cpu().view({nlocal});
+     auto atomic_energy = atomic_energy_tensor.accessor<float, 1>();
+     for (int itag = 0; itag < nlocal; itag++) {
+       int i = tag2i[itag];
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+index 09de3f5a..a31d4b89 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+@@ -504,7 +504,7 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+ 
+   if (eflag_atom) {
+     torch::Tensor atomic_energy_tensor =
+-        output.at("atomic_energy").toTensor().cpu().squeeze();
++        output.at("atomic_energy").toTensor().cpu().view({nlocal});
+     auto atomic_energy = atomic_energy_tensor.accessor<float, 1>();
+     for (int graph_idx = 0; graph_idx < nlocal; graph_idx++) {
+       int i = graph_index_to_i[graph_idx];
+diff --git a/tests/lammps_tests/test_lammps.py b/tests/lammps_tests/test_lammps.py
+index 939b559f..314b8504 100644
+--- a/tests/lammps_tests/test_lammps.py
++++ b/tests/lammps_tests/test_lammps.py
+@@ -8,6 +8,7 @@
+ import numpy as np
+ import pytest
+ import torch
++from ase import Atoms
+ from ase.build import bulk, surface
+ from ase.calculators.singlepoint import SinglePointCalculator
+ 
+@@ -41,6 +42,14 @@ def serial_potential_path(tmp_path_factory):
+     return pot_path
+ 
+ 
++@pytest.fixture(scope='module')
++def serial_potential_path_7net0(tmp_path_factory):
++    tmp = tmp_path_factory.mktemp('serial_potential_7net0')
++    pot_path = str(tmp / 'deployed_serial.pt')
++    deploy(cp_7net0_path, pot_path)
++    return pot_path
++
++
+ @pytest.fixture(scope='module')
+ def serial_potential_path_flash(tmp_path_factory):
+     tmp = tmp_path_factory.mktemp('serial_potential_flash')
+@@ -312,10 +321,7 @@ def test_serial(system, serial_potential_path, ref_calculator, lammps_cmd, tmp_p
+     assert_atoms(atoms, atoms_lammps)
+ 
+ 
+-@pytest.mark.skipif(
+-    not is_flash_available() or not torch.cuda.is_available(),
+-    reason='flashTP or gpu is not available',
+-)
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
+ @pytest.mark.parametrize(
+     'system',
+     ['bulk', 'surface'],
+@@ -503,3 +509,68 @@ def test_cueq_parallel(lammps_cmd, mpirun_cmd, tmp_path):
+     )
+     atoms.calc = ref_calc
+     assert_atoms(atoms, atoms_lammps)
++
++
++def _get_disconnected_system(name):
++    """Build Atoms object for a disconnected test structure."""
++    if name.startswith('single_o'):
++        positions = [[10, 10, 10]]
++        symbols = 'O'
++    elif name.startswith('two_o'):
++        positions = [[5, 10, 10], [15, 10, 10]]
++        symbols = 'OO'
++    elif name.startswith('three_o'):
++        positions = [[10, 10, 10], [12, 10, 10], [10, 10, 20]]
++        symbols = 'OOO'
++    else:
++        raise ValueError(f'Unknown disconnected structure: {name}')
++
++    return Atoms(symbols, positions=positions, cell=[20, 20, 20], pbc=True)
++
++
++_disconnected_systems = [
++    'single_o',
++    'two_o_disconnected',
++    'three_o_partial',
++]
++
++
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_disconnected_serial(
++    system,
++    serial_potential_path_7net0,
++    ref_7net0_calculator,
++    lammps_cmd,
++    tmp_path,
++):
++    atoms = _get_disconnected_system(system)
++    atoms_lammps = serial_lammps_run(
++        atoms=atoms,
++        potential=serial_potential_path_7net0,
++        wd=tmp_path,
++        test_name=f'disconnected serial {system}',
++        lammps_cmd=lammps_cmd,
++    )
++    atoms.calc = ref_7net0_calculator
++    assert_atoms(atoms, atoms_lammps)
++
++
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_disconnected_serial_flash(
++    system,
++    serial_potential_path_flash,
++    ref_7net0_calculator,
++    lammps_cmd,
++    tmp_path,
++):
++    atoms = _get_disconnected_system(system)
++    atoms_lammps = serial_lammps_run(
++        atoms=atoms,
++        potential=serial_potential_path_flash,
++        wd=tmp_path,
++        test_name=f'disconnected serial flash {system}',
++        lammps_cmd=lammps_cmd,
++    )
++    atoms.calc = ref_7net0_calculator
++    assert_atoms(atoms, atoms_lammps, atol=1e-5)
+diff --git a/tests/lammps_tests/test_mliap.py b/tests/lammps_tests/test_mliap.py
+index 1a3c5a80..4c048bfb 100644
+--- a/tests/lammps_tests/test_mliap.py
++++ b/tests/lammps_tests/test_mliap.py
+@@ -9,6 +9,7 @@
+ import numpy as np
+ import pytest
+ import torch
++from ase import Atoms
+ from ase.build import bulk, surface
+ from ase.calculators.singlepoint import SinglePointCalculator
+ 
+@@ -336,10 +337,7 @@ def test_mliap_cueq(
+     assert_atoms(atoms, atoms_lmp, atol=1e-5)
+ 
+ 
+-@pytest.mark.skipif(
+-    not is_flash_available() or not torch.cuda.is_available(),
+-    reason='flashTP or gpu is not available',
+-)
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
+ @pytest.mark.parametrize('system', ['bulk', 'surface'])
+ def test_mliap_flash(
+     system,
+@@ -358,3 +356,90 @@ def test_mliap_flash(
+     )
+     atoms.calc = ref_7net0_calculator
+     assert_atoms(atoms, atoms_lmp, atol=1e-5)
++
++
++def _get_disconnected_system(name):
++    """Build Atoms object for a disconnected test structure."""
++    if name.startswith('single_o'):
++        positions = [[10, 10, 10]]
++        symbols = 'O'
++    elif name.startswith('two_o'):
++        positions = [[5, 10, 10], [15, 10, 10]]
++        symbols = 'OO'
++    elif name.startswith('three_o'):
++        positions = [[10, 10, 10], [12, 10, 10], [10, 10, 20]]
++        symbols = 'OOO'
++    else:
++        raise ValueError(f'Unknown disconnected structure: {name}')
++
++    return Atoms(symbols, positions=positions, cell=[20, 20, 20], pbc=True)
++
++
++_disconnected_systems = [
++    'single_o',
++    'two_o_disconnected',
++    'three_o_partial',
++]
++
++
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_mliap_disconnected(
++    system,
++    mliap_potential_path,
++    ref_7net0_calculator,
++    lammps_cmd,
++    tmp_path,
++):
++    atoms = _get_disconnected_system(system)
++    atoms_lmp = mliap_lammps_run(
++        atoms=atoms,
++        pt_path=mliap_potential_path,
++        wd=tmp_path,
++        test_name=f'mliap disconnected {system}',
++        lammps_cmd=lammps_cmd,
++    )
++    atoms.calc = ref_7net0_calculator
++    assert_atoms(atoms, atoms_lmp, atol=1e-5)
++
++
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_mliap_flash_disconnected(
++    system,
++    mliap_flash_potential_path,
++    ref_7net0_calculator,
++    lammps_cmd,
++    tmp_path,
++):
++    atoms = _get_disconnected_system(system)
++    atoms_lmp = mliap_lammps_run(
++        atoms=atoms,
++        pt_path=mliap_flash_potential_path,
++        wd=tmp_path,
++        test_name=f'mliap flash disconnected {system}',
++        lammps_cmd=lammps_cmd,
++    )
++    atoms.calc = ref_7net0_calculator
++    assert_atoms(atoms, atoms_lmp, atol=1e-5)
++
++
++@pytest.mark.skipif(not is_cue_available(), reason='cueq not available')
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_mliap_cueq_disconnected(
++    system,
++    mliap_cueq_potential_path,
++    ref_7net0_calculator,
++    lammps_cmd,
++    tmp_path,
++):
++    atoms = _get_disconnected_system(system)
++    atoms_lmp = mliap_lammps_run(
++        atoms=atoms,
++        pt_path=mliap_cueq_potential_path,
++        wd=tmp_path,
++        test_name=f'mliap cueq disconnected {system}',
++        lammps_cmd=lammps_cmd,
++        timeout=120,
++    )
++    atoms.calc = ref_7net0_calculator
++    assert_atoms(atoms, atoms_lmp, atol=1e-5)
+diff --git a/tests/unit_tests/test_calculator.py b/tests/unit_tests/test_calculator.py
+index e092eb82..9b19308d 100644
+--- a/tests/unit_tests/test_calculator.py
++++ b/tests/unit_tests/test_calculator.py
+@@ -2,6 +2,7 @@
+ 
+ import numpy as np
+ import pytest
++from ase import Atoms
+ from ase.build import bulk, molecule
+ 
+ from sevenn.calculator import D3Calculator, SevenNetCalculator
+@@ -255,3 +256,110 @@ def test_d3_cal_mol(atoms_mol, d3_cal):
+         atoms_mol.get_potential_energy(force_consistent=True), atoms2_ref['energy']
+     )
+     assert np.allclose(atoms_mol.get_forces(), atoms2_ref['force'])
++
++
++REF_VALUES = {
++    'single_o_pbc': {
++        'energy': -1.9413528442382812,
++        'energies': [-1.9413528442382812],
++        'forces': [[0.0, 0.0, 0.0]],
++        'stress': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
++        'pbc': True,
++    },
++    'two_o_disconnected_pbc': {
++        'energy': -3.882704734802246,
++        'energies': [-1.941352367401123, -1.941352367401123],
++        'forces': [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
++        'stress': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
++        'pbc': True,
++    },
++    'three_o_partial_pbc': {
++        'energy': -6.802117824554443,
++        'energies': [-2.43038272857666, -2.43038272857666, -1.941352367401123],
++        'forces': [
++            [3.8830623626708984, 0.0, 0.0],
++            [-3.8830623626708984, 0.0, 0.0],
++            [0.0, 0.0, 0.0],
++        ],
++        'stress': [0.0009707655990496278, 0.0, 0.0, 0.0, 0.0, 0.0],
++        'pbc': True,
++    },
++}
++
++
++def _get_disconnected_system(name):
++    """Build Atoms object for a disconnected test structure."""
++    if name.startswith('single_o_'):
++        positions = [[10, 10, 10]]
++        symbols = 'O'
++    elif name.startswith('two_o_'):
++        positions = [[5, 10, 10], [15, 10, 10]]
++        symbols = 'OO'
++    elif name.startswith('three_o_'):
++        positions = [[10, 10, 10], [12, 10, 10], [10, 10, 20]]
++        symbols = 'OOO'
++    else:
++        raise ValueError(f'Unknown structure: {name}')
++
++    is_pbc = name.endswith('_pbc')
++    if is_pbc:
++        return Atoms(symbols, positions=positions, cell=[20, 20, 20], pbc=True)
++    else:
++        return Atoms(symbols, positions=positions)
++
++
++_disconnected_systems = [
++    'single_o_pbc',
++    'single_o_mol',
++    'two_o_disconnected_pbc',
++    'two_o_disconnected_mol',
++    'three_o_partial_pbc',
++    'three_o_partial_mol',
++]
++
++
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_disconnected_e3nn(system, sevennet_0_cal):
++    atoms = _get_disconnected_system(system)
++    _test_pbc = system.endswith('_pbc')
++    ref_key = system if _test_pbc else system.replace('_mol', '_pbc')
++    ref = REF_VALUES[ref_key]
++    atoms.calc = sevennet_0_cal
++
++    assert np.allclose(atoms.get_potential_energy(), ref['energy'])
++    assert np.allclose(atoms.get_forces(), ref['forces'])
++    assert np.allclose(atoms.get_potential_energies(), ref['energies'])
++    if _test_pbc:
++        assert np.allclose(atoms.get_stress(), ref['stress'])
++
++
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_disconnected_flash(system, sevennet_0_flash_cal):
++    atoms = _get_disconnected_system(system)
++    _test_pbc = system.endswith('_pbc')
++    ref_key = system if _test_pbc else system.replace('_mol', '_pbc')
++    ref = REF_VALUES[ref_key]
++    atoms.calc = sevennet_0_flash_cal
++
++    assert np.allclose(atoms.get_potential_energy(), ref['energy'])
++    assert np.allclose(atoms.get_forces(), ref['forces'])
++    assert np.allclose(atoms.get_potential_energies(), ref['energies'])
++    if _test_pbc:
++        assert np.allclose(atoms.get_stress(), ref['stress'])
++
++
++@pytest.mark.skipif(not is_cue_available(), reason='cueq not available')
++@pytest.mark.parametrize('system', _disconnected_systems)
++def test_disconnected_cueq(system, sevennet_0_cueq_cal):
++    atoms = _get_disconnected_system(system)
++    _test_pbc = system.endswith('_pbc')
++    ref_key = system if _test_pbc else system.replace('_mol', '_pbc')
++    ref = REF_VALUES[ref_key]
++    atoms.calc = sevennet_0_cueq_cal
++
++    assert np.allclose(atoms.get_potential_energy(), ref['energy'])
++    assert np.allclose(atoms.get_forces(), ref['forces'])
++    assert np.allclose(atoms.get_potential_energies(), ref['energies'])
++    if _test_pbc:
++        assert np.allclose(atoms.get_stress(), ref['stress'])
+diff --git a/tests/unit_tests/test_cueq.py b/tests/unit_tests/test_cueq.py
+index 3df44fff..ec921d03 100644
+--- a/tests/unit_tests/test_cueq.py
++++ b/tests/unit_tests/test_cueq.py
+@@ -84,10 +84,7 @@ def get_model(config_overwrite=None, use_cueq=False, cueq_config=None):
+     return model
+ 
+ 
+-@pytest.mark.skipif(
+-    not is_cue_available() or not torch.cuda.is_available(),
+-    reason='cueq or gpu is not available',
+-)
++@pytest.mark.skipif(not is_cue_available(), reason='cueq not available')
+ @pytest.mark.parametrize(
+     'cf',
+     [
+@@ -133,10 +130,7 @@ def test_model_output(cf):
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:.*is not found from.*')
+-@pytest.mark.skipif(
+-    not is_cue_available() or not torch.cuda.is_available(),
+-    reason='cueq or gpu is not available',
+-)
++@pytest.mark.skipif(not is_cue_available(), reason='cueq not available')
+ @pytest.mark.parametrize(
+     'start_from_cueq',
+     [
+@@ -182,10 +176,7 @@ def test_checkpoint_convert(tmp_path, start_from_cueq):
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:.*is not found from.*')
+-@pytest.mark.skipif(
+-    not is_cue_available() or not torch.cuda.is_available(),
+-    reason='cueq or gpu is not available',
+-)
++@pytest.mark.skipif(not is_cue_available(), reason='cueq not available')
+ @pytest.mark.parametrize(
+     'start_from_cueq',
+     [
+@@ -248,10 +239,7 @@ def acl(a, b, rtol=rtol, atol=atol):
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:.*is not found from.*')
+-@pytest.mark.skipif(
+-    not is_cue_available() or not torch.cuda.is_available(),
+-    reason='cueq or gpu is not available',
+-)
++@pytest.mark.skipif(not is_cue_available(), reason='cueq not available')
+ def test_calculator(tmp_path):
+     cueq = True
+     model = get_model(use_cueq=cueq)
+diff --git a/tests/unit_tests/test_flash.py b/tests/unit_tests/test_flash.py
+index 1b8954e6..54473e9c 100644
+--- a/tests/unit_tests/test_flash.py
++++ b/tests/unit_tests/test_flash.py
+@@ -83,10 +83,7 @@ def get_model(config_overwrite=None, use_flash=False):
+     return model
+ 
+ 
+-@pytest.mark.skipif(
+-    not is_flash_available() or not torch.cuda.is_available(),
+-    reason='flashTP or gpu is not available',
+-)
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
+ @pytest.mark.parametrize(
+     'cf',
+     [
+@@ -129,10 +126,7 @@ def test_model_output(cf):
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:.*is not found from.*')
+-@pytest.mark.skipif(
+-    not is_flash_available() or not torch.cuda.is_available(),
+-    reason='flash or gpu is not available',
+-)
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
+ @pytest.mark.parametrize(
+     'start_from_flash',
+     [
+@@ -178,10 +172,7 @@ def test_checkpoint_convert(tmp_path, start_from_flash):
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:.*is not found from.*')
+-@pytest.mark.skipif(
+-    not is_flash_available() or not torch.cuda.is_available(),
+-    reason='flash or gpu is not available',
+-)
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
+ @pytest.mark.parametrize(
+     'start_from_flash',
+     [
+@@ -244,10 +235,7 @@ def acl(a, b, rtol=rtol, atol=atol):
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:.*is not found from.*')
+-@pytest.mark.skipif(
+-    not is_flash_available() or not torch.cuda.is_available(),
+-    reason='flash or gpu is not available',
+-)
++@pytest.mark.skipif(not is_flash_available(), reason='flash not available')
+ def test_calculator(tmp_path):
+     flash = True
+     model = get_model(use_flash=flash)

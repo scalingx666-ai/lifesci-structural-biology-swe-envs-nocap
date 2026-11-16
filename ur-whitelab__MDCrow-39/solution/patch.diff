@@ -1,0 +1,407 @@
+diff --git a/mdagent/agent/tools.py b/mdagent/agent/tools.py
+index 20aeb1aa..7f6731bb 100644
+--- a/mdagent/agent/tools.py
++++ b/mdagent/agent/tools.py
+@@ -14,6 +14,7 @@
+     PlanBVisualizationTool,
+     RemoveWaterCleaningTool,
+     Scholar2ResultLLM,
++    SerpGitTool,
+     SetUpAndRunTool,
+     SpecializedCleanTool,
+     VisualizationToolRender,
+@@ -46,6 +47,10 @@ def make_tools(llm: BaseLanguageModel, verbose=False):
+         RemoveWaterCleaningTool(path_registry=path_instance),
+         AddHydrogensCleaningTool(path_registry=path_instance),
+     ]
++    # add serpapi tool
++    serp_key = os.getenv("SERP_API_KEY")
++    if serp_key:
++        all_tools.append(SerpGitTool(serp_key))
+ 
+     # add literature search tool
+     # Get the api keys
+diff --git a/mdagent/tools/__init__.py b/mdagent/tools/__init__.py
+index e1a9820b..8d887b2d 100644
+--- a/mdagent/tools/__init__.py
++++ b/mdagent/tools/__init__.py
+@@ -4,6 +4,7 @@
+     RemoveWaterCleaningTool,
+     SpecializedCleanTool,
+ )
++from .git_issues_tool import SerpGitTool
+ from .md_util_tools import Name2PDBTool, get_pdb
+ from .plot_tools import SimulationOutputFigures
+ from .registry import ListRegistryPaths, MapPath2Name, PathRegistry
+@@ -36,4 +37,5 @@
+     "CheckDirectoryFiles",
+     "PlanBVisualizationTool",
+     "SimulationOutputFigures",
++    "SerpGitTool",
+ ]
+diff --git a/mdagent/tools/git_issues_tool.py b/mdagent/tools/git_issues_tool.py
+new file mode 100644
+index 00000000..bba246b5
+--- /dev/null
++++ b/mdagent/tools/git_issues_tool.py
+@@ -0,0 +1,167 @@
++from typing import List, Optional
++
++import langchain
++import requests
++import tiktoken
++from langchain import LLMChain, PromptTemplate
++from langchain.base_language import BaseLanguageModel
++from langchain.tools import BaseTool
++from serpapi import GoogleSearch
++
++
++class GitToolFunctions:
++    """Class to store the functions of the tool."""
++
++    """chain that can be used the tools for summarization or classification"""
++
++    llm_ = langchain.chat_models.ChatOpenAI(
++        temperature=0.05,
++        model_name="gpt-3.5-turbo-16k",
++        request_timeout=1000,
++        max_tokens=2500,
++    )
++
++    def _prompt_summary(self, query: str, output: str, llm: BaseLanguageModel = llm_):
++        prompt_template = """You're receiving the following github issues and comments.
++                            They come after looking for issues
++                            in the openmm repo for the query: {query}.
++                            The responses have the following format:
++                            Issue: body of the issue
++                            Comment: comments in response to the issue.
++                            There are up to 5 comments per issue.
++                            Some of the comments do not address the issue.
++                            You job is to decide:
++                            1) if the issue is relevant to the query.
++                            2) if the comments are relevant to the issue.
++                            Then, make a summary of the issue and comments.
++                            Only keeping the relevant information.
++                            If there are PDB files shared,
++                            just add a few lines from them, not all of it.
++                            If a comment is not relevant,
++                            do not include it in the summary.
++                            And if the issue is not relevant,
++                            do not include it in the summary.
++                            Keep in the summary all possible solutions given
++                            in the comments if they are appropiate.
++                            The summary should have at most 2.5k tokens.
++                            The answer you have to summarize is:
++                            {output}
++
++                            you:"""
++        prompt = PromptTemplate(
++            template=prompt_template, input_variables=["query", "output"]
++        )
++        llm_chain = LLMChain(prompt=prompt, llm=llm)
++
++        return llm_chain.run({"query": query, "output": output})
++
++    """Function to get the number of requests remaining for the Github API """
++
++    def get_requests_remaining(self):
++        url = "https://api.github.com/rate_limit"
++        response = requests.get(url)
++        return response.json()["rate"]["remaining"]
++
++    def make_encoding(self):
++        return tiktoken.encoding_for_model("gpt-4")
++
++
++class SerpGitTool(BaseTool):
++    name = "Openmm Github Issues Search"
++    description = """ Tool that searches inside
++                    github issues in openmm. Make
++                    your query as if you were googling something.
++                    Input: Trying to run a simulation with a
++                    custom forcefield error: error_code.
++                    Output: Relevant issues with your query.
++                    Input: """
++    serp_key: Optional[str]
++
++    def __init__(self, serp_key):
++        super().__init__()
++        self.serp_key = serp_key
++
++    def _run(self, query: str):
++        fxns = GitToolFunctions()
++        # print("this is the key", self.serp_key)
++        params = {
++            "engine": "google",
++            "q": "site:github.com/openmm/openmm/issues " + query,
++            "api_key": self.serp_key,
++        }
++        encoding = fxns.make_encoding()
++        search = GoogleSearch(params)
++        results = search.get_dict()
++
++        organic_results = results["organic_results"]
++        issues_numbers: List = (
++            []
++        )  # list that will contain issue id numbers retrieved from the google search
++        number_of_results = (
++            3  # number of results to be retrieved from the google search
++        )
++        print(len(organic_results), "results found with SERP API")
++        for result in organic_results:
++            if (
++                len(issues_numbers) == number_of_results
++            ):  # break if we have enough results
++                break
++            link = result["link"]
++            number = int(link.split("/")[-1])
++            # check if number is integer
++            if isinstance(number, int):
++                issues_numbers.append(number)
++
++        # search for issues
++
++        number_of_requests = len(issues_numbers) * 2  # 1 for comments, 1 for issues
++        remaining_requests = fxns.get_requests_remaining()
++        print("remaining requests", remaining_requests)
++        if remaining_requests > number_of_requests:
++            issues_dict = {}
++            print("number of issues", len(issues_numbers))
++            for number in issues_numbers:
++                url_comments = f"https://api.github.com/repos/openmm/openmm/issues/{number}/comments"
++                url_issues = (
++                    f"https://api.github.com/repos/openmm/openmm/issues/{number}"
++                )
++                response_issues = requests.get(url_issues)
++                response_comments = requests.get(url_comments)
++
++                if (
++                    response_issues.status_code == 200
++                    and response_comments.status_code == 200
++                ):
++                    issues = response_issues.json()
++                    issue = issues["title"]
++                    body = issues["body"]
++                    comments = response_comments.json()
++                    body += f"\n\n Comments for issue {number}: \n"
++                    for i, comment in enumerate(comments):
++                        body += f"Answer#{i}:{comment['body']} \n"
++                        if i > 5:  # up to 5 comments per issue should be enough,
++                            # some issues have more than 100 comments
++                            break  # TODO definitely summarize comments
++                            # if there are more than x amount of comments.
++                    issues_dict[f"{number}"] = [issue, body]
++                else:
++                    print(f"Error: {response_comments.status_code} for issue {number}")
++                    continue
++
++                # prepare the output
++                output = ""
++                for key in issues_dict.keys():
++                    output += f"Issue {key}: {issues_dict[key][0]} \n"
++                    output += f"Body: {issues_dict[key][1]} \n"
++
++            num_tokens = len(encoding.encode(str(output)))
++            if num_tokens > 4000:
++                # summarize output
++                output = fxns._prompt_summary(query, output)
++            return output
++        else:
++            return "Not enough requests remaining for Github API. Try again later"
++
++    def _arun(self, query) -> str:
++        """Use the tool asynchronously."""
++        raise NotImplementedError("Name2PDB does not support async")
+diff --git a/mypy.ini b/mypy.ini
+index 7f1f0086..dab54b32 100644
+--- a/mypy.ini
++++ b/mypy.ini
+@@ -73,3 +73,15 @@ ignore_missing_imports = True
+  # Ignore missing imports from pytest
+ [mypy-pytest.*]
+ ignore_missing_imports = True
++
++ # Ignore missing imports from tiktoken
++[mypy-tiktoken.*]
++ignore_missing_imports = True
++
++ # Ignore missing imports from google-search-results
++[mypy-google-search-results*]
++ignore_missing_imports = True
++
++# Ignore missing imports from serpapi
++[mypy-serpapi.*]
++ignore_missing_imports = True
+diff --git a/notebooks/gitissues.ipynb b/notebooks/gitissues.ipynb
+new file mode 100644
+index 00000000..21ce6613
+--- /dev/null
++++ b/notebooks/gitissues.ipynb
+@@ -0,0 +1,143 @@
++{
++ "cells": [
++  {
++   "cell_type": "code",
++   "execution_count": 2,
++   "metadata": {},
++   "outputs": [
++    {
++     "data": {
++      "text/plain": [
++       "True"
++      ]
++     },
++     "execution_count": 2,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
++   "source": [
++    "from dotenv import load_dotenv\n",
++    "\n",
++    "load_dotenv()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 3,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import mdagent\n",
++    "from mdagent import MDAgent\n"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 5,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "mrkl = MDAgent()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 6,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "\n",
++      "\n",
++      "\u001b[1m> Entering new RetryAgentExecutor chain...\u001b[0m\n",
++      "The first step to answer this question is to use the Openmm Github Issues Search tool to find relevant issues related to the error 'residue not found in topology' in openmm. \n",
++      "\n",
++      "Action: Openmm Github Issues Search\n",
++      "Action Input: 'residue not found in topology' openmm issue\u001b[32;1m\u001b[1;3mThe first step to answer this question is to use the Openmm Github Issues Search tool to find relevant issues related to the error 'residue not found in topology' in openmm. \n",
++      "\n",
++      "Action: Openmm Github Issues Search\n",
++      "Action Input: 'residue not found in topology' openmm issue\u001b[0m10 results found with SERP API\n",
++      "remaining requests 30\n",
++      "number of issues 3\n",
++      "\n",
++      "Observation: \u001b[33;1m\u001b[1;3mIssue 2733: No template found for residue \n",
++      "Summary: The user is switching from LAMMPS to OpenMM and encountered an error \"No template found for residue 1 (BUP)\" when using the .pdb file. They are unsure why the residue cannot be found in the .xml files. They provided the OpenMM files for review.\n",
++      "\n",
++      "Comment 0: A link to the OpenMM FAQ is provided for reference.\n",
++      "\n",
++      "Comment 1: The user asks if they need to specify all bonds in the .pdb file with the \"CONECT\" label and if they should use the \"HETATM\" label instead of \"ATOM\" for non-standard residues.\n",
++      "\n",
++      "Comment 2: The PDB reader can only assign bonds for standard residues, so the user needs to specify the `CONECT` records for nonstandard residues. The distinction between \"HETATM\" and \"ATOM\" labels may not be necessary in OpenMM.\n",
++      "\n",
++      "Comment 3: Another user shares a similar issue with different ions in water using amoeba2013. They provide their job script and ask for help in debugging the error.\n",
++      "\n",
++      "Comment 4: The user's PDB file is missing element symbols in columns 77-78, causing OpenMM to guess the element based on the atom name. In this case, the atom named \"CS\" is being interpreted as carbon.\n",
++      "\n",
++      "Comment 5: The user thanks for the quick fix and asks if the simulations that ran with other ions used the correct parameters. They also suggest explicitly mentioning the need for element tags in the user manual and example PDB files.\n",
++      "\n",
++      "Comment 6: A suggestion is provided to check the element set by OpenMM for the atom and to write out a new PDB file to verify the correct elements.\n",
++      "\n",
++      "Summary: The user encountered an error with a non-standard residue in the .pdb file. They received help in specifying the missing `CONECT` records and adding element symbols to the PDB file. The issue was resolved, and the user expressed gratitude for the assistance.\u001b[0m\n",
++      "Thought:Thought: The issue seems to be related to non-standard residues in the .pdb file. The solutions suggested include specifying the `CONECT` records for nonstandard residues and adding element symbols to the PDB file. \n",
++      "\n",
++      "Final Answer: To fix the issue 'residue not found in topology' in openmm, users have tried the following solutions:\n",
++      "\n",
++      "1. Specifying the `CONECT` records for nonstandard residues in the .pdb file. The PDB reader in OpenMM can only assign bonds for standard residues, so for nonstandard residues, users need to specify the `CONECT` records.\n",
++      "\n",
++      "2. Adding element symbols to the PDB file. In some cases, the PDB file might be missing element symbols, causing OpenMM to guess the element based on the atom name. To avoid this, users have added the element symbols in the PDB file.\n",
++      "\n",
++      "These solutions were found to be effective in resolving the issue.\u001b[32;1m\u001b[1;3mThought: The issue seems to be related to non-standard residues in the .pdb file. The solutions suggested include specifying the `CONECT` records for nonstandard residues and adding element symbols to the PDB file. \n",
++      "\n",
++      "Final Answer: To fix the issue 'residue not found in topology' in openmm, users have tried the following solutions:\n",
++      "\n",
++      "1. Specifying the `CONECT` records for nonstandard residues in the .pdb file. The PDB reader in OpenMM can only assign bonds for standard residues, so for nonstandard residues, users need to specify the `CONECT` records.\n",
++      "\n",
++      "2. Adding element symbols to the PDB file. In some cases, the PDB file might be missing element symbols, causing OpenMM to guess the element based on the atom name. To avoid this, users have added the element symbols in the PDB file.\n",
++      "\n",
++      "These solutions were found to be effective in resolving the issue.\u001b[0m\n",
++      "\n",
++      "\u001b[1m> Finished chain.\u001b[0m\n"
++     ]
++    },
++    {
++     "data": {
++      "text/plain": [
++       "'Thought: The first step to answer this question is to use the Openmm Github Issues Search tool to find relevant issues related to the error \\'residue not found in topology\\' in openmm. \\n\\nAction: Openmm Github Issues Search\\nAction Input: \\'residue not found in topology\\' openmm issue\\nObservation: Issue 2733: No template found for residue \\nSummary: The user is switching from LAMMPS to OpenMM and encountered an error \"No template found for residue 1 (BUP)\" when using the .pdb file. They are unsure why the residue cannot be found in the .xml files. They provided the OpenMM files for review.\\n\\nComment 0: A link to the OpenMM FAQ is provided for reference.\\n\\nComment 1: The user asks if they need to specify all bonds in the .pdb file with the \"CONECT\" label and if they should use the \"HETATM\" label instead of \"ATOM\" for non-standard residues.\\n\\nComment 2: The PDB reader can only assign bonds for standard residues, so the user needs to specify the `CONECT` records for nonstandard residues. The distinction between \"HETATM\" and \"ATOM\" labels may not be necessary in OpenMM.\\n\\nComment 3: Another user shares a similar issue with different ions in water using amoeba2013. They provide their job script and ask for help in debugging the error.\\n\\nComment 4: The user\\'s PDB file is missing element symbols in columns 77-78, causing OpenMM to guess the element based on the atom name. In this case, the atom named \"CS\" is being interpreted as carbon.\\n\\nComment 5: The user thanks for the quick fix and asks if the simulations that ran with other ions used the correct parameters. They also suggest explicitly mentioning the need for element tags in the user manual and example PDB files.\\n\\nComment 6: A suggestion is provided to check the element set by OpenMM for the atom and to write out a new PDB file to verify the correct elements.\\n\\nSummary: The user encountered an error with a non-standard residue in the .pdb file. They received help in specifying the missing `CONECT` records and adding element symbols to the PDB file. The issue was resolved, and the user expressed gratitude for the assistance.\\nFinal Answer: To fix the issue \\'residue not found in topology\\' in openmm, users have tried the following solutions:\\n\\n1. Specifying the `CONECT` records for nonstandard residues in the .pdb file. The PDB reader in OpenMM can only assign bonds for standard residues, so for nonstandard residues, users need to specify the `CONECT` records.\\n\\n2. Adding element symbols to the PDB file. In some cases, the PDB file might be missing element symbols, causing OpenMM to guess the element based on the atom name. To avoid this, users have added the element symbols in the PDB file.\\n\\nThese solutions were found to be effective in resolving the issue.'"
++      ]
++     },
++     "execution_count": 6,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
++   "source": [
++    "mrkl.run(\"What have people try to do to fix this issue with openmm: 'residue not found in topology' ?\")"
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "DOEregression",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.11.5"
++  },
++  "orig_nbformat": 4
++ },
++ "nbformat": 4,
++ "nbformat_minor": 2
++}
+diff --git a/setup.py b/setup.py
+index 02fda18f..27ffc458 100644
+--- a/setup.py
++++ b/setup.py
+@@ -26,6 +26,9 @@
+         "requests",
+         "python-dotenv",
+         "matplotlib",
++        "google-search-results",
++        "tiktoken",
++        "openai",
+     ],
+     test_suite="tests",
+     long_description=long_description,
+diff --git a/tests/test_fxns.py b/tests/test_fxns.py
+index c0db1e85..ef8b430b 100644
+--- a/tests/test_fxns.py
++++ b/tests/test_fxns.py
+@@ -114,4 +114,4 @@ def test_setup_simulation_from_json(mock_json_load, mock_file_open, sim_fxns):
+ 
+ def test_getpdb(fibronectin, get_registry):
+     name = get_pdb(fibronectin, get_registry)
+-    assert name == "1X3D.cif"
++    assert name == "1X5Y.cif"

@@ -1,0 +1,462 @@
+diff --git a/src/boltzgen/task/predict/predict.py b/src/boltzgen/task/predict/predict.py
+index 1e865f51..9500ddc1 100755
+--- a/src/boltzgen/task/predict/predict.py
++++ b/src/boltzgen/task/predict/predict.py
+@@ -3,6 +3,7 @@
+ quiet_startup()
+ 
+ import os
++from collections.abc import Iterable
+ 
+ # Disable Triton auto-tuning during inference
+ os.environ.setdefault("CUEQ_DEFAULT_CONFIG", "1")
+@@ -15,6 +16,11 @@
+ from pytorch_lightning import LightningModule, Trainer
+ 
+ from pytorch_lightning.strategies import DDPStrategy
++from lightning_fabric.plugins.environments import (
++    ClusterEnvironment,
++    LightningEnvironment,
++    TorchElasticEnvironment,
++)
+ 
+ from boltzgen.task.predict.data_from_generated import FromGeneratedDataModule
+ from boltzgen.task.predict.writer import (
+@@ -167,14 +173,38 @@ def run(self, config: OmegaConf = None, run_prediction=True) -> None:  # noqa: A
+             if isinstance(devices, (list, listconfig.ListConfig))
+             else devices
+         )
+-        if num_devices > 1:
++        if isinstance(num_devices, int) and num_devices > 1:
+             strategy = DDPStrategy()
+             if num_devices > len(self.data.predict_set):
+-                devices = max(1, len(self.data.predict_set))
++                count = max(1, len(self.data.predict_set))
++                devices = (
++                    devices[:count]
++                    if isinstance(devices, (list, listconfig.ListConfig))
++                    else count
++                )
+                 msg = f"Fewer designs than devices. Setting devices to {devices}."
+                 print(msg)
+                 self.trainer["devices"] = devices
+ 
++        if (
++            not self.slurm
++            and os.environ.get("SLURM_NTASKS") == "1"
++            and self.trainer.get("num_nodes", 1) == 1
++            and not TorchElasticEnvironment.detect()
++        ):
++            # One SLURM task reserves GPUs but does not launch DDP workers.
++            # Materialize iterables once so checking cannot consume a generator.
++            plugins = self.trainer.get("plugins")
++            if plugins is None:
++                plugins = []
++            elif isinstance(plugins, Iterable):
++                plugins = list(plugins)
++            else:
++                plugins = [plugins]
++            if not any(isinstance(plugin, ClusterEnvironment) for plugin in plugins):
++                plugins.append(LightningEnvironment())
++            self.trainer["plugins"] = plugins
++
+         self.lightning_trainer = Trainer(
+             default_root_dir=self.output,
+             strategy=strategy,
+@@ -186,9 +216,26 @@ def run(self, config: OmegaConf = None, run_prediction=True) -> None:  # noqa: A
+             ),
+             **self.trainer,
+         )
++        expected_ranks = (
++            self.lightning_trainer.num_devices * self.lightning_trainer.num_nodes
++        )
++        if self.lightning_trainer.world_size != expected_ranks:
++            raise ValueError(
++                "Prediction launcher and device counts disagree: "
++                f"{self.lightning_trainer.world_size} launcher ranks for "
++                f"{expected_ranks} configured workers. Check the launcher, "
++                "devices and num_nodes settings."
++            )
++        if expected_ranks > len(self.data.predict_set):
++            raise ValueError(
++                f"Prediction has {len(self.data.predict_set)} records but "
++                f"{expected_ranks} workers. Set fewer devices or num_nodes so "
++                "each worker receives at least one record."
++            )
+         if run_prediction:
+             # Run training
+             self.lightning_trainer.predict(
+                 self.model_module, datamodule=self.data, return_predictions=False
+             )
++            self.lightning_trainer.strategy.barrier("prediction writes complete")
+             del self.model_module
+diff --git a/tests/test_distributed_prediction.py b/tests/test_distributed_prediction.py
+new file mode 100644
+index 00000000..15090cda
+--- /dev/null
++++ b/tests/test_distributed_prediction.py
+@@ -0,0 +1,268 @@
++"""Run the prediction launcher and sampler with real CPU worker processes."""
++# ruff: noqa: CPY001, INP001, S603
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Any
++
++import pytest
++import torch
++from lightning_fabric.plugins.environments import LightningEnvironment, SLURMEnvironment
++from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
++from pytorch_lightning.plugins.precision import Precision
++from torch.utils.data import DataLoader
++
++
++class IntegerData(LightningDataModule):
++    """Supply integer record identities without model inputs or weights."""
++
++    def __init__(self, count: int) -> None:
++        super().__init__()
++        self.predict_set = list(range(count))
++        self.num_workers = 0
++
++    def predict_dataloader(self) -> DataLoader:
++        """Return the loader that Lightning shards across workers."""
++        return DataLoader(self.predict_set, batch_size=1, num_workers=0)
++
++
++class IdentityModel(LightningModule):
++    """Return record IDs through the real Lightning prediction loop."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.layer = torch.nn.Linear(1, 1)
++
++    def predict_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
++        """Keep identities unchanged so tests can check exact coverage."""
++        return batch
++
++
++class RecordWriter(Callback):
++    """Write multiple outputs per record, delaying one worker deliberately."""
++
++    def __init__(self, output: Path, multiplicity: int) -> None:
++        self.output = output
++        self.multiplicity = multiplicity
++
++    def on_predict_batch_end(  # noqa: PLR0917
++        self,
++        trainer: Trainer,
++        pl_module: LightningModule,  # noqa: ARG002
++        outputs: torch.Tensor,
++        batch: torch.Tensor,  # noqa: ARG002
++        batch_idx: int,  # noqa: ARG002
++        dataloader_idx: int = 0,  # noqa: ARG002
++    ) -> None:
++        """Use synchronous writes, as the production prediction writers do."""
++        if trainer.global_rank == 1:
++            time.sleep(0.1)
++        for item in outputs.tolist():
++            for sample in range(self.multiplicity):
++                (self.output / f"{item}_{sample}.record").write_text(
++                    str(trainer.global_rank)
++                )
++
++
++def run_worker() -> None:
++    """Entry point re-executed by both Lightning and torchrun workers."""
++    from boltzgen.task.predict import predict  # noqa: PLC0415
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("output", type=Path)
++    parser.add_argument("--external-slurm", action="store_true")
++    args = parser.parse_args()
++    if args.external_slurm:
++        # torchrun supplies a real process group rendezvous. Expose those ranks
++        # through SLURM's interface to test externally launched worker selection.
++        os.environ.update(
++            SLURM_NTASKS=os.environ["WORLD_SIZE"],
++            SLURM_NTASKS_PER_NODE=os.environ["LOCAL_WORLD_SIZE"],
++            SLURM_PROCID=os.environ["RANK"],
++            SLURM_LOCALID=os.environ["LOCAL_RANK"],
++            SLURM_NODEID="0",
++        )
++        for key in (
++            "RANK",
++            "GROUP_RANK",
++            "LOCAL_RANK",
++            "LOCAL_WORLD_SIZE",
++            "TORCHELASTIC_RUN_ID",
++        ):
++            os.environ.pop(key, None)
++
++    predict.Boltz.load_from_checkpoint = lambda *_args, **_kwargs: IdentityModel()
++    task = predict.Predict(
++        data=IntegerData(7),
++        writer=RecordWriter(args.output, 3),
++        checkpoint="unused",
++        output=args.output,
++        name="integer_records",
++        recycling_steps=0,
++        sampling_steps=0,
++        slurm=args.external_slurm,
++        trainer={
++            "accelerator": "cpu",
++            "devices": 2,
++            "logger": False,
++            "enable_checkpointing": False,
++            "enable_progress_bar": False,
++        },
++    )
++    task.run()
++    trainer = task.lightning_trainer
++    receipt = {
++        "world_size": trainer.world_size,
++        "environment": type(trainer.strategy.cluster_environment).__name__,
++        "sampler_replicas": trainer.distributed_sampler_kwargs["num_replicas"],
++        "records_seen_at_return": len(list(args.output.glob("*.record"))),
++    }
++    (args.output / f"rank_{trainer.global_rank}.json").write_text(json.dumps(receipt))
++
++
++@pytest.mark.parametrize("launcher", ["local", "allocation", "torchrun", "slurm"])
++def test_every_rank_finishes_writes_before_predict_returns(
++    tmp_path: Path, launcher: str
++) -> None:
++    env = {
++        key: value
++        for key, value in os.environ.items()
++        if not key.startswith(("SLURM_", "TORCHELASTIC_"))
++        and key
++        not in {
++            "RANK",
++            "WORLD_SIZE",
++            "LOCAL_RANK",
++            "LOCAL_WORLD_SIZE",
++            "GROUP_RANK",
++            "MASTER_ADDR",
++            "MASTER_PORT",
++            "NODE_RANK",
++        }
++    }
++    env.update(CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
++    if launcher != "local":
++        env.update(
++            SLURM_NTASKS="1",
++            SLURM_PROCID="0",
++            SLURM_LOCALID="0",
++            SLURM_NODEID="0",
++            SLURM_JOB_NAME="prediction-regression",
++        )
++    command = [sys.executable]
++    if launcher in {"torchrun", "slurm"}:
++        command += [
++            "-m",
++            "torch.distributed.run",
++            "--standalone",
++            "--nnodes=1",
++            "--nproc-per-node=2",
++        ]
++    command += [str(Path(__file__).resolve()), str(tmp_path)]
++    if launcher == "slurm":
++        command.append("--external-slurm")
++    result = subprocess.run(
++        command, env=env, capture_output=True, text=True, timeout=120, check=False
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    expected = {f"{item}_{sample}.record" for item in range(7) for sample in range(3)}
++    assert {item.name for item in tmp_path.glob("*.record")} == expected
++    assert {item.read_text() for item in tmp_path.glob("*.record")} == {"0", "1"}
++    environments = {
++        "local": "LightningEnvironment",
++        "allocation": "LightningEnvironment",
++        "torchrun": "TorchElasticEnvironment",
++        "slurm": "SLURMEnvironment",
++    }
++    for rank in range(2):
++        receipt: dict[str, Any] = json.loads(
++            (tmp_path / f"rank_{rank}.json").read_text()
++        )
++        assert receipt == {
++            "world_size": 2,
++            "environment": environments[launcher],
++            "sampler_replicas": 2,
++            "records_seen_at_return": len(expected),
++        }
++
++
++@pytest.mark.parametrize(
++    "form",
++    [
++        "single",
++        "list",
++        "tuple",
++        "set",
++        "generator",
++        "dict_values",
++        "precision",
++        "mismatched",
++    ],
++)
++def test_explicit_environment_plugins_are_preserved(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, form: str
++) -> None:
++    from boltzgen.task.predict import predict  # noqa: PLC0415
++
++    for key, value in {
++        "SLURM_NTASKS": "1",
++        "SLURM_NNODES": "1",
++        "SLURM_PROCID": "0",
++        "SLURM_LOCALID": "0",
++        "SLURM_NODEID": "0",
++        "SLURM_JOB_NAME": "regression",
++    }.items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
++    monkeypatch.delenv("SLURM_NTASKS_PER_NODE", raising=False)
++    explicit = SLURMEnvironment() if form == "mismatched" else LightningEnvironment()
++    plugins = {
++        "single": explicit,
++        "list": [explicit],
++        "tuple": (explicit,),
++        "set": {explicit},
++        "generator": (item for item in [explicit]),
++        "dict_values": {"environment": explicit}.values(),
++        "precision": [Precision()],
++        "mismatched": explicit,
++    }[form]
++    monkeypatch.setattr(
++        predict.Boltz, "load_from_checkpoint", lambda *_args, **_kwargs: IdentityModel()
++    )
++    task = predict.Predict(
++        data=IntegerData(7),
++        writer=RecordWriter(tmp_path, 3),
++        checkpoint="unused",
++        output=str(tmp_path),
++        name="integer_records",
++        recycling_steps=0,
++        sampling_steps=0,
++        trainer={
++            "accelerator": "cpu",
++            "devices": 2,
++            "plugins": plugins,
++            "logger": False,
++            "enable_checkpointing": False,
++        },
++    )
++    # Predict sets global grad mode; contain that side effect within this test.
++    if form == "mismatched":
++        with torch.enable_grad(), pytest.raises(ValueError, match="counts disagree"):
++            task.run(run_prediction=False)
++        return
++    with torch.enable_grad():
++        task.run(run_prediction=False)
++    actual = task.lightning_trainer.strategy.cluster_environment
++    if form == "precision":
++        assert isinstance(actual, LightningEnvironment)
++    else:
++        assert actual is explicit
++
++
++if __name__ == "__main__":
++    run_worker()
+diff --git a/tests/test_prediction_devices.py b/tests/test_prediction_devices.py
+new file mode 100644
+index 00000000..9b61021d
+--- /dev/null
++++ b/tests/test_prediction_devices.py
+@@ -0,0 +1,90 @@
++"""Real Trainer configuration checks; CUDA availability is simulated, never executed."""
++# ruff: noqa: CPY001, INP001
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++from lightning_fabric.plugins.environments import LightningEnvironment
++from pytorch_lightning import Callback, Trainer
++
++from boltzgen.task.predict import predict
++
++
++def build_trainer(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    *,
++    devices: int | str | list[int],
++    records: int = 100,
++) -> Trainer:
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
++    for key, value in {
++        "SLURM_NTASKS": "1",
++        "SLURM_NTASKS_PER_NODE": "1",
++        "SLURM_NNODES": "1",
++        "SLURM_PROCID": "0",
++        "SLURM_LOCALID": "0",
++        "SLURM_NODEID": "0",
++        "SLURM_JOB_NAME": "prediction-regression",
++    }.items():
++        monkeypatch.setenv(key, value)
++    for key in ("TORCHELASTIC_RUN_ID", "LOCAL_RANK", "RANK", "NODE_RANK", "GROUP_RANK"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(
++        predict.Boltz,
++        "load_from_checkpoint",
++        lambda *_a, **_k: SimpleNamespace(eval=lambda: None),
++    )
++    task = predict.Predict(
++        data=SimpleNamespace(predict_set=range(records), num_workers=0),
++        writer=Callback(),
++        checkpoint="unused",
++        output=str(tmp_path),
++        name="toy",
++        recycling_steps=0,
++        sampling_steps=0,
++        trainer={
++            "accelerator": "cuda",
++            "devices": devices,
++            "logger": False,
++            "enable_checkpointing": False,
++        },
++    )
++    with torch.enable_grad():
++        task.run(run_prediction=False)
++    return task.lightning_trainer
++
++
++@pytest.mark.parametrize("devices", [-1, "auto", "0,2", [0, 2]])
++def test_device_formats_select_local_workers_in_one_task_slurm(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, devices: int | str | list[int]
++) -> None:
++    trainer = build_trainer(monkeypatch, tmp_path, devices=devices)
++    expected_count = 4 if devices in (-1, "auto") else 2
++    assert trainer.num_devices == expected_count
++    assert trainer.distributed_sampler_kwargs == {
++        "num_replicas": expected_count,
++        "rank": 0,
++    }
++    environment = trainer.strategy.cluster_environment
++    assert isinstance(environment, LightningEnvironment)
++    assert not environment.creates_processes_externally
++
++
++def test_device_list_truncation_preserves_device_identity(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    trainer = build_trainer(monkeypatch, tmp_path, devices=[2, 3], records=1)
++    assert trainer.num_devices == 1
++    assert trainer.device_ids == [2]
++
++
++@pytest.mark.parametrize("devices", [-1, "auto", "0,2"])
++def test_resolved_device_count_fails_clearly_before_creating_empty_workers(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, devices: int | str
++) -> None:
++    with pytest.raises(ValueError, match="Set fewer devices or num_nodes"):
++        build_trainer(monkeypatch, tmp_path, devices=devices, records=1)

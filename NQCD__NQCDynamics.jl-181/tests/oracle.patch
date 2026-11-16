@@ -1,0 +1,524 @@
+diff --git a/src/DynamicsMethods/IntegrationAlgorithms/mint.jl b/src/DynamicsMethods/IntegrationAlgorithms/mint.jl
+index ae6148450..902da76ac 100644
+--- a/src/DynamicsMethods/IntegrationAlgorithms/mint.jl
++++ b/src/DynamicsMethods/IntegrationAlgorithms/mint.jl
+@@ -6,6 +6,7 @@ using OrdinaryDiffEq: OrdinaryDiffEq
+ using LinearAlgebra: Hermitian, tr
+ 
+ using NonadiabaticMolecularDynamics.DynamicsMethods: MappingVariableMethods
++using NonadiabaticModels: nstates
+ 
+ """
+     MInt <: OrdinaryDiffEq.OrdinaryDiffEqAlgorithm
+@@ -52,24 +53,28 @@ function OrdinaryDiffEq.initialize!(_, ::MIntCache) end
+     propagate_mapping_variables!(calc, u, dt)
+ 
+     for i=1:nbeads(p)
++        V̄ = tr(calc.potential[i]) / nstates(calc.model)
++        traceless_eigs = calc.eigenvalues[i] .- V̄
+         for j=1:natoms(p)
+             for k=1:ndofs(p)
+-                Γ = get_gamma(calc.adiabatic_derivative[k,j,i], calc.eigenvalues[i], dt)
++                D̄ = tr(calc.derivative[k,j,i]) / nstates(calc.model)
++
++                traceless_adiabatic_deriv = calc.adiabatic_derivative[k,j,i] - Diagonal(fill(D̄, nstates(calc.model)))
++                Γ = get_gamma(traceless_adiabatic_deriv, traceless_eigs, dt)
+                 E = transform_matrix(calc.eigenvectors[i], Γ)
+ 
+-                Ξ = get_xi(calc.adiabatic_derivative[k,j,i], calc.eigenvalues[i], dt)
++                Ξ = get_xi(traceless_adiabatic_deriv, traceless_eigs, dt)
+                 F = transform_matrix(calc.eigenvectors[i], Ξ)
+ 
+                 qmap = MappingVariableMethods.get_mapping_positions(u, i)
+                 pmap = MappingVariableMethods.get_mapping_momenta(u, i)
+-                V = calc.derivative[k,j,i]
+-                force = get_mapping_nuclear_force(qmap, pmap, E, F, V, dt)
++                force = get_mapping_nuclear_force(qmap, pmap, E, F)
+                 DynamicsUtils.get_velocities(u)[k,j,i] -= force / p.atoms.masses[j]
++                DynamicsUtils.get_velocities(u)[k,j,i] -= D̄ / p.atoms.masses[j] * dt
+             end
+         end
+     end
+ 
+-
+     RingPolymers.transform_to_normal_modes!(p.beads, u)
+     step_C!(DynamicsUtils.get_velocities(u), DynamicsUtils.get_positions(u), cayley)
+     RingPolymers.transform_from_normal_modes!(p.beads, u)
+@@ -87,8 +92,10 @@ end
+ 
+ function propagate_mapping_variables!(calc, u, dt)
+     for i=1:length(calc.eigenvalues)
+-        C = get_C_propagator(calc.eigenvalues[i], calc.eigenvectors[i], dt)
+-        D = get_D_propagator(calc.eigenvalues[i], calc.eigenvectors[i], dt)
++        V̄ = tr(calc.potential[i]) / nstates(calc.model)
++        traceless_eigs = calc.eigenvalues[i] .- V̄
++        C = get_C_propagator(traceless_eigs, calc.eigenvectors[i], dt)
++        D = get_D_propagator(traceless_eigs, calc.eigenvectors[i], dt)
+         qmap = MappingVariableMethods.get_mapping_positions(u, i)
+         pmap = MappingVariableMethods.get_mapping_momenta(u, i)
+         q = C * qmap - D * pmap
+@@ -132,10 +139,8 @@ end
+ 
+ "Get the force due to the mapping variables."
+ function get_mapping_nuclear_force(q::AbstractVector, p::AbstractVector,
+-                           E::AbstractMatrix, F::AbstractMatrix,
+-                           diabatic_derivative::Hermitian, dt::Real)
+-    trVdt = tr(diabatic_derivative) * dt
+-    return 0.5 * (q'*E*q + p'*E*p - trVdt) - q'*F*p
++                           E::AbstractMatrix, F::AbstractMatrix)
++    return 0.5 * (q'*E*q + p'*E*p) - q'*F*p
+ end
+ 
+ DynamicsMethods.select_algorithm(::RingPolymerSimulation{<:MappingVariableMethods.NRPMD}) = MInt()
+diff --git a/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl b/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl
+index a18d97915..f2482595a 100644
+--- a/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl
++++ b/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl
+@@ -11,6 +11,7 @@ using NonadiabaticMolecularDynamics:
+     Calculators,
+     Estimators,
+     NonadiabaticDistributions,
++    TimeCorrelationFunctions,
+     ndofs
+ using NonadiabaticModels: NonadiabaticModels, Model
+ using NonadiabaticDynamicsBase: Atoms
+diff --git a/src/DynamicsMethods/MappingVariableMethods/cmm.jl b/src/DynamicsMethods/MappingVariableMethods/cmm.jl
+index d5311476b..985d3300e 100644
+--- a/src/DynamicsMethods/MappingVariableMethods/cmm.jl
++++ b/src/DynamicsMethods/MappingVariableMethods/cmm.jl
+@@ -105,7 +105,7 @@ end
+ function Estimators.diabatic_population(sim::Simulation{<:eCMM}, u)
+     qmap = get_mapping_positions(u)
+     pmap = get_mapping_momenta(u)
+-    2inverse_mapping_kernel(qmap, pmap, sim.method.γ)
++    inverse_mapping_kernel(qmap, pmap, sim.method.γ)
+ end
+ 
+ function Estimators.initial_diabatic_population(sim::Simulation{<:eCMM}, u)
+@@ -114,3 +114,6 @@ function Estimators.initial_diabatic_population(sim::Simulation{<:eCMM}, u)
+     mapping_kernel(qmap, pmap, sim.method.γ)
+ end
+ 
++TimeCorrelationFunctions.evaluate_normalisation(sim::Simulation{<:eCMM},
++    correlation::TimeCorrelationFunctions.PopulationCorrelationFunction) = 2
++
+diff --git a/src/DynamicsMethods/MappingVariableMethods/nrpmd.jl b/src/DynamicsMethods/MappingVariableMethods/nrpmd.jl
+index 845a4377d..e36f792bd 100644
+--- a/src/DynamicsMethods/MappingVariableMethods/nrpmd.jl
++++ b/src/DynamicsMethods/MappingVariableMethods/nrpmd.jl
+@@ -1,7 +1,10 @@
+ 
+-using LinearAlgebra: tr, mul!, dot
++using LinearAlgebra: tr, mul!, dot, Diagonal
+ using ComponentArrays: ComponentVector
++using Distributions: Normal
+ using NonadiabaticMolecularDynamics: RingPolymers
++using NonadiabaticModels: nstates
++using NonadiabaticMolecularDynamics.NonadiabaticDistributions: ElectronicDistribution
+ 
+ """
+     NRPMD{T} <: DynamicsMethods.Method
+@@ -40,21 +43,13 @@ function NonadiabaticMolecularDynamics.RingPolymerSimulation{NRPMD}(atoms::Atoms
+     NonadiabaticMolecularDynamics.RingPolymerSimulation(atoms, model, NRPMD{T}(NonadiabaticModels.nstates(model)), n_beads; kwargs...)
+ end
+ 
+-function DynamicsMethods.DynamicsVariables(sim::RingPolymerSimulation{<:NRPMD}, v, r, electronic::NonadiabaticDistributions.SingleState)
+-    n_states = NonadiabaticModels.nstates(sim.calculator.model)
++function DynamicsMethods.DynamicsVariables(sim::RingPolymerSimulation{<:NRPMD}, v, r, electronic::ElectronicDistribution)
++    K = NonadiabaticModels.nstates(sim)
+     n_beads = length(sim.beads)
+-    state = electronic.state
+-    if electronic.statetype === NonadiabaticDistributions.Diabatic()
+-        qmap = zeros(n_states, n_beads)
+-        pmap = zeros(n_states, n_beads)
+-
+-        θ = rand(n_states, n_beads) .* 2π
+-        qmap .= 1 ./ sqrt.(tan.(-θ) .^ 2 .+ 1)
+-        qmap[state,:] .*= sqrt(3)
+-        pmap = qmap .* tan.(-θ)
+-    else
+-        throw("Adiabatic initialisation not implemented.")
+-    end
++    σ = sqrt(1/2)
++    distribution = Normal(0, σ)
++    qmap = rand(distribution, K, n_beads)
++    pmap = rand(distribution, K, n_beads)
+     return ComponentVector(v=v, r=r, pmap=pmap, qmap=qmap)
+ end
+ 
+@@ -80,11 +75,13 @@ function acceleration!(dv, u, sim::RingPolymerSimulation{<:NRPMD})
+         qmap = get_mapping_positions(u, I[3])
+         pmap = get_mapping_momenta(u, I[3])
+         D = sim.calculator.derivative[I]
+-        mul!(sim.method.temp_q, D, qmap)
+-        mul!(sim.method.temp_p, D, pmap)
++        D̄ = tr(D) / nstates(sim)
++        Dtraceless = D - Diagonal(fill(D̄, nstates(sim)))
++        mul!(sim.method.temp_q, Dtraceless, qmap)
++        mul!(sim.method.temp_p, Dtraceless, pmap)
+         dv[I] = dot(qmap, sim.method.temp_q)
+         dv[I] += dot(pmap, sim.method.temp_p)
+-        dv[I] -= tr(D)
++        dv[I] += 2D̄
+     end
+     lmul!(-1/2, dv)
+     DynamicsUtils.divide_by_mass!(dv, sim.atoms.masses)
+@@ -97,16 +94,45 @@ function set_mapping_force!(du, u, sim::RingPolymerSimulation{<:NRPMD})
+     Calculators.evaluate_potential!(sim.calculator, DynamicsUtils.get_positions(u))
+     for i in range(sim.beads)
+         V = sim.calculator.potential[i]
+-        mul!(get_mapping_positions(du, i), V, get_mapping_momenta(u, i))
+-        mul!(get_mapping_momenta(du, i), V, get_mapping_positions(u, i))
++        V̄ = tr(V) / nstates(sim)
++        Vtraceless = V - Diagonal(fill(V̄, nstates(sim)))
++        mul!(get_mapping_positions(du, i), Vtraceless, get_mapping_momenta(u, i))
++        mul!(get_mapping_momenta(du, i), Vtraceless, get_mapping_positions(u, i))
+         lmul!(-1, get_mapping_momenta(du, i))
+     end
+ end
+ 
+-function Estimators.diabatic_population(::RingPolymerSimulation{<:NRPMD}, u)
+-    qmap = get_mapping_positions(u)
+-    pmap = get_mapping_momenta(u)
+-    sum(qmap.^2 + pmap.^2 .- 1; dims=2) / 2size(qmap, 2)
++function Estimators.diabatic_population(sim::RingPolymerSimulation{<:NRPMD}, u)
++    K = NonadiabaticModels.nstates(sim)
++    population = zeros(K)
++    for i in 1:RingPolymers.nbeads(sim)
++        qmap = get_mapping_positions(u, i)
++        pmap = get_mapping_momenta(u, i)
++        G = exp(-(dot(qmap, qmap) + dot(pmap, pmap)))
++        for j in axes(qmap, 1)
++            population[j] += (qmap[j]^2 + pmap[j]^2 - 1/2) * G * 2^(K+1)
++        end
++    end
++    return population / RingPolymers.nbeads(sim)
++end
++
++function Estimators.initial_diabatic_population(sim::RingPolymerSimulation{<:NRPMD}, u)
++    K = NonadiabaticModels.nstates(sim)
++    population = zeros(K)
++    for i in 1:RingPolymers.nbeads(sim)
++        qmap = get_mapping_positions(u, i)
++        pmap = get_mapping_momenta(u, i)
++        for j in axes(qmap, 1)
++            population[j] += (qmap[j]^2 + pmap[j]^2 - 1/2) * 2^(K+1)
++        end
++    end
++    return population / RingPolymers.nbeads(sim)
++end
++
++function TimeCorrelationFunctions.evaluate_normalisation(sim::RingPolymerSimulation{<:NRPMD},
++    ::TimeCorrelationFunctions.PopulationCorrelationFunction)
++    K = NonadiabaticModels.nstates(sim)
++    return RingPolymers.nbeads(sim)/2^K
+ end
+ 
+ function DynamicsUtils.classical_hamiltonian(sim::RingPolymerSimulation{<:NRPMD}, u)
+@@ -118,11 +144,13 @@ function DynamicsUtils.classical_hamiltonian(sim::RingPolymerSimulation{<:NRPMD}
+ 
+     potential = zero(eltype(u))
+     Calculators.evaluate_potential!(sim.calculator, r)
+-    V = sim.calculator.potential
+     for i in range(sim.beads)
++        V = sim.calculator.potential[i]
++        V̄ = tr(V) / nstates(sim)
++        Vtraceless = V - Diagonal(fill(V̄, nstates(sim)))
+         qmap = get_mapping_positions(u, i)
+         pmap = get_mapping_momenta(u, i)
+-        potential += 0.5 * (pmap'V[i]*pmap + qmap'V[i]*qmap - tr(V[i]))
++        potential += 0.5 * (pmap'Vtraceless*pmap + qmap'Vtraceless*qmap) + V̄
+     end
+ 
+     return kinetic + spring + potential
+diff --git a/src/Ensembles/outputs.jl b/src/Ensembles/outputs.jl
+index 2462da3a3..cfd3318ff 100644
+--- a/src/Ensembles/outputs.jl
++++ b/src/Ensembles/outputs.jl
+@@ -100,31 +100,3 @@ function (output::OutputStateResolvedScattering1D)(sol, i)
+     end
+     return (output, false)
+ end
+-
+-struct PopulationCorrelation{T,S}
+-    sim::S
+-    state::Int
+-    statetype::T
+-end
+-
+-function (output::PopulationCorrelation{Diabatic})(sol, i)
+-    initial_populations = Estimators.initial_diabatic_population(output.sim, first(sol.u))
+-    populations = Estimators.diabatic_population.(output.sim, sol.u)
+-    n = nstates(output.sim)
+-    output = [zeros(n, n) for _=1:length(populations)]
+-    for i=1:length(output)
+-        output[i] .= populations[i] * initial_populations'
+-    end
+-    return (output, false)
+-end
+-
+-function (output::PopulationCorrelation{Adiabatic})(sol, i)
+-    initial_populations = Estimators.initial_adiabatic_population(output.sim, first(sol.u))
+-    populations = Estimators.adiabatic_population.(output.sim, sol.u)
+-    n = nstates(output.sim)
+-    output = [zeros(n, n) for _=1:length(populations)]
+-    for i=1:length(output)
+-        output[i] .= populations[i] * initial_populations'
+-    end
+-    return (output, false)
+-end
+diff --git a/src/NonadiabaticMolecularDynamics.jl b/src/NonadiabaticMolecularDynamics.jl
+index 19688a815..9d087929d 100644
+--- a/src/NonadiabaticMolecularDynamics.jl
++++ b/src/NonadiabaticMolecularDynamics.jl
+@@ -29,6 +29,9 @@ include("DynamicsOutputs.jl")
+ include("NonadiabaticDistributions/NonadiabaticDistributions.jl")
+ @reexport using .NonadiabaticDistributions
+ 
++include("TimeCorrelationFunctions.jl")
++export TimeCorrelationFunctions
++
+ include("DynamicsMethods/DynamicsMethods.jl")
+ @reexport using .DynamicsMethods
+ 
+diff --git a/src/TimeCorrelationFunctions.jl b/src/TimeCorrelationFunctions.jl
+new file mode 100644
+index 000000000..270ea086a
+--- /dev/null
++++ b/src/TimeCorrelationFunctions.jl
+@@ -0,0 +1,69 @@
++
++module TimeCorrelationFunctions
++
++using NonadiabaticMolecularDynamics: AbstractSimulation, Estimators
++using NonadiabaticMolecularDynamics.NonadiabaticDistributions: Diabatic, Adiabatic
++using NonadiabaticMolecularDynamics.NonadiabaticModels: nstates
++
++export PopulationCorrelationFunction
++
++abstract type TimeCorrelationFunction end
++
++function (correlation::TimeCorrelationFunction)(sol, _)
++    sim = correlation.sim
++    template = correlation_template(correlation)
++    out = [similar(template) for _ in 1:length(sol)]
++
++    normalisation = evaluate_normalisation(sim, correlation)
++    initial_value = evaluate_initial_value(sim, correlation, first(sol.u))
++
++    for i in 1:length(sol)
++        final_value = evaluate_final_value(sim, correlation, sol.u[i])
++        correlate!(out[i], normalisation, initial_value, final_value, correlation)
++    end
++
++    return (out, false)
++end
++
++evaluate_normalisation(sim::AbstractSimulation, correlation::TimeCorrelationFunction) = 1
++evaluate_initial_value(sim::AbstractSimulation, correlation::TimeCorrelationFunction, u) = 
++    evaluate_final_value(sim, correlation, u)
++
++function correlate!(out, normalisation, initial_value, final_value, ::TimeCorrelationFunction)
++    @. out = normalisation * initial_value * final_value
++end
++
++function correlation_template(::TimeCorrelationFunction)
++    error("Implement this for your correlation function type.")
++end
++
++struct PopulationCorrelationFunction{T,S<:AbstractSimulation} <: TimeCorrelationFunction
++    sim::S
++    statetype::T
++end
++
++function correlation_template(correlation::PopulationCorrelationFunction)
++    zeros(nstates(correlation.sim), nstates(correlation.sim))
++end
++
++function evaluate_final_value(sim::AbstractSimulation, ::PopulationCorrelationFunction{Diabatic}, u)
++    Estimators.diabatic_population(sim, u)
++end
++
++function evaluate_initial_value(sim::AbstractSimulation, ::PopulationCorrelationFunction{Diabatic}, u)
++    Estimators.initial_diabatic_population(sim, u)
++end
++
++function evaluate_final_value(sim::AbstractSimulation, ::PopulationCorrelationFunction{Adiabatic}, u)
++    Estimators.adiabatic_population(sim, u)
++end
++
++function evaluate_initial_value(sim::AbstractSimulation, ::PopulationCorrelationFunction{Adiabatic}, u)
++    Estimators.initial_adiabatic_population(sim, u)
++end
++
++function correlate!(out, normalisation::Real, initial_value::Vector, final_value::Vector, ::PopulationCorrelationFunction)
++    out .= normalisation .* initial_value * final_value'
++end
++
++end # module
+diff --git a/test/Dynamics/cmm.jl b/test/Dynamics/cmm.jl
+index d6f28271d..8338bb252 100644
+--- a/test/Dynamics/cmm.jl
++++ b/test/Dynamics/cmm.jl
+@@ -56,11 +56,14 @@ end
+             sim = Simulation{eCMM}(Atoms(1), DoubleWell(); γ=γ)
+             out = zeros(2, 2)
+             n = 1e4
++            correlation = TimeCorrelationFunctions.PopulationCorrelationFunction(sim, Diabatic())
++            normalisation = TimeCorrelationFunctions.evaluate_normalisation(sim, correlation)
++
+             for i=1:n
+                 u = DynamicsVariables(sim, 0, 0, SingleState(1))
+-                K = DynamicsMethods.MappingVariableMethods.mapping_kernel(u.qmap, u.pmap, sim.method.γ)
+-                Kinv = DynamicsMethods.MappingVariableMethods.inverse_mapping_kernel(u.qmap, u.pmap, sim.method.γ)
+-                out .+= 2K * Kinv'
++                K = Estimators.initial_diabatic_population(sim, u)
++                Kinv = Estimators.diabatic_population(sim, u)
++                out .+= normalisation * K * Kinv'
+             end
+             @test out ./ n ≈ [1 0; 0 1] atol=0.1
+         end
+diff --git a/test/Dynamics/nrpmd.jl b/test/Dynamics/nrpmd.jl
+index b6e279d0f..2f204c2da 100644
+--- a/test/Dynamics/nrpmd.jl
++++ b/test/Dynamics/nrpmd.jl
+@@ -9,47 +9,67 @@ using NonadiabaticMolecularDynamics.DynamicsMethods.MappingVariableMethods
+ Random.seed!(1)
+ 
+ @test MappingVariableMethods.NRPMD{Float64}(10) isa MappingVariableMethods.NRPMD
+-atoms = Atoms(2.0)
+-sim = RingPolymerSimulation{NRPMD}(atoms, NonadiabaticModels.DoubleWell(), 10; temperature=1e-1)
++atoms = Atoms(1)
++sim = RingPolymerSimulation{NRPMD}(atoms, DoubleWell(), 10; temperature=1e-3)
+ 
+-v = zeros(size(sim))
++v = randn(size(sim))
+ r = randn(size(sim))
+ u = DynamicsVariables(sim, v, r, SingleState(2))
+ 
+-@testset "get_population" begin
+-    population = Estimators.diabatic_population(sim, u)
+-    @test population[1] ≈ 0 atol=1e-10
+-    @test population[2] ≈ 1
++@testset "Population correlation" begin
++    K = NonadiabaticModels.nstates(sim)
++    out = zeros(K, K)
++    n = 1e4
++    correlation = TimeCorrelationFunctions.PopulationCorrelationFunction(sim, Diabatic())
++    normalisation = TimeCorrelationFunctions.evaluate_normalisation(sim, correlation)
++
++    for i=1:n
++        u = DynamicsVariables(sim, v, r, SingleState(1))
++        K = Estimators.initial_diabatic_population(sim, u)
++        Kinv = Estimators.diabatic_population(sim, u)
++        out += normalisation * K * Kinv'
++    end
++   @test out ./ n ≈ [1 0; 0 1] atol=0.1
+ end
+ 
+-function test_motion!(sim, u)
+-    f(x) = DynamicsUtils.classical_hamiltonian(sim, x)
++@testset "motion! obeys Hamilton's equations" begin
++    function test_motion!(sim, u)
++        f(x) = DynamicsUtils.classical_hamiltonian(sim, x)
+ 
+-    grad = FiniteDiff.finite_difference_gradient(f, u)
++        grad = FiniteDiff.finite_difference_gradient(f, u)
+ 
+-    du = zero(u)
+-    DynamicsMethods.motion!(du, u, sim, 0.0)
++        du = zero(u)
++        DynamicsMethods.motion!(du, u, sim, 0.0)
+ 
+-    @test DynamicsUtils.get_positions(du) ≈ DynamicsUtils.get_velocities(grad) ./ sim.atoms.masses' rtol=1e-3
+-    @test DynamicsUtils.get_velocities(du) ≈ -DynamicsUtils.get_positions(grad) ./ sim.atoms.masses' rtol=1e-3
+-    @test MappingVariableMethods.get_mapping_positions(du) ≈ MappingVariableMethods.get_mapping_momenta(grad) rtol=1e-3
+-    @test MappingVariableMethods.get_mapping_momenta(du) ≈ -MappingVariableMethods.get_mapping_positions(grad) rtol=1e-3
+-end
++        @test DynamicsUtils.get_positions(du) ≈ DynamicsUtils.get_velocities(grad) ./ sim.atoms.masses' rtol=1e-3
++        @test DynamicsUtils.get_velocities(du) ≈ -DynamicsUtils.get_positions(grad) ./ sim.atoms.masses' rtol=1e-3
++        @test MappingVariableMethods.get_mapping_positions(du) ≈ MappingVariableMethods.get_mapping_momenta(grad) rtol=1e-3
++        @test MappingVariableMethods.get_mapping_momenta(du) ≈ -MappingVariableMethods.get_mapping_positions(grad) rtol=1e-3
++    end
+ 
+-test_motion!(sim, u)
++    test_motion!(sim, u)
++end
+ 
+-sol = run_trajectory(u, (0, 10.0), sim; output=(:hamiltonian, :position), dt=1e-2)
+-@test sol.hamiltonian[1] ≈ sol.hamiltonian[end] rtol=1e-2
++algs = (DynamicsMethods.IntegrationAlgorithms.MInt(), Tsit5())
++@testset "Energy conservation $alg" for alg in algs
++    sol = run_trajectory(u, (0, 10.0), sim; output=(:hamiltonian, :population), dt=1e-2, algorithm=alg, abstol=1e-8, reltol=1e-8)
++    @test sol.hamiltonian[1] ≈ sol.hamiltonian[end] rtol=1e-2
++end
+ 
+-sol = run_trajectory(u, (0, 10.0), sim; dt=1e-2, algorithm=DynamicsMethods.IntegrationAlgorithms.MInt())
+-sol1 = run_trajectory(u, (0, 10.0), sim; algorithm=Tsit5(), saveat=0:1e-2:10, reltol=1e-10, abstol=1e-10)
+-@test sol.u ≈ sol1.u rtol=1e-3
++@testset "Algorithm comparison" begin
++    sol = run_trajectory(u, (0, 10.0), sim; dt=1e-2, algorithm=DynamicsMethods.IntegrationAlgorithms.MInt())
++    sol1 = run_trajectory(u, (0, 10.0), sim; algorithm=Tsit5(), reltol=1e-10, abstol=1e-10, saveat=sol.t)
++    @test sol.u ≈ sol1.u rtol=1e-2
++end
+ 
+-@testset "MInt algorithm" begin
+-    tspan=(0, 20.0)
++@testset "MInt algorithm convergence" begin
++    tspan=(0, 10.0)
+     prob = DynamicsMethods.create_problem(u, tspan, sim)
+-    dts = (1/2) .^ (14:-1:8)
+-    setup = Dict(:alg => Feagin12(), :adaptive=>true, :reltol=>1e-14, :abstol=>1e-14)
+-    res = analyticless_test_convergence(dts, prob, DynamicsMethods.IntegrationAlgorithms.MInt(), setup)
++    dts = 1 .// 2 .^(8:-1:3)
++
++    alg = DynamicsMethods.IntegrationAlgorithms.MInt()
++    test_alg = Vern9()
++    setup = Dict(:alg => test_alg, :adaptive=>true, :abstol=>1e-8, :reltol=>1e-8)
++    res = analyticless_test_convergence(dts, prob, alg, setup)
+     @test res.𝒪est[:final] ≈ 2 atol=0.1
+ end
+diff --git a/test/Ensembles/outputs.jl b/test/Ensembles/outputs.jl
+index abb4cf0f0..c09b7c17f 100644
+--- a/test/Ensembles/outputs.jl
++++ b/test/Ensembles/outputs.jl
+@@ -31,33 +31,33 @@ end
+     output = Ensembles.OutputQuantisedDiatomic(sim)
+ end
+ 
+-@testset "PopulationCorrelation" begin
++@testset "PopulationCorrelationFunction" begin
+ 
+     @testset "Ehrenfest" begin
+         sim = Simulation{Ehrenfest}(Atoms(2000), TullyModelTwo())
+-        output = Ensembles.PopulationCorrelation(sim, 1, Adiabatic())
++        output = TimeCorrelationFunctions.PopulationCorrelationFunction(sim, Adiabatic())
+         u = DynamicsVariables(sim, hcat(20/2000), hcat(-5), SingleState(1, Adiabatic()))
+         sol = run_trajectory(u, (0, 1000.0), sim)
+         out, cont = output(sol, 1)
+         @test out[1][1,1] ≈ 1
+         @test out[1][2,2] ≈ 0
+-        @test [o[2,1] for o in out] ≈ [1 - o[1,1] for o in out]
++        @test [o[1,2] for o in out] ≈ [1 - o[1,1] for o in out]
+     end
+ 
+     @testset "FSSH" begin
+         sim = Simulation{FSSH}(Atoms(2000), TullyModelTwo())
+-        output = Ensembles.PopulationCorrelation(sim, 1, Adiabatic())
++        output = TimeCorrelationFunctions.PopulationCorrelationFunction(sim, Adiabatic())
+         u = DynamicsVariables(sim, hcat(20/2000), hcat(-5), SingleState(1, Adiabatic()))
+         sol = run_trajectory(u, (0, 1000.0), sim)
+         out, cont = output(sol, 1)
+         @test out[1][1,1] ≈ 1
+         @test out[1][2,2] ≈ 0
+-        @test [o[2,1] for o in out] ≈ [1 - o[1,1] for o in out]
++        @test [o[1,2] for o in out] ≈ [1 - o[1,1] for o in out]
+     end
+ 
+     @testset "eCMM" begin
+         sim = Simulation{eCMM}(Atoms(2000), TullyModelTwo())
+-        output = Ensembles.PopulationCorrelation(sim, 1, Diabatic())
++        output = TimeCorrelationFunctions.PopulationCorrelationFunction(sim, Diabatic())
+         u = DynamicsVariables(sim, hcat(20/2000), hcat(-5), SingleState(1, Diabatic()))
+         sol = run_trajectory(u, (0, 1000.0), sim)
+         out, cont = output(sol, 1)

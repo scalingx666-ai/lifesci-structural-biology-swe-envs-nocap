@@ -1,0 +1,1798 @@
+diff --git a/src/boltzgen/model/models/boltz.py b/src/boltzgen/model/models/boltz.py
+index 6d5ef438..d2b11028 100755
+--- a/src/boltzgen/model/models/boltz.py
++++ b/src/boltzgen/model/models/boltz.py
+@@ -1211,10 +1211,12 @@ def predict_step(
+     ) -> Dict:
+         # Skip invalid samples
+         if "exception" in batch and any(batch["exception"]):
+-            print(f"WARNING: Skipping batch. Exception for {batch['id'][0]}")
++            sample_id = batch.get("id", ["unknown"])[0]
++            print(f"WARNING: Skipping batch. Exception for {sample_id}")
+             return {"exception": True}
+         if "skip" in batch and any(batch["skip"]):
+-            print(f"WARNING: Skipping batch. Skip was set true for {batch['id'][0]}")
++            sample_id = batch.get("id", ["unknown"])[0]
++            print(f"WARNING: Skipping batch. Skip was set true for {sample_id}")
+             return {"skip": True}
+ 
+         # Checkpoint switching logic
+@@ -1325,6 +1327,7 @@ def predict_step(
+                 # pred_dict["confidence"] = out.get("ablation_confidence", None)
+                 pred_dict["pde"] = out["pde"]
+                 pred_dict["plddt"] = out["plddt"]
++                pred_dict["token_level_confidence"] = self.token_level_confidence
+                 pred_dict["confidence_score"] = (
+                     4 * out["complex_plddt"]
+                     + (
+@@ -1340,6 +1343,8 @@ def predict_step(
+                 pred_dict["complex_iplddt"] = out["complex_iplddt"]
+                 pred_dict["complex_pde"] = out["complex_pde"]
+                 pred_dict["complex_ipde"] = out["complex_ipde"]
++                pred_dict["design_to_target_iptm"] = out["design_to_target_iptm"]
++                pred_dict["design_ptm"] = out["design_ptm"]
+                 if self.alpha_pae > 0:
+                     pred_dict["pae"] = out["pae"]
+                     pred_dict["ptm"] = out["ptm"]
+diff --git a/src/boltzgen/model/validation/refolding.py b/src/boltzgen/model/validation/refolding.py
+index abf3a5ce..f88de766 100755
+--- a/src/boltzgen/model/validation/refolding.py
++++ b/src/boltzgen/model/validation/refolding.py
+@@ -227,6 +227,11 @@ def process(
+ 
+         start = time.time()
+         refolded = self.folding_model.predict_step(batch_gen, batch_idx=batch_idx)
++        # Failed/skipped predict_step results contain a scalar status only.
++        # Let the writer count failures, then avoid analyzing missing outputs.
++        if refolded.get("exception") is True or refolded.get("skip") is True:
++            self.writer.write_on_batch_end(prediction=refolded, batch=batch_gen)
++            return
+ 
+         # Affinity prediction
+         self.init_affinity_model(model, logname)
+@@ -235,7 +240,7 @@ def process(
+             aff_pred = self.affinity_model.predict_step(batch_gen, batch_idx=batch_idx)
+ 
+             for k, v in aff_pred.items():
+-                if k not in refolded:
++                if k not in ("exception", "skip") and k not in refolded:
+                     refolded[k] = v
+ 
+             self.aff_writer.write_on_batch_end(
+@@ -269,12 +274,18 @@ def process(
+         if logname == "val_ligand" and self.ligand_plip:
+             self.analyze_task.noncovalents_original = True
+ 
+-        self.analyze_task.compute_metrics(
++        analyzed_sample_id = self.analyze_task.compute_metrics(
+             sample_id=sample_id,
+             suffix=Path(f"rank{model.trainer.global_rank}"),
+             design_dir=Path(design_dir),
+         )
+ 
++        (Path(design_dir) / const.folding_dirname / f"{sample_id}.npz").unlink(
++            missing_ok=True
++        )
++        if analyzed_sample_id is None:
++            return
++
+         data = np.load(self.analyze_task.metrics_dir / f"data_{sample_id}.npz")
+         metrics = np.load(self.analyze_task.metrics_dir / f"metrics_{sample_id}.npz")
+         data = {
+@@ -285,10 +296,6 @@ def process(
+             for k, v in metrics.items()
+         }
+ 
+-        (Path(design_dir) / const.folding_dirname / f"{sample_id}.npz").unlink(
+-            missing_ok=True
+-        )
+-
+         if metrics is not None:
+             self.all_refold_metrics[logname].append(metrics)
+             self.all_refolding_data[logname].append(data)
+@@ -335,6 +342,17 @@ def on_epoch_end_refolding(self, model: LightningModule, logname: str):
+         self.analyze_task.init_datasets(design_dir)
+ 
+         all_metrics = self.gather_lists(model, self.all_refold_metrics[logname])
++        if not all_metrics:
++            self.all_refold_metrics[logname] = []
++            self.all_refolding_data[logname] = []
++            model.log(f"{logname}/num_targets", 0, prog_bar=False, sync_dist=True)
++            model.log(
++                f"{logname}/one_epoch_end_refolding_dur",
++                time.time() - start,
++                sync_dist=True,
++            )
++            return
++
+         df, histograms = self.analyze_task.make_histograms(all_metrics)
+         avg_metrics = df.mean(numeric_only=True).round(5).to_dict()
+         avg_metrics["num_targets"] = len(all_metrics)
+diff --git a/src/boltzgen/resources/config/train/boltzgen.yaml b/src/boltzgen/resources/config/train/boltzgen.yaml
+index 8bc084b4..a08863f2 100755
+--- a/src/boltzgen/resources/config/train/boltzgen.yaml
++++ b/src/boltzgen/resources/config/train/boltzgen.yaml
+@@ -512,7 +512,7 @@ model:
+         transformer_post_ln: false
+         activation_checkpointing: false
+ 
+-      confidence_prediction: false
++      confidence_prediction: true
+       affinity_prediction: false
+       structure_prediction_training: true
+       affinity_model_args:
+diff --git a/src/boltzgen/task/analyze/analyze.py b/src/boltzgen/task/analyze/analyze.py
+index 26587ec8..47894959 100755
+--- a/src/boltzgen/task/analyze/analyze.py
++++ b/src/boltzgen/task/analyze/analyze.py
+@@ -1067,8 +1067,12 @@ def compute_metrics(self, idx=None, sample_id=None, suffix=None, design_dir=None
+                 metrics["native_rmsd_bb_refolded"] = bb_refold_target_rmsd.item()
+ 
+             # Save the refolded structure of the design to a pdb file if novelty computation needs to be run on it later.
++            des_refold_pdb_dir = self.des_refold_pdb_dir
++            if suffix is not None:
++                des_refold_pdb_dir = des_refold_pdb_dir / suffix
++                des_refold_pdb_dir.mkdir(exist_ok=True, parents=True)
+             des_refold_pdb_path = (
+-                self.des_refold_pdb_dir / f"{feat['id']}_des_refold.pdb"
++                des_refold_pdb_dir / f"{feat['id']}_des_refold.pdb"
+             )
+             des_refold_cif_path = des_refold_pdb_path.with_suffix(".cif")
+             if self.novelty_refolded or self.novelty_per_target_refolded:
+@@ -1356,11 +1360,11 @@ def compute_novelty(self, suffix=None):
+             )
+             nov_csv = Path(design_dir) / f"novelty_per_target_original_{self.name}.csv"
+             nov_df.to_csv(nov_csv, index=False, float_format="%.5f")
+-            avg_metrics["mean_novelty_per_target_original"] = (
+-                nov_df["novelty"].mean().round(5)
++            avg_metrics["mean_novelty_per_target_original"] = round(
++                nov_df["novelty"].mean(), 5
+             )
+-            avg_metrics["median_novelty_per_target_original"] = (
+-                nov_df["novelty"].median().round(5)
++            avg_metrics["median_novelty_per_target_original"] = round(
++                nov_df["novelty"].median(), 5
+             )
+             metrics_data["nov_df"] = nov_df
+ 
+@@ -1391,8 +1395,8 @@ def compute_novelty(self, suffix=None):
+             )
+             nov_csv = Path(design_dir) / f"novelty_per_target_refolded_{self.name}.csv"
+             nov_df_refold.to_csv(nov_csv, index=False, float_format="%.5f")
+-            avg_metrics["mean_novelty_per_target_refolded"] = (
+-                nov_df_refold["novelty"].mean().round(5)
++            avg_metrics["mean_novelty_per_target_refolded"] = round(
++                nov_df_refold["novelty"].mean(), 5
+             )
+             avg_metrics["median_novelty_per_target_refolded"] = round(
+                 nov_df_refold["novelty"].median(), 5
+diff --git a/src/boltzgen/task/analyze/analyze_utils.py b/src/boltzgen/task/analyze/analyze_utils.py
+index 682973dd..f971a35b 100644
+--- a/src/boltzgen/task/analyze/analyze_utils.py
++++ b/src/boltzgen/task/analyze/analyze_utils.py
+@@ -543,7 +543,9 @@ def compute_novelty_foldseek(
+     foldseek_binary: str = "/data/rbg/users/hstark/foldseek/bin/foldseek",
+ ) -> pd.DataFrame:
+     if len(files) == 0:
+-        return np.nan
++        return pd.DataFrame(
++            {"query": pd.Series(dtype="object"), "novelty": pd.Series(dtype="float64")}
++        )
+ 
+     aln_tsv = outdir / "aln.tsv"
+     tmp_dir = outdir / "tmp"
+@@ -571,7 +573,7 @@ def compute_novelty_foldseek(
+         names=["query", "target", "alntmscore", "qtmscore", "ttmscore"],
+     )
+     df["tmscore"] = (df["qtmscore"] + df["ttmscore"]) / 2
+-    df = df.groupby("query").max().reset_index()
++    df = df.groupby("query")["tmscore"].max().reset_index()
+     queries = [Path(f).stem for f in files]
+     df = df.set_index("query").reindex(queries, fill_value=0.0).reset_index()
+     df_novelty = df[["query", "tmscore"]].rename(columns={"tmscore": "novelty"})
+diff --git a/src/boltzgen/task/predict/data_from_generated.py b/src/boltzgen/task/predict/data_from_generated.py
+index 2fffc171..8f528eb4 100755
+--- a/src/boltzgen/task/predict/data_from_generated.py
++++ b/src/boltzgen/task/predict/data_from_generated.py
+@@ -710,7 +710,9 @@ def output_path_folded(input_path):
+                 )
+                 return [
+                     output_dir / f"{input_path.stem}.npz",
+-                    output_dir / f"{input_path.stem}.npz",
++                    output_dir.parent
++                    / const.refold_cif_dirname
++                    / f"{input_path.stem}.cif",
+                 ]
+ 
+             def output_path_design_folded(input_path):
+@@ -721,6 +723,9 @@ def output_path_design_folded(input_path):
+                 )
+                 return [
+                     output_dir / f"{input_path.stem}.cif",
++                    output_dir.parent
++                    / const.folding_design_dirname
++                    / f"{input_path.stem}.npz",
+                 ]
+ 
+             def output_path_affinity(input_path):
+diff --git a/src/boltzgen/task/predict/writer.py b/src/boltzgen/task/predict/writer.py
+index f113818c..e182cad5 100755
+--- a/src/boltzgen/task/predict/writer.py
++++ b/src/boltzgen/task/predict/writer.py
+@@ -118,43 +118,73 @@ def write_on_batch_end(  # noqa: PLR0915
+         sample_id: str = None,
+     ) -> None:
+         """Write the predictions to disk."""
++        exception = prediction.get("exception", False)
++        if isinstance(exception, list):
++            exception = exception[0]
++        if exception:
++            self.failed += 1
++            return
++        skip = prediction.get("skip", False)
++        if isinstance(skip, list):
++            skip = skip[0]
++        if skip:
++            return
++
++        # Folding preserves the input molecule identities even when the model
++        # masks them internally. Keep those identities in both NPZ and CIF.
++        prediction = prediction.copy()
++        for key in (
++            "res_type",
++            "ccd",
++            "ref_element",
++            "ref_charge",
++            "ref_atom_name_chars",
++        ):
++            if key in batch:
++                prediction[key] = batch[key]
++
+         pred_dict = {}
+         for key, value in prediction.items():
+             # check object is tensor
+             if key in const.eval_keys:
+                 pred_dict[key] = value.cpu().numpy()
+-        np.savez_compressed(self.outdir / f"{batch['id'][0]}.npz", **pred_dict)
+-
+-        # Get best sample
+-        confidence = 0.8 * pred_dict["iptm"] + 0.2 * pred_dict["ptm"]
++        # Match the sample selected by analyze_utils.get_best_folding_sample.
++        confidence = (
++            0.8 * pred_dict["design_to_target_iptm"] + 0.2 * pred_dict["design_ptm"]
++        )
+         best_idx = np.argmax(confidence)
+-        best_sample_coords = pred_dict["coords"][best_idx]
+ 
+         prediction_out = {}
+         for k in prediction:
+-            if k == "coords":
+-                prediction_out[k] = torch.from_numpy(best_sample_coords)
++            # Coordinates and pLDDT have a sample axis; structure features have
++            # a batch axis and are shared by all samples of this input.
++            if k in ("coords", "plddt"):
++                prediction_out[k] = prediction[k][best_idx]
++            elif k in ("exception", "skip", "token_level_confidence"):
++                continue
+             else:
+                 prediction_out[k] = prediction[k][0]
+ 
+         # Write structure
+         structure, _, _ = Structure.from_feat(prediction_out)
+-        plddt_atom = (
+-            prediction_out["atom_to_token"].float() @ prediction_out["plddt"].float()
+-        )
++        if prediction.get("token_level_confidence", True):
++            plddt_atom = (
++                prediction_out["atom_to_token"].float()
++                @ prediction_out["plddt"].float()
++            )
++        else:
++            plddt_atom = prediction_out["plddt"].float()
+         structure.atoms["bfactor"] = (
+             plddt_atom[prediction_out["atom_pad_mask"].bool()].float().cpu().numpy()
+         )
+         cif_text = to_mmcif(structure)
+-        open(self.refold_cif_dir / f"{batch['id'][0]}.cif", "w").write(cif_text)
+-
+-        # Failed prediction handling
+-        if isinstance(prediction["exception"], bool):
+-            if prediction["exception"]:
+-                self.failed += 1
+-        elif isinstance(prediction["exception"], list):
+-            if prediction["exception"][0]:
+-                self.failed += 1
++        # Publish the complete archive last. An interrupted overwrite must not
++        # leave an old completion marker paired with a new or partial CIF.
++        archive_path = self.outdir / f"{batch['id'][0]}.npz"
++        archive_path.unlink(missing_ok=True)
++        with open(self.refold_cif_dir / f"{batch['id'][0]}.cif", "w") as cif_file:
++            cif_file.write(cif_text)
++        _write_npz_atomically(archive_path, **pred_dict)
+ 
+     def on_predict_epoch_end(
+         self,
+@@ -192,19 +222,24 @@ def write_on_batch_end(  # noqa: PLR0915
+         sample_id: str = None,
+     ) -> None:
+         """Write the predictions to disk."""
++        exception = prediction.get("exception", False)
++        if isinstance(exception, list):
++            exception = exception[0]
++        if exception:
++            self.failed += 1
++            return
++        skip = prediction.get("skip", False)
++        if isinstance(skip, list):
++            skip = skip[0]
++        if skip:
++            return
++
+         pred_dict = {}
+         for key, value in prediction.items():
+             # check object is tensor
+             if key in const.eval_keys:
+                 pred_dict[key] = value.cpu().numpy()
+-        np.savez_compressed(self.outdir / f"{batch['id'][0]}.npz", **pred_dict)
+-
+-        if isinstance(prediction["exception"], bool):
+-            if prediction["exception"]:
+-                self.failed += 1
+-        elif isinstance(prediction["exception"], list):
+-            if prediction["exception"][0]:
+-                self.failed += 1
++        _write_npz_atomically(self.outdir / f"{batch['id'][0]}.npz", **pred_dict)
+ 
+     def on_predict_epoch_end(
+         self,
+diff --git a/tests/test_atom_confidence_export.py b/tests/test_atom_confidence_export.py
+new file mode 100644
+index 00000000..42f38de1
+--- /dev/null
++++ b/tests/test_atom_confidence_export.py
+@@ -0,0 +1,169 @@
++"""Exercise token and atom confidence through real feature generation and CIF IO."""
++# ruff: noqa: INP001, PLR2004
++
++from pathlib import Path
++
++import gemmi
++import numpy as np
++import pytest
++import torch
++from rdkit import Chem
++from test_folding_export_consistency import (
++    _features,
++    _forward_output,
++    _InferenceBoundary,
++)
++
++from boltzgen.data.data import Input, Structure
++from boltzgen.data.feature.featurizer import Featurizer
++from boltzgen.data.tokenize.tokenizer import Tokenizer
++from boltzgen.model.models.boltz import Boltz
++from boltzgen.model.modules.confidence import ConfidenceModule
++from boltzgen.task.analyze.analyze_utils import get_best_folding_sample
++from boltzgen.task.predict.data_from_generated import collate
++from boltzgen.task.predict.writer import FoldingWriter
++
++
++def _real_confidence_features(max_tokens: int | None) -> dict:
++    structure, _, _ = Structure.from_feat(
++        _features(padded=False, missing_atom=False, ligand=False)
++    )
++    tokenized = Tokenizer().tokenize(structure)
++    gly = Chem.MolFromSmiles("NCC(=O)O")
++    for atom, name in zip(gly.GetAtoms(), ["N", "CA", "C", "O", "OXT"]):
++        atom.SetProp("name", name)
++    conformer = Chem.Conformer(5)
++    for index, xyz in enumerate(
++        [
++            (0.0, 0.0, 0.0),
++            (1.0, 0.0, 0.0),
++            (1.0, 1.0, 0.0),
++            (1.0, 2.0, 0.0),
++            (2.0, 1.0, 0.0),
++        ]
++    ):
++        conformer.SetAtomPosition(index, xyz)
++    gly.AddConformer(conformer)
++    input_data = Input(
++        tokens=tokenized.tokens,
++        bonds=tokenized.bonds,
++        token_to_res=tokenized.token_to_res,
++        structure=structure,
++        msa={},
++        templates=None,
++    )
++    features = Featurizer().process(
++        input_data,
++        random=np.random.default_rng(2718),
++        molecules={"GLY": gly},
++        training=False,
++        max_seqs=1,
++        max_tokens=max_tokens,
++        design=True,
++    )
++    features["id"] = "contract"
++    features["exception"] = False
++    features["chain_design_mask"] = features["design_mask"].clone()
++    return features
++
++
++@pytest.mark.parametrize("designfolding", [False, True])
++@pytest.mark.parametrize("max_tokens", [None, 32])
++@pytest.mark.parametrize("token_level", [False, True])
++def test_actual_confidence_granularity_survives_cif_export(  # noqa: PLR0915
++    tmp_path: Path,
++    designfolding: bool,
++    max_tokens: int | None,
++    token_level: bool,
++) -> None:
++    batch = collate([_real_confidence_features(max_tokens)])
++    n_atoms = batch["atom_pad_mask"].shape[-1]
++    n_tokens = batch["token_pad_mask"].shape[-1]
++    assert n_atoms == 32
++    assert n_tokens == (2 if max_tokens is None else 32)
++    output = _forward_output(batch, 2)
++    previous_threads = torch.get_num_threads()
++    torch.set_num_threads(1)
++    try:
++        with torch.random.fork_rng(), torch.inference_mode():
++            torch.manual_seed(31415)
++            module = ConfidenceModule(
++                token_s=8,
++                token_z=8,
++                pairformer_args={"num_blocks": 0},
++                token_level_confidence=token_level,
++                confidence_args={},
++            ).eval()
++            confidence = module(
++                s_inputs=torch.randn(1, n_tokens, 8),
++                s=torch.randn(1, n_tokens, 8),
++                z=torch.randn(1, n_tokens, n_tokens, 8),
++                x_pred=output["sample_atom_coords"],
++                feats=batch,
++                pred_distogram_logits=torch.randn(1, n_tokens, n_tokens, 64),
++                multiplicity=2,
++                run_sequentially=True,
++            )
++    finally:
++        torch.set_num_threads(previous_threads)
++    assert confidence["plddt"].shape == (2, n_tokens if token_level else n_atoms)
++    if not token_level:
++        assert torch.std(confidence["plddt"][1, :4]).item() > 0.001
++    output.update(confidence)
++    output["design_to_target_iptm"] = torch.tensor([0.1, 0.9])
++    output["design_ptm"] = torch.tensor([0.1, 0.9])
++    boundary = _InferenceBoundary(output, 2, mask=False)
++    boundary.token_level_confidence = token_level
++    boundary.alpha_pae = 0.0
++    boundary.predict_args["keys_dict_out"] = []
++    prediction = Boltz.predict_step(boundary, batch)
++    assert prediction["token_level_confidence"] == token_level
++
++    writer = FoldingWriter(str(tmp_path), designfolding=designfolding)
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++    block = gemmi.cif.read_file(
++        str(writer.refold_cif_dir / "contract.cif")
++    ).sole_block()
++    xyz = np.array(
++        [list(block.find_values(f"_atom_site.Cartn_{axis}")) for axis in "xyz"],
++        dtype=float,
++    ).T
++    actual_bfactor = np.array(
++        block.find_values("_atom_site.B_iso_or_equiv"), dtype=float
++    )
++    real = batch["atom_pad_mask"][0].bool()
++    selected = confidence["plddt"][1]
++    atom_values = (
++        batch["atom_to_token"][0].float() @ selected if token_level else selected
++    )
++    np.testing.assert_allclose(xyz, output["sample_atom_coords"][1, real], atol=1e-4)
++    np.testing.assert_allclose(actual_bfactor, atom_values[real].numpy(), atol=1e-5)
++    qa = np.array(block.find_values("_ma_qa_metric_local.metric_value"), dtype=float)
++    np.testing.assert_allclose(qa, atom_values[[0, 4]].numpy() * 100, atol=1e-3)
++
++    with np.load(writer.outdir / "contract.npz") as archive:
++        assert "token_level_confidence" not in archive
++        assert "plddt" not in archive
++        np.testing.assert_array_equal(archive["coords"], prediction["coords"])
++        selected_archive = get_best_folding_sample(archive)
++        np.testing.assert_array_equal(
++            selected_archive["coords"], prediction["coords"][1]
++        )
++
++    if token_level:
++        legacy_prediction = {
++            key: value
++            for key, value in prediction.items()
++            if key != "token_level_confidence"
++        }
++        legacy_writer = FoldingWriter(
++            str(tmp_path / "legacy"), designfolding=designfolding
++        )
++        legacy_writer.write_on_batch_end(prediction=legacy_prediction, batch=batch)
++        legacy = gemmi.cif.read_file(
++            str(legacy_writer.refold_cif_dir / "contract.cif")
++        ).sole_block()
++        legacy_bfactor = np.array(
++            legacy.find_values("_atom_site.B_iso_or_equiv"), dtype=float
++        )
++        np.testing.assert_allclose(legacy_bfactor, actual_bfactor, atol=1e-5)
+diff --git a/tests/test_folding_export_consistency.py b/tests/test_folding_export_consistency.py
+new file mode 100644
+index 00000000..02e90492
+--- /dev/null
++++ b/tests/test_folding_export_consistency.py
+@@ -0,0 +1,500 @@
++"""Exercise folding export through prediction assembly and real mmCIF IO."""
++# ruff: noqa: INP001
++
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import Mock
++
++import gemmi
++import numpy as np
++import pytest
++import torch
++from torch.nn.functional import one_hot
++
++from boltzgen.data import const
++from boltzgen.data.data import Bond, convert_atom_name, convert_ccd
++from boltzgen.model.models.boltz import Boltz
++from boltzgen.model.modules.masker import BoltzMasker
++from boltzgen.task.analyze.analyze_utils import get_best_folding_sample
++from boltzgen.task.predict.data_from_generated import collate
++from boltzgen.task.predict.predict import Predict
++from boltzgen.task.predict.writer import AffinityWriter, FoldingWriter
++
++
++def _features(*, padded: bool, missing_atom: bool, ligand: bool) -> dict[str, Any]:
++    """Build two GLY residues and optionally an atomized three-atom ligand."""
++    real_tokens, real_atoms = (5, 11) if ligand else (2, 8)
++    n_tokens = real_tokens + int(padded)
++    n_atoms = real_atoms + 4 * int(padded)
++    names = ["N", "CA", "C", "O"] * 2
++    names += ["C1", "C2", "O1"] if ligand else []
++    names += [""] * (n_atoms - real_atoms)
++    elements = [7, 6, 6, 8] * 2 + ([6, 6, 8] if ligand else [])
++    elements += [0] * (n_atoms - real_atoms)
++    atom_to_token = torch.zeros(n_atoms, n_tokens)
++    atom_to_token[:4, 0] = 1
++    atom_to_token[4:8, 1] = 1
++    if ligand:
++        atom_to_token[8:11, 2:5] = torch.eye(3)
++    atom_pad = torch.arange(n_atoms) < real_atoms
++    resolved = atom_pad.clone()
++    if missing_atom:
++        resolved[3] = False
++    res_types = [const.token_ids["GLY"]] * 2
++    res_types += [const.token_ids["UNK"]] * 3 if ligand else []
++    res_types += [const.token_ids["<pad>"]] * (n_tokens - real_tokens)
++    coords = torch.zeros(n_atoms, 3)
++    coords[:8] = torch.tensor(
++        [
++            [0, 0, 0],
++            [1, 0, 0],
++            [1, 1, 0],
++            [1, 2, 0],
++            [4, 0, 0],
++            [5, 0, 0],
++            [5, 1, 0],
++            [5, 2, 0],
++        ],
++    )
++    if ligand:
++        coords[8:11] = torch.tensor([[1, 4, 0], [2, 4, 0], [2, 5, 0]])
++    representative = torch.zeros(n_tokens, n_atoms)
++    representative[0, 1] = representative[1, 5] = 1
++    if ligand:
++        representative[2:5, 8:11] = torch.eye(3)
++    asym = torch.zeros(n_tokens, dtype=torch.long)
++    mol_type = torch.zeros(n_tokens, dtype=torch.long)
++    residue_index = torch.arange(n_tokens)
++    token_to_res = torch.arange(n_tokens)
++    ccd = torch.tensor([convert_ccd("GLY")] * n_tokens)
++    standard = torch.ones(n_tokens, dtype=torch.bool)
++    if ligand:
++        asym[2:5] = 1
++        mol_type[2:5] = const.chain_type_ids["NONPOLYMER"]
++        residue_index[2:5] = 0
++        token_to_res[2:5] = 2
++        ccd[2:5] = torch.tensor(convert_ccd("LIG"))
++        standard[2:5] = False
++    features = {
++        "id": "contract",
++        "exception": False,
++        "skip": False,
++        "structure_bonds": np.array([], dtype=Bond),
++        "entity_id": asym.clone(),
++        "asym_id": asym,
++        "sym_id": torch.zeros(n_tokens, dtype=torch.long),
++        "mol_type": mol_type,
++        "res_type": one_hot(torch.tensor(res_types), len(const.tokens)),
++        "coords": coords.unsqueeze(0),
++        "type_bonds": torch.zeros(n_tokens, n_tokens, dtype=torch.long),
++        "new_to_old_atomidx": torch.arange(n_atoms),
++        "ref_element": one_hot(torch.tensor(elements), const.num_elements),
++        "ref_charge": torch.zeros(n_atoms),
++        "ref_atom_name_chars": one_hot(
++            torch.tensor([convert_atom_name(name) for name in names]),
++            64,
++        ),
++        "atom_to_token": atom_to_token,
++        "residue_index": residue_index,
++        "token_index": torch.arange(n_tokens),
++        "atom_resolved_mask": resolved,
++        "token_resolved_mask": torch.arange(n_tokens) < real_tokens,
++        "design_mask": torch.zeros(n_tokens, dtype=torch.bool),
++        "chain_design_mask": torch.zeros(n_tokens, dtype=torch.bool),
++        "atom_pad_mask": atom_pad,
++        "token_pad_mask": (torch.arange(n_tokens) < real_tokens).float(),
++        "is_standard": standard,
++        "ccd": ccd,
++        "token_to_res": token_to_res,
++        "backbone_mask": atom_pad.clone(),
++        "token_to_rep_atom": representative,
++        "bfactor": torch.zeros(n_atoms),
++        "plddt": torch.zeros(n_atoms),
++    }
++    # Supply the normal feature families consumed by the real mask=True path.
++    for key in (
++        "contact_threshold",
++        "contact_conditioning",
++        "token_disto_mask",
++        "binding_type",
++        "structure_group",
++        "cyclic",
++        "modified",
++        "token_distance_mask",
++        "method_feature",
++        "temp_feature",
++        "ph_feature",
++        "design_ss_mask",
++        "ss_type",
++        "feature_residue_index",
++        "feature_asym_id",
++        "symmetric_group",
++        "target_msa_mask",
++        "deletion_mean",
++    ):
++        features[key] = torch.zeros(n_tokens)
++    for key in ("token_pair_mask", "token_bonds"):
++        features[key] = torch.zeros(n_tokens, n_tokens)
++    for key in ("ref_space_uid", "fake_atom_mask", "ref_chirality"):
++        features[key] = torch.zeros(n_atoms)
++    for key in ("msa", "msa_mask", "msa_paired", "deletion_value", "has_deletion"):
++        features[key] = torch.zeros(1, n_tokens)
++    features.update(
++        {
++            "center_coords": torch.zeros(n_tokens, 3),
++            "res_type_clone": features["res_type"].clone(),
++            "profile": torch.zeros(n_tokens, len(const.tokens)),
++            "ref_pos": coords.clone(),
++            "masked_ref_atom_name_chars": features["ref_atom_name_chars"].clone(),
++            "r_set_to_rep_atom": representative.clone(),
++            "token_to_bb4_atoms": torch.zeros(n_tokens, 4, n_atoms),
++        }
++    )
++    return features
++
++
++def _forward_output(batch: dict[str, Any], samples: int) -> dict[str, Any]:
++    """Give each sample distinct coordinates and token confidence."""
++    n_tokens = batch["token_index"].shape[1]
++    coords = torch.cat([batch["coords"][0] + 10 * i for i in range(samples)])
++    plddt = torch.tensor(
++        [
++            [0.15 + 0.1 * i + 0.03 * token for token in range(n_tokens)]
++            for i in range(samples)
++        ]
++    )
++    global_score = torch.full((samples,), 0.1)
++    global_score[0] = 0.9
++    output = {key: torch.zeros(samples) for key in const.eval_keys_confidence}
++    output.update(
++        {
++            "sample_atom_coords": coords,
++            "plddt": plddt,
++            "ptm": global_score,
++            "iptm": global_score.clone(),
++            "complex_plddt": plddt[:, :2].mean(-1),
++            "pde": torch.zeros(samples, n_tokens, n_tokens),
++            "pae": torch.zeros(samples, n_tokens, n_tokens),
++            "pair_chains_iptm": {0: {0: global_score.clone()}},
++            "coords_traj": [coords - 1, coords],
++            "x0_coords_traj": [coords],
++        }
++    )
++    return output
++
++
++class _InferenceBoundary:
++    """Replace only the trained forward pass; keep prediction assembly real."""
++
++    def __init__(self, output: dict[str, Any], samples: int, *, mask: bool) -> None:
++        self.output = output
++        self.checkpoints = None
++        self.step_scale_schedule = None
++        self.noise_scale_schedule = None
++        self.masker = BoltzMasker(mask=mask)
++        self.predict_args = {
++            "recycling_steps": 0,
++            "sampling_steps": 2,
++            "diffusion_samples": samples,
++            "keys_dict_out": list(dict.fromkeys(const.eval_keys_confidence)),
++        }
++        self.inverse_fold = False
++        self.confidence_prediction = True
++        self.token_level_confidence = True
++        self.alpha_pae = 1
++        self.affinity_prediction = False
++        self.inference_counter = 0
++
++    def __call__(self, *_args: object, **_kwargs: object) -> dict[str, Any]:
++        return self.output
++
++
++@pytest.mark.parametrize("keys_dict_out", [None, [], ["plddt"], ["ptm", "iptm"]])
++@pytest.mark.parametrize("mask", [False, True])
++@pytest.mark.parametrize("alpha_pae", [0.0, 1.0])
++def test_default_and_reduced_prediction_keys_preserve_ranking(
++    keys_dict_out: list[str] | None, mask: bool, alpha_pae: float, tmp_path: Path
++) -> None:
++    batch = collate([_features(padded=True, missing_atom=False, ligand=False)])
++    output = _forward_output(batch, 2)
++    output["design_to_target_iptm"][1] = 0.9
++    output["design_ptm"][1] = 0.8
++    writer = FoldingWriter(str(tmp_path))
++    task = Predict(
++        data=None,
++        writer=writer,
++        checkpoint="unused.ckpt",
++        output=str(tmp_path),
++        name="folding",
++        recycling_steps=0,
++        sampling_steps=2,
++        diffusion_samples=2,
++        keys_dict_out=keys_dict_out,
++    )
++    boundary = _InferenceBoundary(output, 2, mask=mask)
++    boundary.alpha_pae = alpha_pae
++    boundary.predict_args = task.predict_args
++    prediction = Boltz.predict_step(boundary, batch)
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++
++    with np.load(writer.outdir / "contract.npz") as archive:
++        selected = get_best_folding_sample(archive)
++    np.testing.assert_array_equal(selected["coords"], output["sample_atom_coords"][1])
++    block = gemmi.cif.read_file(
++        str(writer.refold_cif_dir / "contract.cif")
++    ).sole_block()
++    x = np.array(block.find_values("_atom_site.Cartn_x"), dtype=float)
++    np.testing.assert_allclose(x, output["sample_atom_coords"][1, :8, 0])
++
++
++@pytest.mark.parametrize(
++    ("status", "affinity_status", "mask"),
++    [
++        ("exception", None, False),
++        ("skip", None, False),
++        ("success", None, False),
++        ("success", "exception", True),
++        ("success", "skip", True),
++        ("success", "success", True),
++    ],
++)
++def test_refolding_validation_stops_after_failed_or_skipped_prediction(
++    status: str, affinity_status: str | None, mask: bool, tmp_path: Path
++) -> None:
++    pytest.importorskip(
++        "wandb", reason="Refolding validation uses optional dev dependencies"
++    )
++    from boltzgen.model.validation.refolding import RefoldingValidator  # noqa: PLC0415
++
++    features = _features(padded=False, missing_atom=False, ligand=False)
++    if status != "success":
++        features[status] = True
++    folded_output = _forward_output(collate([features]), 1)
++    boundary = _InferenceBoundary(folded_output, 1, mask=mask)
++    validator = object.__new__(RefoldingValidator)
++    validator.dataset_to_logname = {0: "val_monomer"}
++    validator.inverse_fold = True
++    validator.writer = FoldingWriter(design_dir=None)
++    validator.aff_writer = AffinityWriter(design_dir=None)
++    validator.design_val_step = Mock(return_value=True)
++    validator.init_folding_model = Mock()
++    validator.init_affinity_model = Mock()
++    validator.affinity_model = None
++    if affinity_status is not None:
++        affinity_prediction = (
++            {"exception": False, "affinity_pred_value": torch.tensor([1.25])}
++            if affinity_status == "success"
++            else {affinity_status: True}
++        )
++        validator.affinity_model = SimpleNamespace(
++            predict_step=Mock(return_value=affinity_prediction)
++        )
++    validator.folding_model = SimpleNamespace(
++        predict_step=lambda batch, batch_idx: Boltz.predict_step(
++            boundary, batch, batch_idx
++        )
++    )
++
++    def set_design_dir(design_dir: str) -> None:
++        validator.design_dir = design_dir
++        validator.writer.init_outdir(design_dir)
++        validator.aff_writer.init_outdir(design_dir)
++
++    validator.set_design_dir = set_design_dir
++    compute_metrics = Mock(side_effect=StopIteration("analysis reached"))
++    validator.analyze_task = SimpleNamespace(
++        data=SimpleNamespace(
++            predict_set=SimpleNamespace(get_feat=Mock(return_value=features)),
++            transfer_batch_to_device=Mock(),
++        ),
++        compute_metrics=compute_metrics,
++    )
++    model = SimpleNamespace(
++        device=torch.device("cpu"),
++        trainer=SimpleNamespace(default_root_dir=tmp_path, global_rank=0),
++        current_epoch=0,
++        global_step=0,
++        log=Mock(),
++    )
++    args = {
++        "model": model,
++        "batch": {"id": ["contract"]},
++        "out": {"feat_masked": {"design_mask": features["design_mask"].unsqueeze(0)}},
++        "idx_dataset": 0,
++        "dataloader_idx": 0,
++        "n_samples": 1,
++        "batch_idx": 0,
++    }
++    if status == "success":
++        with pytest.raises(StopIteration, match="analysis reached"):
++            validator.process(**args)
++        compute_metrics.assert_called_once()
++        validator.init_affinity_model.assert_called_once()
++        assert (validator.writer.refold_cif_dir / "contract.cif").exists()
++    else:
++        validator.process(**args)
++        compute_metrics.assert_not_called()
++        validator.init_affinity_model.assert_not_called()
++        assert list(validator.writer.outdir.iterdir()) == []
++        assert list(validator.writer.refold_cif_dir.iterdir()) == []
++    assert validator.writer.failed == int(status == "exception")
++    assert validator.aff_writer.failed == int(affinity_status == "exception")
++    affinity_path = validator.aff_writer.outdir / "contract.npz"
++    assert affinity_path.exists() == (affinity_status == "success")
++    if affinity_status == "success":
++        with np.load(validator.writer.outdir / "contract.npz") as archive:
++            np.testing.assert_array_equal(archive["affinity_pred_value"], [1.25])
++
++
++@pytest.mark.parametrize(("samples", "winner"), [(1, 0), (2, 1), (5, 4)])
++@pytest.mark.parametrize(
++    ("padded", "missing_atom", "ligand"),
++    [
++        (False, False, False),
++        (True, False, False),
++        (True, True, False),
++        (True, True, True),
++    ],
++)
++@pytest.mark.parametrize("mask", [False, True])
++def test_export_matches_analysis_and_selected_confidence(
++    samples: int,
++    winner: int,
++    padded: bool,
++    missing_atom: bool,
++    ligand: bool,
++    mask: bool,
++    tmp_path: Path,
++) -> None:
++    features = _features(padded=padded, missing_atom=missing_atom, ligand=ligand)
++    features["design_mask"][0] = True
++    features["chain_design_mask"][:2] = True
++    if ligand:
++        features["design_mask"][2:5] = True
++        features["backbone_mask"][8:11] = False
++        features["masked_ref_atom_name_chars"][8:11] = one_hot(
++            torch.tensor([convert_atom_name("X")] * 3), 64
++        )
++    batch = collate([features])
++    output = _forward_output(batch, samples)
++    output["design_to_target_iptm"][winner] = 0.9
++    output["design_ptm"][winner] = 0.8
++    prediction = Boltz.predict_step(
++        _InferenceBoundary(output, samples, mask=mask), batch
++    )
++    assert prediction["exception"] == (False if mask else [False])
++    before = {
++        key: value.clone()
++        for key, value in prediction.items()
++        if isinstance(value, torch.Tensor)
++    }
++
++    writer = FoldingWriter(str(tmp_path))
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++
++    assert writer.failed == 0
++    with np.load(writer.outdir / "contract.npz") as archive:
++        assert set(archive.files) == set(const.eval_keys) & set(prediction)
++        for key in archive.files:
++            expected = batch[key] if key == "res_type" else before[key]
++            np.testing.assert_array_equal(archive[key], expected.numpy())
++        analyzed = get_best_folding_sample(archive)
++    np.testing.assert_array_equal(
++        analyzed["coords"], output["sample_atom_coords"][winner]
++    )
++    for key, value in before.items():
++        torch.testing.assert_close(prediction[key], value)
++
++    block = gemmi.cif.read_file(
++        str(writer.refold_cif_dir / "contract.cif")
++    ).sole_block()
++    coordinates = np.column_stack(
++        [
++            np.array(block.find_values(f"_atom_site.Cartn_{axis}"), dtype=float)
++            for axis in "xyz"
++        ]
++    )
++    bfactor = np.array(block.find_values("_atom_site.B_iso_or_equiv"), dtype=float)
++    emitted = batch["atom_resolved_mask"][0] & batch["atom_pad_mask"][0]
++    np.testing.assert_allclose(coordinates, analyzed["coords"][emitted], atol=1e-4)
++    expected_bfactor = batch["atom_to_token"][0] @ output["plddt"][winner]
++    np.testing.assert_allclose(bfactor, expected_bfactor[emitted], atol=1e-5)
++    qa = np.array(block.find_values("_ma_qa_metric_local.metric_value"), dtype=float)
++    np.testing.assert_allclose(qa, output["plddt"][winner, :2] * 100, atol=1e-3)
++    residues = list(block.find_values("_atom_site.label_comp_id"))
++    assert residues == ["GLY"] * (8 - int(missing_atom)) + (
++        ["LIG"] * 3 if ligand else []
++    )
++    atom_names = np.array(
++        ["N", "CA", "C", "O"] * 2 + (["C1", "C2", "O1"] if ligand else [])
++    )
++    np.testing.assert_array_equal(
++        list(block.find_values("_atom_site.label_atom_id")),
++        atom_names[emitted[: len(atom_names)]],
++    )
++
++
++@pytest.mark.parametrize(
++    "ranking", ["agree_nonzero", "weighted", "tie", "zero_interface"]
++)
++def test_ranking_boundaries(ranking: str, tmp_path: Path) -> None:
++    batch = collate([_features(padded=True, missing_atom=False, ligand=False)])
++    output = _forward_output(batch, 2)
++    if ranking == "agree_nonzero":
++        output["iptm"] = output["ptm"] = torch.tensor([0.1, 0.9])
++        output["design_to_target_iptm"] = torch.tensor([0.1, 0.9])
++        output["design_ptm"] = torch.tensor([0.1, 0.9])
++        winner = 1
++    elif ranking == "weighted":
++        output["design_to_target_iptm"] = torch.tensor([0.9, 0.7])
++        output["design_ptm"] = torch.tensor([0.0, 1.0])
++        winner = 1
++    elif ranking == "tie":
++        output["design_to_target_iptm"] = torch.tensor([0.5, 0.5])
++        output["design_ptm"] = torch.tensor([0.5, 0.5])
++        winner = 0
++    else:
++        output["design_to_target_iptm"] = torch.zeros(2)
++        output["design_ptm"] = torch.tensor([0.1, 0.9])
++        winner = 1
++    prediction = Boltz.predict_step(_InferenceBoundary(output, 2, mask=False), batch)
++    writer = FoldingWriter(str(tmp_path), designfolding=True)
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++
++    block = gemmi.cif.read_file(
++        str(writer.refold_cif_dir / "contract.cif")
++    ).sole_block()
++    x = np.array(block.find_values("_atom_site.Cartn_x"), dtype=float)
++    bfactor = np.array(block.find_values("_atom_site.B_iso_or_equiv"), dtype=float)
++    with np.load(writer.outdir / "contract.npz") as archive:
++        selected = get_best_folding_sample(archive)
++    np.testing.assert_allclose(x, output["sample_atom_coords"][winner, :8, 0])
++    np.testing.assert_allclose(x, selected["coords"][:8, 0])
++    expected_bfactor = batch["atom_to_token"][0] @ output["plddt"][winner]
++    np.testing.assert_allclose(bfactor, expected_bfactor[:8], atol=1e-5)
++
++
++@pytest.mark.parametrize("list_status", [False, True])
++@pytest.mark.parametrize("flag", ["exception", "skip"])
++@pytest.mark.parametrize("include_id", [False, True])
++@pytest.mark.parametrize("writer_class", [FoldingWriter, AffinityWriter])
++def test_status_only_predictions_do_not_write_files(
++    flag: str,
++    list_status: bool,
++    include_id: bool,
++    writer_class: type,
++    tmp_path: Path,
++) -> None:
++    batch = {flag: [True]}
++    if include_id:
++        batch["id"] = ["contract"]
++    prediction = Boltz.predict_step(_InferenceBoundary({}, 1, mask=False), batch)
++    assert prediction == {flag: True}
++    if list_status:
++        prediction[flag] = [True]
++    writer = writer_class(str(tmp_path))
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++    assert writer.failed == int(flag == "exception")
++    assert list(writer.outdir.iterdir()) == []
++    assert list(tmp_path.rglob("*.cif")) == []
+diff --git a/tests/test_folding_output_completion.py b/tests/test_folding_output_completion.py
+new file mode 100644
+index 00000000..ada9e7ae
+--- /dev/null
++++ b/tests/test_folding_output_completion.py
+@@ -0,0 +1,253 @@
++"""Interrupted folding exports must be retried until both outputs exist."""
++# ruff: noqa: INP001
++
++import builtins
++from pathlib import Path
++from typing import Any, BinaryIO, Self, TextIO
++
++import gemmi
++import numpy as np
++import pytest
++import torch
++from test_folding_export_consistency import (
++    _features,
++    _forward_output,
++    _InferenceBoundary,
++)
++
++from boltzgen.data.data import Structure
++from boltzgen.data.feature.featurizer import Featurizer
++from boltzgen.data.tokenize.tokenizer import Tokenizer
++from boltzgen.data.write.mmcif import to_mmcif
++from boltzgen.model.models.boltz import Boltz
++from boltzgen.task.predict import data_from_generated
++from boltzgen.task.predict import writer as writer_module
++from boltzgen.task.predict.data_from_generated import (
++    DataConfig,
++    FromGeneratedDataModule,
++    collate,
++)
++from boltzgen.task.predict.writer import AffinityWriter, FoldingWriter
++
++
++def _case(
++    tmp_path: Path, designfolding: bool, *, external: bool = False
++) -> tuple[Path, FoldingWriter, dict[str, Any], dict[str, Any]]:
++    inputs = tmp_path / "inputs"
++    inputs.mkdir()
++    features = _features(padded=True, missing_atom=False, ligand=False)
++    structure, _, _ = Structure.from_feat(features)
++    (inputs / "contract.cif").write_text(to_mmcif(structure))
++    np.savez(inputs / "contract.npz", design_mask=np.zeros(2, dtype=bool))
++    batch = collate([features])
++    output = _forward_output(batch, 2)
++    output["design_to_target_iptm"][1] = 0.9
++    output["design_ptm"][1] = 0.8
++    prediction = Boltz.predict_step(_InferenceBoundary(output, 2, mask=True), batch)
++    root = tmp_path / "separate_outputs" if external else inputs
++    return inputs, FoldingWriter(str(root), designfolding), batch, prediction
++
++
++def _remaining(
++    inputs: Path,
++    writer: FoldingWriter | AffinityWriter,
++    monkeypatch: pytest.MonkeyPatch,
++    *,
++    external: bool = False,
++) -> int:
++    # Only canonical-molecule I/O is replaced: dataset discovery and the
++    # public reuse filter execute normally, without fetching any structures.
++    monkeypatch.setattr(data_from_generated, "load_canonicals", lambda _: {})
++    config = DataConfig(
++        num_targets=10,
++        samples_per_target=10,
++        moldir=str(inputs),
++        tokenizer=Tokenizer(),
++        featurizer=Featurizer(),
++        batch_size=1,
++        num_workers=0,
++        pin_memory=False,
++    )
++    if isinstance(writer, AffinityWriter):
++        primary = writer.outdir
++        kind = "affinity"
++    else:
++        primary = writer.refold_cif_dir if writer.designfolding else writer.outdir
++        kind = "design_folded" if writer.designfolding else "folded"
++    data = FromGeneratedDataModule(
++        cfg=config,
++        design_dir=str(inputs),
++        skip_existing=True,
++        skip_existing_kind=kind,
++        output_dir=str(primary) if external else None,
++    )
++    return len(data.predict_set)
++
++
++@pytest.mark.parametrize("designfolding", [False, True])
++@pytest.mark.parametrize("external", [False, True])
++@pytest.mark.parametrize("present", ["neither", "npz", "cif", "both"])
++def test_reuse_requires_matching_complete_pair(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    designfolding: bool,
++    external: bool,
++    present: str,
++) -> None:
++    inputs, writer, batch, prediction = _case(
++        tmp_path, designfolding, external=external
++    )
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++    if present not in ("npz", "both"):
++        (writer.outdir / "contract.npz").unlink()
++    if present not in ("cif", "both"):
++        (writer.refold_cif_dir / "contract.cif").unlink()
++    assert _remaining(inputs, writer, monkeypatch, external=external) == int(
++        present != "both"
++    )
++
++
++@pytest.mark.parametrize("designfolding", [False, True])
++@pytest.mark.parametrize("existing", [False, True])
++def test_preparation_failure_preserves_only_a_previous_complete_pair(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    designfolding: bool,
++    existing: bool,
++) -> None:
++    inputs, writer, batch, prediction = _case(tmp_path, designfolding)
++    paths = [writer.outdir / "contract.npz", writer.refold_cif_dir / "contract.cif"]
++    if existing:
++        writer.write_on_batch_end(prediction=prediction, batch=batch)
++    previous = [path.read_bytes() if path.exists() else None for path in paths]
++    prediction["coords"] = prediction["coords"] + 25
++
++    def fail_conversion(_structure: Structure) -> str:
++        raise RuntimeError("interrupted CIF conversion")
++
++    with monkeypatch.context() as patch:
++        patch.setattr(writer_module, "to_mmcif", fail_conversion)
++        with pytest.raises(RuntimeError, match="interrupted CIF conversion"):
++            writer.write_on_batch_end(prediction=prediction, batch=batch)
++    assert [path.read_bytes() if path.exists() else None for path in paths] == previous
++    assert _remaining(inputs, writer, monkeypatch) == int(not existing)
++
++
++@pytest.mark.parametrize("designfolding", [False, True])
++@pytest.mark.parametrize("existing", [False, True])
++@pytest.mark.parametrize("stage", ["cif_write", "npz_write", "npz_replace"])
++def test_interrupted_publication_leaves_no_completion_marker_and_retries(  # noqa: C901
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    designfolding: bool,
++    existing: bool,
++    stage: str,
++) -> None:
++    inputs, writer, batch, prediction = _case(tmp_path, designfolding)
++    archive = writer.outdir / "contract.npz"
++    cif = writer.refold_cif_dir / "contract.cif"
++    if existing:
++        writer.write_on_batch_end(prediction=prediction, batch=batch)
++    prediction["coords"] = prediction["coords"] + 25
++    real_open = builtins.open
++
++    class InterruptedCif:
++        def __init__(self) -> None:
++            self.file = real_open(cif, "w")
++
++        def __enter__(self) -> Self:
++            return self
++
++        def __exit__(self, *args: object) -> None:
++            self.file.close()
++
++        def write(self, text: str) -> None:
++            self.file.write(text[:20])
++            self.file.close()
++            raise OSError("interrupted CIF write")
++
++    def interrupted_open(path: str | Path, mode: str = "r") -> TextIO | InterruptedCif:
++        if Path(path) == cif and mode == "w":
++            return InterruptedCif()
++        return real_open(path, mode)
++
++    def interrupted_npz(path: str | Path | BinaryIO, **_arrays: object) -> None:
++        if isinstance(path, (str, Path)):
++            Path(path).write_bytes(b"partial zip")
++        else:
++            path.write(b"partial zip")
++        raise OSError("interrupted NPZ write")
++
++    def interrupted_replace(_source: str | Path, destination: str | Path) -> None:
++        assert Path(destination) == archive
++        raise OSError("interrupted NPZ replace")
++
++    with monkeypatch.context() as patch:
++        if stage == "cif_write":
++            patch.setattr(writer_module, "open", interrupted_open, raising=False)
++        elif stage == "npz_write":
++            patch.setattr(writer_module.np, "savez_compressed", interrupted_npz)
++        else:
++            patch.setattr(writer_module.os, "replace", interrupted_replace)
++        with pytest.raises(OSError, match="interrupted"):
++            writer.write_on_batch_end(prediction=prediction, batch=batch)
++
++    assert not archive.exists()
++    assert not list(writer.outdir.glob("*.tmp"))
++    assert _remaining(inputs, writer, monkeypatch) == 1
++
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++    assert _remaining(inputs, writer, monkeypatch) == 0
++    with np.load(archive) as saved:
++        np.testing.assert_array_equal(saved["coords"], prediction["coords"].numpy())
++    block = gemmi.cif.read_file(str(cif)).sole_block()
++    x = np.asarray(block.find_values("_atom_site.Cartn_x"), dtype=float)
++    np.testing.assert_allclose(x, prediction["coords"][1, :8, 0].numpy())
++
++
++@pytest.mark.parametrize("existing", [False, True])
++@pytest.mark.parametrize("stage", ["write", "replace"])
++def test_affinity_publication_preserves_valid_archive_or_retries(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    existing: bool,
++    stage: str,
++) -> None:
++    inputs, _, batch, _ = _case(tmp_path, designfolding=False)
++    writer = AffinityWriter(str(inputs))
++    archive = writer.outdir / "contract.npz"
++    prediction = {"exception": False, "affinity_pred_value": torch.tensor([1.25])}
++    if existing:
++        writer.write_on_batch_end(prediction=prediction, batch=batch)
++    previous = archive.read_bytes() if existing else None
++    prediction["affinity_pred_value"] = torch.tensor([2.75])
++
++    def interrupted_npz(path: str | Path | BinaryIO, **_arrays: object) -> None:
++        if isinstance(path, (str, Path)):
++            Path(path).write_bytes(b"partial zip")
++        else:
++            path.write(b"partial zip")
++        raise OSError("interrupted affinity write")
++
++    def interrupted_replace(_source: str | Path, destination: str | Path) -> None:
++        assert Path(destination) == archive
++        raise OSError("interrupted affinity replace")
++
++    with monkeypatch.context() as patch:
++        if stage == "write":
++            patch.setattr(writer_module.np, "savez_compressed", interrupted_npz)
++        else:
++            patch.setattr(writer_module.os, "replace", interrupted_replace)
++        with pytest.raises(OSError, match="interrupted affinity"):
++            writer.write_on_batch_end(prediction=prediction, batch=batch)
++    assert (archive.read_bytes() if archive.exists() else None) == previous
++    assert not list(writer.outdir.glob("*.tmp"))
++    assert _remaining(inputs, writer, monkeypatch) == int(not existing)
++    if existing:
++        with np.load(archive) as saved:
++            np.testing.assert_array_equal(saved["affinity_pred_value"], [1.25])
++
++    writer.write_on_batch_end(prediction=prediction, batch=batch)
++    assert _remaining(inputs, writer, monkeypatch) == 0
++    with np.load(archive) as saved:
++        np.testing.assert_array_equal(saved["affinity_pred_value"], [2.75])
+diff --git a/tests/test_novelty_contract.py b/tests/test_novelty_contract.py
+new file mode 100644
+index 00000000..d79ddde2
+--- /dev/null
++++ b/tests/test_novelty_contract.py
+@@ -0,0 +1,113 @@
++"""Empty-rank novelty preserves the helper's DataFrame contract."""
++
++# ruff: noqa: INP001
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import numpy as np
++import pandas as pd
++import pytest
++import torch
++
++from boltzgen.task.analyze import analyze_utils
++from boltzgen.task.analyze.analyze import Analyze
++
++
++def test_empty_foldseek_returns_typed_frame_without_subprocess(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    run = Mock(side_effect=AssertionError("Foldseek must not run with no input"))
++    monkeypatch.setattr(analyze_utils.subprocess, "run", run)
++    result = analyze_utils.compute_novelty_foldseek(
++        indir=tmp_path / "missing-input",
++        outdir=tmp_path,
++        reference_db=tmp_path / "missing-db",
++        files=[],
++    )
++    assert isinstance(result, pd.DataFrame)
++    assert result.empty
++    assert list(result.columns) == ["query", "novelty"]
++    assert result["query"].dtype == np.dtype("object")
++    assert result["novelty"].dtype == np.dtype("float64")
++    run.assert_not_called()
++
++
++@pytest.mark.parametrize(
++    ("flag", "metric_keys"),
++    [
++        ("novelty_original", ["novelty_original"]),
++        ("novelty_refolded", ["novelty_refolded"]),
++        (
++            "novelty_per_target_original",
++            ["mean_novelty_per_target_original", "median_novelty_per_target_original"],
++        ),
++        (
++            "novelty_per_target_refolded",
++            ["mean_novelty_per_target_refolded", "median_novelty_per_target_refolded"],
++        ),
++    ],
++)
++def test_actual_analyze_empty_local_rank_reports_undefined_novelty(
++    flag: str,
++    metric_keys: list[str],
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    run = Mock(side_effect=AssertionError("Foldseek must not run with no input"))
++    monkeypatch.setattr(analyze_utils.subprocess, "run", run)
++    with monkeypatch.context() as patch:
++        patch.setattr(torch, "set_num_interop_threads", lambda _: None)
++        analyzer = Analyze(
++            name="empty-local-rank",
++            data=SimpleNamespace(),
++            design_dir=str(tmp_path),
++            compute_lddts=False,
++            **{flag: True},
++        )
++    metrics, data = analyzer.compute_novelty(suffix=Path("rank0"))
++    assert set(metrics) == set(metric_keys)
++    assert all(np.isnan(value) for value in metrics.values())
++    assert all(frame.empty for frame in data.values())
++    run.assert_not_called()
++
++
++@pytest.mark.parametrize("scenario", ["all_hit", "partial_hit", "empty_alignment"])
++def test_nonempty_foldseek_preserves_search_and_hit_aggregation(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
++) -> None:
++    calls = []
++
++    def run(command: list[str], check: bool) -> None:
++        calls.append((command, check))
++        rows = "design1\ttargetA\t0.5\t0.8\t0.4\ndesign1\ttargetB\t0.5\t0.9\t0.5\n"
++        if scenario == "all_hit":
++            rows += "design2\ttargetC\t0.5\t0.2\t0.4\n"
++        if scenario == "empty_alignment":
++            rows = ""
++        Path(command[4]).write_text(rows)
++
++    monkeypatch.setattr(analyze_utils.subprocess, "run", run)
++    result = analyze_utils.compute_novelty_foldseek(
++        indir=tmp_path / "input",
++        outdir=tmp_path,
++        reference_db=tmp_path / "reference-db",
++        files=["design1.pdb", "design2.pdb"],
++        foldseek_binary="fixture-foldseek",
++    )
++    assert len(calls) == 1
++    assert calls[0][0][:4] == [
++        "fixture-foldseek",
++        "easy-search",
++        str(tmp_path / "input"),
++        str(tmp_path / "reference-db"),
++    ]
++    assert calls[0][1] is True
++    assert list(result["query"]) == ["design1", "design2"]
++    expected = {
++        "all_hit": [0.7, 0.3],
++        "partial_hit": [0.7, 0.0],
++        "empty_alignment": [0.0, 0.0],
++    }[scenario]
++    np.testing.assert_allclose(result["novelty"].to_numpy(dtype=float), expected)
++    assert result["novelty"].mean() == pytest.approx(float(np.mean(expected)))
+diff --git a/tests/test_refolding_analysis_contract.py b/tests/test_refolding_analysis_contract.py
+new file mode 100644
+index 00000000..e1a337ee
+--- /dev/null
++++ b/tests/test_refolding_analysis_contract.py
+@@ -0,0 +1,169 @@
++"""Real analysis success/failure contract through validation export."""
++# ruff: noqa: INP001
++
++from collections import defaultdict
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import Mock
++
++import pytest
++import torch
++from test_atom_confidence_export import _real_confidence_features
++from test_folding_export_consistency import (
++    _features,
++    _forward_output,
++    _InferenceBoundary,
++)
++
++from boltzgen.data.data import Structure
++from boltzgen.model.models.boltz import Boltz
++from boltzgen.task.analyze import analyze_utils
++from boltzgen.task.analyze.analyze import Analyze
++from boltzgen.task.predict.writer import AffinityWriter, FoldingWriter
++
++
++@pytest.mark.parametrize("affinity_status", ["exception", "skip", "success"])
++@pytest.mark.parametrize("novelty", [False, True])
++def test_validator_honors_real_analysis_return_and_cleanup(  # noqa: PLR0915
++    affinity_status: str,
++    novelty: bool,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    pytest.importorskip(
++        "wandb", reason="Refolding validation uses optional dev dependencies"
++    )
++    from boltzgen.model.validation.refolding import RefoldingValidator  # noqa: PLC0415
++
++    features = _real_confidence_features(None)
++    # FromGenerated.get_feat supplies bool design masks to analysis.
++    features["design_mask"] = torch.ones_like(features["design_mask"], dtype=torch.bool)
++    features["chain_design_mask"] = features["design_mask"].clone()
++    if novelty:
++        features["str_gen"], _, _ = Structure.from_feat(
++            _features(padded=False, missing_atom=False, ligand=False)
++        )
++
++    def run_foldseek(command: list[str], *, check: bool) -> None:
++        assert check
++        queries = sorted(Path(command[2]).glob("*.pdb"))
++        assert queries
++        Path(command[4]).write_text(
++            "".join(f"{path.stem}\ttarget\t0.5\t0.8\t0.6\n" for path in queries)
++        )
++
++    monkeypatch.setattr(analyze_utils.subprocess, "run", run_foldseek)
++
++    def get_feat(path: Path, design_mask: torch.Tensor | None = None) -> dict[str, Any]:  # noqa: ARG001
++        feat = dict(features)
++        feat["id"] = path.stem
++        feat["path"] = path
++        return feat
++
++    data = SimpleNamespace(
++        cfg=SimpleNamespace(target_id_regex=r"(contract)"),
++        return_native=False,
++        predict_set=SimpleNamespace(
++            get_feat=get_feat,
++            get_sample=lambda design_dir, sample_id: get_feat(
++                Path(design_dir) / f"{sample_id}.cif"
++            ),
++        ),
++        transfer_batch_to_device=Mock(),
++        init_dataset=Mock(),
++    )
++    # Analyze sets this process-wide option in its constructor. Keep the test
++    # independent of previous Torch work without replacing any analysis logic.
++    with monkeypatch.context() as patch:
++        patch.setattr(torch, "set_num_interop_threads", lambda _: None)
++        analyzer = Analyze(
++            name="actual-analysis",
++            data=data,
++            design_dir=None,
++            allatom_fold_metrics=True,
++            affinity_metrics=True,
++            compute_lddts=False,
++            novelty_original=novelty,
++            novelty_refolded=novelty,
++            novelty_per_target_original=novelty,
++            novelty_per_target_refolded=novelty,
++        )
++    analysis_returns = []
++    real_compute_metrics = analyzer.compute_metrics
++
++    def observe_compute_metrics(**kwargs: object) -> str | None:
++        result = real_compute_metrics(**kwargs)
++        analysis_returns.append(result)
++        return result
++
++    analyzer.compute_metrics = observe_compute_metrics
++    validator = object.__new__(RefoldingValidator)
++    validator.dataset_to_logname = {0: "val_monomer"}
++    validator.inverse_fold = True
++    validator.design_dir = None
++    validator.writer = FoldingWriter(None)
++    validator.aff_writer = AffinityWriter(None)
++    validator.all_refold_metrics = defaultdict(list)
++    validator.all_refolding_data = defaultdict(list)
++    validator.design_val_step = Mock(return_value=True)
++    validator.init_folding_model = Mock()
++    validator.init_affinity_model = Mock()
++    validator.ligand_plip = False
++    validator.analyze_task = analyzer
++
++    def folding_predict(batch: dict[str, Any], batch_idx: int) -> dict[str, Any]:
++        return Boltz.predict_step(
++            _InferenceBoundary(_forward_output(batch, 1), 1, mask=True),
++            batch,
++            batch_idx,
++        )
++
++    def affinity_predict(batch: dict[str, Any], batch_idx: int) -> dict[str, Any]:  # noqa: ARG001
++        if affinity_status == "success":
++            return {"exception": False, "affinity_pred_value": torch.tensor([1.25])}
++        return Boltz.predict_step(
++            _InferenceBoundary({}, 1, mask=False),
++            {affinity_status: [True]},
++            batch_idx,
++        )
++
++    validator.folding_model = SimpleNamespace(predict_step=folding_predict)
++    validator.affinity_model = SimpleNamespace(predict_step=affinity_predict)
++    model = SimpleNamespace(
++        device=torch.device("cpu"),
++        current_epoch=0,
++        global_step=0,
++        log=Mock(),
++        trainer=SimpleNamespace(default_root_dir=tmp_path, global_rank=0),
++    )
++    validator.process(
++        model=model,
++        batch={"id": ["contract"]},
++        out={"feat_masked": {"design_mask": features["design_mask"].unsqueeze(0)}},
++        idx_dataset=0,
++        dataloader_idx=0,
++        n_samples=1,
++        batch_idx=0,
++    )
++    sample_id = "sample0_batch0_rank0_contract"
++    succeeded = affinity_status == "success"
++    assert analysis_returns == ([sample_id] if succeeded else [None])
++    assert validator.writer.failed == 0
++    assert validator.aff_writer.failed == int(affinity_status == "exception")
++    assert (validator.writer.refold_cif_dir / f"{sample_id}.cif").is_file()
++    assert (validator.aff_writer.outdir / f"{sample_id}.npz").exists() == succeeded
++    assert not (validator.writer.outdir / f"{sample_id}.npz").exists()
++    assert len(list(analyzer.metrics_dir.glob("*.npz"))) == (2 if succeeded else 0)
++    assert len(validator.all_refold_metrics["val_monomer"]) == int(succeeded)
++    assert len(validator.all_refolding_data["val_monomer"]) == int(succeeded)
++    if succeeded:
++        assert (
++            validator.all_refold_metrics["val_monomer"][0]["affinity_pred_value"]
++            == 1.25  # noqa: PLR2004
++        )
++        assert validator.all_refolding_data["val_monomer"][0]["sample_id"] == sample_id
++        if novelty:
++            metrics, _ = analyzer.compute_novelty(suffix=Path("rank0"))
++            assert len(metrics) == 6  # noqa: PLR2004
++            assert all(value == pytest.approx(0.7) for value in metrics.values())
+diff --git a/tests/test_refolding_epoch_contract.py b/tests/test_refolding_epoch_contract.py
+new file mode 100644
+index 00000000..553de69b
+--- /dev/null
++++ b/tests/test_refolding_epoch_contract.py
+@@ -0,0 +1,211 @@
++"""Portable regressions for refolding validation epochs with skipped affinity output."""
++# ruff: noqa: INP001
++
++from __future__ import annotations
++
++from collections import defaultdict
++from pathlib import Path
++from types import SimpleNamespace
++from typing import TYPE_CHECKING, Any
++from unittest.mock import Mock
++
++import pytest
++import torch
++from test_atom_confidence_export import _real_confidence_features
++from test_folding_export_consistency import _forward_output, _InferenceBoundary
++
++from boltzgen.model.models.boltz import Boltz
++from boltzgen.task.analyze.analyze import Analyze
++from boltzgen.task.predict.writer import AffinityWriter, FoldingWriter
++
++if TYPE_CHECKING:
++    from boltzgen.model.validation.refolding import RefoldingValidator
++
++
++def _make_validator(
++    root: Path, monkeypatch: pytest.MonkeyPatch
++) -> tuple[RefoldingValidator, Analyze, dict[str, Any], SimpleNamespace]:
++    from boltzgen.model.validation.refolding import RefoldingValidator  # noqa: PLC0415
++
++    features = _real_confidence_features(None)
++    features["design_mask"] = torch.ones_like(features["design_mask"], dtype=torch.bool)
++    features["chain_design_mask"] = features["design_mask"].clone()
++
++    def get_feat(path: Path, design_mask: torch.Tensor | None = None) -> dict[str, Any]:  # noqa: ARG001
++        feat = dict(features)
++        feat["id"] = path.stem
++        feat["path"] = path
++        return feat
++
++    data = SimpleNamespace(
++        cfg=SimpleNamespace(target_id_regex=r"(contract)"),
++        return_native=False,
++        predict_set=SimpleNamespace(
++            get_feat=get_feat,
++            get_sample=lambda design_dir, sample_id: get_feat(
++                Path(design_dir) / f"{sample_id}.cif"
++            ),
++        ),
++        transfer_batch_to_device=Mock(),
++        init_dataset=Mock(),
++    )
++    # Analyze configures PyTorch's process-wide interop pool in its constructor.
++    with monkeypatch.context() as patch:
++        patch.setattr(torch, "set_num_interop_threads", lambda _: None)
++        analyzer = Analyze(
++            name="actual-analysis",
++            data=data,
++            design_dir=None,
++            allatom_fold_metrics=True,
++            affinity_metrics=True,
++            compute_lddts=False,
++        )
++
++    validator = object.__new__(RefoldingValidator)
++    validator.dataset_to_logname = {0: "val_monomer"}
++    validator.inverse_fold = True
++    validator.design_dir = None
++    validator.writer = FoldingWriter(None)
++    validator.aff_writer = AffinityWriter(None)
++    validator.all_refold_metrics = defaultdict(list)
++    validator.all_refolding_data = defaultdict(list)
++    validator.design_val_step = Mock(return_value=True)
++    validator.init_folding_model = Mock()
++    validator.init_affinity_model = Mock()
++    validator.ligand_plip = False
++    validator.analyze_task = analyzer
++    model = SimpleNamespace(
++        device=torch.device("cpu"),
++        current_epoch=0,
++        global_step=0,
++        log=Mock(),
++        logger=None,
++        trainer=SimpleNamespace(
++            default_root_dir=root,
++            global_rank=0,
++            world_size=1,
++        ),
++    )
++    return validator, analyzer, features, model
++
++
++def _process(
++    validator: RefoldingValidator,
++    features: dict[str, Any],
++    model: SimpleNamespace,
++    *,
++    status: str,
++    batch_idx: int,
++) -> None:
++    def fold(batch: dict[str, Any], batch_idx: int) -> dict[str, Any]:
++        return Boltz.predict_step(
++            _InferenceBoundary(_forward_output(batch, 1), 1, mask=True),
++            batch,
++            batch_idx,
++        )
++
++    def affinity(batch: dict[str, Any], batch_idx: int) -> dict[str, Any]:  # noqa: ARG001
++        if status == "success":
++            return {"exception": False, "affinity_pred_value": torch.tensor([1.25])}
++        return Boltz.predict_step(
++            _InferenceBoundary({}, 1, mask=False),
++            {status: [True]},
++            batch_idx,
++        )
++
++    validator.folding_model = SimpleNamespace(predict_step=fold)
++    validator.affinity_model = SimpleNamespace(predict_step=affinity)
++    validator.process(
++        model=model,
++        batch={"id": ["contract"]},
++        out={"feat_masked": {"design_mask": features["design_mask"].unsqueeze(0)}},
++        idx_dataset=0,
++        dataloader_idx=0,
++        n_samples=1,
++        batch_idx=batch_idx,
++    )
++
++
++@pytest.mark.parametrize(
++    ("statuses", "expected_targets"),
++    [
++        pytest.param(("exception",), 0, id="single-failed-affinity"),
++        pytest.param(("exception", "skip"), 0, id="multiple-failed-affinities"),
++        pytest.param(("success",), 1, id="successful-affinity"),
++        pytest.param(("exception", "success"), 1, id="mixed-failed-and-successful"),
++    ],
++)
++def test_refolding_epoch_end_handles_empty_and_mixed_results(
++    statuses: tuple[str, ...],
++    expected_targets: int,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    pytest.importorskip(
++        "wandb", reason="Refolding validation uses optional dev dependencies"
++    )
++    validator, analyzer, features, model = _make_validator(tmp_path, monkeypatch)
++    for batch_idx, status in enumerate(statuses):
++        _process(
++            validator,
++            features,
++            model,
++            status=status,
++            batch_idx=batch_idx,
++        )
++
++    sample_metrics = list(analyzer.metrics_dir.glob("*.npz"))
++    assert len(sample_metrics) == 2 * int(expected_targets == 1)
++
++    validator.on_epoch_end_refolding(model, "val_monomer")
++
++    logged_targets = [
++        call.args[1]
++        for call in model.log.call_args_list
++        if call.args[0] == "val_monomer/num_targets"
++    ]
++    assert logged_targets == [expected_targets]
++    assert validator.all_refold_metrics["val_monomer"] == []
++    assert validator.all_refolding_data["val_monomer"] == []
++
++
++def test_refolding_epoch_gathers_remote_success_before_empty_check(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    pytest.importorskip(
++        "wandb", reason="Refolding validation uses optional dev dependencies"
++    )
++    validator, _analyzer, features, model = _make_validator(tmp_path, monkeypatch)
++    _process(
++        validator,
++        features,
++        model,
++        status="success",
++        batch_idx=0,
++    )
++    remote_metrics = list(validator.all_refold_metrics["val_monomer"])
++    remote_data = list(validator.all_refolding_data["val_monomer"])
++    validator.all_refold_metrics["val_monomer"] = []
++    validator.all_refolding_data["val_monomer"] = []
++
++    model.trainer.world_size = 2
++    gathered = iter([remote_metrics, remote_data])
++
++    def all_gather_object(object_list: list[Any], local_object: list[Any]) -> None:
++        object_list[0] = local_object
++        object_list[1] = next(gathered)
++
++    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
++    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
++
++    validator.on_epoch_end_refolding(model, "val_monomer")
++
++    logged_targets = [
++        call.args[1]
++        for call in model.log.call_args_list
++        if call.args[0] == "val_monomer/num_targets"
++    ]
++    assert logged_targets == [1]
++    assert validator.all_refold_metrics["val_monomer"] == []
++    assert validator.all_refolding_data["val_monomer"] == []

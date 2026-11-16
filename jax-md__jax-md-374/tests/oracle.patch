@@ -1,0 +1,396 @@
+diff --git a/examples/custom_nl.py b/examples/custom_nl.py
+index 9f01374b..6952d713 100644
+--- a/examples/custom_nl.py
++++ b/examples/custom_nl.py
+@@ -267,6 +267,49 @@ def make_diamond_cubic(n_cells, a=5.43):
+ E_ref = energies['Dense']
+ for name, E in energies.items():
+   assert abs(E - E_ref) < 1e-5, f'{name} energy mismatch: {E} vs {E_ref}'
++
++# %% [markdown]
++# ### Forces and Stress Computation
++#
++# We can compute forces using `quantity.force` and stress using `quantity.stress`.
++# The multi-image neighbor list with `graph_featurizer` supports the `perturbation`
++# kwarg required for stress calculation.
++
++# %%
++# Use Sparse format for force/stress computation
++neighbor_fn_lj, energy_fn_lj = energy.lennard_jones_neighbor_list(
++  displacement_fn,
++  box,
++  sigma=sigma,
++  epsilon=epsilon,
++  r_onset=r_onset / sigma,
++  r_cutoff=r_cutoff / sigma,
++  fractional_coordinates=True,
++  neighbor_list_fn=neighbor_list_multi_image,
++  pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++  max_neighbors=max_nbrs,
++  format=partition.Sparse,
++)
++
++# Perturb positions slightly from equilibrium to get non-zero forces
++key = random.PRNGKey(42)
++R_perturbed = R + random.normal(key, R.shape) * 0.01
++
++nbrs_lj = neighbor_fn_lj.allocate(R_perturbed)
++E_lj = float(energy_fn_lj(R_perturbed, nbrs_lj))
++
++# Compute forces
++force_fn = quantity.force(energy_fn_lj)
++F = force_fn(R_perturbed, neighbor=nbrs_lj)
++max_force = float(jnp.max(jnp.abs(F)))
++print(f'Perturbed energy: {E_lj:.6f}')
++print(f'Max force magnitude: {max_force:.6f}')
++
++# Compute stress (3x3 tensor)
++stress = quantity.stress(energy_fn_lj, R_perturbed, box, neighbor=nbrs_lj)
++print(f'Stress tensor (diagonal): [{stress[0,0]:.4f}, {stress[1,1]:.4f}, {stress[2,2]:.4f}]')
++print(f'Pressure: {-jnp.trace(stress) / 3:.6f}')
++
+ # %% [markdown]
+ # ## Example 2: Stillinger-Weber (Three-Body Potential)
+ #
+diff --git a/jax_md/custom_partition.py b/jax_md/custom_partition.py
+index 8ff23a07..2c9cde82 100644
+--- a/jax_md/custom_partition.py
++++ b/jax_md/custom_partition.py
+@@ -1,3 +1,5 @@
++from functools import partial
++
+ import jax
+ import jax.numpy as jnp
+ from jax_md import dataclasses, partition, space
+@@ -1076,7 +1078,7 @@ def neighbor_list_multi_image_mask(
+   return neighbors.idx[0] < N  # [capacity]
+ 
+ 
+-def graph_featurizer(displacement_fn):
++def graph_featurizer(displacement_fn=None):
+   """Create graph featurizer for multi-image neighbor lists.
+ 
+   Converts a NeighborListMultiImage to a jraph.GraphsTuple with displacement
+@@ -1086,27 +1088,40 @@ def graph_featurizer(displacement_fn):
+   so it can be used as a drop-in replacement for multi-image neighbor lists.
+ 
+   Args:
+-    displacement_fn: Displacement function (ignored - uses neighbor.box instead).
++    displacement_fn: Displacement function from ``space.free()``. Must use free
++      boundary conditions since periodicity is handled via explicit shifts.
++      If None, defaults to ``space.free()[0]``.
+ 
+   Returns:
+-    featurize(atoms, positions, neighbor) -> GraphsTuple
++    featurize(atoms, positions, neighbor, **kwargs) -> GraphsTuple
++
++  Raises:
++    ValueError: If displacement_fn is not from ``space.free()``.
+ 
+   Example:
++    >>> from jax_md import space
+     >>> from jax_md.custom_partition import neighbor_list_multi_image, graph_featurizer
++    >>> displacement_fn, _ = space.free()
+     >>> neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff)
+-    >>> featurizer = graph_featurizer(displacement_fn)  # displacement_fn is ignored
++    >>> featurizer = graph_featurizer(displacement_fn)
+     >>> nbrs = neighbor_fn.allocate(positions)
+     >>> graph = featurizer(atoms, positions, nbrs)
+   """
+-  del displacement_fn  # Not used - we use neighbor.box for multi-image
++  if displacement_fn is None:
++    displacement_fn, _ = space.free()
+ 
+-  def featurize(atoms, positions: Array, neighbor: NeighborListMultiImage):
++  def featurize(
++    atoms, positions: Array, neighbor: NeighborListMultiImage, **kwargs
++  ):
+     """Convert neighbor list to graph with displacement edges.
+ 
+     Args:
+       atoms: Node features dict (e.g., {'species': ..., 'positions': ...}).
+       positions: Atom positions (fractional), shape (N, dim).
+       neighbor: Multi-image neighbor list.
++      **kwargs: Additional arguments:
++        - ``box``: Override box for coordinate transformation (for NPT).
++        - ``perturbation``: Strain perturbation for stress via ``quantity.stress``.
+ 
+     Returns:
+       GraphsTuple with displacement vectors as edges.
+@@ -1114,8 +1129,8 @@ def featurize(atoms, positions: Array, neighbor: NeighborListMultiImage):
+     graph = partition.to_jraph(neighbor, nodes=atoms)
+     mask = neighbor_list_multi_image_mask(neighbor)
+ 
+-    # Use box from neighbor list for consistency with shifts
+-    box = neighbor.box
++    # Use box from kwargs if provided, else from neighbor list
++    box = kwargs.pop('box', neighbor.box)
+ 
+     # Get positions and compute displacements with explicit shifts
+     pos_real = space.transform(box, positions)
+@@ -1123,9 +1138,13 @@ def featurize(atoms, positions: Array, neighbor: NeighborListMultiImage):
+     Rb = pos_real[neighbor.senders]
+     shifts_real = space.transform(box, neighbor.shifts)
+ 
+-    # dR = R_j + shift - R_i
+-    dR = Rb + shifts_real - Ra
+-    dR = jnp.where(mask[:, None], dR, 1.0)  # Set masked edges to displacement 1
++    # dR = (R_j + shift) - R_i, using displacement_fn which handles perturbation
++    Rb_shifted = Rb + shifts_real
++    d = jax.vmap(partial(displacement_fn, **kwargs))
++    dR = d(Ra, Rb_shifted)
++
++    # Set masked edges to displacement 1
++    dR = jnp.where(mask[:, None], dR, 1.0)
+ 
+     return graph._replace(edges=dR)
+ 
+diff --git a/jax_md/custom_smap.py b/jax_md/custom_smap.py
+index 737126e6..59464769 100644
+--- a/jax_md/custom_smap.py
++++ b/jax_md/custom_smap.py
+@@ -10,6 +10,10 @@
+ """
+ 
+ from typing import Callable, Tuple, Optional
++import functools
++from functools import partial
++
++import jax
+ import jax.numpy as jnp
+ from jax import ops
+ from jax_md import partition, space, util
+@@ -27,7 +31,7 @@
+ 
+ def pair_neighbor_list_multi_image(
+   pair_fn: Callable[..., Array],
+-  displacement_or_metric=None,  # Ignored, for API compatibility with smap.pair_neighbor_list
++  displacement_fn=None,  # Ignored; always uses space.free() internally
+   species: Optional[Array] = None,  # [N] or None
+   reduce_axis: Optional[Tuple[int, ...]] = None,
+   ignore_unused_parameters: bool = False,  # For API compatibility
+@@ -40,12 +44,12 @@ def pair_neighbor_list_multi_image(
+   with ``NeighborListMultiImage`` to correctly handle small periodic boxes
+   where :math:`r_\text{cut} > L/2`.
+ 
+-  **API Compatibility:**
++  **Displacement Function:**
+ 
+-  The ``displacement_or_metric`` parameter is accepted but ignored (for
+-  signature compatibility with ``smap.pair_neighbor_list``). Multi-image
+-  neighbor lists compute displacements using the box stored in the neighbor
+-  list, so no displacement function is needed.
++  Always uses ``space.free()`` for displacement computation since periodicity
++  is handled via explicit lattice shifts. The ``displacement_fn`` parameter is
++  ignored (for API compatibility with ``smap.pair_neighbor_list``). Supports
++  ``perturbation`` kwarg for stress calculation via ``quantity.stress``.
+ 
+   For each edge :math:`(i, j)` with shift :math:`\mathbf{s}`, computes:
+ 
+@@ -84,6 +88,7 @@ def pair_neighbor_list_multi_image(
+     pair_fn: A function that computes pairwise energies from distances.
+       Examples: ``energy.lennard_jones``, ``energy.morse``, ``energy.soft_sphere``.
+       Signature: ``(dr: Array[capacity], **kwargs) -> Array[capacity]``.
++    displacement_fn: Ignored. Always uses ``space.free()`` internally.
+     species: Optional species array. Shape ``[N]``. If provided, kwargs like
+       ``sigma`` and ``epsilon`` should have shape ``[max_species, max_species]``
+       and will be indexed per-pair.
+@@ -127,9 +132,10 @@ def pair_neighbor_list_multi_image(
+        force_fn = jax.grad(lambda R, nbrs: -lj_energy(R, nbrs))
+        F = force_fn(positions, nbrs)  # Shape: [N, dim]
+   """
+-  # These parameters are accepted for API compatibility but not used.
+-  # Multi-image uses the box from the neighbor list, not a displacement function.
+-  del displacement_or_metric, ignore_unused_parameters
++  # Use space.free() displacement which handles perturbation via kwargs
++  # Delete the passed displacement_fn since it is ignored.
++  del displacement_fn
++  displacement_fn, _ = space.free()
+ 
+   def energy_fn(
+     R: Array,  # [N, dim]
+@@ -161,7 +167,12 @@ def energy_fn(
+       i_safe = jnp.clip(neighbor.receivers, 0, N - 1)  # [capacity]
+       j_safe = jnp.clip(neighbor.senders, 0, N - 1)  # [capacity]
+       shifts_real = space.transform(box, neighbor.shifts)  # [capacity, dim]
+-      dR = R_real[j_safe] + shifts_real - R_real[i_safe]  # [capacity, dim]
++
++      # Use displacement function which handles perturbation naturally
++      Ra = R_real[i_safe]  # [capacity, dim]
++      Rb_shifted = R_real[j_safe] + shifts_real  # [capacity, dim]
++      d = jax.vmap(partial(displacement_fn, **merged_kwargs))
++      dR = d(Ra, Rb_shifted)  # [capacity, dim]
+ 
+       # Compute scalar distances
+       dr = space.distance(dR)  # [capacity]
+@@ -227,9 +238,23 @@ def energy_fn(
+         shifts.shape
+       )  # [N, max_neighbors, dim]
+ 
+-      # Compute displacements: r_j + shift - r_i
++      # Compute displacements using displacement function (handles perturbation)
+       # R_real[:, None, :] broadcasts to [N, 1, dim]
+-      dR = R_neigh + shifts_real - R_real[:, None, :]  # [N, max_neighbors, dim]
++      Ra = jnp.broadcast_to(
++        R_real[:, None, :], R_neigh.shape
++      )  # [N, max_neighbors, dim]
++      Rb_shifted = R_neigh + shifts_real  # [N, max_neighbors, dim]
++
++      # Flatten for vmap, compute displacements, reshape back
++      Ra_flat = Ra.reshape(-1, Ra.shape[-1])  # [N*max_neighbors, dim]
++      Rb_flat = Rb_shifted.reshape(
++        -1, Rb_shifted.shape[-1]
++      )  # [N*max_neighbors, dim]
++      d = jax.vmap(partial(displacement_fn, **merged_kwargs))
++      dR_flat = d(Ra_flat, Rb_flat)  # [N*max_neighbors, dim]
++      dR = dR_flat.reshape(
++        idx.shape[0], idx.shape[1], -1
++      )  # [N, max_neighbors, dim]
+ 
+       # Compute scalar distances
+       dr = space.distance(dR)  # [N, max_neighbors]
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index 06f418a2..cc469e72 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -32,6 +32,11 @@
+ from jax_md import energy
+ from jax_md import partition
+ from jax_md.interpolate import spline
++from jax_md.custom_partition import (
++  neighbor_list_multi_image,
++  estimate_max_neighbors_from_box,
++)
++from jax_md.custom_smap import pair_neighbor_list_multi_image
+ 
+ jax.config.parse_flags_with_absl()
+ 
+@@ -1537,5 +1542,128 @@ def test_coulomb_recip_octions(self):
+     )
+ 
+ 
++def make_fcc_fractional(n_cells, a, dtype):
++  """Create FCC crystal in fractional coordinates."""
++  basis = onp.array(
++    [[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5]]
++  )
++  positions = []
++  for i in range(n_cells):
++    for j in range(n_cells):
++      for k in range(n_cells):
++        for b in basis:
++          positions.append((onp.array([i, j, k]) + b) / n_cells)
++  R = jnp.array(positions, dtype=dtype)
++  box = jnp.eye(3, dtype=dtype) * a * n_cells
++  return R, box
++
++
++class MultiImageNeighborListTest(test_util.JAXMDTestCase):
++  """Tests comparing MIC and Multi-Image neighbor lists."""
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {'testcase_name': f'_dtype={dtype.__name__}', 'dtype': dtype}
++      for dtype in POSITION_DTYPE
++    )
++  )
++  def test_mic_mi_agreement_large_box(self, dtype):
++    """When r_cut < L/2, MIC and MI should give identical results."""
++    # Large box: 4x4x4 FCC, r_cut/L < 0.5
++    R, box = make_fcc_fractional(n_cells=4, a=1.55, dtype=dtype)
++    r_cutoff = 2.5
++    self.assertLess(r_cutoff / float(box[0, 0]), 0.5)
++
++    # Perturb positions
++    key = random.PRNGKey(42)
++    R = R + random.normal(key, R.shape, dtype=dtype) * 0.01
++
++    displacement_fn, _ = space.periodic_general(
++      box, fractional_coordinates=True
++    )
++    max_nbrs = estimate_max_neighbors_from_box(box, r_cutoff, n_atoms=len(R))
++
++    # Multi-Image
++    neighbor_fn_mi, energy_fn_mi = energy.lennard_jones_neighbor_list(
++      displacement_fn,
++      box,
++      r_cutoff=r_cutoff,
++      fractional_coordinates=True,
++      neighbor_list_fn=neighbor_list_multi_image,
++      pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++      max_neighbors=max_nbrs,
++      format=partition.Sparse,
++    )
++    nbrs_mi = neighbor_fn_mi.allocate(R)
++    E_mi = energy_fn_mi(R, nbrs_mi)
++    F_mi = quantity.force(energy_fn_mi)(R, neighbor=nbrs_mi)
++    S_mi = quantity.stress(energy_fn_mi, R, box, neighbor=nbrs_mi)
++
++    # MIC
++    neighbor_fn_mic, energy_fn_mic = energy.lennard_jones_neighbor_list(
++      displacement_fn,
++      box,
++      r_cutoff=r_cutoff,
++      fractional_coordinates=True,
++      format=partition.Sparse,
++    )
++    nbrs_mic = neighbor_fn_mic.allocate(R)
++    E_mic = energy_fn_mic(R, nbrs_mic)
++    F_mic = quantity.force(energy_fn_mic)(R, neighbor=nbrs_mic)
++    S_mic = quantity.stress(energy_fn_mic, R, box, neighbor=nbrs_mic)
++
++    # Looser tolerance for float32 due to different compute paths
++    tol = 1e-4 if dtype == f32 else 1e-10
++    self.assertAllClose(E_mi, E_mic, rtol=tol, atol=tol)
++    self.assertAllClose(F_mi, F_mic, rtol=tol, atol=tol)
++    self.assertAllClose(S_mi, S_mic, rtol=tol, atol=tol)
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {'testcase_name': f'_dtype={dtype.__name__}', 'dtype': dtype}
++      for dtype in POSITION_DTYPE
++    )
++  )
++  def test_mic_mi_difference_small_box(self, dtype):
++    """When r_cut > L/2, MIC misses interactions that MI captures."""
++    # Small box: 2x2x2 FCC, r_cut/L > 0.5
++    R, box = make_fcc_fractional(n_cells=2, a=1.55, dtype=dtype)
++    r_cutoff = 2.5
++    self.assertGreater(r_cutoff / float(box[0, 0]), 0.5)
++
++    displacement_fn, _ = space.periodic_general(
++      box, fractional_coordinates=True
++    )
++    max_nbrs = estimate_max_neighbors_from_box(box, r_cutoff, n_atoms=len(R))
++
++    # Multi-Image
++    neighbor_fn_mi, energy_fn_mi = energy.lennard_jones_neighbor_list(
++      displacement_fn,
++      box,
++      r_cutoff=r_cutoff,
++      fractional_coordinates=True,
++      neighbor_list_fn=neighbor_list_multi_image,
++      pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++      max_neighbors=max_nbrs,
++      format=partition.Sparse,
++    )
++    nbrs_mi = neighbor_fn_mi.allocate(R)
++    E_mi = float(energy_fn_mi(R, nbrs_mi))
++
++    # MIC
++    neighbor_fn_mic, energy_fn_mic = energy.lennard_jones_neighbor_list(
++      displacement_fn,
++      box,
++      r_cutoff=r_cutoff,
++      fractional_coordinates=True,
++      format=partition.Sparse,
++    )
++    nbrs_mic = neighbor_fn_mic.allocate(R)
++    E_mic = float(energy_fn_mic(R, nbrs_mic))
++
++    # MI captures more interactions
++    self.assertLess(E_mi, E_mic)
++
++
+ if __name__ == '__main__':
+   absltest.main()

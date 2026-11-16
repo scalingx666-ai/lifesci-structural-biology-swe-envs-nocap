@@ -1,0 +1,196 @@
+diff --git a/src/Core/Options.jl b/src/Core/Options.jl
+index bce4aba7..4d0b3140 100644
+--- a/src/Core/Options.jl
++++ b/src/Core/Options.jl
+@@ -97,7 +97,7 @@ macro set(opt,val)
+         catch UndefVarError
+             CurrentOptions[$A] = $B
+         end
+-    end
++    end |> esc
+ end
+ 
+ macro set(block)
+diff --git a/src/Core/PhysicalConstants.jl b/src/Core/PhysicalConstants.jl
+index 529fc6a2..f6fda674 100644
+--- a/src/Core/PhysicalConstants.jl
++++ b/src/Core/PhysicalConstants.jl
+@@ -29,15 +29,15 @@ Computed as 1/Fermi.PhysicalConstants.bohr_to_angstrom
+ """
+ angstrom_to_bohr = 1/bohr_to_angstrom
+ 
++hartree_to_kcalmol = 627.509474
++hartree_to_kjmol = 2625.49964
++hartree_to_cm = 219474.6313708
++hartree_to_eV = 27.21138505
++
+ """
+     Fermi.PhysicalConstants.atomic_number(atom::String)
+ 
+ Given a string with the element symbol, return its atomic number
+-
+-# Arguments:
+-
+-    atom   String representing an element
+-
+ """
+ function atomic_number(atom::String)
+     
+diff --git a/src/Methods/FocalPointAnalysis/FPA.jl b/src/Methods/FocalPointAnalysis/FPA.jl
+index 23341bca..332275a8 100644
+--- a/src/Methods/FocalPointAnalysis/FPA.jl
++++ b/src/Methods/FocalPointAnalysis/FPA.jl
+@@ -17,8 +17,10 @@ function FPA{T}(grid::Array{Tuple{String,String},1}) where T <: AbstractFloat
+     data = zeros(length(grid), 4)
+     molecule = Molecule()
+     x = 1
++    @set basis 3-21g
++    currentRHF = RHF(molecule)
+     for (b,m) in grid
+-        row = get_fpa_row(molecule, m, b, T)
++        currentRHF, row = get_fpa_row(molecule, m, b, T, currentRHF)
+         push!(basis, b)
+         for i in eachindex(row)
+             data[x,i] = row[i]
+@@ -29,25 +31,44 @@ function FPA{T}(grid::Array{Tuple{String,String},1}) where T <: AbstractFloat
+     extrapolated, ext_ind = extrapolate(data, basis, methods)
+     push!(basis, "CBS")
+ 
+-    @output "\n ⇒ Final FPA (absolute):\n"
+     fpa = FPA{T}(basis, methods, extrapolated, ext_ind)
++    @output "\n⇒ Final FPA Energy:   {:15.10f}\n" fpa.data[end,end]
+     print_fpa(fpa)
+-    @output "⇒ Final FPA Energy:   {:15.10f}\n" fpa.data[end,end]
+     return fpa
+ end
+ 
+-function get_fpa_row(molecule::Molecule, upmethod::String, basis::String, T::DataType)
++function get_fpa_row(molecule::Molecule, upmethod::String, basis::String, T::DataType, RHFguess::Nothing)
+ 
+     Fermi.CurrentOptions["basis"] = basis
+     
+     @output "\n   → Starting FPA row for {}\n\n" basis
+-    aoint = Fermi.Integrals.ConventionalAOIntegrals(molecule)
+-    RHFwfn = Fermi.HartreeFock.RHF(molecule, aoint)
++    aoint = ConventionalAOIntegrals(molecule)
++    RHFwfn = RHF(molecule, aoint)
+ 
+     if lowercase(upmethod) == "rhf"
+-        return RHFwfn.energy
++        return RHFwfn, (RHFwfn.energy)
+     end
+ 
++    get_fpa_corr_row(upmethod, basis, T, RHFwfn, aoint)
++end
++
++function get_fpa_row(molecule::Molecule, upmethod::String, basis::String, T::DataType, RHFguess::RHF)
++
++    Fermi.CurrentOptions["basis"] = basis
++    
++    @output "\n   → Starting FPA row for {}\n\n" basis
++    aoint = ConventionalAOIntegrals(molecule)
++    RHFwfn = RHF(RHFguess, aoint)
++
++    if lowercase(upmethod) == "rhf"
++        return RHFwfn, (RHFwfn.energy)
++    end
++
++    get_fpa_corr_row(upmethod, basis, T, RHFwfn, aoint)
++end
++
++function get_fpa_corr_row(upmethod::String, basis::String, T::DataType, RHFwfn::RHF, aoint::ConventionalAOIntegrals)
++
+     drop_occ = Fermi.CurrentOptions["drop_occ"]
+     drop_vir = Fermi.CurrentOptions["drop_vir"]
+ 
+@@ -58,12 +79,12 @@ function get_fpa_row(molecule::Molecule, upmethod::String, basis::String, T::Dat
+     CCSDwfn = RCCSD{T}(RHFwfn, moint, Fermi.CoupledCluster.CTF()) 
+ 
+     if lowercase(upmethod) == "ccsd"
+-        return RHFwfn.energy, CCSDwfn.GuessEnergy, CCSDwfn.CorrelationEnergy
++        return RHFwfn, (RHFwfn.energy, CCSDwfn.GuessEnergy, CCSDwfn.CorrelationEnergy)
+     end
+ 
+     CCSDpTwfn = RCCSDpT{T}(CCSDwfn, moint)
+ 
+     if lowercase(upmethod) == "ccsd(t)"
+-        return RHFwfn.energy, CCSDwfn.GuessEnergy, CCSDwfn.CorrelationEnergy, CCSDpTwfn.correction+CCSDwfn.CorrelationEnergy
++        return RHFwfn, (RHFwfn.energy, CCSDwfn.GuessEnergy, CCSDwfn.CorrelationEnergy, CCSDpTwfn.correction+CCSDwfn.CorrelationEnergy)
+     end
+ end
+diff --git a/src/Methods/FocalPointAnalysis/FocalPointAnalysis.jl b/src/Methods/FocalPointAnalysis/FocalPointAnalysis.jl
+index 11e0f149..1d7eea78 100644
+--- a/src/Methods/FocalPointAnalysis/FocalPointAnalysis.jl
++++ b/src/Methods/FocalPointAnalysis/FocalPointAnalysis.jl
+@@ -24,17 +24,43 @@ struct ecFPA{T} <: AbstractFPA
+     extrapolated_indexes::Array{Tuple{Int64,Int64},1}
+ end
+ 
+-function print_fpa(fpa::T) where T <: AbstractFPA
++function print_fpa(fpa::T; incremental=false) where T <: AbstractFPA
++
++    data = copy(fpa.data)
++    if incremental
++        for k in size(fpa.data,2):-1:2
++           data[:,k] -= data[:,k-1]
++        end
++    end
++
+     format = ft_printf("%15.10f")
+     put_braket = (v,i,j) -> (i,j) in fpa.extrapolated_indexes ? "["*v*"]" : v
+ 
+-    out = pretty_table(String, fpa.data, fpa.methods, alignment=:c,
++    out = pretty_table(String, data, fpa.methods, alignment=:c,
+     formatters = (format, put_braket), row_names=fpa.basis, 
+     row_name_column_title="Basis Set")
+ 
+     @output "\n{}\n" out
+ end
+ 
++function Base.:*(N::T, F::FPA) where T <: Number
++    return FPA(F.basis, F.methods, N.*F.data, F.extrapolated_indexes)
++end
++
++function Base.:+(A::FPA, B::FPA)
++    @assert A.methods == B.methods
++    @assert A.basis == B.basis
++    @assert A.extrapolated_indexes == B.extrapolated_indexes
++    return FPA(A.basis, B.methods, A.data+B.data, A.extrapolated_indexes)
++end
++
++function Base.:-(A::FPA, B::FPA)
++    @assert A.methods == B.methods
++    @assert A.basis == B.basis
++    @assert A.extrapolated_indexes == B.extrapolated_indexes
++    return FPA(A.basis, B.methods, A.data-B.data, A.extrapolated_indexes)
++end
++
+ include("Extrapolation.jl")
+ include("FPA.jl")
+ include("ecFPA.jl")
+diff --git a/src/Methods/HartreeFock/RHF/RHF.jl b/src/Methods/HartreeFock/RHF/RHF.jl
+index fd98db87..777009e6 100644
+--- a/src/Methods/HartreeFock/RHF/RHF.jl
++++ b/src/Methods/HartreeFock/RHF/RHF.jl
+@@ -62,6 +62,12 @@ function RHF()
+     Alg = select_algorithm(Fermi.CurrentOptions["scf_alg"])
+     RHF(molecule, aoint, Alg)
+ end
++
++function RHF(molecule::Molecule)
++    aoint = ConventionalAOIntegrals(molecule) 
++    Alg = select_algorithm(Fermi.CurrentOptions["scf_alg"])
++    RHF(molecule, aoint, Alg)
++end
+ """
+ Fermi.HartreeFock.RHF(molecule::Molecule, aoint::ConventionalAOIntegrals)
+ 
+@@ -82,3 +88,8 @@ function RHF(wfn::RHF)
+     Alg = select_algorithm(Fermi.CurrentOptions["scf_alg"])
+     RHF(wfn, Alg)
+ end
++
++function RHF(wfn::RHF, aoint::ConventionalAOIntegrals)
++    Alg = select_algorithm(Fermi.CurrentOptions["scf_alg"])
++    RHF(wfn, aoint, Alg)
++end

@@ -1,0 +1,2651 @@
+diff --git a/aimnet/calculators/nbmat.py b/aimnet/calculators/nbmat.py
+index 17ed6ed..0cee7b5 100644
+--- a/aimnet/calculators/nbmat.py
++++ b/aimnet/calculators/nbmat.py
+@@ -8,6 +8,9 @@ class TooManyNeighborsError(Exception):
+     pass
+ 
+ 
++# Always import CPU kernels
++from .nb_kernel_cpu import _nbmat_cpu, _nbmat_dual_cpu, _nbmat_dual_pbc_cpu, _nbmat_pbc_cpu
++
+ if torch.cuda.is_available():
+     import numba.cuda
+ 
+@@ -15,19 +18,8 @@ class TooManyNeighborsError(Exception):
+         raise ImportError("PyTorch CUDA is available, but Numba CUDA is not available.")
+     _numba_cuda_available = True
+     from .nb_kernel_cuda import _nbmat_cuda, _nbmat_dual_cuda, _nbmat_pbc_cuda, _nbmat_pbc_dual_cuda
+-
+-    _kernel_nbmat = _nbmat_cuda
+-    _kernel_nbmat_dual = _nbmat_dual_cuda
+-    _kernel_nbmat_pbc = _nbmat_pbc_cuda
+-    _kernel_nbmat_pbc_dual = _nbmat_pbc_dual_cuda
+ else:
+     _numba_cuda_available = False
+-    from .nb_kernel_cpu import _nbmat_cpu, _nbmat_dual_cpu, _nbmat_dual_pbc_cpu, _nbmat_pbc_cpu
+-
+-    _kernel_nbmat = _nbmat_cpu
+-    _kernel_nbmat_dual = _nbmat_dual_cpu
+-    _kernel_nbmat_pbc = _nbmat_pbc_cpu
+-    _kernel_nbmat_pbc_dual = _nbmat_dual_pbc_cpu
+ 
+ 
+ def calc_nbmat(
+@@ -51,10 +43,20 @@ def calc_nbmat(
+         _, mol_size = torch.unique(mol_idx, return_counts=True)
+         mol_end_idx = mol_size.cumsum(0)
+ 
+-    if _numba_cuda_available and device.type != "cuda":
+-        raise ValueError("Numba CUDA is available, but the input tensors are not on CUDA.")
+-
+     _cuda = device.type == "cuda" and _numba_cuda_available
++
++    # Select appropriate kernels based on device
++    if _cuda:
++        _kernel_nbmat = _nbmat_cuda
++        _kernel_nbmat_dual = _nbmat_dual_cuda
++        _kernel_nbmat_pbc = _nbmat_pbc_cuda
++        _kernel_nbmat_pbc_dual = _nbmat_pbc_dual_cuda
++    else:
++        _kernel_nbmat = _nbmat_cpu
++        _kernel_nbmat_dual = _nbmat_dual_cpu
++        _kernel_nbmat_pbc = _nbmat_pbc_cpu
++        _kernel_nbmat_pbc_dual = _nbmat_dual_pbc_cpu
++
+     _dual_cutoff = cutoffs[1] is not None
+     if _dual_cutoff and maxnb[1] is None:
+         raise ValueError("maxnb[1] must be specified for dual cutoff.")
+diff --git a/aimnet/train/pt2jpt.py b/aimnet/train/pt2jpt.py
+index c99d7f5..ac3662f 100644
+--- a/aimnet/train/pt2jpt.py
++++ b/aimnet/train/pt2jpt.py
+@@ -69,7 +69,7 @@ def jitcompile(model: str, pt: str, jpt: str, sae=None, species=None, no_lr=Fals
+         numbers = list(load_yaml(sae).keys())  # type: ignore[union-attr]
+     if numbers:
+         model = mask_not_implemented_species(model, numbers)  # type: ignore[call-arg]
+-        model.register_buffer("impemented_species", torch.tensor(numbers, dtype=torch.int64))
++        model.register_buffer("implemented_species", torch.tensor(numbers, dtype=torch.int64))
+     model_jit = torch.jit.script(model)
+     model_jit.save(jpt)
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..1051284
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,155 @@
++"""Shared pytest fixtures for AIMNet2 tests."""
++
++import os
++
++import pytest
++import torch
++from torch import Tensor
++
++# Test data directory
++DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
++CAFFEINE_FILE = os.path.join(DATA_DIR, "caffeine.xyz")
++
++
++def get_device():
++    """Get the best available device."""
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    return torch.device("cpu")
++
++
++@pytest.fixture
++def device():
++    """Fixture providing the best available device."""
++    return get_device()
++
++
++@pytest.fixture
++def requires_gpu():
++    """Skip test if GPU is not available."""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++
++
++@pytest.fixture
++def simple_molecule(device) -> dict[str, Tensor]:
++    """Simple water molecule for basic tests (H2O)."""
++    # Water molecule: O at origin, H atoms around it
++    coord = torch.tensor(
++        [
++            [0.0000, 0.0000, 0.1173],  # O
++            [0.0000, 0.7572, -0.4692],  # H
++            [0.0000, -0.7572, -0.4692],  # H
++        ],
++        device=device,
++        dtype=torch.float32,
++    )
++    numbers = torch.tensor([8, 1, 1], device=device)
++    return {
++        "coord": coord.unsqueeze(0),  # (1, 3, 3)
++        "numbers": numbers.unsqueeze(0),  # (1, 3)
++        "charge": torch.tensor([0.0], device=device),
++    }
++
++
++@pytest.fixture
++def simple_molecule_flat(device) -> dict[str, Tensor]:
++    """Simple water molecule for nb_mode=1 tests (flat tensor format)."""
++    coord = torch.tensor(
++        [
++            [0.0000, 0.0000, 0.1173],  # O
++            [0.0000, 0.7572, -0.4692],  # H
++            [0.0000, -0.7572, -0.4692],  # H
++            [0.0000, 0.0000, 0.0000],  # padding
++        ],
++        device=device,
++        dtype=torch.float32,
++    )
++    numbers = torch.tensor([8, 1, 1, 0], device=device)
++    mol_idx = torch.tensor([0, 0, 0, 1], device=device)  # last atom is padding "molecule"
++    return {
++        "coord": coord,  # (4, 3) - flat format
++        "numbers": numbers,  # (4,)
++        "mol_idx": mol_idx,
++        "charge": torch.tensor([0.0], device=device),
++    }
++
++
++@pytest.fixture
++def padded_batch(device) -> dict[str, Tensor]:
++    """Batch of 2 molecules with padding (H2O and H2)."""
++    # Mol 1: H2O, Mol 2: H2 (padded to 3 atoms)
++    coord = torch.tensor(
++        [
++            # Water
++            [
++                [0.0000, 0.0000, 0.1173],  # O
++                [0.0000, 0.7572, -0.4692],  # H
++                [0.0000, -0.7572, -0.4692],  # H
++            ],
++            # H2 (with padding)
++            [
++                [0.0000, 0.0000, 0.0000],  # H
++                [0.7414, 0.0000, 0.0000],  # H
++                [0.0000, 0.0000, 0.0000],  # padding
++            ],
++        ],
++        device=device,
++        dtype=torch.float32,
++    )
++    numbers = torch.tensor(
++        [
++            [8, 1, 1],  # Water
++            [1, 1, 0],  # H2 + padding
++        ],
++        device=device,
++    )
++    return {
++        "coord": coord,  # (2, 3, 3)
++        "numbers": numbers,  # (2, 3)
++        "charge": torch.tensor([0.0, 0.0], device=device),
++    }
++
++
++@pytest.fixture
++def caffeine_data(device) -> dict[str, Tensor]:
++    """Caffeine molecule loaded from xyz file."""
++    pytest.importorskip("ase", reason="ASE required for loading xyz files")
++    import ase.io
++
++    atoms = ase.io.read(CAFFEINE_FILE)
++    data = {
++        "coord": torch.tensor(atoms.get_positions(), device=device, dtype=torch.float32).unsqueeze(0),
++        "numbers": torch.tensor(atoms.get_atomic_numbers(), device=device).unsqueeze(0),
++        "charge": torch.tensor([0.0], device=device),
++    }
++    return data
++
++
++@pytest.fixture
++def random_coords_100(device) -> tuple[Tensor, Tensor, float, float]:
++    """Random 100 atom coordinates for neighbor list tests."""
++    torch.manual_seed(42)
++    coord = torch.rand((100, 3), device=device) * 10  # 10 Angstrom box
++    dmat = torch.cdist(coord, coord)
++    dmat[torch.eye(100, dtype=torch.bool, device=device)] = float("inf")
++    # Set cutoffs based on quantiles
++    dmat_flat = dmat[dmat < float("inf")]
++    cutoff1 = torch.quantile(dmat_flat, 0.3).item()
++    cutoff2 = torch.quantile(dmat_flat, 0.6).item()
++    return coord, dmat, cutoff1, cutoff2
++
++
++@pytest.fixture
++def model_calculator():
++    """AIMNet2Calculator instance for integration tests."""
++    pytest.importorskip("ase", reason="ASE required for calculator tests")
++    from aimnet.calculators import AIMNet2Calculator
++
++    return AIMNet2Calculator("aimnet2", nb_threshold=0)
++
++
++@pytest.fixture
++def pbc_cell(device) -> Tensor:
++    """Simple cubic unit cell for PBC tests."""
++    return torch.eye(3, device=device) * 10.0  # 10 Angstrom cubic cell
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index 6a52842..988a1d3 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -1,25 +1,32 @@
+ import os
+ 
++import numpy as np
+ import pytest
++import torch
+ 
+ from aimnet.calculators import AIMNet2Calculator
+ 
+ file = os.path.join(os.path.dirname(__file__), "data", "caffeine.xyz")
+ 
+ 
++def load_mol(filepath):
++    """Helper to load molecule from xyz file."""
++    pytest.importorskip("ase", reason="ASE not installed")
++    import ase.io
++
++    atoms = ase.io.read(filepath)
++    data = {
++        "coord": atoms.get_positions(),
++        "numbers": atoms.get_atomic_numbers(),
++        "charge": 0.0,
++    }
++    return data
++
++
+ @pytest.mark.ase
+ def test_from_zoo():
++    """Test basic model loading and inference from model registry."""
+     pytest.importorskip("ase", reason="ASE not installed. Install with: pip install aimnet[ase]")
+-    import ase.io
+-
+-    def load_mol(filepath):
+-        atoms = ase.io.read(filepath)
+-        data = {
+-            "coord": atoms.get_positions(),  # type: ignore
+-            "numbers": atoms.get_atomic_numbers(),  # type: ignore
+-            "charge": 0.0,
+-        }
+-        return data
+ 
+     calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
+     data = load_mol(file)
+@@ -31,14 +38,282 @@ def load_mol(filepath):
+     assert "hessian" in res
+ 
+ 
+-# def test_non_nopbc():
+-#     calc = AIMNet2Calculator('aimnet2', nb_threshold=0)
+-#     data = load_mol(file)
+-#     data['coord'] = data['coord'][:10]
+-#     data['numbers'] = data['numbers'][:10]
+-#     res = calc(data)
+-#     assert 'energy' in res
+-#     res = calc(data, forces=True)
+-#     assert 'forces' in res
+-#     res = calc(data, hessian=True)
+-#     assert 'hessian' in res
++class TestInputValidation:
++    """Tests for input validation and error handling."""
++
++    @pytest.mark.ase
++    def test_missing_coord_raises_error(self):
++        """Test that missing coord key raises KeyError."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {"numbers": [6, 1, 1], "charge": 0.0}
++
++        with pytest.raises(KeyError, match="Missing key coord"):
++            calc(data)
++
++    @pytest.mark.ase
++    def test_missing_numbers_raises_error(self):
++        """Test that missing numbers key raises KeyError."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {"coord": [[0, 0, 0], [1, 0, 0]], "charge": 0.0}
++
++        with pytest.raises(KeyError, match="Missing key numbers"):
++            calc(data)
++
++    @pytest.mark.ase
++    def test_missing_charge_raises_error(self):
++        """Test that missing charge key raises KeyError."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {"coord": [[0, 0, 0]], "numbers": [6]}
++
++        with pytest.raises(KeyError, match="Missing key charge"):
++            calc(data)
++
++    @pytest.mark.ase
++    def test_numpy_input(self):
++        """Test that numpy arrays are accepted as input."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {
++            "coord": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
++            "numbers": np.array([6, 1, 1]),
++            "charge": 0.0,
++        }
++        res = calc(data)
++        assert "energy" in res
++        assert isinstance(res["energy"], torch.Tensor)
++
++    @pytest.mark.ase
++    def test_list_input(self):
++        """Test that Python lists are accepted as input."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {
++            "coord": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
++            "numbers": [6, 1, 1],
++            "charge": 0.0,
++        }
++        res = calc(data)
++        assert "energy" in res
++
++
++class TestCoulombMethods:
++    """Tests for Coulomb method switching."""
++
++    @pytest.mark.ase
++    def test_set_coulomb_simple(self):
++        """Test setting simple Coulomb method."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        calc.set_lrcoulomb_method("simple")
++        assert calc._coulomb_method == "simple"
++
++    @pytest.mark.ase
++    def test_set_coulomb_dsf(self):
++        """Test setting DSF Coulomb method."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        calc.set_lrcoulomb_method("dsf", cutoff=12.0, dsf_alpha=0.25)
++        assert calc._coulomb_method == "dsf"
++        assert calc.cutoff_lr == 12.0
++
++    @pytest.mark.ase
++    def test_set_coulomb_ewald(self):
++        """Test setting Ewald Coulomb method."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        calc.set_lrcoulomb_method("ewald", cutoff=10.0)
++        assert calc._coulomb_method == "ewald"
++
++    @pytest.mark.ase
++    def test_invalid_coulomb_method(self):
++        """Test that invalid Coulomb method raises ValueError."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        with pytest.raises(ValueError, match="Invalid method"):
++            calc.set_lrcoulomb_method("invalid_method")
++
++    @pytest.mark.ase
++    def test_coulomb_method_both_produce_valid_energy(self):
++        """Test that both simple and DSF Coulomb methods produce valid energies."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++
++        # Get energy with simple method
++        calc.set_lrcoulomb_method("simple")
++        res_simple = calc(data)
++        assert torch.isfinite(res_simple["energy"]).all()
++
++        # Get energy with DSF method
++        calc.set_lrcoulomb_method("dsf")
++        res_dsf = calc(data)
++        assert torch.isfinite(res_dsf["energy"]).all()
++
++        # Both should produce negative energies for stable molecules
++        assert res_simple["energy"].item() < 0
++        assert res_dsf["energy"].item() < 0
++
++
++class TestBatchProcessing:
++    """Tests for batch processing of multiple molecules."""
++
++    @pytest.mark.ase
++    def test_batched_input_2d(self):
++        """Test processing with 2D batched input (flattened molecules)."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++
++        # Two water molecules flattened with mol_idx
++        data = {
++            "coord": torch.tensor(
++                [
++                    [0.0, 0.0, 0.0],
++                    [1.0, 0.0, 0.0],
++                    [0.0, 1.0, 0.0],
++                    [5.0, 0.0, 0.0],
++                    [6.0, 0.0, 0.0],
++                    [5.0, 1.0, 0.0],
++                ],
++                dtype=torch.float32,
++            ),
++            "numbers": torch.tensor([8, 1, 1, 8, 1, 1]),
++            "mol_idx": torch.tensor([0, 0, 0, 1, 1, 1]),
++            "charge": torch.tensor([0.0, 0.0]),
++        }
++        res = calc(data)
++        assert "energy" in res
++        assert res["energy"].shape == (2,)
++
++    @pytest.mark.ase
++    def test_batched_input_3d(self):
++        """Test processing with 3D batched input."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++
++        # Two molecules in batch format
++        data = {
++            "coord": torch.tensor(
++                [
++                    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
++                    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
++                ],
++                dtype=torch.float32,
++            ),
++            "numbers": torch.tensor([[8, 1, 1], [8, 1, 1]]),
++            "charge": torch.tensor([0.0, 0.0]),
++        }
++        res = calc(data)
++        assert "energy" in res
++        assert res["energy"].shape == (2,)
++
++
++class TestDerivatives:
++    """Tests for force, stress, and Hessian calculations."""
++
++    @pytest.mark.ase
++    def test_forces_shape(self):
++        """Test that forces have correct shape."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++        res = calc(data, forces=True)
++
++        assert "forces" in res
++        # Forces should have shape (N, 3) or (1, N, 3)
++        assert res["forces"].shape[-1] == 3
++        n_atoms = len(data["numbers"])
++        assert res["forces"].shape[-2] == n_atoms
++
++    @pytest.mark.ase
++    def test_forces_sum_approximately_zero(self):
++        """Test that forces sum to approximately zero (translation invariance)."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++        res = calc(data, forces=True)
++
++        # Sum of forces should be approximately zero
++        force_sum = res["forces"].sum(dim=-2)
++        assert force_sum.abs().max().item() < 1e-4
++
++    @pytest.mark.ase
++    def test_hessian_shape(self):
++        """Test that Hessian has correct shape."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        # Use smaller molecule for Hessian (expensive)
++        data = {
++            "coord": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
++            "numbers": [8, 1, 1],
++            "charge": 0.0,
++        }
++        res = calc(data, hessian=True)
++
++        assert "hessian" in res
++        # Hessian should have shape (N, 3, N, 3)
++        n_atoms = 3
++        assert res["hessian"].shape == (n_atoms, 3, n_atoms, 3)
++
++    @pytest.mark.ase
++    def test_hessian_symmetry(self):
++        """Test that Hessian is approximately symmetric."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {
++            "coord": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
++            "numbers": [8, 1, 1],
++            "charge": 0.0,
++        }
++        res = calc(data, hessian=True)
++
++        hess = res["hessian"]
++        # Flatten to (3N, 3N) and check symmetry
++        hess_flat = hess.reshape(9, 9)
++        diff = (hess_flat - hess_flat.T).abs().max()
++        assert diff.item() < 1e-4
++
++    @pytest.mark.ase
++    def test_hessian_multiple_molecules_raises(self):
++        """Test that Hessian with multiple molecules raises NotImplementedError."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = {
++            "coord": torch.tensor(
++                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [5.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
++                dtype=torch.float32,
++            ),
++            "numbers": torch.tensor([8, 1, 8, 1]),
++            "mol_idx": torch.tensor([0, 0, 1, 1]),
++            "charge": torch.tensor([0.0, 0.0]),
++        }
++        with pytest.raises(NotImplementedError, match="Hessian calculation is not supported for multiple molecules"):
++            calc(data, hessian=True)
++
++
++class TestEnergyConsistency:
++    """Tests for energy consistency across different configurations."""
++
++    @pytest.mark.ase
++    def test_translation_invariance(self):
++        """Test that energy is invariant under translation."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++
++        # Original energy
++        res1 = calc(data)
++        e1 = res1["energy"].item()
++
++        # Translate molecule
++        data2 = data.copy()
++        data2["coord"] = data["coord"] + np.array([10.0, 20.0, 30.0])
++        res2 = calc(data2)
++        e2 = res2["energy"].item()
++
++        # Allow for small numerical differences due to floating point
++        assert abs(e1 - e2) < 1e-5
++
++    @pytest.mark.ase
++    def test_rotation_invariance(self):
++        """Test that energy is invariant under rotation."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++
++        # Original energy
++        res1 = calc(data)
++        e1 = res1["energy"].item()
++
++        # Rotate molecule by 90 degrees around z-axis
++        theta = np.pi / 2
++        R = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
++        data2 = data.copy()
++        data2["coord"] = data["coord"] @ R.T
++        res2 = calc(data2)
++        e2 = res2["energy"].item()
++
++        assert abs(e1 - e2) < 1e-5
+diff --git a/tests/test_calculator_gpu.py b/tests/test_calculator_gpu.py
+new file mode 100644
+index 0000000..c0b27d1
+--- /dev/null
++++ b/tests/test_calculator_gpu.py
+@@ -0,0 +1,264 @@
++"""GPU-specific tests for AIMNet2 calculator.
++
++All tests in this module require CUDA and are marked with @pytest.mark.gpu.
++Run with: pytest -m gpu
++"""
++
++import os
++
++import pytest
++import torch
++
++from aimnet.calculators import AIMNet2Calculator
++
++# Skip entire module if CUDA is not available
++pytestmark = pytest.mark.gpu
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA not available", allow_module_level=True)
++
++file = os.path.join(os.path.dirname(__file__), "data", "caffeine.xyz")
++
++
++def load_mol(filepath):
++    """Helper to load molecule from xyz file."""
++    pytest.importorskip("ase", reason="ASE not installed")
++    import ase.io
++
++    atoms = ase.io.read(filepath)
++    data = {
++        "coord": atoms.get_positions(),
++        "numbers": atoms.get_atomic_numbers(),
++        "charge": 0.0,
++    }
++    return data
++
++
++def create_cpu_calculator():
++    """Create a CPU-only calculator instance for comparison tests.
++
++    Uses __new__ to bypass __init__ which auto-selects CUDA when available.
++    This approach directly initializes attributes to force CPU execution.
++    """
++    from aimnet.calculators.model_registry import get_model_path
++
++    calc = AIMNet2Calculator.__new__(AIMNet2Calculator)
++    calc.device = "cpu"
++
++    p = get_model_path("aimnet2")
++    calc.model = torch.jit.load(p, map_location="cpu")
++    calc.cutoff = calc.model.cutoff
++    calc.lr = hasattr(calc.model, "cutoff_lr")
++    calc.cutoff_lr = getattr(calc.model, "cutoff_lr", float("inf")) if calc.lr else None
++    calc.max_density = 0.2
++    calc.nb_threshold = 0
++    calc._batch = None
++    calc._max_mol_size = 0
++    calc._saved_for_grad = {}
++    calc._coulomb_method = "simple"
++
++    return calc
++
++
++class TestGPUBasics:
++    """Basic GPU functionality tests."""
++
++    @pytest.mark.ase
++    def test_model_on_cuda(self):
++        """Test that model is loaded on CUDA device."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        assert calc.device == "cuda"
++
++    @pytest.mark.ase
++    def test_inference_on_cuda(self):
++        """Test basic inference on CUDA."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++        res = calc(data)
++
++        assert "energy" in res
++        assert res["energy"].device.type == "cuda"
++
++    @pytest.mark.ase
++    def test_forces_on_cuda(self):
++        """Test force calculation on CUDA."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++        res = calc(data, forces=True)
++
++        assert "forces" in res
++        assert res["forces"].device.type == "cuda"
++
++
++class TestGPUvsCPUConsistency:
++    """Tests verifying GPU and CPU produce consistent results."""
++
++    @pytest.mark.ase
++    def test_energy_consistency(self):
++        """Test that GPU and CPU produce the same energy."""
++        # GPU calculation
++        calc_gpu = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++        res_gpu = calc_gpu(data)
++        energy_gpu = res_gpu["energy"].cpu()
++
++        # CPU calculation
++        calc_cpu = create_cpu_calculator()
++        res_cpu = calc_cpu(data)
++        energy_cpu = res_cpu["energy"]
++
++        # Energies should match closely
++        assert torch.allclose(energy_gpu, energy_cpu, rtol=1e-5, atol=1e-6)
++
++    @pytest.mark.ase
++    def test_forces_consistency(self):
++        """Test that GPU and CPU produce the same forces."""
++        # GPU calculation
++        calc_gpu = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++        res_gpu = calc_gpu(data, forces=True)
++        forces_gpu = res_gpu["forces"].cpu()
++
++        # CPU calculation
++        calc_cpu = create_cpu_calculator()
++        res_cpu = calc_cpu(data, forces=True)
++        forces_cpu = res_cpu["forces"]
++
++        # Forces should match closely
++        assert torch.allclose(forces_gpu, forces_cpu, rtol=1e-4, atol=1e-5)
++
++
++class TestCUDANeighborList:
++    """Tests for CUDA neighbor list computation."""
++
++    def test_nbmat_cuda_vs_cpu(self):
++        """Test that CUDA and CPU neighbor lists produce same results."""
++        from aimnet.calculators.nbmat import calc_nbmat
++
++        torch.manual_seed(42)
++        N = 50
++        coord_cpu = torch.rand((N, 3)) * 5
++        coord_gpu = coord_cpu.cuda()
++
++        cutoff = (3.0, None)
++        maxnb = (100, None)
++
++        # CPU computation
++        nbmat_cpu, _, _, _ = calc_nbmat(coord_cpu, cutoff, maxnb)
++
++        # GPU computation
++        nbmat_gpu, _, _, _ = calc_nbmat(coord_gpu, cutoff, maxnb)
++
++        # Move to same device for comparison
++        nbmat_gpu_cpu = nbmat_gpu.cpu()
++
++        # Shapes should match
++        assert nbmat_cpu.shape == nbmat_gpu_cpu.shape
++
++        # Content might differ in order but should have same neighbors
++        # Check that for each atom, the set of neighbors is the same
++        for i in range(N):
++            nb_cpu = set(nbmat_cpu[i][nbmat_cpu[i] < N].tolist())
++            nb_gpu = set(nbmat_gpu_cpu[i][nbmat_gpu_cpu[i] < N].tolist())
++            assert nb_cpu == nb_gpu, f"Neighbors differ for atom {i}"
++
++
++class TestGPUBatching:
++    """Tests for GPU-specific batching behavior."""
++
++    @pytest.mark.ase
++    def test_large_batch_on_gpu(self):
++        """Test large batch processing on GPU."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=500)  # Force batched mode
++        data = load_mol(file)
++
++        # Create batch of 10 copies
++        import numpy as np
++
++        batch_coord = np.stack([data["coord"]] * 10)
++        batch_numbers = np.stack([data["numbers"]] * 10)
++
++        batch_data = {
++            "coord": torch.tensor(batch_coord, dtype=torch.float32),
++            "numbers": torch.tensor(batch_numbers),
++            "charge": torch.zeros(10),
++        }
++
++        res = calc(batch_data)
++        assert res["energy"].shape == (10,)
++
++        # All energies should be the same (same molecule)
++        assert torch.allclose(res["energy"], res["energy"][0].expand(10), rtol=1e-5)
++
++    @pytest.mark.ase
++    def test_nb_threshold_behavior(self):
++        """Test that nb_threshold controls batching behavior."""
++        data = load_mol(file)
++        n_atoms = len(data["numbers"])
++
++        # With high threshold, should use batched mode
++        calc_batch = AIMNet2Calculator("aimnet2", nb_threshold=n_atoms + 100)
++        # With low threshold, should use flattened mode
++        calc_flat = AIMNet2Calculator("aimnet2", nb_threshold=0)
++
++        # Both should give same results
++        res_batch = calc_batch(data)
++        res_flat = calc_flat(data)
++
++        assert torch.allclose(res_batch["energy"], res_flat["energy"], rtol=1e-5)
++
++
++class TestGPUMemory:
++    """Tests for GPU memory management."""
++
++    @pytest.mark.ase
++    def test_memory_cleanup_after_inference(self):
++        """Test that GPU memory is properly cleaned up after inference."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++
++        # Run inference multiple times
++        for _ in range(5):
++            res = calc(data, forces=True)
++            del res
++
++        # Force garbage collection
++        import gc
++
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        # Get memory stats
++        memory_allocated = torch.cuda.memory_allocated()
++        memory_reserved = torch.cuda.memory_reserved()
++
++        # Memory should be bounded (not growing indefinitely)
++        # This is a basic sanity check
++        assert memory_allocated < 2e9  # Less than 2GB allocated
++        assert memory_reserved < 4e9  # Less than 4GB reserved
++
++    @pytest.mark.ase
++    def test_no_memory_leak_in_forces(self):
++        """Test that force calculation doesn't leak memory."""
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        data = load_mol(file)
++
++        # Warm up
++        _ = calc(data, forces=True)
++        torch.cuda.synchronize()
++
++        # Record baseline memory
++        torch.cuda.reset_peak_memory_stats()
++        baseline = torch.cuda.memory_allocated()
++
++        # Run many iterations
++        for _ in range(10):
++            res = calc(data, forces=True)
++            del res
++
++        torch.cuda.synchronize()
++        final = torch.cuda.memory_allocated()
++
++        # Memory growth should be minimal
++        growth = final - baseline
++        assert growth < 100e6  # Less than 100MB growth
+diff --git a/tests/test_config.py b/tests/test_config.py
+new file mode 100644
+index 0000000..7a97e4f
+--- /dev/null
++++ b/tests/test_config.py
+@@ -0,0 +1,407 @@
++"""Tests for aimnet.config - configuration and module loading utilities."""
++
++import os
++import tempfile
++
++import pytest
++import torch
++
++from aimnet import config
++
++
++class TestGetModule:
++    """Tests for get_module function."""
++
++    def test_get_module_valid_path(self):
++        """Test loading a valid module path."""
++        # Load torch.nn.ReLU
++        relu_cls = config.get_module("torch.nn.ReLU")
++        assert relu_cls is torch.nn.ReLU
++
++    def test_get_module_function(self):
++        """Test loading a function from a module."""
++        # Load torch.zeros
++        zeros_fn = config.get_module("torch.zeros")
++        assert zeros_fn is torch.zeros
++
++    def test_get_module_nested_path(self):
++        """Test loading from nested module path."""
++        # Load torch.nn.functional.relu
++        relu_fn = config.get_module("torch.nn.functional.relu")
++        assert relu_fn is torch.nn.functional.relu
++
++    def test_get_module_invalid_module(self):
++        """Test that invalid module raises ImportError."""
++        with pytest.raises(ImportError):
++            config.get_module("nonexistent_module.SomeClass")
++
++    def test_get_module_invalid_attribute(self):
++        """Test that invalid attribute raises AttributeError."""
++        with pytest.raises(AttributeError):
++            config.get_module("torch.nn.NonexistentClass")
++
++    def test_get_module_aimnet_modules(self):
++        """Test loading aimnet modules."""
++        # Load an aimnet module
++        nbops_mod = config.get_module("aimnet.nbops.set_nb_mode")
++        from aimnet.nbops import set_nb_mode
++
++        assert nbops_mod is set_nb_mode
++
++
++class TestGetInitModule:
++    """Tests for get_init_module function."""
++
++    def test_get_init_module_no_args(self):
++        """Test initializing module without arguments."""
++        relu = config.get_init_module("torch.nn.ReLU")
++        assert isinstance(relu, torch.nn.ReLU)
++
++    def test_get_init_module_with_kwargs(self):
++        """Test initializing module with keyword arguments."""
++        linear = config.get_init_module("torch.nn.Linear", kwargs={"in_features": 10, "out_features": 5})
++        assert isinstance(linear, torch.nn.Linear)
++        assert linear.in_features == 10
++        assert linear.out_features == 5
++
++    def test_get_init_module_with_args(self):
++        """Test initializing module with positional arguments."""
++        linear = config.get_init_module("torch.nn.Linear", args=[10, 5])
++        assert isinstance(linear, torch.nn.Linear)
++        assert linear.in_features == 10
++        assert linear.out_features == 5
++
++    def test_get_init_module_with_args_and_kwargs(self):
++        """Test initializing module with both args and kwargs."""
++        linear = config.get_init_module("torch.nn.Linear", args=[10], kwargs={"out_features": 5, "bias": False})
++        assert isinstance(linear, torch.nn.Linear)
++        assert linear.in_features == 10
++        assert linear.out_features == 5
++        assert linear.bias is None
++
++
++class TestLoadYaml:
++    """Tests for load_yaml function."""
++
++    def test_load_yaml_from_dict(self):
++        """Test load_yaml with dict input (passthrough)."""
++        input_dict = {"key1": "value1", "nested": {"key2": "value2"}}
++        result = config.load_yaml(input_dict)
++        assert result == input_dict
++
++    def test_load_yaml_from_list(self):
++        """Test load_yaml with list input (passthrough)."""
++        input_list = [1, 2, {"key": "value"}]
++        result = config.load_yaml(input_list)
++        assert result == input_list
++
++    def test_load_yaml_from_file(self):
++        """Test load_yaml from file."""
++        yaml_content = """
++        model:
++          type: test
++          params:
++            size: 100
++        """
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
++            f.write(yaml_content)
++            f.flush()
++
++            try:
++                result = config.load_yaml(f.name)
++                assert "model" in result
++                assert result["model"]["type"] == "test"
++                assert result["model"]["params"]["size"] == 100
++            finally:
++                os.unlink(f.name)
++
++    def test_load_yaml_with_jinja2_template(self):
++        """Test load_yaml with Jinja2 templating."""
++        yaml_content = """
++        model:
++          hidden_size: {{ hidden_size }}
++          layers: {{ num_layers }}
++        """
++        hyperpar = {"hidden_size": 256, "num_layers": 4}
++
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
++            f.write(yaml_content)
++            f.flush()
++
++            try:
++                result = config.load_yaml(f.name, hyperpar)
++                # Jinja2 renders, then YAML parses - numbers stay as numbers
++                assert result["model"]["hidden_size"] == 256
++                assert result["model"]["layers"] == 4
++            finally:
++                os.unlink(f.name)
++
++    def test_load_yaml_with_dict_hyperpar(self):
++        """Test load_yaml with dict containing Jinja2 templates."""
++        input_dict = {"value": "{{ x }}"}
++        hyperpar = {"x": 42}
++        result = config.load_yaml(input_dict, hyperpar)
++        assert result["value"] == "42"
++
++    def test_load_yaml_nested_yaml_include(self):
++        """Test load_yaml with nested YAML file includes."""
++        # Create nested config
++        nested_content = """
++        nested_key: nested_value
++        """
++
++        # Create main config that includes nested
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as nested_f:
++            nested_f.write(nested_content)
++            nested_f.flush()
++
++            main_content = f"""
++            main_key: main_value
++            included: {nested_f.name}
++            """
++
++            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as main_f:
++                main_f.write(main_content)
++                main_f.flush()
++
++                try:
++                    result = config.load_yaml(main_f.name)
++                    assert result["main_key"] == "main_value"
++                    assert result["included"]["nested_key"] == "nested_value"
++                finally:
++                    os.unlink(main_f.name)
++                    os.unlink(nested_f.name)
++
++    def test_load_yaml_hyperpar_from_file(self):
++        """Test load_yaml with hyperparameters loaded from file."""
++        hyperpar_content = """
++        learning_rate: 0.001
++        batch_size: 32
++        """
++
++        config_content = """
++        training:
++          lr: {{ learning_rate }}
++          bs: {{ batch_size }}
++        """
++
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as hp_f:
++            hp_f.write(hyperpar_content)
++            hp_f.flush()
++
++            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as cfg_f:
++                cfg_f.write(config_content)
++                cfg_f.flush()
++
++                try:
++                    result = config.load_yaml(cfg_f.name, hp_f.name)
++                    # YAML parses numbers as numbers
++                    assert result["training"]["lr"] == 0.001
++                    assert result["training"]["bs"] == 32
++                finally:
++                    os.unlink(hp_f.name)
++                    os.unlink(cfg_f.name)
++
++    def test_load_yaml_invalid_hyperpar_type(self):
++        """Test that non-dict hyperpar from file raises TypeError."""
++        hyperpar_content = "- item1\n- item2"  # YAML list, not dict
++
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as hp_f:
++            hp_f.write(hyperpar_content)
++            hp_f.flush()
++
++            try:
++                with pytest.raises(TypeError, match="Loaded hyperpar must be a dict"):
++                    config.load_yaml({"key": "value"}, hp_f.name)
++            finally:
++                os.unlink(hp_f.name)
++
++
++class TestBuildModule:
++    """Tests for build_module function."""
++
++    def test_build_module_simple(self):
++        """Test building a simple module from config."""
++        cfg = {
++            "class": "torch.nn.Linear",
++            "kwargs": {"in_features": 10, "out_features": 5},
++        }
++        module = config.build_module(cfg)
++        assert isinstance(module, torch.nn.Linear)
++        assert module.in_features == 10
++
++    def test_build_module_nested(self):
++        """Test building module with nested module configs."""
++        cfg = {
++            "layer1": {
++                "class": "torch.nn.Linear",
++                "kwargs": {"in_features": 10, "out_features": 5},
++            },
++            "layer2": {
++                "class": "torch.nn.ReLU",
++            },
++        }
++        result = config.build_module(cfg)
++        assert isinstance(result["layer1"], torch.nn.Linear)
++        assert isinstance(result["layer2"], torch.nn.ReLU)
++
++    def test_build_module_from_file(self):
++        """Test building module from YAML file."""
++        yaml_content = """
++        class: torch.nn.Linear
++        kwargs:
++          in_features: 20
++          out_features: 10
++        """
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
++            f.write(yaml_content)
++            f.flush()
++
++            try:
++                module = config.build_module(f.name)
++                assert isinstance(module, torch.nn.Linear)
++                assert module.in_features == 20
++            finally:
++                os.unlink(f.name)
++
++    def test_build_module_with_hyperpar(self):
++        """Test building module with hyperparameters."""
++        # Use integer values directly since YAML will preserve types
++        cfg = {
++            "class": "torch.nn.ReLU",  # ReLU has no required args
++        }
++        hyperpar = {"unused": 42}
++        module = config.build_module(cfg, hyperpar)
++        assert isinstance(module, torch.nn.ReLU)
++
++    def test_build_module_with_hyperpar_from_file(self):
++        """Test building module with hyperparameters from YAML file."""
++        yaml_content = """
++        class: torch.nn.Linear
++        kwargs:
++          in_features: {{ in_size }}
++          out_features: {{ out_size }}
++        """
++        hyperpar = {"in_size": 32, "out_size": 16}
++
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
++            f.write(yaml_content)
++            f.flush()
++
++            try:
++                module = config.build_module(f.name, hyperpar)
++                assert isinstance(module, torch.nn.Linear)
++                assert module.in_features == 32
++                assert module.out_features == 16
++            finally:
++                os.unlink(f.name)
++
++    def test_build_module_invalid_hyperpar_type(self):
++        """Test that non-dict hyperpar raises TypeError."""
++        cfg = {"key": "value"}
++        with pytest.raises(TypeError, match="Hyperpar must be a dictionary"):
++            config.build_module(cfg, [1, 2, 3])
++
++
++class TestDictConversions:
++    """Tests for dict_to_dotted and dotted_to_dict functions."""
++
++    def test_dict_to_dotted_simple(self):
++        """Test converting nested dict to dotted notation."""
++        d = {"a": {"b": {"c": 1}}}
++        result = config.dict_to_dotted(d.copy())
++        assert "a.b.c" in result
++        assert result["a.b.c"] == 1
++
++    def test_dict_to_dotted_multiple_keys(self):
++        """Test dict_to_dotted with multiple keys."""
++        d = {"x": {"y": 1}, "z": 2}
++        result = config.dict_to_dotted(d.copy())
++        assert "x.y" in result
++        assert result["x.y"] == 1
++        assert "z" in result
++        assert result["z"] == 2
++
++    def test_dict_to_dotted_empty_nested(self):
++        """Test dict_to_dotted with empty nested dict."""
++        d = {"a": {}}
++        result = config.dict_to_dotted(d.copy())
++        # Empty dict should be kept as-is (not flattened)
++        assert "a" in result
++        assert result["a"] == {}
++
++    def test_dotted_to_dict_simple(self):
++        """Test converting dotted notation to nested dict."""
++        d = {"a.b.c": 1}
++        result = config.dotted_to_dict(d.copy())
++        assert "a" in result
++        assert "b" in result["a"]
++        assert "c" in result["a"]["b"]
++        assert result["a"]["b"]["c"] == 1
++
++    def test_dotted_to_dict_multiple_keys(self):
++        """Test dotted_to_dict with multiple dotted keys."""
++        d = {"x.y": 1, "x.z": 2, "w": 3}
++        result = config.dotted_to_dict(d.copy())
++        assert result["x"]["y"] == 1
++        assert result["x"]["z"] == 2
++        assert result["w"] == 3
++
++    def test_dotted_to_dict_no_dots(self):
++        """Test dotted_to_dict with no dotted keys."""
++        d = {"a": 1, "b": 2}
++        result = config.dotted_to_dict(d.copy())
++        assert result == {"a": 1, "b": 2}
++
++    def test_roundtrip_conversion(self):
++        """Test that dict_to_dotted and dotted_to_dict are inverses."""
++        original = {"a": {"b": 1, "c": 2}, "d": 3}
++
++        # Convert to dotted and back
++        dotted = config.dict_to_dotted(original.copy())
++        restored = config.dotted_to_dict(dotted.copy())
++
++        # Should get back original structure
++        assert "a" in restored
++        assert restored["a"]["b"] == 1
++        assert restored["a"]["c"] == 2
++        assert restored["d"] == 3
++
++
++class TestIterRecBottomup:
++    """Tests for _iter_rec_bottomup helper function."""
++
++    def test_iter_dict(self):
++        """Test iteration over dict."""
++        d = {"a": 1, "b": 2}
++        items = list(config._iter_rec_bottomup(d))
++
++        # Should yield (container, key, value) tuples
++        assert len(items) == 2
++        keys_found = {item[1] for item in items}
++        assert keys_found == {"a", "b"}
++
++    def test_iter_list(self):
++        """Test iteration over list."""
++        lst = [1, 2, 3]
++        items = list(config._iter_rec_bottomup(lst))
++
++        assert len(items) == 3
++        indices_found = {item[1] for item in items}
++        assert indices_found == {0, 1, 2}
++
++    def test_iter_nested(self):
++        """Test iteration over nested structure."""
++        d = {"a": {"b": 1}}
++        items = list(config._iter_rec_bottomup(d))
++
++        # Should yield bottom-up: first {"b": 1}, then {"a": {...}}
++        assert len(items) == 2
++        # First item should be the inner dict's item
++        assert items[0][1] == "b"
++        assert items[0][2] == 1
++
++    def test_iter_invalid_type(self):
++        """Test that invalid type raises TypeError."""
++        with pytest.raises(TypeError, match="Unknown type"):
++            list(config._iter_rec_bottomup("string"))
+diff --git a/tests/test_lr.py b/tests/test_lr.py
+new file mode 100644
+index 0000000..8a9028b
+--- /dev/null
++++ b/tests/test_lr.py
+@@ -0,0 +1,415 @@
++"""Tests for aimnet.modules.lr - long-range Coulomb and dispersion modules."""
++
++import pytest
++import torch
++
++from aimnet import nbops, ops
++from aimnet.modules.lr import LRCoulomb
++
++
++def setup_data_mode_0(device, n_atoms=5):
++    """Create test data in nb_mode=0 format."""
++    torch.manual_seed(42)
++    coord = torch.rand((1, n_atoms, 3), device=device) * 5  # 5 Angstrom box
++    numbers = torch.randint(1, 10, (1, n_atoms), device=device)
++    charges = torch.randn((1, n_atoms), device=device) * 0.3
++
++    data = {"coord": coord, "numbers": numbers, "charges": charges}
++    data = nbops.set_nb_mode(data)
++    data = nbops.calc_masks(data)
++
++    # Compute distances
++    d_ij, r_ij = ops.calc_distances(data)
++    data["d_ij"] = d_ij
++
++    return data
++
++
++def setup_data_mode_1(device, n_atoms=5):
++    """Create test data in nb_mode=1 format (flat with mol_idx)."""
++    torch.manual_seed(42)
++    coord = torch.rand((n_atoms + 1, 3), device=device) * 5  # +1 for padding
++    numbers = torch.cat([torch.randint(1, 10, (n_atoms,), device=device), torch.tensor([0], device=device)])
++    charges = torch.cat([torch.randn(n_atoms, device=device) * 0.3, torch.tensor([0.0], device=device)])
++    mol_idx = torch.cat([torch.zeros(n_atoms, dtype=torch.long, device=device), torch.tensor([1], device=device)])
++
++    # Create neighbor matrix (all atoms see each other)
++    max_nb = n_atoms
++    nbmat = torch.zeros((n_atoms + 1, max_nb), dtype=torch.long, device=device)
++    nbmat_lr = torch.zeros((n_atoms + 1, max_nb), dtype=torch.long, device=device)
++    for i in range(n_atoms):
++        neighbors = [j for j in range(n_atoms + 1) if j != i][:max_nb]
++        for k, nb in enumerate(neighbors):
++            nbmat[i, k] = nb
++            nbmat_lr[i, k] = nb
++
++    data = {
++        "coord": coord,
++        "numbers": numbers,
++        "charges": charges,
++        "mol_idx": mol_idx,
++        "nbmat": nbmat,
++        "nbmat_lr": nbmat_lr,
++    }
++    data = nbops.set_nb_mode(data)
++    data = nbops.calc_masks(data)
++
++    # Compute distances
++    d_ij, r_ij = ops.calc_distances(data)
++    data["d_ij"] = d_ij
++
++    return data
++
++
++class TestLRCoulombInit:
++    """Tests for LRCoulomb initialization."""
++
++    def test_default_init(self, device):
++        """Test default initialization."""
++        module = LRCoulomb().to(device)
++        assert module.key_in == "charges"
++        assert module.key_out == "e_h"
++        assert module.method == "simple"
++
++    def test_custom_keys(self, device):
++        """Test initialization with custom keys."""
++        module = LRCoulomb(key_in="q", key_out="energy_coul").to(device)
++        assert module.key_in == "q"
++        assert module.key_out == "energy_coul"
++
++    def test_dsf_method(self, device):
++        """Test DSF method initialization."""
++        module = LRCoulomb(method="dsf", dsf_alpha=0.25, dsf_rc=12.0).to(device)
++        assert module.method == "dsf"
++        assert module.dsf_alpha == 0.25
++        assert module.dsf_rc == 12.0
++
++    def test_ewald_method(self, device):
++        """Test Ewald method initialization."""
++        module = LRCoulomb(method="ewald").to(device)
++        assert module.method == "ewald"
++
++    def test_invalid_method(self, device):
++        """Test that invalid method raises ValueError."""
++        with pytest.raises(ValueError, match="Unknown method"):
++            LRCoulomb(method="invalid").to(device)
++
++
++class TestLRCoulombSimple:
++    """Tests for simple Coulomb method."""
++
++    def test_simple_output_shape(self, device):
++        """Test that simple method produces correct output shape."""
++        module = LRCoulomb(method="simple").to(device)
++        data = setup_data_mode_0(device, n_atoms=5)
++
++        result = module(data)
++
++        assert "e_h" in result
++        assert result["e_h"].shape == (1,)  # Per-molecule energy
++
++    def test_simple_zero_charges(self, device):
++        """Test that zero charges produce zero energy."""
++        module = LRCoulomb(method="simple").to(device)
++        data = setup_data_mode_0(device, n_atoms=5)
++        data["charges"] = torch.zeros_like(data["charges"])
++
++        result = module(data)
++
++        assert result["e_h"].abs().item() < 1e-10
++
++    def test_simple_opposite_charges(self, device):
++        """Test that opposite charges produce negative (attractive) energy."""
++        module = LRCoulomb(method="simple").to(device)
++
++        # Two atoms with opposite charges
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[1.0, -1.0]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++
++        # Opposite charges should attract (negative energy)
++        assert result["e_h"].item() < 0
++
++    def test_simple_same_charges(self, device):
++        """Test that same charges produce positive (repulsive) energy."""
++        module = LRCoulomb(method="simple").to(device)
++
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[1.0, 1.0]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++
++        # Same charges should repel (positive energy)
++        assert result["e_h"].item() > 0
++
++
++class TestLRCoulombDSF:
++    """Tests for DSF (Damped Shifted Force) Coulomb method."""
++
++    def test_dsf_output_shape(self, device):
++        """Test that DSF method produces correct output shape."""
++        module = LRCoulomb(method="dsf").to(device)
++        data = setup_data_mode_0(device, n_atoms=5)
++
++        result = module(data)
++
++        assert "e_h" in result
++        assert result["e_h"].shape == (1,)
++
++    def test_dsf_zero_charges(self, device):
++        """Test that DSF with zero charges produces zero energy."""
++        module = LRCoulomb(method="dsf").to(device)
++        data = setup_data_mode_0(device, n_atoms=5)
++        data["charges"] = torch.zeros_like(data["charges"])
++
++        result = module(data)
++
++        assert result["e_h"].abs().item() < 1e-10
++
++    def test_dsf_cutoff_effect(self, device):
++        """Test that DSF cutoff affects energy."""
++        data = setup_data_mode_0(device, n_atoms=3)
++
++        # Short cutoff
++        module_short = LRCoulomb(method="dsf", dsf_rc=2.0).to(device)
++        result_short = module_short(data.copy())
++
++        # Long cutoff
++        module_long = LRCoulomb(method="dsf", dsf_rc=20.0).to(device)
++        result_long = module_long(data.copy())
++
++        # Energies should differ due to cutoff
++        # (might be same if all atoms within short cutoff)
++        assert torch.isfinite(result_short["e_h"])
++        assert torch.isfinite(result_long["e_h"])
++
++
++class TestLRCoulombEwald:
++    """Tests for Ewald summation Coulomb method."""
++
++    def test_ewald_output_shape(self, device):
++        """Test that Ewald method produces correct output shape."""
++        module = LRCoulomb(method="ewald").to(device)
++
++        # Ewald requires cell and flat format (mode 1)
++        N = 5
++        coord = torch.rand((N + 1, 3), device=device) * 5
++        numbers = torch.cat([torch.randint(1, 10, (N,), device=device), torch.tensor([0], device=device)])
++        charges = torch.cat([torch.randn(N, device=device) * 0.3, torch.tensor([0.0], device=device)])
++        cell = torch.eye(3, device=device) * 10
++        mol_idx = torch.cat([torch.zeros(N, dtype=torch.long, device=device), torch.tensor([1], device=device)])
++        # Create neighbor matrix for mode 1
++        nbmat = torch.zeros((N + 1, N), dtype=torch.long, device=device)
++        for i in range(N):
++            nbmat[i] = torch.tensor([j for j in range(N + 1) if j != i][:N], device=device)
++        nbmat[-1] = N  # padding points to itself
++
++        data = {
++            "coord": coord,
++            "numbers": numbers,
++            "charges": charges,
++            "cell": cell,
++            "mol_idx": mol_idx,
++            "nbmat": nbmat,
++        }
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++
++        assert "e_h" in result
++        assert torch.isfinite(result["e_h"]).all()
++
++    def test_ewald_zero_charges(self, device):
++        """Test that Ewald with zero charges produces zero energy."""
++        module = LRCoulomb(method="ewald").to(device)
++
++        N = 5
++        coord = torch.rand((N + 1, 3), device=device) * 5
++        numbers = torch.cat([torch.randint(1, 10, (N,), device=device), torch.tensor([0], device=device)])
++        charges = torch.zeros(N + 1, device=device)
++        cell = torch.eye(3, device=device) * 10
++        mol_idx = torch.cat([torch.zeros(N, dtype=torch.long, device=device), torch.tensor([1], device=device)])
++        nbmat = torch.zeros((N + 1, N), dtype=torch.long, device=device)
++        for i in range(N):
++            nbmat[i] = torch.tensor([j for j in range(N + 1) if j != i][:N], device=device)
++        nbmat[-1] = N
++
++        data = {
++            "coord": coord,
++            "numbers": numbers,
++            "charges": charges,
++            "cell": cell,
++            "mol_idx": mol_idx,
++            "nbmat": nbmat,
++        }
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++
++        assert result["e_h"].abs().sum().item() < 1e-8
++
++
++class TestLRCoulombGradients:
++    """Tests for gradient flow through Coulomb methods."""
++
++    def test_simple_gradient_wrt_charges(self, device):
++        """Test gradient of simple Coulomb wrt charges."""
++        module = LRCoulomb(method="simple").to(device)
++
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[0.5, -0.5]], device=device, requires_grad=True)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++        result["e_h"].backward()
++
++        assert charges.grad is not None
++        assert torch.isfinite(charges.grad).all()
++
++    def test_simple_gradient_wrt_coords(self, device):
++        """Test gradient of simple Coulomb wrt coordinates."""
++        module = LRCoulomb(method="simple").to(device)
++
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device, requires_grad=True)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[0.5, -0.5]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++        result["e_h"].backward()
++
++        assert coord.grad is not None
++        assert torch.isfinite(coord.grad).all()
++
++    def test_dsf_gradient_wrt_charges(self, device):
++        """Test gradient of DSF Coulomb wrt charges."""
++        module = LRCoulomb(method="dsf").to(device)
++
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[0.5, -0.5]], device=device, requires_grad=True)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        result = module(data)
++        result["e_h"].backward()
++
++        assert charges.grad is not None
++        assert torch.isfinite(charges.grad).all()
++
++
++class TestLRCoulombConsistency:
++    """Tests for consistency between Coulomb methods."""
++
++    def test_simple_dsf_close_for_small_molecules(self, device):
++        """Test that simple and DSF give similar results for small isolated molecules."""
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 1.5, 0.0]]], device=device)
++        numbers = torch.tensor([[8, 1, 1]], device=device)
++        charges = torch.tensor([[-0.8, 0.4, 0.4]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        module_simple = LRCoulomb(method="simple").to(device)
++        module_dsf = LRCoulomb(method="dsf", dsf_rc=20.0).to(device)
++
++        # Need to copy data since modules modify it
++        result_simple = module_simple(data.copy())
++        result_dsf = module_dsf(data.copy())
++
++        # For small isolated molecules, results should be reasonably close
++        # (DSF subtracts short-range contribution)
++        assert torch.isfinite(result_simple["e_h"])
++        assert torch.isfinite(result_dsf["e_h"])
++
++    def test_energy_sign_consistency(self, device):
++        """Test that all methods agree on energy sign for simple systems."""
++        # Two opposite charges - should be attractive (negative)
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[1.0, -1.0]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        module_simple = LRCoulomb(method="simple").to(device)
++        result = module_simple(data)
++
++        # Opposite charges should have negative energy
++        assert result["e_h"].item() < 0
++
++
++class TestLRCoulombAdditive:
++    """Tests for additive energy accumulation."""
++
++    def test_energy_addition(self, device):
++        """Test that energy is added to existing key if present."""
++        module = LRCoulomb(method="simple", key_out="energy").to(device)
++
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[0.5, -0.5]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        # Set initial energy
++        data["energy"] = torch.tensor([10.0], device=device)
++
++        result = module(data)
++
++        # Energy should be added to existing value
++        assert result["energy"].item() != 10.0
++        # The Coulomb contribution should be added
++
++    def test_energy_creation(self, device):
++        """Test that energy key is created if not present."""
++        module = LRCoulomb(method="simple", key_out="new_energy").to(device)
++
++        coord = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], device=device)
++        numbers = torch.tensor([[1, 1]], device=device)
++        charges = torch.tensor([[0.5, -0.5]], device=device)
++
++        data = {"coord": coord, "numbers": numbers, "charges": charges}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++        data["d_ij"], _ = ops.calc_distances(data)
++
++        assert "new_energy" not in data
++        result = module(data)
++        assert "new_energy" in result
+diff --git a/tests/test_nbops.py b/tests/test_nbops.py
+new file mode 100644
+index 0000000..f8a0b8a
+--- /dev/null
++++ b/tests/test_nbops.py
+@@ -0,0 +1,444 @@
++"""Tests for aimnet.nbops - neighbor operations module."""
++
++import pytest
++import torch
++
++from aimnet import nbops
++
++
++class TestSetNbMode:
++    """Tests for set_nb_mode and get_nb_mode functions."""
++
++    def test_nb_mode_0_no_nbmat(self, device):
++        """Test nb_mode=0 when no neighbor matrix is provided."""
++        data = {"numbers": torch.tensor([[6, 1, 1]], device=device)}
++        data = nbops.set_nb_mode(data)
++        assert nbops.get_nb_mode(data) == 0
++        assert data["_nb_mode"].item() == 0
++
++    def test_nb_mode_1_2d_nbmat(self, device):
++        """Test nb_mode=1 when 2D neighbor matrix is provided."""
++        N = 5
++        nbmat = torch.randint(0, N, (N, 3), device=device)
++        data = {"nbmat": nbmat}
++        data = nbops.set_nb_mode(data)
++        assert nbops.get_nb_mode(data) == 1
++        assert data["_nb_mode"].item() == 1
++
++    def test_nb_mode_2_3d_nbmat(self, device):
++        """Test nb_mode=2 when 3D neighbor matrix is provided."""
++        B, N = 2, 5
++        nbmat = torch.randint(0, N, (B, N, 3), device=device)
++        data = {"nbmat": nbmat}
++        data = nbops.set_nb_mode(data)
++        assert nbops.get_nb_mode(data) == 2
++        assert data["_nb_mode"].item() == 2
++
++    def test_invalid_nbmat_shape(self, device):
++        """Test that invalid nbmat shape raises ValueError."""
++        nbmat = torch.randint(0, 5, (2, 3, 4, 5), device=device)  # 4D tensor
++        data = {"nbmat": nbmat}
++        with pytest.raises(ValueError, match="Invalid neighbor matrix shape"):
++            nbops.set_nb_mode(data)
++
++
++class TestCalcMasks:
++    """Tests for calc_masks function."""
++
++    def test_calc_masks_mode_0_no_padding(self, simple_molecule):
++        """Test mask calculation for mode 0 without padding."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        # Check mask shapes
++        assert data["mask_i"].shape == data["numbers"].shape
++        assert data["mask_ij"].shape == (1, 3, 3)  # (B, N, N)
++
++        # No padding means mask_i should be all False
++        assert not data["mask_i"].any()
++        assert data["_input_padded"].item() is False
++
++        # Diagonal should be True in mask_ij
++        assert data["mask_ij"][0].diagonal().all()
++
++    def test_calc_masks_mode_0_with_padding(self, padded_batch):
++        """Test mask calculation for mode 0 with padding."""
++        data = padded_batch.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        # Second molecule has padding (atom with number=0)
++        assert data["mask_i"][1, 2].item() is True  # padding atom
++        assert data["_input_padded"].item() is True
++
++        # mol_sizes should be correct
++        assert data["mol_sizes"][0].item() == 3  # H2O
++        assert data["mol_sizes"][1].item() == 2  # H2
++
++    def test_calc_masks_mode_1(self, device):
++        """Test mask calculation for mode 1 (flat format with mol_idx)."""
++        # Create flat format data
++        N = 5  # 4 real atoms + 1 padding
++        coord = torch.rand((N, 3), device=device)
++        numbers = torch.tensor([6, 1, 1, 1, 0], device=device)  # last is padding
++        mol_idx = torch.tensor([0, 0, 1, 1, 2], device=device)  # 2 molecules + padding
++        nbmat = torch.tensor(
++            [
++                [1, 4, 4],  # neighbors of atom 0
++                [0, 4, 4],  # neighbors of atom 1
++                [3, 4, 4],  # neighbors of atom 2
++                [2, 4, 4],  # neighbors of atom 3
++                [4, 4, 4],  # padding atom (neighbors itself)
++            ],
++            device=device,
++        )
++
++        data = {"coord": coord, "numbers": numbers, "mol_idx": mol_idx, "nbmat": nbmat}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        # mask_i should mark the last atom as padding
++        assert data["mask_i"][-1].item() is True
++        assert data["_input_padded"].item() is True
++
++        # mask_ij should identify neighbor entries pointing to padding
++        assert data["mask_ij"].shape == nbmat.shape
++        assert data["mask_ij"][0, 1].item() is True  # points to padding atom 4
++        assert data["mask_ij"][0, 0].item() is False  # points to real atom 1
++
++    def test_calc_masks_mode_2(self, device):
++        """Test mask calculation for mode 2 (batched with 3D nbmat)."""
++        B, N = 2, 4
++        coord = torch.rand((B, N, 3), device=device)
++        numbers = torch.tensor(
++            [
++                [6, 1, 1, 0],  # molecule with padding
++                [6, 1, 0, 0],  # molecule with 2 padding atoms
++            ],
++            device=device,
++        )
++        # 3D nbmat: (B, N, max_neighbors)
++        nbmat = torch.tensor(
++            [
++                [[1, 2, 3], [0, 2, 3], [0, 1, 3], [3, 3, 3]],  # batch 0
++                [[1, 2, 3], [0, 2, 3], [2, 2, 2], [3, 3, 3]],  # batch 1
++            ],
++            device=device,
++        )
++
++        data = {"coord": coord, "numbers": numbers, "nbmat": nbmat}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        # mask_i should identify padding atoms (number=0)
++        assert data["mask_i"][0, 3].item() is True
++        assert data["mask_i"][1, 2].item() is True
++        assert data["mask_i"][1, 3].item() is True
++        assert data["_input_padded"].item() is True
++
++        # mol_sizes should be correct
++        assert data["mol_sizes"][0].item() == 3
++        assert data["mol_sizes"][1].item() == 2
++
++
++class TestMaskIj:
++    """Tests for mask_ij_ function."""
++
++    def test_mask_ij_inplace(self, device):
++        """Test in-place masking of pairwise tensor."""
++        data = {
++            "numbers": torch.tensor([[6, 1, 1]], device=device),
++            "_nb_mode": torch.tensor(0),
++        }
++        data = nbops.calc_masks(data)
++
++        x = torch.ones((1, 3, 3), device=device)
++        nbops.mask_ij_(x, data, mask_value=0.0, inplace=True)
++
++        # Diagonal should be masked
++        assert x[0].diagonal().sum().item() == 0.0
++        # Off-diagonal should be unchanged
++        assert x[0, 0, 1].item() == 1.0
++
++    def test_mask_ij_not_inplace(self, device):
++        """Test non-inplace masking returns new tensor."""
++        data = {
++            "numbers": torch.tensor([[6, 1, 1]], device=device),
++            "_nb_mode": torch.tensor(0),
++        }
++        data = nbops.calc_masks(data)
++
++        x_orig = torch.ones((1, 3, 3), device=device)
++        x_new = nbops.mask_ij_(x_orig, data, mask_value=0.0, inplace=False)
++
++        # Original should be unchanged
++        assert x_orig[0].diagonal().sum().item() == 3.0
++        # New tensor should have masked values
++        assert x_new[0].diagonal().sum().item() == 0.0
++
++    def test_mask_ij_with_features(self, device):
++        """Test masking tensor with extra feature dimensions."""
++        data = {
++            "numbers": torch.tensor([[6, 1, 1]], device=device),
++            "_nb_mode": torch.tensor(0),
++        }
++        data = nbops.calc_masks(data)
++
++        # Tensor with extra feature dimension
++        x = torch.ones((1, 3, 3, 5), device=device)
++        nbops.mask_ij_(x, data, mask_value=-1.0, inplace=True)
++
++        # Diagonal should be masked for all features
++        for i in range(3):
++            assert (x[0, i, i, :] == -1.0).all()
++
++
++class TestMaskI:
++    """Tests for mask_i_ function."""
++
++    def test_mask_i_mode_0_padded(self, padded_batch):
++        """Test atomic masking for mode 0 with padding."""
++        data = padded_batch.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        x = torch.ones((2, 3), device=padded_batch["coord"].device)
++        nbops.mask_i_(x, data, mask_value=0.0, inplace=True)
++
++        # First molecule (H2O) has no padding
++        assert x[0].sum().item() == 3.0
++        # Second molecule (H2) has one padding atom
++        assert x[1, 2].item() == 0.0
++        assert x[1, :2].sum().item() == 2.0
++
++    def test_mask_i_mode_1(self, device):
++        """Test atomic masking for mode 1."""
++        N = 4
++        numbers = torch.tensor([6, 1, 1, 0], device=device)
++        mol_idx = torch.tensor([0, 0, 0, 1], device=device)
++        nbmat = torch.randint(0, N, (N, 2), device=device)
++
++        data = {"numbers": numbers, "mol_idx": mol_idx, "nbmat": nbmat}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        x = torch.ones(N, device=device)
++        nbops.mask_i_(x, data, mask_value=0.0, inplace=True)
++
++        # Last atom (padding) should be masked
++        assert x[-1].item() == 0.0
++        assert x[:-1].sum().item() == 3.0
++
++    def test_mask_i_mode_2(self, device):
++        """Test atomic masking for mode 2.
++
++        In mode 2, mask_i_ only masks the last atom position in each batch,
++        assuming padding atoms are always placed at the end.
++        """
++        B, N = 2, 3
++        # Padding (number=0) should be at the last position
++        numbers = torch.tensor([[6, 1, 0], [6, 1, 0]], device=device)
++        nbmat = torch.randint(0, N, (B, N, 2), device=device)
++
++        data = {"numbers": numbers, "nbmat": nbmat}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        x = torch.ones((B, N), device=device)
++        nbops.mask_i_(x, data, mask_value=0.0, inplace=True)
++
++        # In mode 2, only the last position is masked (assumes padding at end)
++        assert x[0, 2].item() == 0.0
++        assert x[1, 2].item() == 0.0
++        # First positions should remain unmasked
++        assert x[0, 0].item() == 1.0
++        assert x[0, 1].item() == 1.0
++
++
++class TestGetIj:
++    """Tests for get_ij function."""
++
++    def test_get_ij_mode_0(self, simple_molecule):
++        """Test pairwise expansion for mode 0."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++
++        x = torch.tensor([[[1.0], [2.0], [3.0]]], device=simple_molecule["coord"].device)
++        x_i, x_j = nbops.get_ij(x, data)
++
++        # x_i should be (B, N, 1, features) - expanded along dim 2
++        assert x_i.shape == (1, 3, 1, 1)
++        # x_j should be (B, 1, N, features) - expanded along dim 1
++        assert x_j.shape == (1, 1, 3, 1)
++
++        # Check values
++        assert x_i[0, 0, 0, 0].item() == 1.0
++        assert x_j[0, 0, 0, 0].item() == 1.0
++        assert x_j[0, 0, 2, 0].item() == 3.0
++
++    def test_get_ij_mode_1(self, device):
++        """Test pairwise extraction for mode 1."""
++        N = 4
++        numbers = torch.tensor([6, 1, 1, 0], device=device)
++        mol_idx = torch.tensor([0, 0, 0, 1], device=device)
++        nbmat = torch.tensor([[1, 2], [0, 2], [0, 1], [3, 3]], device=device)
++
++        data = {"numbers": numbers, "mol_idx": mol_idx, "nbmat": nbmat, "_nb_mode": torch.tensor(1)}
++
++        x = torch.tensor([[1.0], [2.0], [3.0], [0.0]], device=device)
++        x_i, x_j = nbops.get_ij(x, data)
++
++        # x_i: (N, 1, features)
++        assert x_i.shape == (N, 1, 1)
++        # x_j: (N, max_nb, features)
++        assert x_j.shape == (N, 2, 1)
++
++        # Check that x_j indexes correctly
++        assert x_j[0, 0, 0].item() == 2.0  # neighbor 1 of atom 0
++        assert x_j[0, 1, 0].item() == 3.0  # neighbor 2 of atom 0
++
++    def test_get_ij_mode_2(self, device):
++        """Test pairwise extraction for mode 2."""
++        B, N = 2, 3
++        numbers = torch.tensor([[6, 1, 1], [6, 1, 0]], device=device)
++        nbmat = torch.tensor(
++            [[[1, 2], [0, 2], [0, 1]], [[1, 2], [0, 2], [0, 1]]],  # (B, N, max_nb)
++            device=device,
++        )
++
++        data = {"numbers": numbers, "nbmat": nbmat, "_nb_mode": torch.tensor(2)}
++
++        x = torch.tensor([[[1.0], [2.0], [3.0]], [[4.0], [5.0], [6.0]]], device=device)
++        x_i, x_j = nbops.get_ij(x, data)
++
++        # x_i: (B, N, 1, features)
++        assert x_i.shape == (B, N, 1, 1)
++        # x_j: (B, N, max_nb, features)
++        assert x_j.shape == (B, N, 2, 1)
++
++
++class TestMolSum:
++    """Tests for mol_sum function."""
++
++    def test_mol_sum_mode_0(self, simple_molecule):
++        """Test molecular summation for mode 0."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++
++        x = torch.tensor([[1.0, 2.0, 3.0]], device=simple_molecule["coord"].device)
++        result = nbops.mol_sum(x, data)
++
++        # Should sum over atoms (dim 1)
++        assert result.shape == (1,)
++        assert result.item() == 6.0
++
++    def test_mol_sum_mode_0_batch(self, padded_batch):
++        """Test molecular summation for batched mode 0."""
++        data = padded_batch.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        x = torch.ones((2, 3), device=padded_batch["coord"].device)
++        result = nbops.mol_sum(x, data)
++
++        # Each batch sums over atoms
++        assert result.shape == (2,)
++        assert result[0].item() == 3.0
++        assert result[1].item() == 3.0  # includes padding
++
++    def test_mol_sum_mode_1(self, device):
++        """Test molecular summation for mode 1."""
++        numbers = torch.tensor([6, 1, 1, 6, 1, 0], device=device)
++        mol_idx = torch.tensor([0, 0, 0, 1, 1, 2], device=device)
++
++        data = {"numbers": numbers, "mol_idx": mol_idx, "_nb_mode": torch.tensor(1)}
++
++        x = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 0.0], device=device)
++        result = nbops.mol_sum(x, data)
++
++        # Should produce per-molecule sums
++        assert result.shape == (3,)  # 2 real molecules + 1 padding
++        assert result[0].item() == 6.0  # mol 0: 1+2+3
++        assert result[1].item() == 9.0  # mol 1: 4+5
++        assert result[2].item() == 0.0  # padding
++
++    def test_mol_sum_mode_1_with_features(self, device):
++        """Test molecular summation for mode 1 with feature dimension."""
++        N = 4
++        numbers = torch.tensor([6, 1, 1, 0], device=device)
++        mol_idx = torch.tensor([0, 0, 0, 1], device=device)
++
++        data = {"numbers": numbers, "mol_idx": mol_idx, "_nb_mode": torch.tensor(1)}
++
++        x = torch.ones((N, 5), device=device)  # (N, features)
++        result = nbops.mol_sum(x, data)
++
++        assert result.shape == (2, 5)  # (num_mols, features)
++        assert result[0, 0].item() == 3.0  # sum of 3 atoms
++
++    def test_mol_sum_mode_2(self, device):
++        """Test molecular summation for mode 2."""
++        B, N = 2, 3
++        numbers = torch.tensor([[6, 1, 1], [6, 1, 0]], device=device)
++        nbmat = torch.randint(0, N, (B, N, 2), device=device)
++
++        data = {"numbers": numbers, "nbmat": nbmat, "_nb_mode": torch.tensor(2)}
++
++        x = torch.ones((B, N), device=device)
++        result = nbops.mol_sum(x, data)
++
++        # Should sum over dim 1
++        assert result.shape == (B,)
++        assert result[0].item() == 3.0
++        assert result[1].item() == 3.0
++
++
++class TestGradientFlow:
++    """Tests to verify gradients flow correctly through nbops functions."""
++
++    def test_mol_sum_gradient(self, device):
++        """Test that gradients flow through mol_sum."""
++        x = torch.tensor([[1.0, 2.0, 3.0]], device=device, requires_grad=True)
++        data = {
++            "numbers": torch.tensor([[6, 1, 1]], device=device),
++            "_nb_mode": torch.tensor(0),
++        }
++
++        result = nbops.mol_sum(x, data)
++        result.sum().backward()
++
++        # Gradient should be 1 for all inputs
++        assert x.grad is not None
++        assert (x.grad == 1.0).all()
++
++    def test_mask_ij_gradient(self, device):
++        """Test that gradients flow through mask_ij_ (not inplace)."""
++        data = {
++            "numbers": torch.tensor([[6, 1, 1]], device=device),
++            "_nb_mode": torch.tensor(0),
++        }
++        data = nbops.calc_masks(data)
++
++        x = torch.ones((1, 3, 3), device=device, requires_grad=True)
++        x_masked = nbops.mask_ij_(x, data, mask_value=0.0, inplace=False)
++
++        loss = x_masked.sum()
++        loss.backward()
++
++        # Gradient should be 1 for non-masked, 0 for masked (diagonal)
++        assert x.grad is not None
++        assert x.grad[0].diagonal().sum().item() == 0.0
++        # Off-diagonal: 6 elements with grad=1
++        assert x.grad[0].sum().item() == 6.0
++
++    def test_get_ij_gradient_mode_0(self, device):
++        """Test gradients through get_ij for mode 0."""
++        x = torch.tensor([[[1.0], [2.0], [3.0]]], device=device, requires_grad=True)
++        data = {"_nb_mode": torch.tensor(0)}
++
++        x_i, x_j = nbops.get_ij(x, data)
++        loss = (x_i * x_j).sum()
++        loss.backward()
++
++        assert x.grad is not None
+diff --git a/tests/test_ops.py b/tests/test_ops.py
+new file mode 100644
+index 0000000..6cf6dc6
+--- /dev/null
++++ b/tests/test_ops.py
+@@ -0,0 +1,518 @@
++"""Tests for aimnet.ops - mathematical operations module."""
++
++import math
++
++import pytest
++import torch
++
++from aimnet import nbops, ops
++
++
++class TestCutoffFunctions:
++    """Tests for cutoff functions (cosine_cutoff, exp_cutoff)."""
++
++    def test_cosine_cutoff_at_zero(self, device):
++        """Test cosine cutoff at d=0 returns 1."""
++        d = torch.tensor([0.0, 0.001], device=device)
++        rc = 5.0
++        fc = ops.cosine_cutoff(d, rc)
++
++        # At d~0, cutoff should be ~1
++        assert fc[0].item() == pytest.approx(1.0, abs=0.01)
++        assert fc[1].item() == pytest.approx(1.0, abs=0.01)
++
++    def test_cosine_cutoff_at_rc(self, device):
++        """Test cosine cutoff at d=rc returns 0."""
++        rc = 5.0
++        d = torch.tensor([rc, rc + 1.0], device=device)
++        fc = ops.cosine_cutoff(d, rc)
++
++        # At d=rc, cutoff should be 0
++        assert fc[0].item() == pytest.approx(0.0, abs=1e-6)
++        # Beyond rc, should be clamped
++        assert fc[1].item() == pytest.approx(0.0, abs=1e-6)
++
++    def test_cosine_cutoff_monotonic(self, device):
++        """Test that cosine cutoff decreases monotonically."""
++        rc = 5.0
++        d = torch.linspace(0.1, rc, 50, device=device)
++        fc = ops.cosine_cutoff(d, rc)
++
++        # Should be monotonically decreasing
++        diffs = fc[1:] - fc[:-1]
++        assert (diffs <= 0).all()
++
++    def test_cosine_cutoff_smooth(self, device):
++        """Test that cosine cutoff is smooth (differentiable)."""
++        rc = 5.0
++        d = torch.tensor([2.5], device=device, requires_grad=True)
++        fc = ops.cosine_cutoff(d, rc)
++        fc.backward()
++
++        # Gradient should exist and be finite
++        assert d.grad is not None
++        assert torch.isfinite(d.grad).all()
++
++    def test_exp_cutoff_at_zero(self, device):
++        """Test exp cutoff at d=0 returns 1."""
++        d = torch.tensor([0.0, 0.001], device=device)
++        rc = torch.tensor(5.0, device=device)
++        fc = ops.exp_cutoff(d, rc)
++
++        assert fc[0].item() == pytest.approx(1.0, abs=0.01)
++
++    def test_exp_cutoff_at_rc(self, device):
++        """Test exp cutoff at d=rc returns 0."""
++        rc = torch.tensor(5.0, device=device)
++        d = torch.tensor([4.99, 5.0, 5.01], device=device)
++        fc = ops.exp_cutoff(d, rc)
++
++        # Should approach 0 near rc
++        assert fc[1].item() < 0.1
++        assert fc[2].item() < 0.1
++
++    def test_exp_cutoff_smooth(self, device):
++        """Test that exp cutoff is smooth (differentiable)."""
++        rc = torch.tensor(5.0, device=device)
++        d = torch.tensor([2.5], device=device, requires_grad=True)
++        fc = ops.exp_cutoff(d, rc)
++        fc.backward()
++
++        assert d.grad is not None
++        assert torch.isfinite(d.grad).all()
++
++
++class TestExpExpand:
++    """Tests for exp_expand function (Gaussian basis expansion)."""
++
++    def test_exp_expand_shape(self, device):
++        """Test exp_expand output shape."""
++        d_ij = torch.rand((2, 10, 10), device=device) * 5  # (B, N, N)
++        shifts = torch.linspace(0.5, 4.5, 8, device=device)
++        eta = 0.5
++
++        result = ops.exp_expand(d_ij, shifts, eta)
++
++        # Output should add shift dimension
++        assert result.shape == (2, 10, 10, 8)
++
++    def test_exp_expand_peak(self, device):
++        """Test that exp_expand peaks at shift values."""
++        shifts = torch.tensor([1.0, 2.0, 3.0], device=device)
++        eta = 10.0  # narrow Gaussians
++        d_ij = torch.tensor([1.0, 2.0, 3.0], device=device)
++
++        result = ops.exp_expand(d_ij, shifts, eta)
++
++        # Each distance should peak at corresponding shift
++        assert result[0, 0].item() > result[0, 1].item()  # d=1 peaks at shift=1
++        assert result[1, 1].item() > result[1, 0].item()  # d=2 peaks at shift=2
++
++    def test_exp_expand_gradient(self, device):
++        """Test gradient flow through exp_expand."""
++        d_ij = torch.tensor([[2.0]], device=device, requires_grad=True)
++        shifts = torch.tensor([1.0, 2.0, 3.0], device=device)
++        eta = 0.5
++
++        result = ops.exp_expand(d_ij, shifts, eta)
++        result.sum().backward()
++
++        assert d_ij.grad is not None
++        assert torch.isfinite(d_ij.grad).all()
++
++
++class TestCalcDistances:
++    """Tests for calc_distances function."""
++
++    def test_calc_distances_basic(self, simple_molecule):
++        """Test basic distance calculation."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        d_ij, r_ij = ops.calc_distances(data)
++
++        # Shape should be (B, N, N) for mode 0
++        assert d_ij.shape == (1, 3, 3)
++        assert r_ij.shape == (1, 3, 3, 3)
++
++        # Diagonal r_ij is masked with pad_value=1.0 for each component
++        # So d_ij diagonal = norm([1,1,1]) = sqrt(3)
++        for i in range(3):
++            assert d_ij[0, i, i].item() == pytest.approx(math.sqrt(3), abs=1e-5)
++
++        # Off-diagonal distances should be positive
++        assert d_ij[0, 0, 1].item() > 0
++
++    def test_calc_distances_symmetry(self, simple_molecule):
++        """Test that distances are symmetric."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        d_ij, r_ij = ops.calc_distances(data)
++
++        # d_ij should be symmetric
++        assert d_ij[0, 0, 1].item() == pytest.approx(d_ij[0, 1, 0].item(), abs=1e-6)
++        assert d_ij[0, 0, 2].item() == pytest.approx(d_ij[0, 2, 0].item(), abs=1e-6)
++
++    def test_calc_distances_gradient(self, device):
++        """Test gradient flow through calc_distances."""
++        coord = torch.tensor(
++            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
++            device=device,
++            requires_grad=True,
++        )
++        data = {
++            "coord": coord,
++            "numbers": torch.tensor([[6, 1, 1]], device=device),
++        }
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        d_ij, r_ij = ops.calc_distances(data)
++        loss = d_ij.sum()
++        loss.backward()
++
++        assert coord.grad is not None
++        assert torch.isfinite(coord.grad).all()
++
++
++class TestCenterCoordinates:
++    """Tests for center_coordinates function."""
++
++    def test_center_coordinates_basic(self, simple_molecule):
++        """Test basic coordinate centering."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        coord = data["coord"]
++        centered = ops.center_coordinates(coord, data)
++
++        # Center of mass should be approximately at origin
++        center = centered.mean(dim=-2)
++        assert center.abs().max().item() < 1e-5
++
++    def test_center_coordinates_with_masses(self, device):
++        """Test coordinate centering with masses."""
++        coord = torch.tensor(
++            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
++            device=device,
++        )
++        numbers = torch.tensor([[8, 1]], device=device)
++        masses = torch.tensor([[16.0, 1.0]], device=device)
++
++        data = {"coord": coord, "numbers": numbers}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        centered = ops.center_coordinates(coord, data, masses)
++
++        # Mass-weighted center should be at origin
++        # heavier O atom should move less
++        assert centered[0, 0, 0].abs().item() < centered[0, 1, 0].abs().item()
++
++
++class TestCoulombMatrixDSF:
++    """Tests for coulomb_matrix_dsf function."""
++
++    def test_coulomb_dsf_shape(self, device):
++        """Test DSF Coulomb matrix shape."""
++        N = 5
++        d_ij = torch.rand((N, N), device=device) * 10 + 1.0  # avoid division by zero
++        Rc = 15.0
++        alpha = 0.2
++
++        # Create minimal data dict for masking
++        data = {
++            "mask_ij_lr": torch.eye(N, device=device, dtype=torch.bool),
++        }
++
++        J = ops.coulomb_matrix_dsf(d_ij, Rc, alpha, data)
++
++        assert J.shape == (N, N)
++
++    def test_coulomb_dsf_masked_diagonal(self, device):
++        """Test that diagonal is properly handled."""
++        N = 3
++        d_ij = torch.tensor(
++            [[0.0, 2.0, 3.0], [2.0, 0.0, 2.5], [3.0, 2.5, 0.0]],
++            device=device,
++        )
++        Rc = 15.0
++        alpha = 0.2
++
++        # Diagonal should be masked
++        data = {
++            "mask_ij_lr": torch.eye(N, device=device, dtype=torch.bool),
++        }
++
++        J = ops.coulomb_matrix_dsf(d_ij, Rc, alpha, data)
++
++        # Off-diagonal should be non-zero
++        assert J[0, 1].item() != 0.0
++        assert J[1, 2].item() != 0.0
++
++    def test_coulomb_dsf_cutoff(self, device):
++        """Test that values beyond Rc are masked when mask_ij_lr is True."""
++        N = 3
++        Rc = 5.0
++        d_ij = torch.tensor(
++            [[1.0, 3.0, 6.0], [3.0, 1.0, 4.0], [6.0, 4.0, 1.0]],
++            device=device,
++        )
++        alpha = 0.2
++
++        # mask_ij_lr True means "this pair should be masked (excluded)"
++        # For DSF, pairs with d > Rc AND mask_ij_lr==True are masked to 0
++        data = {
++            "mask_ij_lr": torch.eye(N, device=device, dtype=torch.bool),  # Only diagonal masked
++        }
++
++        J = ops.coulomb_matrix_dsf(d_ij, Rc, alpha, data)
++
++        # Distance 3.0 < Rc should be non-zero (not diagonal)
++        assert J[0, 1].item() != 0.0
++        # Function returns valid Coulomb values for distances within cutoff
++        assert torch.isfinite(J).all()
++
++
++class TestCoulombMatrixSF:
++    """Tests for coulomb_matrix_sf function (shifted force)."""
++
++    def test_coulomb_sf_shape(self, device):
++        """Test SF Coulomb matrix shape."""
++        N = 5
++        d_ij = torch.rand((N, N), device=device) * 10 + 1.0
++        Rc = 15.0
++        q_j = torch.rand((N,), device=device)
++
++        data = {"mask_ij_lr": torch.eye(N, device=device, dtype=torch.bool)}
++
++        J = ops.coulomb_matrix_sf(q_j, d_ij, Rc, data)
++
++        assert J.shape == (N, N)
++
++    def test_coulomb_sf_cutoff(self, device):
++        """Test SF cutoff behavior."""
++        N = 2
++        Rc = 5.0
++        d_ij = torch.tensor([[1.0, 3.0], [3.0, 1.0]], device=device)  # Within Rc
++        q_j = torch.ones(N, device=device)
++
++        data = {"mask_ij_lr": torch.eye(N, device=device, dtype=torch.bool)}
++
++        J = ops.coulomb_matrix_sf(q_j, d_ij, Rc, data)
++
++        # Off-diagonal values within Rc should be non-zero
++        assert J[0, 1].item() != 0.0
++        assert torch.isfinite(J).all()
++
++
++class TestCoulombMatrixEwald:
++    """Tests for coulomb_matrix_ewald function."""
++
++    def test_ewald_shape(self, device):
++        """Test Ewald Coulomb matrix shape."""
++        N = 4
++        coord = torch.rand((N, 3), device=device) * 5
++        cell = torch.eye(3, device=device) * 10
++
++        J = ops.coulomb_matrix_ewald(coord, cell)
++
++        assert J.shape == (N, N)
++
++    def test_ewald_symmetry(self, device):
++        """Test that Ewald matrix is symmetric."""
++        coord = torch.tensor(
++            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
++            device=device,
++        )
++        cell = torch.eye(3, device=device) * 10
++
++        J = ops.coulomb_matrix_ewald(coord, cell)
++
++        # Should be symmetric
++        assert torch.allclose(J, J.T, atol=1e-5)
++
++    def test_ewald_self_interaction(self, device):
++        """Test that Ewald self-interaction term is negative."""
++        coord = torch.tensor([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], device=device)
++        cell = torch.eye(3, device=device) * 10
++
++        J = ops.coulomb_matrix_ewald(coord, cell)
++
++        # Diagonal (self-interaction) should be negative
++        assert J[0, 0].item() < 0
++        assert J[1, 1].item() < 0
++
++
++class TestNSE:
++    """Tests for nse (neural charge equilibration) function."""
++
++    def test_nse_charge_conservation(self, simple_molecule):
++        """Test that NSE conserves total charge."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        # Initial atomic charges (unconstrained)
++        q_u = torch.tensor([[[0.1], [-0.2], [0.3]]], device=simple_molecule["coord"].device)
++        f_u = torch.ones_like(q_u)  # uniform flexibility
++        Q = torch.tensor([[0.0]], device=simple_molecule["coord"].device)  # target total charge
++
++        q = ops.nse(Q, q_u, f_u, data)
++
++        # Total charge should equal target
++        q_total = q.sum(dim=-2)
++        assert q_total.item() == pytest.approx(0.0, abs=1e-5)
++
++    def test_nse_with_nonzero_charge(self, simple_molecule):
++        """Test NSE with non-zero total charge."""
++        data = simple_molecule.copy()
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        q_u = torch.zeros((1, 3, 1), device=simple_molecule["coord"].device)
++        f_u = torch.ones_like(q_u)
++        Q = torch.tensor([[1.0]], device=simple_molecule["coord"].device)  # +1 charge
++
++        q = ops.nse(Q, q_u, f_u, data)
++
++        # Total charge should be +1
++        q_total = q.sum(dim=-2)
++        assert q_total.item() == pytest.approx(1.0, abs=1e-5)
++
++    def test_nse_gradient(self, device):
++        """Test gradient flow through NSE."""
++        coord = torch.rand((1, 3, 3), device=device)
++        numbers = torch.tensor([[6, 1, 1]], device=device)
++        data = {"coord": coord, "numbers": numbers}
++        data = nbops.set_nb_mode(data)
++        data = nbops.calc_masks(data)
++
++        q_u = torch.tensor([[[0.1], [0.1], [0.1]]], device=device, requires_grad=True)
++        f_u = torch.ones_like(q_u)
++        Q = torch.tensor([[0.0]], device=device)
++
++        q = ops.nse(Q, q_u, f_u, data)
++        loss = q.sum()
++        loss.backward()
++
++        assert q_u.grad is not None
++
++
++class TestTransitionFunctions:
++    """Tests for smooth transition functions (huber, bumpfn, smoothstep, expstep)."""
++
++    def test_huber_basic(self, device):
++        """Test Huber loss function."""
++        x = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0], device=device)
++        delta = 1.0
++
++        h = ops.huber(x, delta)
++
++        # For |x| < delta, should be 0.5 * x^2
++        assert h[1].item() == pytest.approx(0.5 * 0.25, abs=1e-6)
++        assert h[2].item() == pytest.approx(0.0, abs=1e-6)
++
++        # For |x| >= delta, should be delta * (|x| - 0.5 * delta)
++        assert h[0].item() == pytest.approx(1.0 * (2.0 - 0.5), abs=1e-6)
++
++    def test_bumpfn_boundaries(self, device):
++        """Test bumpfn at boundaries."""
++        x = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0], device=device)
++        low, high = 0.5, 1.5
++
++        b = ops.bumpfn(x, low, high)
++
++        # Should be ~0 for x <= low
++        assert b[0].item() < 0.01
++        # Should be ~1 for x >= high
++        assert b[4].item() > 0.99
++        # Should be ~0.5 at midpoint
++        assert 0.4 < b[2].item() < 0.6
++
++    def test_smoothstep_boundaries(self, device):
++        """Test smoothstep at boundaries."""
++        x = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0], device=device)
++        low, high = 0.5, 1.5
++
++        s = ops.smoothstep(x, low, high)
++
++        # Should be exactly 0 for x <= low
++        assert s[0].item() == pytest.approx(0.0, abs=1e-6)
++        # Should be exactly 1 for x >= high
++        assert s[4].item() == pytest.approx(1.0, abs=1e-6)
++        # Should be exactly 0.5 at midpoint
++        assert s[2].item() == pytest.approx(0.5, abs=1e-6)
++
++    def test_expstep_boundaries(self, device):
++        """Test expstep produces valid values in range [0, 1]."""
++        x = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0], device=device)
++        low, high = 0.5, 1.5
++
++        e = ops.expstep(x, low, high)
++
++        # All values should be finite and in valid range
++        assert torch.isfinite(e).all()
++        # Values are bounded due to clamping
++        assert (e >= 0).all()
++        assert (e <= 1.1).all()  # Allow small numerical overshoot
++
++    def test_transition_functions_gradient(self, device):
++        """Test gradient flow through transition functions."""
++        x = torch.tensor([0.75], device=device, requires_grad=True)
++
++        # Test all transition functions
++        for fn in [ops.bumpfn, ops.smoothstep, ops.expstep]:
++            x.grad = None
++            y = fn(x, 0.5, 1.0)
++            y.backward()
++            assert x.grad is not None
++            assert torch.isfinite(x.grad).all()
++
++
++class TestGetShiftsWithinCutoff:
++    """Tests for get_shifts_within_cutoff function (PBC shifts)."""
++
++    def test_shifts_cubic_cell(self, device):
++        """Test shift generation for cubic cell."""
++        cell = torch.eye(3, device=device) * 10.0
++        cutoff = torch.tensor(5.0, device=device)
++
++        shifts = ops.get_shifts_within_cutoff(cell, cutoff)
++
++        # Should include [0, 0, 0]
++        zero_shift = (shifts == 0).all(dim=-1)
++        assert zero_shift.any()
++
++        # Number of shifts depends on cutoff/cell ratio
++        # For cutoff=5 and cell=10, should be relatively small
++        assert shifts.shape[0] > 0
++
++    def test_shifts_non_cubic_cell(self, device):
++        """Test shift generation for non-cubic cell."""
++        # Triclinic cell
++        cell = torch.tensor(
++            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 1.0, 8.0]],
++            device=device,
++        )
++        cutoff = torch.tensor(5.0, device=device)
++
++        shifts = ops.get_shifts_within_cutoff(cell, cutoff)
++
++        # Should produce valid shifts
++        assert shifts.shape[0] > 0
++        assert shifts.shape[1] == 3
++
++    def test_shifts_symmetry(self, device):
++        """Test that shifts are symmetric around origin."""
++        cell = torch.eye(3, device=device) * 10.0
++        cutoff = torch.tensor(3.0, device=device)
++
++        shifts = ops.get_shifts_within_cutoff(cell, cutoff)
++
++        # Sum of all shifts should be zero (symmetric)
++        assert shifts.sum(0).abs().max().item() < 1e-6

@@ -1,0 +1,523 @@
+diff --git a/quippy/quippy/convert.py b/quippy/quippy/convert.py
+index 3288031828..eb01b52a58 100644
+--- a/quippy/quippy/convert.py
++++ b/quippy/quippy/convert.py
+@@ -38,15 +38,46 @@
+ MASSCONVERT = 103.6426957074462
+ 
+ 
+-def ase_to_quip(ase_atoms: ase.Atoms, quip_atoms=None):
++def ase_to_quip(ase_atoms: ase.Atoms, quip_atoms=None, add_arrays=None, add_info=None):
+     """
+     Converter to put the info from an ase atoms object into a quip atoms object.
+     Copies everything to make sure there is not linking back.
+ 
+-    Checks if the
++    Notes on add_arrays and add_info:
++        - overwriting a parameter is not possible yet
++        - only float arrays can be added, integers are converted to floats by fortran, fails for strings
++        - keys can only be strings, as the fortran dictionary will not accept anything else,\
++        integer keys are converted to strings
++        - possible types:
++            None - only defaults: pos, Z, cell, pbc, momenta (if exists)
++            str  - single key
++            list - all the list elements are added
++            True - all of the arrays
++
++    Copying from ase.Atoms.info supports:
++    =============== ===== ===== ==== =======================================================================
++    type            0D    1D    2D   Note
++    =============== ===== ===== ==== =======================================================================
++    real            no*   yes   yes  scalars kept as arrays of one dimension with one element
++    int             yes   yes   yes
++    bool            no*   yes   NO   zero dim. kept as array of one dimension with one element
++    =============== ===== ===== ==== =======================================================================
++
++    Copying from ase.Atoms.arrays supports:
++    =============== ===== ==== =======================================================================
++    type            1D    2D   Note
++    =============== ===== ==== =======================================================================
++    real            yes   yes  scalars kept as arrays of one dimension with one element
++    int             yes   yes
++    bool            yes   NO   zero dim. kept as array of one dimension with one element
++    =============== ===== ==== =======================================================================
++
++    Logical arrays are kept as ones and zeros, and normally retrieved as int32.
+ 
+     :param ase_atoms:
+     :param quip_atoms:
++    :param add_arrays: keys to take from ase.Atoms.arrays
++    :param add_info:  keys to take from ase.Atoms.info
+     :return:
+     """
+ 
+@@ -79,10 +110,179 @@ def ase_to_quip(ase_atoms: ase.Atoms, quip_atoms=None):
+         _quippy.f90wrap_atoms_add_property_real_2da(this=quip_atoms._handle, name='velo',
+                                                     value=velocities_ase_to_quip(ase_atoms.get_velocities()))
+ 
+-    # go through all properties
++    def key_spec_to_list(keyspec, default, exclude=()):
++        if keyspec is True:
++            # taking all the array keys that are not handled elsewhere
++            keyspec = set(default.keys())
++            [keyspec.discard(used_key) for used_key in exclude]
++            keyspec = list(keyspec)
++        elif isinstance(keyspec, str):
++            # if only one is given as a string
++            keyspec = [keyspec]
++        elif isinstance(keyspec, list) or isinstance(keyspec, np.ndarray):
++            keyspec = list(keyspec)
++        else:
++            # fixme: decide what to do here, now it is just not adding anything
++            keyspec = []
++
++        return keyspec
++
++    # go through all properties for issue#170
++    if add_arrays is not None:
++        add_arrays = key_spec_to_list(add_arrays, ase_atoms.arrays, exclude=['numbers', 'positions', 'momenta'])
++        for info_name in add_arrays:
++            try:
++                value = np.array(ase_atoms.arrays[info_name])
++            except KeyError:
++                # fixme: give some warning here if needed
++                continue
++            add_property_array(quip_atoms, info_name, value)
++
++    if add_info is not None:
++        add_info = key_spec_to_list(add_info, ase_atoms.info, exclude=[])
++        for info_name in add_info:
++            try:
++                value = np.array(ase_atoms.info[info_name])
++            except KeyError:
++                # fixme: give some warning here if needed
++                continue
++            add_param_value(quip_atoms, info_name, value)
++
+     return quip_atoms
+ 
+ 
++def add_param_value(quip_atoms, name, value):
++    """
++    Adds property to a quip atoms object in params dictionary, from ase.Atoms.info
++
++    Supports:
++    =============== ===== ===== ==== =======================================================================
++    type            0D    1D    2D   Note
++    =============== ===== ===== ==== =======================================================================
++    real            no*   yes   yes  scalars kept as arrays of one dimension with one element
++    int             yes   yes   yes
++    bool            no*   yes   NO   zero dim. kept as array of one dimension with one element
++    =============== ===== ===== ==== =======================================================================
++
++    Note: logical arrays are kept as ones and zeros, and normally retrieved as int32.
++
++    :param quip_atoms:
++    :param name:
++    :param value:
++    :return:
++    """
++    # to make sure it is a numpy array, so we can use the dtype and shape of it
++    if not isinstance(value, np.ndarray):
++        value = np.array(value)
++
++    # decide type
++    arr_dtype_kind = value.dtype.kind
++    dim = len(value.shape)
++    if arr_dtype_kind == 'b':
++        # only 1D works, 0->1
++        fortran_type_name = 'l'
++        if dim >= 2:
++            raise TypeError('2d logical array is not supported')
++        elif dim == 0:
++            # change to a one dimension instead
++            value = np.atleast_1d(value)
++            dim = len(value.shape)  # update dimension!!!
++    elif arr_dtype_kind in ['u', 'i']:
++        # 0,1,2 are all working
++        fortran_type_name = 'i'
++    elif arr_dtype_kind == 'f':
++        # only 1,2 D works, 0->1
++        fortran_type_name = 'r'
++        if dim == 0:
++            # change to a one dimension instead
++            value = np.atleast_1d(value)
++            dim = len(value.shape)  # update dimension!!!
++    else:
++        # so it is one of:
++        # c complex floating - point
++        # m timedelta
++        # M datetime
++        # O object
++        # V void
++        # strings not supported yet, f90wrap_atoms_add_property_str needs some
++        raise TypeError('given dtype ({}) is not supported'.format(arr_dtype_kind))
++
++    # decide dim
++    if dim == 0:
++        add_property_method = getattr(_quippy, 'f90wrap_dictionary_set_value_{}'.format(fortran_type_name))
++    elif dim == 1:
++        add_property_method = getattr(_quippy, 'f90wrap_dictionary_set_value_{}_a'.format(fortran_type_name))
++    elif dim == 2:
++        add_property_method = getattr(_quippy, 'f90wrap_atoms_add_property_{}_2da'.format(fortran_type_name))
++        value = value.T
++    else:
++        raise ValueError(
++            'unsupported dimension ({}) of attribute in conversion from ase to quip atoms objects'.format(dim))
++    add_property_method(this=quip_atoms.params._handle, key=name, value=value)
++
++
++def add_property_array(quip_atoms, name, value):
++    """
++    Adds property to a quip atoms object
++
++    Supports:
++    =============== ===== ==== =======================================================================
++    type            1D    2D   Note
++    =============== ===== ==== =======================================================================
++    real            yes   yes  scalars kept as arrays of one dimension with one element
++    int             yes   yes
++    bool            yes   NO   zero dim. kept as array of one dimension with one element
++    =============== ===== ==== =======================================================================
++
++    Note: logical arrays are kept as ones and zeros, and normally retrieved as int32.
++
++    :param quip_atoms:
++    :param name:
++    :param value:
++    :return:
++    """
++    # to make sure it is a numpy array, so we can use the dtype and shape of it
++    if not isinstance(value, np.ndarray):
++        value = np.array(value)
++
++    # add the value, 1d/2d array
++    dim = len(value.shape)
++    arr_dtype_kind = value.dtype.kind
++
++    # decide the fortran type
++    if arr_dtype_kind == 'b':
++        if dim < 2:
++            fortran_type_name = 'logical'
++        else:
++            raise TypeError('2d logical array is not supported')
++    elif arr_dtype_kind in ['u', 'i']:
++        fortran_type_name = 'int'
++    elif arr_dtype_kind == 'f':
++        fortran_type_name = 'real'
++    # elif arr_dtype_kind in ['S', 'U']:
++    #     fortran_type_name = 'str'
++    else:
++        # so it is one of:
++        # c complex floating - point
++        # m timedelta
++        # M datetime
++        # O object
++        # V void
++        # strings not supported yet, f90wrap_atoms_add_property_str needs some
++        raise TypeError('given dtype ({}) is not supported'.format(arr_dtype_kind))
++
++    # decide dim
++    if dim == 1:
++        add_property_method = getattr(_quippy, 'f90wrap_atoms_add_property_{}_a'.format(fortran_type_name))
++        add_property_method(this=quip_atoms._handle, name=name, value=value)
++    elif dim == 2:
++        add_property_method = getattr(_quippy, 'f90wrap_atoms_add_property_{}_2da'.format(fortran_type_name))
++        add_property_method(this=quip_atoms._handle, name=name, value=value.T)
++    else:
++        raise ValueError(
++            'unsupported dimension ({}) of attribute in conversion from ase to quip atoms objects'.format(dim))
++
++
+ def velocities_ase_to_quip(velocities):
+     """
+     Convert the ASE velocities to QUIP velocities
+diff --git a/quippy/quippy/potential.py b/quippy/quippy/potential.py
+index 63343abc6d..a48711ab21 100644
+--- a/quippy/quippy/potential.py
++++ b/quippy/quippy/potential.py
+@@ -61,7 +61,7 @@ class Potential(ase.calculators.calculator.Calculator):
+         finalise=True
+     """)
+     def __init__(self, args_str="", param_str=None, atoms=None, calculation_always_required=False, param_filename=None,
+-                 calc_args=None, **kwargs):
++                 calc_args=None, add_arrays=None, add_info=None, **kwargs):
+         quippy.potential_module.Potential.__init__.__doc__
+ 
+         self._default_properties = ['energy', 'forces']
+@@ -77,6 +77,9 @@ def __init__(self, args_str="", param_str=None, atoms=None, calculation_always_r
+             self._quip_potential = quippy.potential_module.Potential(args_str=args_str, param_str=param_str)
+         # init the quip atoms as None, to have the variable
+         self._quip_atoms = None
++        # init the info and array keys that need to be added when converting atoms objects
++        self.add_arrays = add_arrays
++        self.add_info = add_info
+ 
+         # from old
+         if atoms is not None:
+@@ -105,6 +108,23 @@ def __init__(self, args_str="", param_str=None, atoms=None, calculation_always_r
+         'pbc', 'initial_charges' and 'initial_magmoms'.
+     calc_args: argument string to pass to Fortran calc() routine.
+         This is appended to `self.calc_args`, if this is set.
++    add_arrays: list, str or True
++        Arrays to carry over from `atoms.arrays` to the Fortran atoms object when calling calculate()
++        If the same argument is filled in calculate, then it will overwrite this.
++        String arrays not supported.
++        possible types:
++            None - only defaults: `pos`, `Z`, `cell`, `pbc`, `momenta` (as velo, if exists)
++            str  - single key
++            list - all list elements as keys
++            True - all of the arrays from `atoms.arrays`
++    add_info: list, str or True
++        Info to carry over from `atoms.info` to the Fortran atoms object when calling calculate()
++        If the same argument is filled in calculate, then it will overwrite this.
++        possible types:
++            None - only defaults: `pos`, `Z`, `cell`, `pbc`, `momenta` (as velo, if exists)
++            str  - single key
++            list - all list elements as keys
++            True - all of the values from `atoms.info`
+ 
+     Arrays can also be passed directly to the Fortran routine using
+     the `forces`, `virial`, `local_energy`, `local_virial`
+@@ -120,7 +140,8 @@ def __init__(self, args_str="", param_str=None, atoms=None, calculation_always_r
+     def calculate(self, atoms=None, properties=None, system_changes=None,
+                   forces=None, virial=None, local_energy=None,
+                   local_virial=None, vol_per_atom=None,
+-                  copy_all_properties=True, calc_args=None, **kwargs):
++                  copy_all_properties=True, calc_args=None, add_arrays=None,
++                  add_info=None, **kwargs):
+ 
+         # handling the property inputs
+         if properties is None:
+@@ -172,7 +193,10 @@ def calculate(self, atoms=None, properties=None, system_changes=None,
+             return
+ 
+         # construct the quip atoms object which we will use to calculate on
+-        self._quip_atoms = quippy.convert.ase_to_quip(self.atoms)
++        # if add_arrays/add_info given to this object is not None, then OVERWRITES the value set in __init__
++        self._quip_atoms = quippy.convert.ase_to_quip(self.atoms,
++                                                      add_arrays=add_arrays if add_arrays is not None else self.add_arrays,
++                                                      add_info=add_info if add_info is not None else self.add_info)
+ 
+         # constructing args_string with automatically aliasing the calculateable non-quippy properties
+         # calc_args string to be passed to Fortran code
+diff --git a/tests/quippytest.py b/tests/quippytest.py
+index 6ba71e187a..b262903e52 100644
+--- a/tests/quippytest.py
++++ b/tests/quippytest.py
+@@ -69,11 +69,21 @@ def assertArrayAlmostEqual(self, first, second, tol=1e-7):
+ 
+         absdiff = abs(first - second)
+         if np.max(absdiff) > tol:
+-            print('First array: \n', first)
+-            print('\n \n Second array: \n', second)
+-            print('\n \n Abs Difference: \n', absdiff)
+-            self.fail('Maximum abs difference between array elements is %e at location %r' % (np.max(absdiff),
+-                                                                                              np.argmax(absdiff)))
++            print('First array:\n{}'.format(first))
++            print('\n \n Second array:\n{}'.format(second))
++            print('\n \n Abs Difference:\n{}'.format(absdiff))
++            self.fail('Maximum abs difference between array elements is {} at location {}'.format(np.max(absdiff),
++                                                                                                  np.argmax(absdiff)))
++
++    def assertArrayIntEqual(self, first, second):
++        first = np.array(first)
++        second = np.array(second)
++        self.assertEqual(first.shape, second.shape)
++
++        if not np.all(first == second):
++            print('First array:\n{}'.format(first))
++            print('\n \n Second array:\n{}'.format(second))
++            self.fail('Two bool arrays not matching, difference is\n {}'.format(first == second))
+ 
+ 
+ def skip(f):
+diff --git a/tests/test_converter.py b/tests/test_converter.py
+new file mode 100644
+index 0000000000..c338f7ebf4
+--- /dev/null
++++ b/tests/test_converter.py
+@@ -0,0 +1,183 @@
++# HQ XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
++# HQ X
++# HQ X   quippy: Python interface to QUIP atomistic simulation library
++# HQ X
++# HQ X   Copyright T. K. Stenczel 2019
++# HQ X
++# HQ X   These portions of the source code are released under the GNU General
++# HQ X   Public License, version 2, http://www.gnu.org/copyleft/gpl.html
++# HQ X
++# HQ X   If you would like to license the source code under different terms,
++# HQ X   please contact James Kermode, james.kermode@gmail.com
++# HQ X
++# HQ X   When using this software, please cite the following reference:
++# HQ X
++# HQ X   http://www.jrkermode.co.uk/quippy
++# HQ X
++# HQ XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
++
++import quippy
++import quippytest
++import ase
++import numpy as np
++
++
++class Test_Converter(quippytest.QuippyTestCase):
++    def setUp(self):
++        # this is a base atoms object, which is used afterwards
++        self.at_base = ase.Atoms('HCOO', positions=[[0, 0, 0], [1, 0, 0], [2., 0, 0], [3., 0, 0]], cell=[3, 3, 3],
++                                 pbc=True)
++        self.at_base.set_momenta([[0, 0, 0], [1, 0, 0], [2., 0, 0], [5., 0, 0]])
++
++        self.ref_real_1d = np.array([0., 0., 11., 24.])
++        self.ref_real_2d = np.array([[0., 0., 11.],
++                                     [0.1, 6.9, 0.],
++                                     [0.2, 0., 0.],
++                                     [0.03, 0., 24.]])
++
++        self.ref_int_1d = np.array([0, 0, 11, 24])
++        self.ref_int_2d = np.array([[0, 0, 11],
++                                    [1, 9, 0],
++                                    [2, 0, 0],
++                                    [3, 0, 24]])
++
++        self.ref_str_1d = np.array(['a', 'b', 'c', 'd'])
++        self.ref_str_2d = np.array([['a', 'b'],
++                                    ['c', 'd'],
++                                    ['a', 'r'],
++                                    ['f', 'd']])
++
++        self.at_base.arrays['dummy_real_1d'] = self.ref_real_1d
++        self.at_base.arrays['dummy_real_2d'] = self.ref_real_2d
++        self.at_base.arrays['dummy_int_1d'] = self.ref_int_1d
++        self.at_base.arrays['dummy_int_2d'] = self.ref_int_2d
++
++        self.ref_bool_1d = np.array([True, False, True, True])
++        self.ref_bool_2d = np.zeros((2, 4), dtype=bool)
++
++        self.ref_info = dict(real=0.2, logical_T=True, logical_F=False, integer=2)
++        self.at_base.info.update(self.ref_info)
++
++    def test_convert_add_from_info(self):
++        at = self.at_base.copy()
++
++        # fixme this is a hack to get the first element of the array
++        # real
++        raw_dict_output = self._convert_at_add_arrays_and_info(at, add_info='real')
++        self.assertAlmostEqual(raw_dict_output['real'], self.ref_info['real'], delta=1E-06)
++
++        # logical
++        raw_dict_output = self._convert_at_add_arrays_and_info(at, add_info=['logical_T', 'logical_F'])
++        self.assertEqual(raw_dict_output['logical_T'], self.ref_info['logical_T'])
++        self.assertEqual(raw_dict_output['logical_F'], self.ref_info['logical_F'])
++
++        # integer
++        raw_dict_output = self._convert_at_add_arrays_and_info(at, add_info=['integer'])
++        self.assertEqual(raw_dict_output['integer'], self.ref_info['integer'])
++
++    def test_convert_add_arguent_types(self):
++        # testing the different ways of specifying arguments
++
++        # None
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_info=None)
++        for key in self.at_base.arrays.keys():
++            self.assertNotIn(key, raw_dict_output.keys())
++        for key in self.at_base.info.keys():
++            self.assertNotIn(key, raw_dict_output.keys())
++
++        # string
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_info='real')
++        self.assertIn('real', raw_dict_output.keys())
++
++        # list
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_info=['real'])
++        self.assertIn('real', raw_dict_output.keys())
++
++        # tuple
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_info=('real'))
++        self.assertIn('real', raw_dict_output.keys())
++
++        # np.array
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_info=np.array(['real']))
++        self.assertIn('real', raw_dict_output.keys())
++
++        # True
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_info=True, add_arrays=True)
++        self.assertIn('real', raw_dict_output.keys())
++        for key in self.at_base.arrays.keys():
++            if key in ['numbers', 'positions', 'momenta']:
++                continue
++            self.assertIn(key, raw_dict_output.keys())
++        for key in self.at_base.info.keys():
++            self.assertIn(key, raw_dict_output.keys())
++
++    def test_convert_add_wrong_shape(self):
++        """ Passing an array of the wrong shape"""
++        # setup of a separate atoms for this test
++        at = self.at_base.copy()
++        at.arrays['wrong_shape'] = np.zeros((1, 6), dtype=float)
++        self.assertRaises(RuntimeError, self._convert_at_add_arrays_and_info, at, add_arrays='wrong_shape')
++
++    def test_convert_add_real(self):
++        # default
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base)
++        self.assertNotIn('dummy_real_2d', raw_dict_output.keys())
++        self.assertNotIn('dummy_real_1d', raw_dict_output.keys())
++
++        # 2d only
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_arrays='dummy_real_2d')
++        self.assertArrayAlmostEqual(raw_dict_output['dummy_real_2d'], self.ref_real_2d.T, tol=1E-06)
++
++        # 1d only
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_arrays=['dummy_real_1d'])
++        self.assertArrayAlmostEqual(raw_dict_output['dummy_real_1d'], self.ref_real_1d, tol=1E-06)
++
++    def test_convert_add_int(self):
++        # 2d only
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_arrays='dummy_int_2d')
++        self.assertArrayIntEqual(raw_dict_output['dummy_int_2d'], self.ref_int_2d.T)
++
++        # 1d only
++        raw_dict_output = self._convert_at_add_arrays_and_info(self.at_base, add_arrays=['dummy_int_1d'])
++        self.assertArrayIntEqual(raw_dict_output['dummy_int_1d'], self.ref_int_1d)
++
++    def test_convert_add_arrays_bool(self):
++        # setup of a separate atoms for this test
++        at = self.at_base.copy()
++        at.arrays['dummy_bool_1d'] = self.ref_bool_1d
++        at.arrays['dummy_bool_2d'] = self.ref_bool_2d
++
++        # 1d bool array
++        raw_dict_output = self._convert_at_add_arrays_and_info(at, add_arrays='dummy_bool_1d')
++        self.assertArrayIntEqual(raw_dict_output['dummy_bool_1d'], self.ref_bool_1d)
++
++        # 2d bool array
++        self.assertRaises(TypeError, self._convert_at_add_arrays_and_info, at, add_arrays='dummy_bool_2d')
++
++    def test_convert_add_arrays_unsupported_types(self):
++        # setup of a separate atoms for this test
++        at = self.at_base.copy()
++        at.arrays.update(dummy_obj_2d=np.zeros((3, 4), dtype=np.object),
++                         dummy_cplx_2d=np.zeros((3, 4), dtype=np.complex),
++                         dummy_void_2d=np.zeros((3, 4), dtype=np.void))
++
++        # all should raise an error, the
++        self.assertRaises(TypeError, self._convert_at_add_arrays_and_info, at, add_arrays='dummy_obj_2d')
++        self.assertRaises(TypeError, self._convert_at_add_arrays_and_info, at, add_arrays='dummy_void_2d')
++        self.assertRaises(TypeError, self._convert_at_add_arrays_and_info, at, add_arrays='dummy_cplx_2d')
++
++    @staticmethod
++    def _convert_at_add_arrays_and_info(at, add_info=None, add_arrays=None):
++        """
++        Method for calling the converter and returning both the arrays and info in one dict.
++        Yes, clashes are possible between keys but the tests don't need that right now.
++        """
++        at_quip = quippy.convert.ase_to_quip(at, add_arrays=add_arrays, add_info=add_info)
++        raw_arrays = quippy.convert.get_dict_arrays(at_quip.properties)
++        raw_info = quippy.convert.get_dict_arrays(at_quip.params)
++        raw_arrays.update(raw_info)
++        return raw_arrays
++
++
++if __name__ == '__main__':
++    unittest.main()

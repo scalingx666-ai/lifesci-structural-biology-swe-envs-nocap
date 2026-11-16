@@ -1,0 +1,1318 @@
+diff --git a/docs/jax_md.simulate.rst b/docs/jax_md.simulate.rst
+index ca3747a7..dc07fb77 100644
+--- a/docs/jax_md.simulate.rst
++++ b/docs/jax_md.simulate.rst
+@@ -4,6 +4,54 @@ Simulation Routines
+ .. default-role:: code
+ .. automodule:: jax_md.simulate
+ 
++Fixed Center Of Mass
++--------------------
++Pass ``fix_center_of_mass=True`` to a simulation constructor to remove
++center-of-mass (COM) momentum, including from explicitly supplied momenta.
++Initialization leaves positions and forces unchanged. Each subsequent
++momentum kick obeys the same constraint. This option is intended for
++translationally invariant potentials, not an imposed net force.
++
++The momentum projection is
++``p_i <- p_i - m_i * sum(p) / sum(m)``. It works for unequal masses and removes
++only global translation, not rotation. A system of ``N`` particles in ``d``
++dimensions has ``d * (N - 1)`` kinetic degrees of freedom. Multiple arrays
++share one global COM constraint. This option supports particle dynamics with
++momenta only; Brownian and rigid-body dynamics are not covered.
++
++Periodic runs can use wrapped positions and existing neighbour lists. Wrapping
++can change the numerical mean of the stored coordinates even when COM momentum
++is zero; it does not represent COM drift. In NPT, the usual box dilation still
++acts on positions: zero COM momentum does not prevent their affine scaling with
++the box. NPT CSVR requires fractional positions. NPT Nose-Hoover's position
++update is unchanged by this option.
++
++``simulate.temperature(state)`` automatically uses the constrained kinetic
++degrees of freedom. When using ``quantity.temperature`` directly, pass
++``fix_center_of_mass=True`` explicitly. The old Langevin ``center_velocity``
++argument remains unused for compatibility; it does not activate this option.
++Fixed-COM Langevin requires scalar uniform translational friction.
++
++Both barostats retain the standard NPT volume distribution after integrating
++out COM, rather than changing finite-system averages by one particle.
++This is a different finite-system convention from i-PI's ``BaroBZP``, which
++retains its ``kT`` piston correction and ``-kT * log(V)`` term with ``fixcom``.
++For NPT CSVR this means ``3 * N - 2`` particle-plus-piston kinetic degrees of
++freedom, a ``2 * kT`` piston correction, and ``-2 * kT * log(V)`` in the
++modified Hamiltonian. For the existing MTK-style Nose-Hoover equations,
++``alpha = 1 + d / (d * (N - 1))``, the piston force gains ``d * kT``, and the
++extended invariant gains ``-kT * log(V)``. These corrections account for the
++extra volume weight of the eliminated COM coordinate; see
++`Bussi et al., 2009 <https://arxiv.org/abs/0901.0779>`_. In particular, an ideal
++gas still has ``p(V)`` proportional to ``V**N * exp(-pressure * V / kT)``.
++
++Kinetic energy and temperature refer to motion relative to COM. The raw
++mechanical pressure computed from this kinetic energy excludes COM motion.
++To reconstruct the unconstrained ensemble's mean pressure, pass
++``kinetic_energy + d * kT / 2`` to ``quantity.pressure``, where ``kT`` is the
++target temperature. The volume corrections above do not restore the missing
++COM kinetic energy to the particle momenta themselves.
++
+ Deterministic Simulation Environments
+ --------------------------------------
+ .. autofunction:: nve
+diff --git a/jax_md/quantity.py b/jax_md/quantity.py
+index 47c6427c..66350cf3 100644
+--- a/jax_md/quantity.py
++++ b/jax_md/quantity.py
+@@ -19,7 +19,7 @@
+ from absl import logging
+ 
+ from jax import grad, vmap, eval_shape
+-from jax.tree_util import tree_map, tree_reduce
++from jax.tree_util import tree_map, tree_reduce, tree_leaves
+ import jax.numpy as jnp
+ from jax import ops
+ from jax import ShapeDtypeStruct
+@@ -104,9 +104,18 @@ def force_fn(R, **kwargs):
+ 
+ 
+ @functools.singledispatch
+-def count_dof(position: Array) -> int:
++def count_dof(position: Array, fix_center_of_mass: bool = False) -> int:
++  """Count kinetic degrees of freedom, optionally excluding global translation."""
+   util.check_custom_simulation_type(position)
+-  return tree_reduce(lambda accum, x: accum + x.size, position, 0)
++  dof = tree_reduce(lambda accum, x: accum + x.size, position, 0)
++  if fix_center_of_mass:
++    leaves = tree_leaves(position)
++    if not leaves or any(x.ndim != 2 for x in leaves):
++      raise ValueError('Fixed COM requires particle arrays of shape [n, d].')
++    if len({x.shape[-1] for x in leaves}) != 1:
++      raise ValueError('Fixed COM requires particle arrays of shape [n, d].')
++    dof -= leaves[0].shape[-1]
++  return dof
+ 
+ 
+ def volume(dimension: int, box: Box) -> Array:
+@@ -165,6 +174,7 @@ def temperature(
+   momentum: Array | None = None,
+   velocity: Array | None = None,
+   mass: Array | float = 1.0,
++  fix_center_of_mass: bool = False,
+ ) -> Array | float:
+   """Computes the temperature of a system.
+ 
+@@ -175,6 +185,8 @@ def temperature(
+     momentum: Array specifying the momentum of the system.
+     velocity: Array specifying the velocity of the system.
+     mass: Array specifying the mass of the constituents.
++    fix_center_of_mass: Exclude the translational center-of-mass degrees of
++      freedom. Momenta or velocities must already have zero total momentum.
+ 
+   Returns:
+     The temperature of the system in units of the Boltzmann constant.
+@@ -194,7 +206,7 @@ def temperature(
+   q = velocity if momentum is None else momentum
+   util.check_custom_simulation_type(q)
+ 
+-  dof = count_dof(q)
++  dof = count_dof(q, True) if fix_center_of_mass else count_dof(q)
+ 
+   kT = tree_map(lambda m, q: util.high_precision_sum(t(q, m)) / dof, mass, q)
+   return tree_reduce(operator.add, kT, 0.0)
+diff --git a/jax_md/simulate.py b/jax_md/simulate.py
+index 331d30d4..d73a9143 100644
+--- a/jax_md/simulate.py
++++ b/jax_md/simulate.py
+@@ -138,6 +138,32 @@ def canonicalize_fn(mass):
+   return state.set(mass=tree_map(canonicalize_fn, state.mass))
+ 
+ 
++def project_momentum(momentum, mass):
++  """Subtract the mass-weighted share of total momentum from each particle."""
++  total_momentum = tree_reduce(
++    lambda a, b: a + b, tree_map(lambda p: jnp.sum(p, axis=0), momentum)
++  )
++  masses = tree_map(
++    lambda p, m: jnp.sum(jnp.broadcast_to(m, p.shape[:-1] + (1,))),
++    momentum,
++    mass,
++  )
++  v_cm = total_momentum / tree_reduce(lambda a, b: a + b, masses)
++  return tree_map(lambda p, m: p - m * v_cm, momentum, mass)
++
++
++@dispatch_by_state
++def constrain_center_of_mass(state: T) -> T:
++  """Remove COM momentum without changing positions or cached forces."""
++  if not getattr(state, 'fix_center_of_mass', False):
++    return state
++  if quantity.count_dof(state.position, True) <= 0:
++    raise ValueError(
++      'Fixed COM requires at least one internal degree of freedom.'
++    )
++  return state.set(momentum=project_momentum(state.momentum, state.mass))
++
++
+ @dispatch_by_state
+ def initialize_momenta(state: T, key: Array, kT: ArrayLike) -> T:
+   """Initialize momenta with the Maxwell-Boltzmann distribution."""
+@@ -150,7 +176,7 @@ def initialize_momenta(state: T, key: Array, kT: ArrayLike) -> T:
+   def initialize_fn(k, r, m):
+     p = jnp.sqrt(m * kT) * random.normal(k, r.shape, dtype=r.dtype)
+     # If simulating more than one particle, center the momentum.
+-    if r.shape[0] > 1:
++    if r.shape[0] > 1 and not getattr(state, 'fix_center_of_mass', False):
+       p = p - jnp.mean(p, axis=0, keepdims=True)
+     return p
+ 
+@@ -170,7 +196,7 @@ def momentum_step(state: T, dt: float | Array) -> T:
+   """Apply a single step of the time evolution operator for momenta."""
+   assert hasattr(state, 'momentum')
+   new_momentum = tree_map(lambda p, f: p + dt * f, state.momentum, state.force)
+-  return state.set(momentum=new_momentum)
++  return constrain_center_of_mass(state.set(momentum=new_momentum))
+ 
+ 
+ @dispatch_by_state
+@@ -199,7 +225,11 @@ def kinetic_energy(state: T) -> Array | float:
+ @dispatch_by_state
+ def temperature(state: T) -> Array | float:
+   """Compute the temperature of a state."""
+-  return quantity.temperature(momentum=state.momentum, mass=state.mass)
++  return quantity.temperature(
++    momentum=state.momentum,
++    mass=state.mass,
++    fix_center_of_mass=getattr(state, 'fix_center_of_mass', False),
++  )
+ 
+ 
+ """Deterministic Simulations
+@@ -271,6 +301,9 @@ class NVEState:
+   momentum: Array
+   force: Array
+   mass: Array | float
++  fix_center_of_mass: bool = dataclasses.static_field(
++    default=False, kw_only=True
++  )
+ 
+   @property
+   def velocity(self) -> Array:
+@@ -278,7 +311,9 @@ def velocity(self) -> Array:
+ 
+ 
+ # pylint: disable=invalid-name
+-def nve(energy_or_force_fn, shift_fn, dt=1e-3, **sim_kwargs):
++def nve(
++  energy_or_force_fn, shift_fn, dt=1e-3, fix_center_of_mass=False, **sim_kwargs
++):
+   """Simulates a system in the NVE ensemble.
+ 
+   Samples from the microcanonical ensemble in which the number of particles
+@@ -293,6 +328,8 @@ def nve(energy_or_force_fn, shift_fn, dt=1e-3, **sim_kwargs):
+       Both `R` and `dR` should be ndarrays of shape `[n, spatial_dimension]`.
+     dt: Floating point number specifying the timescale (step size) of the
+       simulation.
++    fix_center_of_mass: Remove COM momentum without changing initial positions.
++      See the fixed-COM conventions in the simulation docs.
+   Returns:
+     See above.
+   """
+@@ -303,13 +340,13 @@ def init_fn(key, R, kT, mass=f32(1.0), momenta=None, **kwargs):
+     force = force_fn(R, **kwargs)
+     # Momentum placeholder; overwritten below once mass is canonical.
+     P = tree_map(jnp.zeros_like, R)
+-    state = NVEState(R, P, force, mass)
++    state = NVEState(R, P, force, mass, fix_center_of_mass=fix_center_of_mass)
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, key, kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
+-    return state
++    return constrain_center_of_mass(state)
+ 
+   @jit
+   def step_fn(state, **kwargs):
+@@ -564,6 +601,9 @@ class NVTNoseHooverState:
+   force: Array
+   mass: Array
+   chain: NoseHooverChain
++  fix_center_of_mass: bool = dataclasses.static_field(
++    default=False, kw_only=True
++  )
+ 
+   @property
+   def velocity(self):
+@@ -579,6 +619,7 @@ def nvt_nose_hoover(
+   chain_steps: int = 2,
+   sy_steps: int = 3,
+   tau: float | Array | None = None,
++  fix_center_of_mass: bool = False,
+   **sim_kwargs,
+ ) -> Simulator:
+   """Simulation in the NVT ensemble using a Nose Hoover Chain thermostat.
+@@ -610,6 +651,8 @@ def nvt_nose_hoover(
+     tau: A floating point timescale over which temperature equilibration
+       occurs. Measured in units of `dt`. The performance of the Nose-Hoover
+       chain thermostat can be quite sensitive to this choice.
++    fix_center_of_mass: Remove COM momentum and exclude translation from
++      the thermostat's kinetic degrees of freedom.
+   Returns:
+     See above.
+ 
+@@ -639,18 +682,30 @@ def nvt_nose_hoover(
+   def init_fn(key, R, mass=f32(1.0), momenta=None, **kwargs):
+     _kT = kT if 'kT' not in kwargs else kwargs['kT']
+ 
+-    dof = quantity.count_dof(R)
++    dof = (
++      quantity.count_dof(R, True)
++      if fix_center_of_mass
++      else quantity.count_dof(R)
++    )
+ 
+     # Momentum and chain placeholders; both are overwritten below once the
+     # mass is canonical and the kinetic energy is known.
+     P = tree_map(jnp.zeros_like, R)
+     chain = thermostat.initialize(dof, f32(0.0), _kT)
+-    state = NVTNoseHooverState(R, P, force_fn(R, **kwargs), mass, chain)
++    state = NVTNoseHooverState(
++      R,
++      P,
++      force_fn(R, **kwargs),
++      mass,
++      chain,
++      fix_center_of_mass=fix_center_of_mass,
++    )
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, key, _kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
++    state = constrain_center_of_mass(state)
+     KE = kinetic_energy(state)
+     return state.set(chain=thermostat.initialize(dof, KE, _kT))
+ 
+@@ -698,7 +753,7 @@ def nvt_nose_hoover_invariant(
+   PE = energy_fn(state.position, **kwargs)
+   KE = kinetic_energy(state)
+ 
+-  DOF = quantity.count_dof(state.position)
++  DOF = state.chain.degrees_of_freedom
+   E = PE + KE
+ 
+   c = state.chain
+@@ -753,6 +808,9 @@ class NPTNoseHooverState:
+ 
+   barostat: NoseHooverChain
+   thermostat: NoseHooverChain
++  fix_center_of_mass: bool = dataclasses.static_field(
++    default=False, kw_only=True
++  )
+ 
+   @property
+   def velocity(self) -> Array:
+@@ -808,6 +866,7 @@ def npt_nose_hoover(
+   kT: ArrayLike,
+   barostat_kwargs: Dict[str, Any] | None = None,
+   thermostat_kwargs: Dict[str, Any] | None = None,
++  fix_center_of_mass: bool = False,
+ ) -> Simulator:
+   """Simulation in the NPT ensemble using a pair of Nose Hoover Chains.
+ 
+@@ -838,6 +897,9 @@ def npt_nose_hoover(
+     thermostat_kwargs: A dictionary of keyword arguments passed to the
+       thermostat NHC. Any parameters not set are drawn from a relatively robust
+       default set.
++    fix_center_of_mass: Remove COM momentum without recentering positions.
++      The thermostat excludes translation; the barostat includes the volume
++      weight obtained by integrating out COM, preserving standard NPT averages.
+ 
+   Returns:
+     See above.
+@@ -893,16 +955,22 @@ def init_fn(key, R, box, mass=f32(1.0), momenta=None, **kwargs):
+       box_mass,
+       dUdV,
+       barostat.initialize(1, KE_box, _kT),
+-      thermostat.initialize(quantity.count_dof(R), f32(0.0), _kT),
++      thermostat.initialize(
++        quantity.count_dof(R, fix_center_of_mass), f32(0.0), _kT
++      ),
++      fix_center_of_mass=fix_center_of_mass,
+     )  # pytype: disable=wrong-arg-count
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, key, _kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
++    state = constrain_center_of_mass(state)
+     KE = kinetic_energy(state)
+     return state.set(
+-      thermostat=thermostat.initialize(quantity.count_dof(R), KE, _kT)
++      thermostat=thermostat.initialize(
++        quantity.count_dof(R, fix_center_of_mass), KE, _kT
++      )
+     )
+ 
+   def update_box_mass(state, kT):
+@@ -919,12 +987,15 @@ def box_force(
+     momentum,
+     mass,
+     pressure,
++    kT,
+   ) -> Array:
+     N, dim = position.shape
+ 
+     KE2 = util.high_precision_sum(momentum**2 / mass)
+ 
+-    return alpha * KE2 - dUdV - pressure * vol * dim
++    # Integrating out the COM contributes an extra V to the NPT density.
++    correction = dim * kT if fix_center_of_mass else 0
++    return alpha * KE2 - dUdV - pressure * vol * dim + correction
+ 
+   def exp_iL1(box, R, V, V_b, **kwargs):
+     x = V_b * dt
+@@ -942,6 +1013,7 @@ def exp_iL2(alpha, P, F, V_b):
+ 
+   def inner_step(state, **kwargs):
+     _pressure = kwargs.pop('pressure', pressure)
++    _kT = kwargs.get('kT', kT)
+ 
+     R, P, M, F = state.position, state.momentum, state.mass, state.force
+     R_b, P_b, M_b = state.box_position, state.box_momentum, state.box_mass
+@@ -954,10 +1026,13 @@ def inner_step(state, **kwargs):
+ 
+     vol, box_fn = _npt_box_info(state)
+ 
+-    alpha = 1 + 1 / N
+-    G_e = box_force(alpha, vol, dUdV, R, P, M, _pressure)
++    dof = quantity.count_dof(R, fix_center_of_mass)
++    alpha = 1 + dim / dof
++    G_e = box_force(alpha, vol, dUdV, R, P, M, _pressure, _kT)
+     P_b = P_b + dt_2 * G_e
+     P = exp_iL2(alpha, P, F, P_b / M_b)
++    if fix_center_of_mass:
++      P = project_momentum(P, M)
+ 
+     R_b = R_b + P_b / M_b * dt
+     state = state.set(box_position=R_b)
+@@ -968,7 +1043,9 @@ def inner_step(state, **kwargs):
+     R = exp_iL1(box, R, P / M, P_b / M_b)
+     _, F, dUdV = force_stress_fn(R, box, **kwargs)
+     P = exp_iL2(alpha, P, F, P_b / M_b)
+-    G_e = box_force(alpha, vol, dUdV, R, P, M, _pressure)
++    if fix_center_of_mass:
++      P = project_momentum(P, M)
++    G_e = box_force(alpha, vol, dUdV, R, P, M, _pressure, _kT)
+     P_b = P_b + dt_2 * G_e
+ 
+     return state.set(
+@@ -1036,7 +1113,7 @@ def npt_nose_hoover_invariant(
+   PE = energy_fn(state.position, box=box_fn(volume), **kwargs)
+   KE = kinetic_energy(state)
+ 
+-  DOF = state.position.size
++  DOF = state.thermostat.degrees_of_freedom
+   E = PE + KE
+ 
+   c = state.thermostat
+@@ -1050,6 +1127,8 @@ def npt_nose_hoover_invariant(
+ 
+   E += pressure * volume
+   E += state.box_momentum**2 / (2 * state.box_mass)
++  if state.fix_center_of_mass:
++    E -= kT * jnp.log(volume)
+ 
+   return E
+ 
+@@ -1100,6 +1179,9 @@ class NVTLangevinState:
+   force: Array
+   mass: Array
+   rng: Array
++  fix_center_of_mass: bool = dataclasses.static_field(
++    default=False, kw_only=True
++  )
+ 
+   @property
+   def velocity(self) -> Array:
+@@ -1114,11 +1196,17 @@ def stochastic_step(
+   gamma: float | Array,
+ ):
+   """A single stochastic step (the `O` step)."""
++  if getattr(state, 'fix_center_of_mass', False) and jnp.ndim(gamma) != 0:
++    raise ValueError(
++      'Fixed-COM Langevin requires scalar translational friction.'
++    )
+   c1 = jnp.exp(-gamma * dt)
+   c2 = jnp.sqrt(kT * (1 - c1**2))
+   momentum_dist = Normal(c1 * state.momentum, c2**2 * state.mass)
+   key, split = random.split(state.rng)
+-  return state.set(momentum=momentum_dist.sample(split), rng=key)
++  return constrain_center_of_mass(
++    state.set(momentum=momentum_dist.sample(split), rng=key)
++  )
+ 
+ 
+ def nvt_langevin(
+@@ -1128,6 +1216,7 @@ def nvt_langevin(
+   kT: ArrayLike | util.PyTree,
+   gamma: float | util.PyTree = 0.1,
+   center_velocity: bool = True,
++  fix_center_of_mass: bool = False,
+   **sim_kwargs,
+ ) -> Simulator:
+   """Simulation in the NVT ensemble using the BAOAB Langevin thermostat.
+@@ -1156,8 +1245,9 @@ def nvt_langevin(
+       should pass `kT` as a keyword argument to the step function.
+     gamma: A float specifying the friction coefficient between the particles
+       and the solvent.
+-    center_velocity: A boolean specifying whether or not the center of mass
+-      position should be subtracted.
++    center_velocity: Deprecated unused argument; use ``fix_center_of_mass``.
++    fix_center_of_mass: Remove COM momentum without recentering positions.
++      Requires uniform scalar translational friction.
+   Returns:
+     See above.
+ 
+@@ -1173,13 +1263,20 @@ def init_fn(key, R, mass=f32(1.0), momenta=None, **kwargs):
+     _kT = kwargs.pop('kT', kT)
+     key, split = random.split(key)
+     force = force_fn(R, **kwargs)
+-    state = NVTLangevinState(R, tree_map(jnp.zeros_like, R), force, mass, key)
++    state = NVTLangevinState(
++      R,
++      tree_map(jnp.zeros_like, R),
++      force,
++      mass,
++      key,
++      fix_center_of_mass=fix_center_of_mass,
++    )
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, split, _kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
+-    return state
++    return constrain_center_of_mass(state)
+ 
+   @jit
+   def step_fn(state, **kwargs):
+@@ -1281,15 +1378,14 @@ def apply_fn(state, **kwargs):
+ 
+ @dataclasses.dataclass
+ class NPTCSVRState:
+-  """State information for the unconstrained-COM NPT CSVR integrator.
++  """State information for the isotropic NPT CSVR integrator.
+ 
+   The isotropic box is parameterized by ``box_position`` such that
+   ``box_position = log((V / V_0) ** (1 / 3))``. ``box_momentum`` is the
+   momentum conjugate to this coordinate and ``box_mass`` is the piston mass.
+   ``dUdV`` is the derivative of the potential with respect to an isotropic
+   affine perturbation, evaluated at the current state. The state uses the
+-  complete particle momentum distribution; no center-of-mass projection is
+-  applied.
++  complete particle momentum distribution unless ``fix_center_of_mass=True``.
+   """
+ 
+   position: Array
+@@ -1305,6 +1401,9 @@ class NPTCSVRState:
+   potential_energy: Array
+   rng: Array
+   conserved_quantity: Array
++  fix_center_of_mass: bool = dataclasses.static_field(
++    default=False, kw_only=True
++  )
+ 
+   @property
+   def velocity(self) -> Array:
+@@ -1328,11 +1427,12 @@ def npt_csvr(
+   kT: ArrayLike,
+   tau_p: float,
+   tau_t: float,
++  fix_center_of_mass: bool = False,
+ ) -> Simulator:
+-  """Simulation in the unconstrained-COM NPT ensemble using CSVR.
++  """Simulation in the isotropic NPT ensemble using CSVR.
+ 
+   This is the isotropic Bussi-Zykova-Timan-Parrinello integrator [#bzp2009]_.
+-  The particle center of mass and total momentum are unconstrained. The
++  By default the particle COM and total momentum are unconstrained. The
+   particle momenta and the piston velocity are coupled to the same canonical
+   velocity-rescaling thermostat, with ``3 * N + 1`` kinetic degrees of
+   freedom.
+@@ -1357,6 +1457,9 @@ def npt_csvr(
+     tau_p: The piston relaxation timescale. The piston mass is initialized as
+       ``3 * N * kT * tau_p**2``.
+     tau_t: The CSVR thermostat relaxation timescale.
++    fix_center_of_mass: Remove COM momentum with ``3 * N - 2`` particle-plus-
++      piston kinetic degrees of freedom, without recentering positions.
++      The piston thermal correction and log-volume term then use ``2 * kT``.
+ 
+   Returns:
+     An ``(init_fn, apply_fn)`` pair.
+@@ -1404,7 +1507,7 @@ def modified_hamiltonian(
+       + kinetic
+       + piston_kinetic
+       + _pressure * volume
+-      - _kT * jnp.log(volume)
++      - (2 if fix_center_of_mass else 1) * _kT * jnp.log(volume)
+     )
+ 
+   def init_fn(
+@@ -1447,6 +1550,7 @@ def init_fn(
+       potential_energy,
+       state_key,
+       zero,
++      fix_center_of_mass=fix_center_of_mass,
+     )
+     state = canonicalize_mass(state)
+ 
+@@ -1458,6 +1562,8 @@ def init_fn(
+     else:
+       state = canonicalize_momenta(state, momenta)
+ 
++    state = constrain_center_of_mass(state)
++
+     if box_velocity is None:
+       box_velocity = jnp.sqrt(_kT / box_mass) * random.normal(
+         piston_key, dtype=R.dtype
+@@ -1483,7 +1589,7 @@ def init_fn(
+   def csvr_update(state, _kT):
+     """Apply one exact CSVR half-step to particles and the piston."""
+     next_key, normal_key, chi_square_key = random.split(state.rng, 3)
+-    dof = state.position.size + 1
++    dof = quantity.count_dof(state.position, fix_center_of_mass) + 1
+     kinetic = quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
+     kinetic += state.box_momentum**2 / (2 * state.box_mass)
+     kinetic = jnp.maximum(kinetic, jnp.finfo(state.position.dtype).tiny)
+@@ -1509,7 +1615,8 @@ def piston_half_step(
+   ):
+     kinetic = quantity.kinetic_energy(momentum=momentum, mass=mass)
+     internal_pressure = (2 * kinetic - dUdV) / (3 * volume)
+-    eta_dot = 3 * (volume * (internal_pressure - pressure) + kT)
++    correction = (2 if fix_center_of_mass else 1) * kT
++    eta_dot = 3 * (volume * (internal_pressure - pressure) + correction)
+     eta = eta + eta_dot * dt_2 / box_mass
+     eta += util.high_precision_sum(force * momentum / mass) * dt_2**2 / box_mass
+     eta += util.high_precision_sum(force**2 / mass) * dt_2**3 / (3 * box_mass)
+@@ -1525,6 +1632,8 @@ def nph_step(state, _pressure, _kT, **kwargs):
+       eta, P, F, M, state.dUdV, volume, M_b, _pressure, _kT
+     )
+     P = P + dt_2 * F
++    if fix_center_of_mass:
++      P = project_momentum(P, M)
+ 
+     old_H = modified_hamiltonian(
+       state.potential_energy,
+@@ -1549,6 +1658,8 @@ def nph_step(state, _pressure, _kT, **kwargs):
+     volume = quantity.volume(3, box)
+     eta = piston_half_step(eta, P, F, M, dUdV, volume, M_b, _pressure, _kT)
+     P = P + dt_2 * F
++    if fix_center_of_mass:
++      P = project_momentum(P, M)
+     P_b = M_b * eta
+ 
+     new_H = modified_hamiltonian(
+@@ -2039,6 +2150,7 @@ def temp_rescale(
+   kT: ArrayLike,
+   window: float,
+   fraction: float,
++  fix_center_of_mass: bool = False,
+   **sim_kwargs,
+ ) -> Simulator:
+   """Simulation using explicit velocity rescaling.
+@@ -2061,6 +2173,7 @@ def temp_rescale(
+       rescaling is performed. Measured in units of `kT`.
+     fraction: Floating point number which determines the amount of rescaling
+       applied to the velocities. Takes values from 0.0-1.0.
++    fix_center_of_mass: Remove COM momentum and use the internal temperature.
+   Returns:
+     See above.
+ 
+@@ -2085,17 +2198,27 @@ def velocity_rescale(state, window, fraction, kT):
+   def init_fn(key, R, mass=f32(1.0), momenta=None, **kwargs):
+     # Reuse the NVEState dataclass
+     state = NVEState(
+-      R, tree_map(jnp.zeros_like, R), force_fn(R, **kwargs), mass
++      R,
++      tree_map(jnp.zeros_like, R),
++      force_fn(R, **kwargs),
++      mass,
++      fix_center_of_mass=fix_center_of_mass,
+     )
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, key, kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
+-    return state
++    return constrain_center_of_mass(state)
+ 
+   def apply_fn(state, **kwargs):
+-    state = velocity_rescale(state, window, fraction, kT)
++    # Rescaling is undefined at zero kinetic energy; forces can restart motion.
++    state = lax.cond(
++      kinetic_energy(state) > 0,
++      lambda s: velocity_rescale(s, window, fraction, kT),
++      lambda s: s,
++      state,
++    )
+     state = velocity_verlet(force_fn, shift_fn, dt, state, **kwargs)
+     return state
+ 
+@@ -2108,6 +2231,7 @@ def temp_berendsen(
+   dt: float | Array,
+   kT: ArrayLike,
+   tau: float | Array,
++  fix_center_of_mass: bool = False,
+   **sim_kwargs,
+ ) -> Simulator:
+   """Simulation using the Berendsen thermostat.
+@@ -2130,6 +2254,7 @@ def temp_berendsen(
+       should pass `kT` as a keyword argument to the step function.
+     tau: A floating point number determining how fast the temperature
+       is relaxed during the simulation. Measured in units of `dt`.
++    fix_center_of_mass: Remove COM momentum and use the internal temperature.
+   Returns:
+     See above.
+ 
+@@ -2151,17 +2276,27 @@ def berendsen_update(state, tau, kT, dt):
+   def init_fn(key, R, mass=f32(1.0), momenta=None, **kwargs):
+     # Reuse the NVEState dataclass
+     state = NVEState(
+-      R, tree_map(jnp.zeros_like, R), force_fn(R, **kwargs), mass
++      R,
++      tree_map(jnp.zeros_like, R),
++      force_fn(R, **kwargs),
++      mass,
++      fix_center_of_mass=fix_center_of_mass,
+     )
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, key, kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
+-    return state
++    return constrain_center_of_mass(state)
+ 
+   def apply_fn(state, **kwargs):
+-    state = berendsen_update(state, tau, kT, dt)
++    # Rescaling is undefined at zero kinetic energy; forces can restart motion.
++    state = lax.cond(
++      kinetic_energy(state) > 0,
++      lambda s: berendsen_update(s, tau, kT, dt),
++      lambda s: s,
++      state,
++    )
+     state = velocity_verlet(force_fn, shift_fn, dt, state, **kwargs)
+     return state
+ 
+@@ -2173,6 +2308,7 @@ def nvk(
+   shift_fn: ShiftFn,
+   dt: float | Array,
+   kT: ArrayLike,
++  fix_center_of_mass: bool = False,
+   **sim_kwargs,
+ ) -> Simulator:
+   """Simulation in the NVK (isokinetic) ensemble using the Gaussian thermostat.
+@@ -2195,6 +2331,7 @@ def nvk(
+     kT: Floating point number specifying the temperature in units of Boltzmann
+       constant. To update the temperature dynamically during a simulation one
+       should pass `kT` as a keyword argument to the step function.
++    fix_center_of_mass: Remove COM momentum without recentering positions.
+   Returns:
+     See above.
+ 
+@@ -2247,7 +2384,7 @@ def momentum_update(state, KE):
+       s_t,
+       s_dot_t,
+     )
+-    return state.set(momentum=new_momentum)
++    return constrain_center_of_mass(state.set(momentum=new_momentum))
+ 
+   def position_update(state, shift_fn, **kwargs):
+     if isinstance(shift_fn, Callable):
+@@ -2266,14 +2403,18 @@ def init_fn(key, R, mass=f32(1.0), momenta=None, **kwargs):
+     key, split = random.split(key)
+     # Reuse the NVEState dataclass
+     state = NVEState(
+-      R, tree_map(jnp.zeros_like, R), force_fn(R, **kwargs), mass
++      R,
++      tree_map(jnp.zeros_like, R),
++      force_fn(R, **kwargs),
++      mass,
++      fix_center_of_mass=fix_center_of_mass,
+     )
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, split, _kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
+-    return state
++    return constrain_center_of_mass(state)
+ 
+   def apply_fn(state, **kwargs):
+     _KE = kinetic_energy(state)
+@@ -2292,6 +2433,7 @@ def temp_csvr(
+   dt: float | Array,
+   kT: ArrayLike,
+   tau: float | Array,
++  fix_center_of_mass: bool = False,
+   **sim_kwargs,
+ ) -> Simulator:
+   """Simulation using the canonical sampling through velocity rescaling (CSVR) thermostat.
+@@ -2318,6 +2460,8 @@ def temp_csvr(
+       should pass `kT` as a keyword argument to the step function.
+     tau: A floating point number determining how fast the temperature
+       is relaxed during the simulation. Measured in units of `dt`.
++    fix_center_of_mass: Remove COM momentum and exclude translation from
++      the kinetic-energy distribution sampled by the thermostat.
+   Returns:
+     See above.
+ 
+@@ -2332,74 +2476,67 @@ def temp_csvr(
+   force_fn = quantity.canonicalize_force(energy_or_force_fn)
+   dt = f32(dt)
+ 
+-  def sum_noises(state, key):
+-    """Sum of N independent gaussian noises squared.
+-    Adapted from https://github.com/GiovanniBussi/StochasticVelocityRescaling
+-    For more details see Eq.A7 Bussi et al. [#bussi2007]_"""
+-    dof = quantity.count_dof(state.position) - 1
+-    _dtype = state.position.dtype
+-
+-    if dof == 0:
+-      """If there are no terms return zero."""
+-      return 0
+-
+-    elif dof == 1:
+-      """For a single noise term, directly calculate the square of the Gaussian
+-      noise value."""
+-      rr = random.normal(key, dtype=_dtype)
+-      return rr * rr
+-
+-    elif dof % 2 == 0:
+-      """For an even number of noise terms, use the gamma-distributed random
+-      number generator"""
+-      return 2.0 * random.gamma(key, dof // 2, dtype=_dtype)
+-
+-    else:
+-      """For an odd number of noise terms, sum two terms: one from the
+-      gamma-distributed generator and another from the square of a
+-      Gaussian-distributed random number."""
+-      rr = random.normal(key, dtype=_dtype)
+-      return 2.0 * random.gamma(key, (dof - 1) // 2, dtype=_dtype) + (rr * rr)
+-
+   def csvr_update(state, tau, kT, dt):
+     """Update the momentum by an scaling factor as described by
+     Eq.A7 Bussi et al. [#bussi2007]_"""
+-    key, split = random.split(state.rng)
+-    dof = quantity.count_dof(state.position)
++    next_key, normal_key, chi_square_key = random.split(state.rng, 3)
++    dof = (
++      quantity.count_dof(state.position, True)
++      if fix_center_of_mass
++      else quantity.count_dof(state.position)
++    )
+ 
+     _kT = temperature(state)
+ 
+     KE_old = dof * _kT / 2
+     KE_new = dof * kT / 2
+ 
+-    r1 = random.normal(key, dtype=state.position.dtype)
+-    r2 = sum_noises(state, key)
++    dtype = tree_flatten(state.position)[0][0].dtype
++    r1 = random.normal(normal_key, dtype=dtype)
++    r2 = (
++      2 * random.gamma(chi_square_key, 0.5 * (dof - 1), dtype=dtype)
++      if dof > 1
++      else 0
++    )
+ 
+     c1 = jnp.exp(-dt / tau)
+     c2 = (1 - c1) * KE_new / KE_old / dof
+ 
+     scale = c1 + (c2 * ((r1 * r1) + r2)) + (2 * r1 * jnp.sqrt(c1 * c2))
+-    lam = jnp.sqrt(scale)
++    lam = jnp.sqrt(jnp.maximum(scale, 0))
+ 
+     new_momentum = tree_map(lambda p: p * lam, state.momentum)
+-    return state.set(momentum=new_momentum, rng=key)
++    return state.set(momentum=new_momentum, rng=next_key)
+ 
+   def init_fn(key, R, mass=f32(1.0), momenta=None, **kwargs):
+     _kT = kwargs.pop('kT', kT)
+     key, split = random.split(key)
+     # Reuse the NVTLangevinState dataclass
+     state = NVTLangevinState(
+-      R, tree_map(jnp.zeros_like, R), force_fn(R, **kwargs), mass, key
++      R,
++      tree_map(jnp.zeros_like, R),
++      force_fn(R, **kwargs),
++      mass,
++      key,
++      fix_center_of_mass=fix_center_of_mass,
+     )
+     state = canonicalize_mass(state)
+     if momenta is None:
+       state = initialize_momenta(state, split, _kT)
+     else:
+       state = canonicalize_momenta(state, momenta)
+-    return state
++    return constrain_center_of_mass(state)
+ 
+   def apply_fn(state, **kwargs):
+-    state = csvr_update(state, tau, kT, dt)
++    # Rescaling is undefined at zero kinetic energy; forces can restart motion.
++    # Same guard as i-PI's ThermoSVR.step, lines 508-510:
++    # https://github.com/i-pi/i-pi/blob/e1460fef7cb889472324c47b644a6f8340a474e2/ipi/engine/thermostats.py#L508-L510
++    state = lax.cond(
++      kinetic_energy(state) > 0,
++      lambda s: csvr_update(s, tau, kT, dt),
++      lambda s: s,
++      state,
++    )
+     state = velocity_verlet(force_fn, shift_fn, dt, state, **kwargs)
+     return state
+ 
+diff --git a/tests/simulate_test.py b/tests/simulate_test.py
+index 7fd93a37..a267f949 100644
+--- a/tests/simulate_test.py
++++ b/tests/simulate_test.py
+@@ -15,6 +15,7 @@
+ """Tests for google3.third_party.py.jax_md.simulate."""
+ 
+ import functools
++from typing import Any
+ 
+ from absl.testing import absltest
+ from absl.testing import parameterized
+@@ -23,6 +24,7 @@
+ from jax import vmap
+ from jax import random
+ from jax import lax
++from jax import grad
+ 
+ import jax
+ import jax.numpy as np
+@@ -1311,6 +1313,421 @@ def test_temp_csvr(self, spatial_dimension, dtype):
+       assert np.abs(T_emp - T) < 0.1
+       assert state.position.dtype == dtype
+ 
++  @parameterized.product(
++    thermostat=['temp_csvr', 'temp_berendsen', 'temp_rescale'],
++    fixed=[False, True],
++    forces=[False, True],
++    dtype=DTYPE,
++  )
++  def test_temp_zero_kinetic_energy(self, thermostat, fixed, forces, dtype):
++    """JIT skips zero-energy rescaling but still allows forces to create motion."""
++    R = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=dtype)
++    mass = np.array([1.0, 2.0], dtype=dtype)
++    E = lambda R, **kwargs: forces * np.sum((R - np.mean(R, axis=0)) ** 2)
++    kwargs = (
++      {'window': 0.1, 'fraction': 0.5}
++      if thermostat == 'temp_rescale'
++      else {'tau': 0.1}
++    )
++    init, step = getattr(simulate, thermostat)(
++      E, space.free()[1], 0.01, 1.0, fix_center_of_mass=fixed, **kwargs
++    )
++    momenta = mass[:, None] * np.ones_like(R) if fixed else np.zeros_like(R)
++    state = init(random.PRNGKey(0), R, mass=mass, momenta=momenta)
++    self.assertEqual(simulate.kinetic_energy(state), 0)
++    after = jit(step)(state)
++    self.assertTrue(np.all(np.isfinite(after.momentum)))
++    if thermostat == 'temp_csvr':
++      self.assertAllClose(after.rng, state.rng, atol=0, rtol=0)
++    if forces:
++      self.assertGreater(simulate.kinetic_energy(after), 0)
++      resumed = jit(step)(after)
++      self.assertTrue(np.all(np.isfinite(resumed.momentum)))
++      if thermostat == 'temp_csvr':
++        self.assertFalse(np.array_equal(resumed.rng, after.rng))
++    else:
++      self.assertAllClose(after.momentum, state.momentum, atol=0, rtol=0)
++      self.assertAllClose(after.position, state.position, atol=0, rtol=0)
++
++  @parameterized.product(shape=[(1, 1), (3, 2), (3, 3)], dtype=DTYPE)
++  def test_temp_csvr_one_step_distribution(self, shape, dtype):
++    """Independent CSVR noise must give the exact one-step kinetic moments."""
++    R = np.zeros(shape, dtype=dtype)
++    E = lambda R, **kwargs: np.sum(R * 0)
++    init_fn, step_fn = simulate.temp_csvr(E, space.free()[1], 1.0, 1.0, 1.0)
++    state = init_fn(random.PRNGKey(0), R, momenta=np.ones_like(R))
++
++    def sample(key):
++      result = step_fn(state.set(rng=key))
++      return result.momentum, simulate.kinetic_energy(result)
++
++    momentum, kinetic = jit(vmap(sample))(
++      random.split(random.PRNGKey(1), 20000)
++    )
++    self.assertTrue(np.all(np.isfinite(momentum)))
++    self.assertAllClose(
++      np.mean(kinetic), R.size / 2, rtol=0.025, check_dtypes=False
++    )
++    self.assertAllClose(
++      np.var(kinetic),
++      R.size / 2 * (1 - np.exp(-2.0)),
++      rtol=0.05,
++      check_dtypes=False,
++    )
++
++
++class CenterOfMassTest(test_util.JAXMDTestCase):
++  def test_constraint_only_changes_momentum(self):
++    """The COM constraint leaves positions and even nonzero net forces alone."""
++    state = simulate.NVEState(
++      position=np.arange(6.0).reshape(3, 2),
++      momentum=np.arange(6.0).reshape(3, 2) + 1,
++      force=np.ones((3, 2)),
++      mass=np.arange(1.0, 4.0)[:, None],
++      fix_center_of_mass=True,
++    )
++    constrained = simulate.constrain_center_of_mass(state)
++    self.assertAllClose(constrained.position, state.position, atol=0, rtol=0)
++    self.assertAllClose(constrained.force, state.force, atol=0, rtol=0)
++    self.assertAllClose(np.sum(constrained.momentum, axis=0), np.zeros(2))
++    self.assertAllClose(
++      constrained.velocity[1:] - constrained.velocity[:-1],
++      state.velocity[1:] - state.velocity[:-1],
++    )
++
++  @parameterized.parameters(
++    'nve', 'nvt_langevin', 'temp_csvr', 'npt_csvr', 'npt_nose_hoover'
++  )
++  def test_wrapped_neighbor_list(self, integrator):
++    """A close pair across the periodic boundary must survive COM initialization."""
++    npt = integrator.startswith('npt')
++    fractional = integrator == 'npt_csvr'
++    R = np.array([[9.99, 1.0, 1.0], [0.98, 1.0, 1.0], [4.03, 4.0, 4.0]])
++    if fractional:
++      R /= 10
++    displacement, shift = space.periodic_general(
++      10.0, fractional_coordinates=fractional
++    )
++    pair = energy.soft_sphere_pair(displacement, sigma=1.0)
++    neighbor_fn, E = energy.soft_sphere_neighbor_list(
++      displacement,
++      10.0,
++      sigma=1.0,
++      dr_threshold=0,
++      fractional_coordinates=fractional,
++      disable_cell_list=npt and not fractional,
++    )
++    neighbor = neighbor_fn.allocate(R)
++    kwargs: dict[str, Any] = dict(dt=0.001, fix_center_of_mass=True)
++    if integrator != 'nve':
++      kwargs['kT'] = 1.0
++    if integrator == 'temp_csvr':
++      kwargs['tau'] = 0.1
++    if npt:
++      kwargs['pressure'] = 0.1
++    if integrator == 'npt_csvr':
++      kwargs.update(tau_p=1.0, tau_t=0.1)
++    # Bind the initial list so force inference need not trace its metadata.
++    energy_fn = lambda R, neighbor=neighbor, **kw: E(R, neighbor=neighbor, **kw)
++    init, step = getattr(simulate, integrator)(energy_fn, shift, **kwargs)
++    state = init(
++      random.PRNGKey(9),
++      R,
++      mass=np.arange(1.0, 4.0),
++      **({'box': 10.0} if npt else {'kT': 1.0}),
++    )
++    self.assertAllClose(state.position, R, atol=0, rtol=0)
++    self.assertAllClose(state.force, -grad(E)(R, neighbor=neighbor), atol=1e-12)
++    self.assertGreater(pair(R), 0)
++
++    @jit
++    def advance(state, neighbor):
++      kwargs = {'box': state.box} if npt else {}
++      neighbor = neighbor.update(state.position, **kwargs)
++      state = step(state, neighbor=neighbor)
++      kwargs = {'box': state.box} if npt else {}
++      neighbor = neighbor.update(state.position, **kwargs)
++      return state, neighbor
++
++    for _ in range(10):
++      state, neighbor = advance(state, neighbor)
++      kwargs = {'box': state.box} if npt else {}
++      self.assertFalse(neighbor.did_buffer_overflow)
++      self.assertAllClose(
++        E(state.position, neighbor=neighbor, **kwargs),
++        pair(state.position, **kwargs),
++        atol=1e-12,
++      )
++      self.assertAllClose(
++        -grad(E)(state.position, neighbor=neighbor, **kwargs),
++        -grad(pair)(state.position, **kwargs),
++        atol=1e-12,
++      )
++
++  @parameterized.product(
++    integrator=[
++      'nve',
++      'nvt_nose_hoover',
++      'nvt_langevin',
++      'temp_csvr',
++      'temp_berendsen',
++      'temp_rescale',
++      'nvk',
++    ],
++    dim=[2, 3],
++    dtype=DTYPE,
++    supplied=[False, True],
++  )
++  def test_constraint(self, integrator, dim, dtype, supplied):
++    """Momentum-based integrators keep COM fixed for unequal masses."""
++    R = np.arange(4 * dim, dtype=dtype).reshape(4, dim) / 10
++    mass = np.arange(1, 5, dtype=dtype)
++    E = lambda R, **kw: np.sum((R - np.mean(R, axis=0)) ** 2) / 10
++    kwargs: dict[str, Any] = dict(dt=0.001, fix_center_of_mass=True)
++    if integrator != 'nve':
++      kwargs['kT'] = 1.0
++    if integrator in ('temp_csvr', 'temp_berendsen'):
++      kwargs['tau'] = 0.1
++    if integrator == 'temp_rescale':
++      kwargs.update(window=0.1, fraction=0.5)
++    init, step = getattr(simulate, integrator)(E, space.free()[1], **kwargs)
++    kwargs = {'kT': 1.0} if integrator == 'nve' else {}
++    if supplied:
++      kwargs['momenta'] = R + 1
++    state = init(random.PRNGKey(1), R, mass=mass, **kwargs)
++    self.assertAllClose(state.position, R, atol=0, rtol=0)
++    initial_center = np.sum(mass[:, None] * R, axis=0) / np.sum(mass)
++
++    def advance(state, _):
++      state = step(state)
++      center = np.sum(state.mass * state.position, axis=0) / np.sum(state.mass)
++      total_p = np.sum(state.momentum, axis=0)
++      return state, (center, total_p)
++
++    state, (centers, momenta) = jit(
++      lambda s: lax.scan(advance, s, None, length=100)
++    )(state)
++    tol = 2e-5 if dtype == f32 else 1e-12
++    self.assertAllClose(
++      centers, np.broadcast_to(initial_center, centers.shape), atol=tol
++    )
++    self.assertAllClose(momenta, np.zeros_like(momenta), atol=tol)
++    self.assertEqual(state.position.dtype, dtype)
++    self.assertAllClose(
++      simulate.temperature(state),
++      2 * simulate.kinetic_energy(state) / (3 * dim),
++    )
++    self.assertEqual(state.momentum.dtype, dtype)
++
++  @parameterized.product(
++    source=['initialization', 'langevin', 'csvr'], dim=[2, 3]
++  )
++  def test_maxwell_distribution(self, source, dim):
++    """Check the constrained Maxwell covariance and chi-squared kinetic energy."""
++    R = np.zeros((4, dim))
++    mass = np.arange(1, 5, dtype=R.dtype)
++    E = lambda R, **kw: np.sum(R * 0)
++    if source == 'csvr':
++      init, step = simulate.temp_csvr(
++        E, space.free()[1], 10.0, 1.0, 0.1, fix_center_of_mass=True
++      )
++    else:
++      init, step = simulate.nvt_langevin(
++        E, space.free()[1], 10.0, 1.0, gamma=10.0, fix_center_of_mass=True
++      )
++
++    def sample(key):
++      state = init(key, R, mass=mass)
++      if source != 'initialization':
++        state = step(state)
++      return state.momentum, simulate.kinetic_energy(state)
++
++    momentum, kinetic = jit(vmap(sample))(
++      random.split(random.PRNGKey(2), 20000)
++    )
++    dof = 3 * dim
++    self.assertAllClose(np.mean(kinetic), dof / 2, rtol=0.025)
++    self.assertAllClose(np.var(kinetic), dof / 2, rtol=0.04)
++    expected = np.diag(mass) - mass[:, None] * mass[None, :] / np.sum(mass)
++    self.assertAllClose(
++      np.cov(momentum[:, :, 0].T), expected, atol=0.07, rtol=0.04
++    )
++
++  @parameterized.product(integrator=['csvr', 'nhc'], dtype=DTYPE)
++  def test_npt_invariant(self, integrator, dtype):
++    """NPT preserves COM momentum while allowing the usual affine box dilation."""
++    R = np.array(
++      [[0, 0, 0], [1.3, 0, 0], [0, 1.3, 0], [0, 0, 1.3]], dtype=dtype
++    )
++    box = dtype(5.0)
++    fractional = integrator == 'csvr'
++    displacement, shift = space.periodic_general(
++      box, fractional_coordinates=fractional, wrapped=False
++    )
++    E = energy.lennard_jones_pair(displacement, r_onset=1.8, r_cutoff=2.0)
++    if fractional:
++      R /= box
++    if integrator == 'csvr':
++      init, step = simulate.npt_csvr(
++        E,
++        shift,
++        dtype(0.0002),
++        0.4,
++        1.0,
++        1.0,
++        float('inf'),
++        fix_center_of_mass=True,
++      )
++      invariant = lambda s: s.conserved_quantity
++    else:
++      init, step = simulate.npt_nose_hoover(
++        E,
++        shift,
++        dtype(0.0002),
++        0.4,
++        1.0,
++        thermostat_kwargs={'tau': 0.1},
++        barostat_kwargs={'tau': 1.0},
++        fix_center_of_mass=True,
++      )
++      invariant = lambda s: simulate.npt_nose_hoover_invariant(E, s, 0.4, 1.0)
++    state = init(
++      random.PRNGKey(4),
++      R,
++      box=np.eye(3, dtype=dtype) * box,
++      mass=np.arange(1, 5, dtype=dtype),
++    )
++    self.assertAllClose(state.position, R, atol=0, rtol=0)
++    initial_center = np.sum(state.mass * R, axis=0) / np.sum(state.mass)
++    initial = invariant(state)
++
++    def advance(state, _):
++      state = step(state)
++      center = np.sum(state.mass * state.position, axis=0) / np.sum(state.mass)
++      if not fractional:
++        center /= (quantity.volume(3, state.box) / box**3) ** (1 / 3)
++      return state, (invariant(state), center, np.sum(state.momentum, axis=0))
++
++    state, (invariants, centers, momenta) = jit(
++      lambda s: lax.scan(advance, s, None, length=1000)
++    )(state)
++    tol = 0.002 if dtype == f32 else 0.0001
++    self.assertAllClose(
++      invariants, np.full_like(invariants, initial), atol=tol, rtol=0
++    )
++    self.assertAllClose(
++      centers, np.broadcast_to(initial_center, centers.shape), atol=tol, rtol=0
++    )
++    self.assertAllClose(momenta, np.zeros_like(momenta), atol=tol, rtol=0)
++    self.assertTrue(np.all(np.isfinite(invariants)))
++
++  @parameterized.parameters('csvr', 'nhc')
++  def test_npt_ideal_gas(self, integrator):
++    """For N=4, standard NPT gives p(V) proportional to V**4 * exp(-V)."""
++    R = np.zeros((4, 3))
++    E = lambda R, **kw: np.sum(R * 0)
++    _, shift = space.periodic_general(
++      5 ** (1 / 3), fractional_coordinates=integrator == 'csvr', wrapped=False
++    )
++    if integrator == 'csvr':
++      init, step = simulate.npt_csvr(
++        E, shift, 0.004, 1.0, 1.0, 0.5, 0.1, fix_center_of_mass=True
++      )
++    else:
++      init, step = simulate.npt_nose_hoover(
++        E,
++        shift,
++        0.004,
++        1.0,
++        1.0,
++        barostat_kwargs={'tau': 0.5},
++        thermostat_kwargs={'tau': 0.1},
++        fix_center_of_mass=True,
++      )
++    states = jit(
++      vmap(lambda k: init(k, R, box=5 ** (1 / 3), mass=np.arange(1.0, 5.0)))
++    )(random.split(random.PRNGKey(5), 32))
++    step = vmap(step)
++    states = jit(lambda s: lax.fori_loop(0, 5000, lambda i, s: step(s), s))(
++      states
++    )
++
++    def sample(states, _):
++      states = lax.fori_loop(0, 20, lambda i, s: step(s), states)
++      volume = vmap(lambda s: quantity.volume(3, s.box))(states)
++      return states, (volume, vmap(simulate.kinetic_energy)(states))
++
++    _, (volumes, kinetic) = jit(
++      lambda s: lax.scan(sample, s, None, length=1500)
++    )(states)
++    # Independent trajectories, rather than correlated frames, set the errors.
++    for samples, expected_mean, expected_var in (
++      (volumes, 5.0, 5.0),
++      (kinetic, 4.5, 4.5),
++    ):
++      means = onp.mean(samples, axis=0)
++      variances = onp.var(samples, axis=0)
++      for estimates, expected in (
++        (means, expected_mean),
++        (variances, expected_var),
++      ):
++        error = onp.std(estimates, ddof=1) / onp.sqrt(len(estimates))
++        self.assertLess(abs(onp.mean(estimates) - expected), 6 * error + 0.02)
++    # Restore the eliminated COM's mean kinetic pressure, kT / V.
++    pressure_means = onp.mean((2 * kinetic / 3 + 1) / volumes, axis=0)
++    error = onp.std(pressure_means, ddof=1) / onp.sqrt(len(pressure_means))
++    self.assertLess(abs(onp.mean(pressure_means) - 1), 6 * error + 0.01)
++
++  def test_nonuniform_langevin_friction_is_rejected(self):
++    E = lambda R, **kw: np.sum(R * 0)
++    init, step = simulate.nvt_langevin(
++      E,
++      space.free()[1],
++      0.01,
++      1.0,
++      gamma=np.ones((4, 1)),
++      fix_center_of_mass=True,
++    )
++    state = init(random.PRNGKey(0), np.zeros((4, 3)))
++    with self.assertRaisesRegex(ValueError, 'scalar translational friction'):
++      step(state)
++
++  @parameterized.parameters('nve', 'nvt_nose_hoover', 'temp_csvr')
++  def test_multiple_arrays_share_one_constraint(self, integrator):
++    """Species represented by separate arrays must share one global COM."""
++    R = {'a': np.array([[1.0, 2.0]]), 'b': np.array([[3.0, 4.0], [5.0, 6.0]])}
++    mass = {'a': np.array([1.0]), 'b': np.array([2.0, 3.0])}
++    E = lambda R, **kw: np.sum(R['a'] * 0) + np.sum(R['b'] * 0)
++    kwargs = dict(dt=0.001, fix_center_of_mass=True)
++    if integrator != 'nve':
++      kwargs['kT'] = 1.0
++    if integrator == 'temp_csvr':
++      kwargs['tau'] = 0.1
++    init, step = getattr(simulate, integrator)(E, space.free()[1], **kwargs)
++    state = init(
++      random.PRNGKey(8),
++      R,
++      mass=mass,
++      **({'kT': 1.0} if integrator == 'nve' else {}),
++    )
++    state = jit(step)(state)
++    total_p = np.sum(state.momentum['a'], axis=0) + np.sum(
++      state.momentum['b'], axis=0
++    )
++    self.assertAllClose(total_p, np.zeros(2), atol=1e-6)
++    self.assertFalse(np.allclose(state.momentum['a'], 0))
++    self.assertEqual(quantity.count_dof(R, True), 4)
++    self.assertAllClose(
++      simulate.temperature(state), simulate.kinetic_energy(state) / 2
++    )
++
++  def test_single_particle_constraint_is_rejected(self):
++    init, _ = simulate.nve(
++      lambda R, **kw: np.sum(R * 0), space.free()[1], fix_center_of_mass=True
++    )
++    with self.assertRaisesRegex(ValueError, 'internal degree of freedom'):
++      init(random.PRNGKey(0), np.zeros((1, 3)), kT=1.0)
++
+ 
+ if __name__ == '__main__':
+   absltest.main()

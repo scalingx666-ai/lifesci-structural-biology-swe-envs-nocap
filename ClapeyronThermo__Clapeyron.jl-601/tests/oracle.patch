@@ -1,0 +1,148 @@
+diff --git a/lib/StaticForwardDiffTags/src/StaticForwardDiffTags.jl b/lib/StaticForwardDiffTags/src/StaticForwardDiffTags.jl
+index eb43c1724..97394db00 100644
+--- a/lib/StaticForwardDiffTags/src/StaticForwardDiffTags.jl
++++ b/lib/StaticForwardDiffTags/src/StaticForwardDiffTags.jl
+@@ -37,6 +37,7 @@ end
+ # Deliberately does NOT recurse closure type params F.
+ @inline contains_tag(::Type, target) = false
+ @inline contains_tag(::Type{<:Tag{F,V}}, target) where {F,V} = contains_tag(V, target)
++@inline contains_tag(::Type{STag{F,V}}, target) where {F,V} = contains_tag(V, target)
+ @inline contains_tag(::Type{<:Dual{T,V,N}}, target) where {T,V,N} =
+     (T === target) || contains_tag(T, target) || contains_tag(V, target)
+ 
+@@ -70,6 +71,9 @@ end
+ 
+ #Static checking of STags
+ @inline function ≺(::Type{STag{F1,V1}}, ::Type{STag{F2,V2}}) where {F1,V1,F2,V2}
++    #genuine nesting by tag identity: depths may coincide when a context valtype adds a Dual layer
++    contains_tag(V2, STag{F1,V1}) && return true
++    contains_tag(V1, STag{F2,V2}) && return false
+     T1 = Tag{F1,V1}
+     T2 = Tag{F2,V2}
+     d1 = tagdepth(T1)
+diff --git a/src/methods/differentials.jl b/src/methods/differentials.jl
+index a0888a12a..fc15345ed 100755
+--- a/src/methods/differentials.jl
++++ b/src/methods/differentials.jl
+@@ -289,3 +289,8 @@ function __gradients_for_root_finders(x::Union{AbstractArray{T},T},tups,tups_pri
+ end
+ 
+ IFTDuals.promote_my_type(m::EoSModel) = eltype(m)
++
++#STag-aware symmetry checks, mirroring IFTDuals' Tag/Tag semantics
++IFTDuals.is_symm(::Type{STag{F1,V1}},::Type{ForwardDiff.Tag{F2,V2}}) where {F1,V1,F2,V2} = false
++IFTDuals.is_symm(::Type{ForwardDiff.Tag{F1,V1}},::Type{STag{F2,V2}}) where {F1,V1,F2,V2} = false
++IFTDuals.is_symm(::Type{STag{F1,V1}},::Type{STag{F2,V2}}) where {F1,V1,F2,V2} = F1 === F2
+diff --git a/src/models/CompositeModel/GammaPhi.jl b/src/models/CompositeModel/GammaPhi.jl
+index 66a3a9d1a..446d0ed0a 100644
+--- a/src/models/CompositeModel/GammaPhi.jl
++++ b/src/models/CompositeModel/GammaPhi.jl
+@@ -79,7 +79,7 @@ function PTFlashWrapper(model::GammaPhi,p,T,z,equilibrium)
+     if is_idealmodel(fluidmodel) && !is_lle(equilibrium)
+         ActivitySaturationError(model.activity,tp_flash)
+     end
+-    TT = Base.promote_eltype(model,p,T,z)
++    TT = Solvers.primal_eltype(Base.promote_eltype(model,p,T,z))
+     wrapper = PTFlashWrapper{TT}(model,equilibrium,fluidmodel.pure)
+     if is_vle(equilibrium) || is_unknown(equilibrium)
+         update_temperature!(wrapper,T)
+@@ -164,10 +164,11 @@ function __lnγ_sat(wrapper::PTFlashWrapper,p,T,w,cache = nothing,vol0 = nothing
+     μmix .= μmix_temp
+     sat = wrapper.sat
+     fug = wrapper.fug
++    pures = wrapper.pures
+     RT = Rgas(model)*T
+     for i in 1:length(logγ)
+-        logϕᵢ = fug[i]
+-        pᵢ,vpureᵢ,_ = sat[i]
++        pᵢ,vpureᵢ,vvᵢ = saturation_pressure_ad2(sat[i],pures[i],T)
++        logϕᵢ = __eval_tpd_delta_g_sati(pures[i],T,fug[i],vvᵢ,pᵢ)
+         μᵢ_over_RT = logϕᵢ + log(pᵢ*vpureᵢ/RT)
+         logγ[i] = log(vpureᵢ/vol) + μmix[i]/RT - μᵢ_over_RT -  vpureᵢ*(p - pᵢ)/RT
+     end
+diff --git a/src/models/utility/PTFlashWrapper.jl b/src/models/utility/PTFlashWrapper.jl
+index 9fdc1569f..90963e717 100644
+--- a/src/models/utility/PTFlashWrapper.jl
++++ b/src/models/utility/PTFlashWrapper.jl
+@@ -25,12 +25,12 @@ function PTFlashWrapper{TT}(model,equilibrium,pures = split_pure_model(model)) w
+ end
+ 
+ function PTFlashWrapper(model,equilibrium,pures = split_pure_model(model))
+-    TT = Base.promote_eltype(model,Float64)
++    TT = Solvers.primal_eltype(Base.promote_eltype(model,Float64))
+     return PTFlashWrapper{TT}(model,equilibrium,pures)
+ end
+ 
+ function PTFlashWrapper(model,p,T,z,equilibrium)
+-    TT = Base.promote_eltype(model,p,T,z)
++    TT = Solvers.primal_eltype(Base.promote_eltype(model,p,T,z))
+     wrapper = PTFlashWrapper{TT}(model,equilibrium)
+     update_temperature!(wrapper,T)
+     return wrapper
+@@ -48,20 +48,20 @@ end
+ 
+ function update_temperature!(model::PTFlashWrapper,T)
+     isnan(T) && return nothing
++    λT = primalval(T)
+     pures = model.pures
+     lnϕ = model.fug
+     sats = model.sat
+-    TT = eltype(lnϕ)
+     for i in 1:length(model)
+-        pure = pures[i]
+-        sat = saturation_pressure(pure,T)
++        pure = primalval(pures[i])
++        sat = saturation_pressure(pure,λT)
+         ps,vl,vv = sat
+         sats[i] = sat
+         gasmodel_i = gas_model(pure)
+         if is_idealmodel(gasmodel_i)
+             lnϕ[i] = 0.0
+         else
+-            lnϕ[i] = VT_lnϕ_pure(gasmodel_i,vv,T,ps)
++            lnϕ[i] = VT_lnϕ_pure(gasmodel_i,vv,λT,ps)
+         end
+     end
+     return nothing
+diff --git a/src/models/utility/PTFlashWrapper/fugacity.jl b/src/models/utility/PTFlashWrapper/fugacity.jl
+index 1c9ef48e2..a2d8abe31 100644
+--- a/src/models/utility/PTFlashWrapper/fugacity.jl
++++ b/src/models/utility/PTFlashWrapper/fugacity.jl
+@@ -25,13 +25,14 @@ end
+ 
+ function tpd_delta_d_vapour!(d,wrapper,p,T)
+     lnϕsat,sat = wrapper.fug,wrapper.sat
++    pure = wrapper.pures
+     gasmodel = gas_model(wrapper)
+     is_ideal = is_idealmodel(gasmodel)
+     RT = Rgas(gasmodel)*T
+     for i in eachindex(d)
+-        ps,vl,vv = sat[i]
++        ps,vl,vv = saturation_pressure_ad2(sat[i],pure[i],T)
+         Δd = log(ps/p)
+-        is_ideal || (Δd += vl*(p - ps)/RT + lnϕsat[i])
++        is_ideal || (Δd += vl*(p - ps)/RT + __eval_tpd_delta_g_sati(pure[i],T,lnϕsat[i],vv,ps))
+         d[i] = d[i] - Δd
+     end
+     return d
+diff --git a/test/test_methods_api_flash.jl b/test/test_methods_api_flash.jl
+index cf617be3e..6bccc4ffe 100644
+--- a/test/test_methods_api_flash.jl
++++ b/test/test_methods_api_flash.jl
+@@ -812,6 +812,16 @@ end
+     @test Tb < T0 < Td
+ end
+ 
++@testset "PT_property implicit AD (activity models)" begin
++    fluid = NRTL(["butan-1-ol", "propan-2-ol", "water"]; puremodel=PR)
++    fh_p(p) = enthalpy(fluid, p, 300., [1.,1.,1.])
++    fh_T(T) = enthalpy(fluid, 1e5, T, [1.,1.,1.])
++    fh_x(x) = enthalpy(fluid, 1e5, 300., [x,1.,1.])
++    @test Clapeyron.Solvers.derivative(fh_p,1e5) ≈ 0.00014228987244983664 rtol = 1e-6
++    @test Clapeyron.Solvers.derivative(fh_T,300.) ≈ isobaric_heat_capacity(fluid, 1e5, 300., [1.,1.,1.]) rtol = 1e-10
++    @test Clapeyron.Solvers.derivative(fh_x,1.) ≈ -41038.85252193186 rtol = 1e-6
++end
++
+ @testset "bubble/dew point algorithms" begin
+     system1 = PCSAFT(["methanol","cyclohexane"])
+     p = 1e5

@@ -1,0 +1,340 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 538c12a2..74d60594 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,10 @@
+ # egui_dock changelog
+ 
++## 0.11.0 - TBD
++
++### Added
++- `filter_map_tabs`, `filter_tabs`, and `retain_tabs` ([#217](https://github.com/Adanos020/egui_dock/pull/217))
++
+ ## 0.10.0 - 2024-01-09
+ 
+ ### Added
+diff --git a/src/dock_state/mod.rs b/src/dock_state/mod.rs
+index e95024f8..404526d8 100644
+--- a/src/dock_state/mod.rs
++++ b/src/dock_state/mod.rs
+@@ -458,10 +458,20 @@ impl<Tab> DockState<Tab> {
+             .flat_map(|nodes| nodes.iter())
+     }
+ 
+-    /// Returns a new DockState while mapping the tab type
+-    pub fn map_tabs<F, NewTab>(&self, function: F) -> DockState<NewTab>
++    /// Returns a new [`DockState`] while mapping and filtering the tab type.
++    /// Any remaining empty [`Node`]s and [`Surface`]s are removed.
++    ///
++    /// ```
++    /// # use egui_dock::{DockState, Node};
++    /// let dock_state = DockState::new(vec![1, 2, 3]);
++    /// let mapped_dock_state = dock_state.filter_map_tabs(|tab| (tab % 2 == 1).then(|| tab.to_string()));
++    ///
++    /// let tabs: Vec<_> = mapped_dock_state.iter_all_tabs().map(|(_, tab)| tab.to_owned()).collect();
++    /// assert_eq!(tabs, vec!["1".to_string(), "3".to_string()]);
++    /// ```
++    pub fn filter_map_tabs<F, NewTab>(&self, function: F) -> DockState<NewTab>
+     where
+-        F: FnMut(&Tab) -> NewTab + Clone,
++        F: Clone + FnMut(&Tab) -> Option<NewTab>,
+     {
+         let DockState {
+             surfaces,
+@@ -470,7 +480,10 @@ impl<Tab> DockState<Tab> {
+         } = self;
+         let surfaces = surfaces
+             .iter()
+-            .map(|surface| surface.map_tabs(function.clone()))
++            .filter_map(|surface| {
++                let surface = surface.filter_map_tabs(function.clone());
++                (!surface.is_empty()).then_some(surface)
++            })
+             .collect();
+         DockState {
+             surfaces,
+@@ -478,6 +491,63 @@ impl<Tab> DockState<Tab> {
+             translations: translations.clone(),
+         }
+     }
++
++    /// Returns a new [`DockState`] while mapping the tab type.
++    ///
++    /// ```
++    /// # use egui_dock::{DockState, Node};
++    /// let dock_state = DockState::new(vec![1, 2, 3]);
++    /// let mapped_dock_state = dock_state.map_tabs(|tab| tab.to_string());
++    ///
++    /// let tabs: Vec<_> = mapped_dock_state.iter_all_tabs().map(|(_, tab)| tab.to_owned()).collect();
++    /// assert_eq!(tabs, vec!["1".to_string(), "2".to_string(), "3".to_string()]);
++    /// ```
++    pub fn map_tabs<F, NewTab>(&self, mut function: F) -> DockState<NewTab>
++    where
++        F: Clone + FnMut(&Tab) -> NewTab,
++    {
++        self.filter_map_tabs(move |tab| Some(function(tab)))
++    }
++
++    /// Returns a new [`DockState`] while filtering the tab type.
++    /// Any remaining empty [`Node`]s and [`Surface`]s are removed.
++    ///
++    /// ```
++    /// # use egui_dock::{DockState, Node};
++    /// let dock_state = DockState::new(["tab1", "tab2", "outlier"].map(str::to_string).to_vec());
++    /// let filtered_dock_state = dock_state.filter_tabs(|tab| tab.starts_with("tab"));
++    ///
++    /// let tabs: Vec<_> = filtered_dock_state.iter_all_tabs().map(|(_, tab)| tab.to_owned()).collect();
++    /// assert_eq!(tabs, vec!["tab1".to_string(), "tab2".to_string()]);
++    /// ```
++    pub fn filter_tabs<F>(&self, mut predicate: F) -> DockState<Tab>
++    where
++        F: Clone + FnMut(&Tab) -> bool,
++        Tab: Clone,
++    {
++        self.filter_map_tabs(move |tab| predicate(tab).then(|| tab.clone()))
++    }
++
++    /// Removes all tabs for which `predicate` returns `false`.
++    /// Any remaining empty [`Node`]s and [`Surface`]s are also removed.
++    ///
++    /// ```
++    /// # use egui_dock::{DockState, Node};
++    /// let mut dock_state = DockState::new(["tab1", "tab2", "outlier"].map(str::to_string).to_vec());
++    /// dock_state.retain_tabs(|tab| tab.starts_with("tab"));
++    ///
++    /// let tabs: Vec<_> = dock_state.iter_all_tabs().map(|(_, tab)| tab.to_owned()).collect();
++    /// assert_eq!(tabs, vec!["tab1".to_string(), "tab2".to_string()]);
++    /// ```
++    pub fn retain_tabs<F>(&mut self, predicate: F)
++    where
++        F: Clone + FnMut(&mut Tab) -> bool,
++    {
++        self.surfaces.retain_mut(|surface| {
++            surface.retain_tabs(predicate.clone());
++            !surface.is_empty()
++        });
++    }
+ }
+ 
+ impl<Tab> DockState<Tab>
+diff --git a/src/dock_state/surface.rs b/src/dock_state/surface.rs
+index 1fdf7e95..476a7a7f 100644
+--- a/src/dock_state/surface.rs
++++ b/src/dock_state/surface.rs
+@@ -76,16 +76,57 @@ impl<Tab> Surface<Tab> {
+             .flat_map(|(index, node)| node.iter_tabs_mut().map(move |tab| (NodeIndex(index), tab)))
+     }
+ 
+-    /// Returns a new Surface while mapping the tab type
+-    pub fn map_tabs<F, NewTab>(&self, function: F) -> Surface<NewTab>
++    /// Returns a new [`Surface`] while mapping and filtering the tab type.
++    /// Any remaining empty [`Node`]s and are removed, and if this [`Surface`] remains empty,
++    /// it'll change to [`Surface::Empty`].
++    pub fn filter_map_tabs<F, NewTab>(&self, function: F) -> Surface<NewTab>
+     where
+-        F: FnMut(&Tab) -> NewTab + Clone,
++        F: Clone + FnMut(&Tab) -> Option<NewTab>,
+     {
+         match self {
+             Surface::Empty => Surface::Empty,
+-            Surface::Main(tree) => Surface::Main(tree.map_tabs(function)),
++            Surface::Main(tree) => Surface::Main(tree.filter_map_tabs(function)),
+             Surface::Window(tree, window_state) => {
+-                Surface::Window(tree.map_tabs(function), window_state.clone())
++                let tree = tree.filter_map_tabs(function);
++                if tree.is_empty() {
++                    Surface::Empty
++                } else {
++                    Surface::Window(tree, window_state.clone())
++                }
++            }
++        }
++    }
++
++    /// Returns a new [`Surface`] while mapping the tab type.
++    pub fn map_tabs<F, NewTab>(&self, mut function: F) -> Surface<NewTab>
++    where
++        F: Clone + FnMut(&Tab) -> NewTab,
++    {
++        self.filter_map_tabs(move |tab| Some(function(tab)))
++    }
++
++    /// Returns a new [`Surface`] while filtering the tab type.
++    /// Any remaining empty [`Node`]s and are removed, and if this [`Surface`] remains empty,
++    /// it'll change to [`Surface::Empty`].
++    pub fn filter_tabs<F>(&self, mut predicate: F) -> Surface<Tab>
++    where
++        F: Clone + FnMut(&Tab) -> bool,
++        Tab: Clone,
++    {
++        self.filter_map_tabs(move |tab| predicate(tab).then(|| tab.clone()))
++    }
++
++    /// Removes all tabs for which `predicate` returns `false`.
++    /// Any remaining empty [`Node`]s and are also removed, and if this [`Surface`] remains empty,
++    /// it'll change to [`Surface::Empty`].
++    pub fn retain_tabs<F>(&mut self, predicate: F)
++    where
++        F: Clone + FnMut(&mut Tab) -> bool,
++    {
++        if let Surface::Main(tree) | Surface::Window(tree, _) = self {
++            tree.retain_tabs(predicate);
++            if tree.is_empty() {
++                *self = Surface::Empty;
+             }
+         }
+     }
+diff --git a/src/dock_state/tree/mod.rs b/src/dock_state/tree/mod.rs
+index 4c8d5988..2a52f25c 100644
+--- a/src/dock_state/tree/mod.rs
++++ b/src/dock_state/tree/mod.rs
+@@ -734,10 +734,11 @@ impl<Tab> Tree<Tab> {
+         tab
+     }
+ 
+-    /// Returns a new Tree while mapping the tab type
+-    pub fn map_tabs<F, NewTab>(&self, function: F) -> Tree<NewTab>
++    /// Returns a new [`Tree`] while mapping and filtering the tab type.
++    /// Any remaining empty [`Node`]s are removed.
++    pub fn filter_map_tabs<F, NewTab>(&self, function: F) -> Tree<NewTab>
+     where
+-        F: FnMut(&Tab) -> NewTab + Clone,
++        F: Clone + FnMut(&Tab) -> Option<NewTab>,
+     {
+         let Tree {
+             focused_node,
+@@ -745,13 +746,49 @@ impl<Tab> Tree<Tab> {
+         } = self;
+         let nodes = nodes
+             .iter()
+-            .map(|node| node.map_tabs(function.clone()))
++            .filter_map(|node| {
++                let node = node.filter_map_tabs(function.clone());
++                match node {
++                    Node::Leaf { ref tabs, .. } => (!tabs.is_empty()).then_some(node),
++                    _ => Some(node),
++                }
++            })
+             .collect();
+         Tree {
+             nodes,
+             focused_node: *focused_node,
+         }
+     }
++
++    /// Returns a new [`Tree`] while mapping the tab type.
++    pub fn map_tabs<F, NewTab>(&self, mut function: F) -> Tree<NewTab>
++    where
++        F: Clone + FnMut(&Tab) -> NewTab,
++    {
++        self.filter_map_tabs(move |tab| Some(function(tab)))
++    }
++
++    /// Returns a new [`Tree`] while filtering the tab type.
++    /// Any remaining empty [`Node`]s are removed.
++    pub fn filter_tabs<F>(&self, mut predicate: F) -> Tree<Tab>
++    where
++        F: Clone + FnMut(&Tab) -> bool,
++        Tab: Clone,
++    {
++        self.filter_map_tabs(move |tab| predicate(tab).then(|| tab.clone()))
++    }
++
++    /// Removes all tabs for which `predicate` returns `false`.
++    /// Any remaining empty [`Node`]s are also removed.
++    pub fn retain_tabs<F>(&mut self, predicate: F)
++    where
++        F: Clone + FnMut(&mut Tab) -> bool,
++    {
++        self.nodes.retain_mut(|node| {
++            node.retain_tabs(predicate.clone());
++            !node.is_empty()
++        });
++    }
+ }
+ 
+ impl<Tab> Tree<Tab>
+diff --git a/src/dock_state/tree/node.rs b/src/dock_state/tree/node.rs
+index cc1c4c7b..26958e89 100644
+--- a/src/dock_state/tree/node.rs
++++ b/src/dock_state/tree/node.rs
+@@ -289,10 +289,11 @@ impl<Tab> Node<Tab> {
+         }
+     }
+ 
+-    /// Returns a new Node while mapping the tab type
+-    pub fn map_tabs<F, NewTab>(&self, function: F) -> Node<NewTab>
++    /// Returns a new [`Node`] while mapping and filtering the tab type.
++    /// If this [`Node`] remains empty, it will change to [`Node::Empty`].
++    pub fn filter_map_tabs<F, NewTab>(&self, function: F) -> Node<NewTab>
+     where
+-        F: FnMut(&Tab) -> NewTab,
++        F: FnMut(&Tab) -> Option<NewTab>,
+     {
+         match self {
+             Node::Leaf {
+@@ -301,13 +302,20 @@ impl<Tab> Node<Tab> {
+                 tabs,
+                 active,
+                 scroll,
+-            } => Node::Leaf {
+-                rect: *rect,
+-                viewport: *viewport,
+-                tabs: tabs.iter().map(function).collect(),
+-                active: *active,
+-                scroll: *scroll,
+-            },
++            } => {
++                let tabs: Vec<_> = tabs.iter().filter_map(function).collect();
++                if tabs.is_empty() {
++                    Node::Empty
++                } else {
++                    Node::Leaf {
++                        rect: *rect,
++                        viewport: *viewport,
++                        tabs,
++                        active: *active,
++                        scroll: *scroll,
++                    }
++                }
++            }
+             Node::Empty => Node::Empty,
+             Node::Vertical { rect, fraction } => Node::Vertical {
+                 rect: *rect,
+@@ -319,4 +327,36 @@ impl<Tab> Node<Tab> {
+             },
+         }
+     }
++
++    /// Returns a new [`Node`] while mapping the tab type.
++    pub fn map_tabs<F, NewTab>(&self, mut function: F) -> Node<NewTab>
++    where
++        F: FnMut(&Tab) -> NewTab,
++    {
++        self.filter_map_tabs(move |tab| Some(function(tab)))
++    }
++
++    /// Returns a new [`Node`] while filtering the tab type.
++    /// If this [`Node`] remains empty, it will change to [`Node::Empty`].
++    pub fn filter_tabs<F>(&self, mut predicate: F) -> Node<Tab>
++    where
++        F: Clone + FnMut(&Tab) -> bool,
++        Tab: Clone,
++    {
++        self.filter_map_tabs(move |tab| predicate(tab).then(|| tab.clone()))
++    }
++
++    /// Removes all tabs for which `predicate` returns `false`.
++    /// If this [`Node`] remains empty, it will change to [`Node::Empty`].
++    pub fn retain_tabs<F>(&mut self, predicate: F)
++    where
++        F: Clone + FnMut(&mut Tab) -> bool,
++    {
++        if let Node::Leaf { tabs, .. } = self {
++            tabs.retain_mut(predicate);
++            if tabs.is_empty() {
++                *self = Node::Empty;
++            }
++        }
++    }
+ }

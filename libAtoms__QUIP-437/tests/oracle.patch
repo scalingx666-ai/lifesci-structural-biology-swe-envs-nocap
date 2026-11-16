@@ -1,0 +1,149 @@
+diff --git a/src/GAP b/src/GAP
+index 05ace0e35d..17468dca62 160000
+--- a/src/GAP
++++ b/src/GAP
+@@ -1 +1 @@
+-Subproject commit 05ace0e35d299d69a20eee54602afb4de08c672f
++Subproject commit 17468dca621ff08a01cceb95bf66650e877331ff
+diff --git a/src/libAtoms/Matrix.f95 b/src/libAtoms/Matrix.f95
+index 6d349b2edf..9d30ecd596 100644
+--- a/src/libAtoms/Matrix.f95
++++ b/src/libAtoms/Matrix.f95
+@@ -272,24 +272,27 @@ subroutine MatrixD_to_array1d(this, array)
+   end if
+ end subroutine MatrixD_to_array1d
+ 
+-subroutine MatrixD_QR_Solve(A_SP, B_SP)
++subroutine MatrixD_QR_Solve(A_SP, B_SP, cheat_nb_A)
+   type(MatrixD), intent(inout) :: A_SP, B_SP
++  logical, intent(in) :: cheat_nb_A
+ 
+   if (A_SP%ScaLAPACK_Info_obj%active .and. &
+       B_SP%ScaLAPACK_Info_obj%active) then
+-    call ScaLAPACK_Matrix_QR_Solve(A_SP%ScaLAPACK_Info_obj, A_SP%data, B_SP%ScaLAPACK_Info_obj, B_SP%data)
++    call ScaLAPACK_Matrix_QR_Solve(A_SP%ScaLAPACK_Info_obj, A_SP%data, &
++      B_SP%ScaLAPACK_Info_obj, B_SP%data, cheat_nb_A)
+   else
+     call system_abort("MatrixD_QR_Solve() without ScaLAPACK is not implemented.")
+   endif
+ end subroutine MatrixD_QR_Solve
+ 
+-subroutine SP_Matrix_QR_Solve(A, B, X, ScaLAPACK_obj, blocksize)
+-  real(dp), intent(in), dimension(:,:), target :: A
+-  real(dp), intent(in), dimension(:), target :: B
++subroutine SP_Matrix_QR_Solve(A, B, X, ScaLAPACK_obj, mb_A, nb_A)
++  real(dp), intent(inout), dimension(:,:), target :: A
++  real(dp), intent(inout), dimension(:), target :: B
+   real(dp), intent(out), dimension(:) :: X
+   type(ScaLAPACK), intent(in) :: ScaLAPACK_obj
+-  integer, intent(in) :: blocksize
++  integer, intent(in) :: mb_A, nb_A
+ 
++  logical :: cheat_nb_A
+   integer :: mb, nb, ml, nl, mg, ng
+   type(MatrixD) :: A_SP, B_SP
+ 
+@@ -298,22 +301,30 @@ subroutine SP_Matrix_QR_Solve(A, B, X, ScaLAPACK_obj, blocksize)
+   mg = ml * ScaLAPACK_obj%n_proc_rows
+   ng = nl * ScaLAPACK_obj%n_proc_cols
+ 
+-  mb = blocksize
+-  nb = blocksize
++  mb = mb_A
++  nb = nb_A
++
++  cheat_nb_A = .false.
++  if (mb /= nb) then
++    if (ScaLAPACK_obj%n_proc_cols > 1) &
++      call system_abort("SP_Matrix_QR_Solve: blocksizes differ: "//mb//" "//nb//char(16) &
++        // "Cannot cheat for more than one process column: "//ScaLAPACK_obj%n_proc_cols)
++    cheat_nb_A = .true.
++  end if
+ 
+   if (ScaLAPACK_obj%my_proc_row+1 < ScaLAPACK_obj%n_proc_rows .and. mod(ml, mb) /= 0) &
+     call system_abort("SP_Matrix_QR_Solve: nrows is not a multiple of blocksize: "//ml//" "//mb)
+   if (ScaLAPACK_obj%my_proc_col+1 < ScaLAPACK_obj%n_proc_cols .and. mod(nl, nb) /= 0) &
+     call system_abort("SP_Matrix_QR_Solve: ncols is not a multiple of blocksize: "//nl//" "//nb)
+ 
+-  ! Scalapack needs mb == nb for p?trtrs
+   call initialise(A_SP, mg, ng, mb, nb, scalapack_obj=ScaLAPACK_obj, use_allocate=.false.)
+-  call initialise(B_SP, mg, 1, nb, 1, scalapack_obj=ScaLAPACK_obj, use_allocate=.false.)
++  call initialise(B_SP, mg,  1, mb,  1, scalapack_obj=ScaLAPACK_obj, use_allocate=.false.)
+ 
+   A_SP%data => A
+   B_SP%data(lbound(B,1):ubound(B,1),1:1) => B(:)
+ 
+-  call MatrixD_QR_Solve(A_SP, B_SP)
++  ! Scalapack needs mb == nb for p?trtrs, cheating if only single process column
++  call MatrixD_QR_Solve(A_SP, B_SP, cheat_nb_A)
+   call MatrixD_to_array1d(B_SP, X)
+ 
+   call finalise(A_SP)
+diff --git a/src/libAtoms/ScaLAPACK.f95 b/src/libAtoms/ScaLAPACK.f95
+index 1245b4e490..3d18f670e2 100644
+--- a/src/libAtoms/ScaLAPACK.f95
++++ b/src/libAtoms/ScaLAPACK.f95
+@@ -1384,32 +1384,45 @@ subroutine ScaLAPACK_pdormqr_wrapper(A_info, A_data, C_info, C_data, tau, work)
+ #endif
+ end subroutine ScaLAPACK_pdormqr_wrapper
+ 
+-subroutine ScaLAPACK_pdtrtrs_wrapper(A_info, A_data, B_info, B_data)
+-  type(Matrix_ScaLAPACK_Info), intent(in) :: A_info, B_info
++subroutine ScaLAPACK_pdtrtrs_wrapper(A_info, A_data, B_info, B_data, cheat_nb_A)
++  type(Matrix_ScaLAPACK_Info), intent(inout) :: A_info, B_info
+   real(dp), intent(inout), dimension(:,:) :: A_data ! distributed triangular matrix
+   real(dp), intent(inout), dimension(:,:)  :: B_data !
++  logical, intent(in) :: cheat_nb_A
+ 
+-  integer :: n, nrhs, info
++  integer, parameter :: mb_ = 5, nb_ = 6
++  integer :: n, nrhs, info, nb
+ 
+ #ifdef SCALAPACK
+   n = min(A_info%N_R, A_info%N_C)
+   nrhs = B_info%N_C
+ 
++  if (cheat_nb_A) then
++    nb = A_info%desc(nb_)
++    A_info%desc(nb_) = A_info%desc(mb_)
++  end if
++
+   ! A(lda,n+), B(ldb,nrhs+)
+   call pdtrtrs('U', 'N', 'N', n, nrhs, A_data, 1, 1, A_info%desc, &
+       B_data, 1, 1, B_info%desc, info)
++
++  if (cheat_nb_A) then
++    A_info%desc(nb_) = nb
++  end if
++
+ #endif
+ end subroutine ScaLAPACK_pdtrtrs_wrapper
+ 
+-subroutine ScaLAPACK_matrix_QR_solve(A_info, A_data, B_info, B_data)
++subroutine ScaLAPACK_matrix_QR_solve(A_info, A_data, B_info, B_data, cheat_nb_A)
+   type(Matrix_ScaLAPACK_Info), intent(inout) :: A_info, B_info
+   real(dp), intent(inout), dimension(:,:) :: A_data, B_data
++  logical, intent(in) :: cheat_nb_A
+ 
+   real(dp), dimension(:), allocatable :: tau, work
+ 
+   call ScaLAPACK_pdgeqrf_wrapper(A_info, A_data, tau, work)
+   call ScaLAPACK_pdormqr_wrapper(A_info, A_data, B_info, B_data, tau, work)
+-  call ScaLAPACK_pdtrtrs_wrapper(A_info, A_data, B_info, B_data)
++  call ScaLAPACK_pdtrtrs_wrapper(A_info, A_data, B_info, B_data, cheat_nb_A)
+ end subroutine ScaLAPACK_matrix_QR_solve
+ 
+ subroutine ScaLAPACK_to_array1d(A_info, A_data, array)
+diff --git a/tests/test_gapfit.py b/tests/test_gapfit.py
+index 033e7a0d02..ea9a849f28 100644
+--- a/tests/test_gapfit.py
++++ b/tests/test_gapfit.py
+@@ -135,7 +135,7 @@ def test_gap_fit_silicon(self):
+     @unittest.skipIf(os.environ.get('HAVE_SCALAPACK') != '1', 'ScaLAPACK support not enabled')
+     def test_gap_fit_silicon_scalapack(self):
+         command_line = self.cl_template.safe_substitute(SPARSE_METHOD='sparse_method=FILE sparse_file=si_gap_fit_sparseX.inp')
+-        command_line += ' mpi_blocksize=101'  # not a divisor of n_sparse
++        command_line += ' mpi_blocksize_rows=101'  # not a divisor of nrows
+         self.run_gap_fit(command_line, prefix='mpirun -np 2')
+         with open(self.log_name) as f:
+             self.assertTrue("Using ScaLAPACK to solve QR" in f.read())

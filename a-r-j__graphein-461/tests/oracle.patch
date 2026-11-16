@@ -1,0 +1,147 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 07714dbc2..fd36c51c6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,8 @@
+ 
+ #### Bugfixes
+ 
++* Fix `add_peptide_bonds` / `add_sequence_distance_edges` and `peptide_bonds` overwriting the kinds of existing edges (they checked `G.has_edge` with loop positions instead of node IDs). [#461](https://github.com/a-r-j/graphein/pull/461)
++* Fix `compute_chain_graph` and `compute_secondary_structure_graph` with `return_weighted_graph=True` adding edge kinds to the input graph (edge kind sets were shared rather than copied). [#461](https://github.com/a-r-j/graphein/pull/461)
+ * Fix the sdist (and the wheel `uv build` builds from it) containing no Python code: the hatch sdist `include` list only listed the README, LICENSE and two CSVs. It now includes `graphein/`. Removes the unused `MANIFEST.in`, which hatchling ignores.
+ * Replace deprecated class-based `Config` with `model_config = ConfigDict(...)` in `GRNGraphConfig` and `PPIGraphConfig` to silence `PydanticDeprecatedSince20` warnings.
+ * Pin `setuptools<81` so `bioservices` can still import `pkg_resources`, which setuptools 81 removed. Newer `bioservices` releases drop `pkg_resources` but require `lxml<6`, which is affected by CVE-2026-41066.
+diff --git a/graphein/protein/edges/distance.py b/graphein/protein/edges/distance.py
+index 8b22c2159..5738d86f5 100644
+--- a/graphein/protein/edges/distance.py
++++ b/graphein/protein/edges/distance.py
+@@ -230,14 +230,7 @@ def add_sequence_distance_edges(
+                 # If this checks out, we add a peptide bond
+                 if (cond_1) and (cond_2):
+                     # Adds "peptide bond" between current residue and the next
+-                    if G.has_edge(i, i + d):
+-                        G.edges[i, i + d]["kind"].add(name)
+-                    else:
+-                        G.add_edge(
+-                            residue[0],
+-                            chain_residues[i + d][0],
+-                            kind={name},
+-                        )
++                    add_edge(G, residue[0], chain_residues[i + d][0], name)
+             except IndexError:
+                 continue
+     return G
+diff --git a/graphein/protein/edges/intramolecular.py b/graphein/protein/edges/intramolecular.py
+index c55547ca6..858f27fce 100644
+--- a/graphein/protein/edges/intramolecular.py
++++ b/graphein/protein/edges/intramolecular.py
+@@ -59,14 +59,11 @@ def peptide_bonds(G: nx.Graph) -> nx.Graph:
+             # If this checks out, we add a peptide bond
+             if cond_1 and cond_2:
+                 # Adds "peptide_bond" between current residue and the next
+-                if G.has_edge(i, i + 1):
+-                    G.edges[i, i + 1]["kind"].add("peptide_bond")
++                u, v = residue[0], chain_residues[i + 1][0]
++                if G.has_edge(u, v):
++                    G.edges[u, v]["kind"].add("peptide_bond")
+                 else:
+-                    G.add_edge(
+-                        residue[0],
+-                        chain_residues[i + 1][0],
+-                        kind={"peptide_bond"},
+-                    )
++                    G.add_edge(u, v, kind={"peptide_bond"})
+             else:
+                 continue
+     return G
+diff --git a/graphein/protein/graphs.py b/graphein/protein/graphs.py
+index 4c5817799..fd3cb93dc 100644
+--- a/graphein/protein/graphs.py
++++ b/graphein/protein/graphs.py
+@@ -1086,7 +1086,7 @@ def compute_chain_graph(
+     # Add edges
+     for u, v, d in g.edges(data=True):
+         h.add_edge(
+-            g.nodes[u]["chain_id"], g.nodes[v]["chain_id"], kind=d["kind"]
++            g.nodes[u]["chain_id"], g.nodes[v]["chain_id"], kind=set(d["kind"])
+         )
+     # Remove self-loops if necessary. Checks for equality between nodes in a
+     # given edge.
+@@ -1126,7 +1126,7 @@ def compute_weighted_graph_from_multigraph(g: nx.MultiGraph) -> nx.Graph:
+                 except KeyError:
+                     H[u][v][kind] = 1
+         else:
+-            H.add_edge(u, v, weight=len(d["kind"]), kind=d["kind"])
++            H.add_edge(u, v, weight=len(d["kind"]), kind=set(d["kind"]))
+             for kind in list(d["kind"]):
+                 H[u][v][kind] = 1
+     return H
+@@ -1225,7 +1225,7 @@ def compute_secondary_structure_graph(
+     for u, v, d in g.edges(data=True):
+         try:
+             h.add_edge(
+-                ss_list[u], ss_list[v], kind=d["kind"], source=f"{u}_{v}"
++                ss_list[u], ss_list[v], kind=set(d["kind"]), source=f"{u}_{v}"
+             )
+         except KeyError as e:
+             log.debug(f"Edge {u}-{v} not added to secondary structure graph. \
+diff --git a/tests/protein/edges/test_distance.py b/tests/protein/edges/test_distance.py
+index c3be2c6de..f89e063d4 100644
+--- a/tests/protein/edges/test_distance.py
++++ b/tests/protein/edges/test_distance.py
+@@ -20,6 +20,7 @@
+ from graphein.protein.edges.distance import (
+     INFINITE_DIST,
+     add_k_nn_edges,
++    add_peptide_bonds,
+     add_salt_bridges,
+     add_sequence_distance_edges,
+     add_vdw_clashes,
+@@ -29,6 +30,7 @@
+     get_ring_atoms,
+     get_ring_centroids,
+ )
++from graphein.protein.edges.intramolecular import peptide_bonds
+ from graphein.protein.graphs import construct_graph, read_pdb_to_dataframe
+ from graphein.protein.resi_atoms import (
+     AROMATIC_RESIS,
+@@ -454,3 +456,18 @@ def test_insertion_codes_in_add_k_nn_edges():
+     ]
+ 
+     assert set(g.edges()) == set(edges_expected)
++
++
++@pytest.mark.parametrize("peptide_fn", [add_peptide_bonds, peptide_bonds])
++def test_peptide_bonds_keep_existing_edge_kinds(peptide_fn):
++    """Adding peptide bonds must not overwrite kinds of existing edges."""
++    knn = partial(add_k_nn_edges, k=3)
++    kinds = []
++    for funcs in ([knn, peptide_fn], [peptide_fn, knn]):
++        config = ProteinGraphConfig(edge_construction_functions=funcs)
++        g = construct_graph(config=config, path=str(DATA_PATH))
++        kinds.append(
++            {frozenset((u, v)): d["kind"] for u, v, d in g.edges(data=True)}
++        )
++    assert kinds[0] == kinds[1]
++    assert any({"knn", "peptide_bond"} <= k for k in kinds[0].values())
+diff --git a/tests/protein/test_graphs.py b/tests/protein/test_graphs.py
+index f7e8e7d41..7a5670df8 100644
+--- a/tests/protein/test_graphs.py
++++ b/tests/protein/test_graphs.py
+@@ -622,3 +622,16 @@ def remove_hetatms(df: pd.DataFrame) -> pd.DataFrame:
+         if d["element_symbol"] in {"H", "D", "T"}:
+             has_H.append(n)
+     assert len(has_H) > 0, "No hydrogen isotopes are present"
++
++
++def test_weighted_chain_graph_does_not_modify_input():
++    config = ProteinGraphConfig(
++        edge_construction_functions=[
++            partial(add_k_nn_edges, k=5),
++            add_ionic_interactions,
++        ]
++    )
++    g = construct_graph(config=config, path=str(PDB_DATA_PATH))
++    before = {(u, v): set(d["kind"]) for u, v, d in g.edges(data=True)}
++    compute_chain_graph(g, return_weighted_graph=True)
++    assert {(u, v): d["kind"] for u, v, d in g.edges(data=True)} == before

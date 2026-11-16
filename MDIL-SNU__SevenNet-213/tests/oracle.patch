@@ -1,0 +1,353 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index db2749fc..b9666bbe 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,9 +16,12 @@ inference, train, etc
+ - pre-commit uses python3.11
+ - cuequivaraiance optional libraries
+ - some gitignores
++- assign cell volume 0 instead of eps for non-pbc system
++- remove redundant CELL and CELL_SHIFT
+ 
+ ### Fixed
+ - Circular import in sevenn.checkpoint (dev0)
++- Circular import in error_recorder
+ - Fix typing issues
+ - Added missing typings (especially return type)
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 4aa6c738..a7021822 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "sevenn"
+-version = "0.11.2.dev0"
++version = "0.11.2.dev1"
+ authors = [
+     { name = "Yutack Park", email = "parkyutack@snu.ac.kr" },
+     { name = "Haekwan Jeon", email = "haekwan98@snu.ac.kr" },
+diff --git a/sevenn/calculator.py b/sevenn/calculator.py
+index 2c219cb7..571334b9 100644
+--- a/sevenn/calculator.py
++++ b/sevenn/calculator.py
+@@ -196,19 +196,21 @@ def output_to_results(self, output: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+         }
+ 
+     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
++        is_ts_type = isinstance(self.model, torch_script_type)
++
+         # call parent class to set necessary atom attributes
+         Calculator.calculate(self, atoms, properties, system_changes)
+         if atoms is None:
+             raise ValueError('No atoms to evaluate')
+         data = AtomGraphData.from_numpy_dict(
+-            unlabeled_atoms_to_graph(atoms, self.cutoff)
++            unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=is_ts_type)
+         )
+         if self.modal:
+             data[KEY.DATA_MODALITY] = self.modal
+ 
+         data.to(self.device)  # type: ignore
+ 
+-        if isinstance(self.model, torch_script_type):
++        if is_ts_type:
+             data[KEY.NODE_FEATURE] = torch.tensor(
+                 [self.type_map[z.item()] for z in data[KEY.NODE_FEATURE]],
+                 dtype=torch.int64,
+diff --git a/sevenn/error_recorder.py b/sevenn/error_recorder.py
+index 20be6514..262ea06f 100644
+--- a/sevenn/error_recorder.py
++++ b/sevenn/error_recorder.py
+@@ -1,5 +1,14 @@
+ from copy import deepcopy
+-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Callable,
++    Dict,
++    List,
++    Optional,
++    Tuple,
++    Union,
++)
+ 
+ import torch
+ import torch.distributed as dist
+@@ -7,9 +16,11 @@
+ import sevenn._keys as KEY
+ from sevenn.train.loss import LossDefinition
+ 
+-from .atom_graph_data import AtomGraphData
+ from .train.optim import loss_dict
+ 
++if TYPE_CHECKING:
++    from .atom_graph_data import AtomGraphData
++
+ _ERROR_TYPES = {
+     'TotalEnergy': {
+         'name': 'Energy',
+@@ -116,10 +127,12 @@ def __init__(
+         self.ignore_unlabeled = ignore_unlabeled
+         self.value = AverageNumber()
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         raise NotImplementedError
+ 
+-    def _retrieve(self, output: AtomGraphData) -> Tuple[torch.Tensor, torch.Tensor]:
++    def _retrieve(
++        self, output: 'AtomGraphData'
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
+         y_ref = output[self.ref_key] * self.coeff
+         y_pred = output[self.pred_key] * self.coeff
+         if self.per_atom:
+@@ -167,7 +180,7 @@ def _square_error(
+     ) -> torch.Tensor:
+         return self._se(y_ref.view(-1, vdim), y_pred.view(-1, vdim)).sum(dim=1)
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         y_ref, y_pred = self._retrieve(output)
+         se = self._square_error(y_ref, y_pred, self.vdim)
+         self.value.update(se)
+@@ -191,7 +204,7 @@ def _square_error(
+     ) -> torch.Tensor:
+         return self._se(y_ref, y_pred)
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         y_ref, y_pred = self._retrieve(output)
+         y_ref = y_ref.view(-1)
+         y_pred = y_pred.view(-1)
+@@ -215,7 +228,7 @@ def _square_error(
+     ) -> torch.Tensor:
+         return torch.abs(y_ref - y_pred)
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         y_ref, y_pred = self._retrieve(output)
+         y_ref = y_ref.reshape((-1,))
+         y_pred = y_pred.reshape((-1,))
+@@ -235,7 +248,7 @@ def __init__(self, func: Callable, **kwargs) -> None:
+         super().__init__(**kwargs)
+         self.func = func
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         y_ref, y_pred = self._retrieve(output)
+         se = self.func(y_ref, y_pred) if len(y_ref) > 0 else torch.tensor([])
+         self.value.update(se)
+@@ -259,7 +272,7 @@ def __init__(
+         )
+         self.loss_def = loss_def
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         loss = self.loss_def.get_loss(output)  # type: ignore
+         self.value.update(loss)  # type: ignore
+ 
+@@ -275,7 +288,7 @@ def __init__(self, metrics: List[Tuple[ErrorMetric, float]], **kwargs) -> None:
+         self.metrics = metrics
+         assert kwargs['unit'] is None
+ 
+-    def update(self, output: AtomGraphData) -> None:
++    def update(self, output: 'AtomGraphData') -> None:
+         for metric, _ in self.metrics:
+             metric.update(output)
+ 
+@@ -310,11 +323,11 @@ def __init__(self, metrics: List[ErrorMetric]) -> None:
+         self.history = []
+         self.metrics = metrics
+ 
+-    def _update(self, output: AtomGraphData) -> None:
++    def _update(self, output: 'AtomGraphData') -> None:
+         for metric in self.metrics:
+             metric.update(output)
+ 
+-    def update(self, output: AtomGraphData, no_grad=True) -> None:
++    def update(self, output: 'AtomGraphData', no_grad=True) -> None:
+         if no_grad:
+             with torch.no_grad():
+                 self._update(output)
+diff --git a/sevenn/scripts/inference.py b/sevenn/scripts/inference.py
+index 93c998f4..a7e99f77 100644
+--- a/sevenn/scripts/inference.py
++++ b/sevenn/scripts/inference.py
+@@ -79,12 +79,8 @@ def per_atom_dct_list(dct, keys):
+         sfx_list = ['xx', 'yy', 'zz', 'xy', 'yz', 'zx']  # for stress
+         writer = None
+         for output in output_list:
+-            cell_dct = {KEY.CELL: output[KEY.CELL]}
+-            cell_dct = unfold_dct_val(cell_dct, [KEY.CELL], ['a', 'b', 'c'])
+-            data = {
+-                **unfold_dct_val(output, per_graph_keys, sfx_list),
+-                **cell_dct,
+-            }
++            data = unfold_dct_val(output, per_graph_keys, sfx_list)
++
+             if writer is None:
+                 writer = csv.DictWriter(f, fieldnames=data.keys())
+                 writer.writeheader()
+diff --git a/sevenn/train/dataload.py b/sevenn/train/dataload.py
+index 48cdc8b3..f2720f5e 100644
+--- a/sevenn/train/dataload.py
++++ b/sevenn/train/dataload.py
+@@ -99,33 +99,32 @@ def _correct_scalar(v):
+         assert False, f'{type(v)} is not expected'
+ 
+ 
+-def unlabeled_atoms_to_graph(atoms: ase.Atoms, cutoff: float):
++def unlabeled_atoms_to_graph(
++    atoms: ase.Atoms, cutoff: float, with_shift: bool = False
++):
+     pos = atoms.get_positions()
+     cell = np.array(atoms.get_cell())
+     pbc = atoms.get_pbc()
+ 
+-    edge_src, edge_dst, edge_vec, shifts = _graph_build_f(cutoff, pbc, cell, pos)
++    edge_src, edge_dst, edge_vec, shift = _graph_build_f(cutoff, pbc, cell, pos)
+ 
+     edge_idx = np.array([edge_src, edge_dst])
+ 
+     atomic_numbers = atoms.get_atomic_numbers()
+ 
+-    cell = np.array(cell)
+-    vol = _correct_scalar(atoms.cell.volume)
+-    if vol == 0:
+-        vol = np.array(np.finfo(float).eps)
+-
+     data = {
+-        KEY.NODE_FEATURE: atomic_numbers,
++        KEY.NODE_FEATURE: atomic_numbers,  # just placeholder
+         KEY.ATOMIC_NUMBERS: atomic_numbers,
+         KEY.POS: pos,
+         KEY.EDGE_IDX: edge_idx,
+         KEY.EDGE_VEC: edge_vec,
+-        KEY.CELL: cell,
+-        KEY.CELL_SHIFT: shifts,
+-        KEY.CELL_VOLUME: vol,
++        KEY.CELL_VOLUME: _correct_scalar(atoms.cell.volume),
+         KEY.NUM_ATOMS: _correct_scalar(len(atomic_numbers)),
+     }
++
++    if with_shift:
++        data[KEY.CELL_SHIFT] = shift
++        data[KEY.CELL] = cell
+     data[KEY.INFO] = {}
+     return data
+ 
+@@ -136,6 +135,7 @@ def atoms_to_graph(
+     transfer_info: bool = True,
+     y_from_calc: bool = False,
+     allow_unlabeled: bool = False,
++    with_shift: bool = False,
+ ):
+     """
+     From ase atoms, return AtomGraphData as graph based on cutoff radius
+@@ -187,18 +187,13 @@ def atoms_to_graph(
+     cell = np.array(atoms.get_cell())
+     pbc = atoms.get_pbc()
+ 
+-    edge_src, edge_dst, edge_vec, shifts = _graph_build_f(cutoff, pbc, cell, pos)
++    edge_src, edge_dst, edge_vec, shift = _graph_build_f(cutoff, pbc, cell, pos)
+ 
+     edge_idx = np.array([edge_src, edge_dst])
+     atomic_numbers = atoms.get_atomic_numbers()
+ 
+-    cell = np.array(cell)
+-    vol = _correct_scalar(atoms.cell.volume)
+-    if vol == 0:
+-        vol = np.array(np.finfo(float).eps)
+-
+     data = {
+-        KEY.NODE_FEATURE: atomic_numbers,
++        KEY.NODE_FEATURE: atomic_numbers,  # just placeholder
+         KEY.ATOMIC_NUMBERS: atomic_numbers,
+         KEY.POS: pos,
+         KEY.EDGE_IDX: edge_idx,
+@@ -206,13 +201,15 @@ def atoms_to_graph(
+         KEY.ENERGY: _correct_scalar(y_energy),
+         KEY.FORCE: y_force,
+         KEY.STRESS: y_stress.reshape(1, 6),  # to make batch have (n_node, 6)
+-        KEY.CELL: cell,
+-        KEY.CELL_SHIFT: shifts,
+-        KEY.CELL_VOLUME: vol,
++        KEY.CELL_VOLUME: _correct_scalar(atoms.cell.volume),
+         KEY.NUM_ATOMS: _correct_scalar(len(atomic_numbers)),
+         KEY.PER_ATOM_ENERGY: _correct_scalar(y_energy / len(pos)),
+     }
+ 
++    if with_shift:
++        data[KEY.CELL_SHIFT] = shift
++        data[KEY.CELL] = cell
++
+     if transfer_info and atoms.info is not None:
+         info = copy.deepcopy(atoms.info)
+         # save only metadata
+diff --git a/tests/unit_tests/test_data.py b/tests/unit_tests/test_data.py
+index fda1effd..90b2b007 100644
+--- a/tests/unit_tests/test_data.py
++++ b/tests/unit_tests/test_data.py
+@@ -114,7 +114,7 @@ def test_atoms_to_graph(atoms_type, init_y_as):
+     assert graph['per_atom_energy'] == (graph['total_energy'] / len(atoms))
+     assert graph['num_atoms'] == len(atoms)
+     if not is_stress:
+-        assert graph['cell_volume'] == np.finfo(float).eps
++        assert graph['cell_volume'] == 0.0
+ 
+ 
+ @pytest.mark.parametrize('atoms_type', ['bulk', 'mol', 'isolated'])
+@@ -142,7 +142,7 @@ def test_unlabeled_atoms_to_graph(atoms_type):
+ 
+     assert graph['num_atoms'] == len(atoms)
+     if not atoms.pbc.all():
+-        assert graph['cell_volume'] == np.finfo(float).eps
++        assert graph['cell_volume'] == 0.0
+ 
+ 
+ @pytest.mark.parametrize('init_y_as', ['calc', 'info'])
+@@ -470,8 +470,6 @@ def test_graph_build_ase_and_matscipy(atoms_type):
+     atomic_numbers = atoms.get_atomic_numbers()
+     cell = np.array(cell)
+     vol = dl._correct_scalar(atoms.cell.volume)
+-    if vol == 0:
+-        vol = np.array(np.finfo(float).eps)
+ 
+     data_ase = {
+         KEY.NODE_FEATURE: atomic_numbers,
+@@ -479,8 +477,6 @@ def test_graph_build_ase_and_matscipy(atoms_type):
+         KEY.POS: pos,
+         KEY.EDGE_IDX: edge_idx_ase,
+         KEY.EDGE_VEC: edge_vec_ase,
+-        KEY.CELL: cell,
+-        KEY.CELL_SHIFT: shifts_ase,
+         KEY.CELL_VOLUME: vol,
+         KEY.NUM_ATOMS: dl._correct_scalar(len(atomic_numbers)),
+     }
+@@ -496,8 +492,6 @@ def test_graph_build_ase_and_matscipy(atoms_type):
+     atomic_numbers = atoms.get_atomic_numbers()
+     cell = np.array(cell)
+     vol = dl._correct_scalar(atoms.cell.volume)
+-    if vol == 0:
+-        vol = np.array(np.finfo(float).eps)
+ 
+     data_matsci = {
+         KEY.NODE_FEATURE: atomic_numbers,
+@@ -505,8 +499,6 @@ def test_graph_build_ase_and_matscipy(atoms_type):
+         KEY.POS: pos,
+         KEY.EDGE_IDX: edge_idx_matsci,
+         KEY.EDGE_VEC: edge_vec_matsci,
+-        KEY.CELL: cell,
+-        KEY.CELL_SHIFT: shifts_matsci,
+         KEY.CELL_VOLUME: vol,
+         KEY.NUM_ATOMS: dl._correct_scalar(len(atomic_numbers)),
+     }
+@@ -518,4 +510,5 @@ def test_graph_build_ase_and_matscipy(atoms_type):
+     matsci_pred_stress = output_matsci[KEY.PRED_STRESS]
+     assert torch.equal(ase_pred_energy, matsci_pred_energy)
+     assert torch.allclose(ase_pred_force, matsci_pred_force, atol=1e-06)
+-    assert torch.allclose(ase_pred_stress, matsci_pred_stress)
++    if vol != 0:  # pbc system
++        assert torch.allclose(ase_pred_stress, matsci_pred_stress)

@@ -1,0 +1,616 @@
+diff --git a/.github/actions/setup-uv-env/action.yml b/.github/actions/setup-uv-env/action.yml
+index 0a643ce..4a2dd46 100644
+--- a/.github/actions/setup-uv-env/action.yml
++++ b/.github/actions/setup-uv-env/action.yml
+@@ -27,14 +27,7 @@ runs:
+           uses: astral-sh/setup-uv@v8.1.0
+           with:
+               enable-cache: true
+-
+-        - name: Cache Warp kernels
+-          uses: actions/cache@v5
+-          with:
+-              path: ~/.cache/warp
+-              key: warp-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+-              restore-keys: |
+-                  warp-${{ runner.os }}-
++              cache-dependency-glob: "uv.lock"
+ 
+         - name: Install dependencies
+           env:
+@@ -43,8 +36,8 @@ runs:
+           run: |
+               set -e
+ 
+-              # Build uv sync command
+-              CMD="uv sync"
++              # Build uv sync command; --locked fails if uv.lock is out of date
++              CMD="uv sync --locked"
+ 
+               # Add groups
+               if [ -n "$INPUT_GROUPS" ]; then
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+index 9771c14..10114b9 100644
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -14,6 +14,16 @@ updates:
+       labels:
+           - "dependencies"
+           - "python"
++      # Held back on purpose; see the lock policy in the maintainer notes.
++      ignore:
++          - dependency-name: "wandb"
++            versions: [">=0.31"]
++          - dependency-name: "pandas"
++            versions: [">=3"]
++          - dependency-name: "optuna"
++            versions: [">=5"]
++          - dependency-name: "ruff"
++            versions: [">=0.17"]
+       groups:
+           python-patch:
+               applies-to: version-updates
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 3d006e9..f425036 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -6,15 +6,99 @@ on:
+             - main
+     pull_request:
+         types: [opened, synchronize, reopened, ready_for_review]
+-
++    workflow_dispatch:
++
++# A newer push to a PR cancels its running CI. On main, a run in progress
++# finishes and only queued intermediate runs are replaced by the newest one.
++concurrency:
++    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
++    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
++
++# CI tiers. A PR runs the bracketing versions (Python 3.11 and 3.14, torch 2.10
++# and 2.15). Pushes to main, manual dispatches, and PRs labeled `ci:full` run
++# the full matrix. Docs-only PRs skip the test jobs, and draft PRs skip them
++# until marked ready. `ci-ok` is the only required status check, so jobs can be
++# skipped or renamed without touching branch protection.
+ jobs:
++    changes:
++        if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
++        runs-on: ubuntu-latest
++        timeout-minutes: 5
++        permissions:
++            contents: read
++            pull-requests: read
++        outputs:
++            code: ${{ steps.filter.outputs.code }}
++            full: ${{ steps.filter.outputs.full }}
++        steps:
++            - id: filter
++              env:
++                  GH_TOKEN: ${{ github.token }}
++                  EVENT: ${{ github.event_name }}
++                  PR: ${{ github.event.pull_request.number }}
++                  LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
++              run: |
++                  set -euo pipefail
++                  code=true
++                  full=false
++                  if [ "$EVENT" != "pull_request" ] || [[ ",$LABELS," == *",ci:full,"* ]]; then
++                    full=true
++                  fi
++                  if [ "$EVENT" = "pull_request" ]; then
++                    files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename')
++                    # Skip the test jobs only when every changed file is documentation.
++                    if ! grep -qvE '^(docs/|README\.md$|CHANGELOG\.md$|CONTRIBUTING\.md$|LICENSE$|mkdocs\.yml$)' <<<"$files"; then
++                      code=false
++                    fi
++                  fi
++                  echo "code=$code full=$full"
++                  echo "code=$code" >> "$GITHUB_OUTPUT"
++                  echo "full=$full" >> "$GITHUB_OUTPUT"
++
++    quality:
++        runs-on: ubuntu-latest
++        timeout-minutes: 8
++        steps:
++            - name: Check out
++              uses: actions/checkout@v7
++
++            - uses: actions/cache@v6
++              with:
++                  path: ~/.cache/pre-commit
++                  key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
++
++            - name: Set up the environment
++              uses: ./.github/actions/setup-uv-env
++              with:
++                  groups: dev
++
++            - name: Run checks
++              run: make check
++
++    check-docs:
++        runs-on: ubuntu-latest
++        timeout-minutes: 8
++        steps:
++            - name: Check out
++              uses: actions/checkout@v7
++
++            - name: Set up the environment
++              uses: ./.github/actions/setup-uv-env
++              with:
++                  groups: docs
++
++            - name: Check if documentation can be built
++              run: uv run mkdocs build -s
++
+     tests-wheel:
++        needs: changes
++        if: needs.changes.outputs.code == 'true'
+         runs-on: ubuntu-latest
+-        timeout-minutes: 20
++        timeout-minutes: 8
+         steps:
+             - uses: actions/checkout@v7
+               with:
+-                  fetch-depth: 0
++                  fetch-depth: 0 # hatch-vcs needs tags for the version
+             - uses: actions/setup-python@v6.2.0
+               with:
+                   python-version: "3.11"
+@@ -38,32 +122,14 @@ jobs:
+                   "$GITHUB_WORKSPACE/.wheel-smoke/bin/python" -I \
+                       "$GITHUB_WORKSPACE/scripts/wheel_smoke.py"
+ 
+-    quality:
+-        runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        steps:
+-            - name: Check out
+-              uses: actions/checkout@v7
+-
+-            - uses: actions/cache@v6
+-              with:
+-                  path: ~/.cache/pre-commit
+-                  key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+-
+-            - name: Set up the environment
+-              uses: ./.github/actions/setup-uv-env
+-              with:
+-                  groups: dev
+-
+-            - name: Run checks
+-              run: make check
+-
+     tests-core:
++        needs: changes
++        if: needs.changes.outputs.code == 'true'
+         runs-on: ubuntu-latest
+-        timeout-minutes: 20
++        timeout-minutes: 12
+         strategy:
+             matrix:
+-                python-version: ["3.11", "3.13", "3.14"]
++                python-version: ${{ fromJSON(needs.changes.outputs.full == 'true' && '["3.11", "3.13", "3.14"]' || '["3.11", "3.14"]') }}
+             fail-fast: false
+         defaults:
+             run:
+@@ -71,8 +137,6 @@ jobs:
+         steps:
+             - name: Check out
+               uses: actions/checkout@v7
+-              with:
+-                  fetch-depth: 0
+ 
+             - name: Set up the environment
+               uses: ./.github/actions/setup-uv-env
+@@ -81,16 +145,18 @@ jobs:
+                   groups: dev
+ 
+             - name: Cache model weights
++              id: weights
+               uses: actions/cache@v6
+               with:
+                   path: ~/.cache/aimnet
+                   key: aimnet-weights-${{ hashFiles('aimnet/calculators/model_registry.yaml') }}
+ 
+-            - name: Pre-fetch model weights
++            - name: Pre-fetch model weights (cache miss only)
++              if: steps.weights.outputs.cache-hit != 'true'
+               run: uv run aimnet download --all
+ 
+             - name: Run tests
+-              run: uv run pytest tests -m "not gpu and not network and not ase and not pysis and not train and not hf and not torch_sim and not slow" --cov --cov-config=pyproject.toml --cov-report=xml
++              run: uv run pytest tests -m "not gpu and not network and not ase and not pysis and not train and not hf and not torch_sim and not slow"
+ 
+     # Probes torch-core API + CPU-numerics drift across the supported range.
+     # NOT a dependency-graph test: torch is reinstalled on top of the locked
+@@ -103,13 +169,16 @@ jobs:
+     # coherently via reinstall-on-top (it can break with a `triton_key` ImportError).
+     # The compile path's cross-version validation belongs in a
+     # resolver-coherent env, not this eager API/numerics probe.
++    #
++    # The locked torch (2.14) is left out: tests-core already runs it.
+     tests-torch:
++        needs: changes
++        if: needs.changes.outputs.code == 'true'
+         runs-on: ubuntu-latest
+-        timeout-minutes: 20
++        timeout-minutes: 12
+         strategy:
+             matrix:
+-                torch-version:
+-                    ["2.10.*", "2.11.*", "2.12.*", "2.13.*", "2.14.*", "2.15.*"]
++                torch-version: ${{ fromJSON(needs.changes.outputs.full == 'true' && '["2.10.*", "2.11.*", "2.12.*", "2.13.*", "2.15.*"]' || '["2.10.*", "2.15.*"]') }}
+             fail-fast: false
+         defaults:
+             run:
+@@ -117,8 +186,6 @@ jobs:
+         steps:
+             - name: Check out
+               uses: actions/checkout@v7
+-              with:
+-                  fetch-depth: 0
+ 
+             - name: Set up the environment
+               uses: ./.github/actions/setup-uv-env
+@@ -138,6 +205,7 @@ jobs:
+                   uv run --no-sync python -c "import torch; print('torch', torch.__version__)"
+ 
+             - name: Cache model weights
++              id: weights
+               uses: actions/cache@v6
+               with:
+                   path: ~/.cache/aimnet
+@@ -148,72 +216,26 @@ jobs:
+                   UV_NO_SYNC: "1"
+                   # Eager only: see job comment — inductor/triton can't be tested via reinstall-on-top.
+                   TORCHDYNAMO_DISABLE: "1"
++                  WEIGHTS_CACHED: ${{ steps.weights.outputs.cache-hit }}
+               run: |
+-                  uv run --no-sync aimnet download --all
++                  if [ "$WEIGHTS_CACHED" != "true" ]; then uv run --no-sync aimnet download --all; fi
+                   uv run --no-sync pytest tests \
+                       -m "not gpu and not network and not ase and not pysis and not train and not hf and not torch_sim and not slow"
+ 
+-    tests-ase:
+-        runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        strategy:
+-            matrix:
+-                python-version: ["3.11"]
+-            fail-fast: false
+-        defaults:
+-            run:
+-                shell: bash
+-        steps:
+-            - name: Check out
+-              uses: actions/checkout@v7
+-
+-            - name: Set up the environment
+-              uses: ./.github/actions/setup-uv-env
+-              with:
+-                  python-version: ${{ matrix.python-version }}
+-                  groups: dev
+-                  extras: ase
+-
+-            - name: Run ASE tests
+-              run: uv run pytest tests -m "ase and not sella and not slow" --cov --cov-config=pyproject.toml --cov-report=xml
+-
+-    tests-train:
+-        runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        strategy:
+-            matrix:
+-                python-version: ["3.11"]
+-            fail-fast: false
+-        defaults:
+-            run:
+-                shell: bash
+-        steps:
+-            - name: Check out
+-              uses: actions/checkout@v7
+-
+-            - name: Set up the environment
+-              uses: ./.github/actions/setup-uv-env
+-              with:
+-                  python-version: ${{ matrix.python-version }}
+-                  groups: dev
+-                  extras: train
+-
+-            - name: Run train-marked tests (allow empty)
+-              run: |
+-                  set -e
+-                  uv run pytest tests -m train --cov --cov-config=pyproject.toml --cov-report=xml || rc=$?
+-                  if [ "${rc:-0}" -eq 5 ]; then
+-                    echo "No train-marked tests collected; treating as success."
+-                    exit 0
+-                  fi
+-                  exit "${rc:-0}"
+-
+-    tests-pysis:
++    # One environment with every extra. The marker expression is the union of
++    # the former per-extra jobs, minus the GPU-marked ASE tests (tests-pbc-cpu).
++    # The bare markers deliberately include slow-, gpu- and network-marked tests
++    # of each extra (TorchSim energy/stress smoke, HF loading); GPU-only tests
++    # skip themselves without CUDA. TorchSim needs Python 3.12+, so its tests
++    # skip on 3.11.
++    tests-extras:
++        needs: changes
++        if: needs.changes.outputs.code == 'true'
+         runs-on: ubuntu-latest
+-        timeout-minutes: 20
++        timeout-minutes: 15
+         strategy:
+             matrix:
+-                python-version: ["3.11", "3.14"]
++                python-version: ${{ fromJSON(needs.changes.outputs.full == 'true' && '["3.11", "3.12", "3.14"]' || '["3.11", "3.14"]') }}
+             fail-fast: false
+         defaults:
+             run:
+@@ -227,87 +249,25 @@ jobs:
+               with:
+                   python-version: ${{ matrix.python-version }}
+                   groups: dev
+-                  extras: pysis
+-
+-            - name: Run pysis-marked tests (allow empty)
+-              run: |
+-                  set -e
+-                  uv run pytest tests -m pysis --cov --cov-config=pyproject.toml --cov-report=xml || rc=$?
+-                  if [ "${rc:-0}" -eq 5 ]; then
+-                    echo "No pysis-marked tests collected; treating as success."
+-                    exit 0
+-                  fi
+-                  exit "${rc:-0}"
+-
+-    tests-sella:
+-        runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        strategy:
+-            matrix:
+-                python-version: ["3.11", "3.14"]
+-            fail-fast: false
+-        defaults:
+-            run:
+-                shell: bash
+-        steps:
+-            - name: Check out
+-              uses: actions/checkout@v7
++                  extras: ase,train,pysis,sella,hf,torchsim
+ 
+-            - name: Set up the environment
+-              uses: ./.github/actions/setup-uv-env
++            - name: Restore model weights
++              uses: actions/cache/restore@v6
+               with:
+-                  python-version: ${{ matrix.python-version }}
+-                  groups: dev
+-                  extras: sella
+-
+-            - name: Run sella-marked tests (allow empty)
+-              run: |
+-                  set -e
+-                  uv run pytest tests -m sella --cov --cov-config=pyproject.toml --cov-report=xml || rc=$?
+-                  if [ "${rc:-0}" -eq 5 ]; then
+-                    echo "No sella-marked tests collected; treating as success."
+-                    exit 0
+-                  fi
+-                  exit "${rc:-0}"
+-
+-    tests-hf:
+-        runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        strategy:
+-            matrix:
+-                python-version: ["3.11"]
+-            fail-fast: false
+-        defaults:
+-            run:
+-                shell: bash
+-        steps:
+-            - name: Check out
+-              uses: actions/checkout@v7
+-
+-            - name: Set up the environment
+-              uses: ./.github/actions/setup-uv-env
+-              with:
+-                  python-version: ${{ matrix.python-version }}
+-                  groups: dev
+-                  extras: hf
++                  path: ~/.cache/aimnet
++                  key: aimnet-weights-${{ hashFiles('aimnet/calculators/model_registry.yaml') }}
+ 
+-            - name: Run hf-marked tests (allow empty)
+-              run: |
+-                  set -e
+-                  uv run pytest tests -m hf --cov --cov-config=pyproject.toml --cov-report=xml || rc=$?
+-                  if [ "${rc:-0}" -eq 5 ]; then
+-                    echo "No hf-marked tests collected; treating as success."
+-                    exit 0
+-                  fi
+-                  exit "${rc:-0}"
++            - name: Run extras tests
++              run: uv run pytest tests -m "(ase and not gpu and not slow) or train or pysis or sella or hf or torch_sim"
+ 
+-    tests-torchsim:
++    # GPU-marked periodic tests (PBC, Ewald, PME, DSF) run on CPU. This is CI's
++    # only run of tests/test_pbc.py; it is the slowest test set, so it gets its
++    # own job in parallel with the others.
++    tests-pbc-cpu:
++        needs: changes
++        if: needs.changes.outputs.code == 'true'
+         runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        strategy:
+-            matrix:
+-                python-version: ["3.12", "3.13", "3.14"]
+-            fail-fast: false
++        timeout-minutes: 15
+         defaults:
+             run:
+                 shell: bash
+@@ -318,53 +278,53 @@ jobs:
+             - name: Set up the environment
+               uses: ./.github/actions/setup-uv-env
+               with:
+-                  python-version: ${{ matrix.python-version }}
++                  python-version: "3.11"
+                   groups: dev
+-                  extras: torchsim,ase
+-
+-            - name: Run torch_sim-marked tests (allow empty)
+-              run: |
+-                  set -e
+-                  uv run pytest tests -m torch_sim --cov --cov-config=pyproject.toml --cov-report=xml || rc=$?
+-                  if [ "${rc:-0}" -eq 5 ]; then
+-                    echo "No torch_sim-marked tests collected; treating as success."
+-                    exit 0
+-                  fi
+-                  exit "${rc:-0}"
+-
+-    check-docs:
+-        runs-on: ubuntu-latest
+-        timeout-minutes: 20
+-        steps:
+-            - name: Check out
+-              uses: actions/checkout@v7
++                  extras: ase
+ 
+-            - name: Set up the environment
+-              uses: ./.github/actions/setup-uv-env
++            - name: Restore model weights
++              uses: actions/cache/restore@v6
+               with:
+-                  groups: docs
++                  path: ~/.cache/aimnet
++                  key: aimnet-weights-${{ hashFiles('aimnet/calculators/model_registry.yaml') }}
+ 
+-            - name: Check if documentation can be built
+-              run: uv run mkdocs build -s
++            - name: Run GPU-marked ASE tests on CPU
++              env:
++                  CUDA_VISIBLE_DEVICES: ""
++              run: uv run pytest tests -m "ase and gpu and not sella and not slow"
+ 
+-    deploy-docs:
+-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+-        timeout-minutes: 20
++    # The single required status check. Fails if any needed job failed or was
++    # cancelled; skipped jobs (docs-only or draft PRs) count as passing.
++    ci-ok:
++        if: always()
+         needs:
+             [
++                changes,
+                 quality,
++                check-docs,
+                 tests-wheel,
+                 tests-core,
+                 tests-torch,
+-                tests-ase,
+-                tests-train,
+-                tests-pysis,
+-                tests-sella,
+-                tests-hf,
+-                tests-torchsim,
+-                check-docs,
++                tests-extras,
++                tests-pbc-cpu,
+             ]
+         runs-on: ubuntu-latest
++        timeout-minutes: 5
++        steps:
++            - name: All required jobs passed or were skipped
++              env:
++                  RESULTS: ${{ join(needs.*.result, ' ') }}
++              run: |
++                  echo "needs results: $RESULTS"
++                  case " $RESULTS " in
++                    *" failure "*|*" cancelled "*) exit 1 ;;
++                  esac
++
++    deploy-docs:
++        needs: ci-ok
++        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-ok.result == 'success'
++        runs-on: ubuntu-latest
++        timeout-minutes: 10
+         steps:
+             - name: Check out
+               uses: actions/checkout@v7
+diff --git a/.github/workflows/on-release-main.yml b/.github/workflows/on-release-main.yml
+index aadaf67..14cb7d6 100644
+--- a/.github/workflows/on-release-main.yml
++++ b/.github/workflows/on-release-main.yml
+@@ -16,6 +16,7 @@ env:
+ jobs:
+     publish:
+         runs-on: ubuntu-latest
++        timeout-minutes: 15
+         permissions:
+             contents: read
+         steps:
+@@ -53,6 +54,7 @@ jobs:
+     deploy-docs:
+         needs: publish
+         runs-on: ubuntu-latest
++        timeout-minutes: 10
+         steps:
+             - name: Check out
+               uses: actions/checkout@v7
+diff --git a/.github/workflows/registry-fleet.yml b/.github/workflows/registry-fleet.yml
+index b050300..067af46 100644
+--- a/.github/workflows/registry-fleet.yml
++++ b/.github/workflows/registry-fleet.yml
+@@ -15,7 +15,7 @@ concurrency:
+ jobs:
+     registry-fleet:
+         runs-on: ubuntu-latest
+-        timeout-minutes: 30
++        timeout-minutes: 15
+         steps:
+             - uses: actions/checkout@v7
+ 
+diff --git a/.github/workflows/security.yml b/.github/workflows/security.yml
+index bfe5247..0766df2 100644
+--- a/.github/workflows/security.yml
++++ b/.github/workflows/security.yml
+@@ -3,10 +3,17 @@ name: Security
+ on:
+     push:
+         branches: [main]
++        paths: ["**/*.py", ".github/workflows/security.yml"]
+     pull_request:
++        paths: ["**/*.py", ".github/workflows/security.yml"]
+     schedule:
+         - cron: "0 6 * * 2" # Tuesdays 06:00 UTC
+ 
++# CodeQL is not a required check, so path filtering cannot block a merge.
++concurrency:
++    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
++    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
++
+ permissions:
+     contents: read
+ 
+@@ -14,7 +21,7 @@ jobs:
+     codeql:
+         name: CodeQL
+         runs-on: ubuntu-latest
+-        timeout-minutes: 20
++        timeout-minutes: 10
+         permissions:
+             actions: read
+             contents: read
+diff --git a/.github/workflows/torch-latest.yml b/.github/workflows/torch-latest.yml
+index 6786367..b0a0bf9 100644
+--- a/.github/workflows/torch-latest.yml
++++ b/.github/workflows/torch-latest.yml
+@@ -13,7 +13,7 @@ jobs:
+     # signal, not a PR gate.
+     tests-torch-latest:
+         runs-on: ubuntu-latest
+-        timeout-minutes: 30
++        timeout-minutes: 15
+         defaults:
+             run:
+                 shell: bash

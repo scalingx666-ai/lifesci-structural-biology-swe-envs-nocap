@@ -1,0 +1,780 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f25783636..495ce805a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,11 +1,12 @@
+ # Changelog
+ 
++- 2026-10-11: Fixed the martinise library (libaa2cg) to make it deterministic - Issue #1657
+ - 2026-10-03: Corrected mislabelled A2G glycan and fixed some parameters - Issue #1709
+ - 2026-10-02: Corrected ssdihed: range for automatic alpha/beta dihedrals and the definition in yaml - Issue #1668 
+ - 2026-09-23: Fixed various issues in notebooks - Issue #1697
+ - 2026-09-21: Corrected seperate.cns - Issue #1392
+-- 2026-09-17: Implemented worflow validation again general parameters - Issue #1693
+ - 2026-09-18: Added `dnascan` module for mutagenesis scanning of DNA base pairs - Issue #1634
++- 2026-09-17: Implemented worflow validation again general parameters - Issue #1693
+ - 2026-09-09: Adding missing execution modes to default.yaml - Issue #1690
+ - 2026-08-01: Fixed autotoppar/PRODRG topology generation when the unknown ligand is embedded in a larger system - Issue #1645
+ - 2026-09-02: Fixed identical seed per sampling_factor replica in flexref, mdref and emref - Issue #1685
+diff --git a/examples/refine-complex/refine-complex-CG-test.cfg b/examples/refine-complex/refine-complex-CG-test.cfg
+new file mode 100644
+index 000000000..93a0f26ee
+--- /dev/null
++++ b/examples/refine-complex/refine-complex-CG-test.cfg
+@@ -0,0 +1,38 @@
++# ====================================================================
++# Refinment of a complex example
++
++# directory in which the scoring will be done
++run_dir = "run1-CG-refinement"
++
++# execution mode
++mode = "local"
++ncores = 10
++
++# molecules to be refined (given as a single complex PDBs)
++molecules =  [
++    "data/e2a-hpr_1GGR_A.pdb",
++    "data/e2a-hpr_1GGR_B.pdb"
++    ]
++
++# ====================================================================
++# Parameters for each stage are defined below, prefer full paths
++# ====================================================================
++[topoaa]
++
++[topocg]
++
++# required to create the complex for cgtoaa
++[emref]
++nemsteps = 0
++
++[cgtoaa]
++# generate five model for each input model
++sampling_factor = 5
++
++[emref]
++
++[caprieval]
++reference_fname = "data/e2a-hpr_1GGR.pdb"
++
++# ====================================================================
++
+diff --git a/src/haddock/libs/libaa2cg.py b/src/haddock/libs/libaa2cg.py
+index 70893666d..b4ca81b93 100644
+--- a/src/haddock/libs/libaa2cg.py
++++ b/src/haddock/libs/libaa2cg.py
+@@ -56,6 +56,11 @@
+ 
+ CRYST_LINE = "CRYST1 " + os.linesep
+ 
++# Fallback seed for the ``SCD*`` dummy beads, used by callers that have no
++# ``iniseed`` parameter of their own. Kept equal to the ``topocg`` default; the
++# test suite asserts that.
++DEFAULT_SEED = 917
++
+ 
+ def norm(a):
+     """
+@@ -373,47 +378,44 @@ def ss_classification(ss, program="dssp"):
+ charged = ["ARG", "LYS", "ASP", "GLU"]
+ 
+ 
+-def add_dummy(bead_list, dist=0.11, n=2):
+-    """
++def add_dummy(bead_list, rng, dist, n):
++    """Place the ``SCD*`` dummy beads around the last bead of a residue.
++
++    The beads are laid out along a randomly oriented axis through the parent
++    bead: the first at ``+dist``, the second (if any) at ``-dist``, so that a
++    pair straddles the parent symmetrically. Only the *orientation* is random.
+ 
+     Args:
+-        bead_list:
+-        dist:
+-        n:
++        bead_list: ``(name, coordinates)`` pairs of the residue's real beads.
++            The dummy beads are attached to the last one.
++        rng: ``random.Random`` instance used to orient the dummy beads.
++        dist: Distance from the parent bead, in angstrom (see ``map_cg``).
++        n: Number of dummy beads, 1 or 2.
+ 
+     Returns:
+-
++        Mapping of bead name (``SCD1``, ``SCD2``) to its coordinates.
+     """
+-    new_bead_dic = {}
+-
+-    # Generate a random vector in a sphere of -1 to +1, to add to the bead position
+-    v = [
+-        random.random() * 2.0 - 1,
+-        random.random() * 2.0 - 1,
+-        random.random() * 2.0 - 1,
+-    ]
+-
+-    # Calculated the length of the vector and divide by the final distance of the dummy bead
+-    norm_v = norm(v) / dist
+-
+-    # Resize the vector
+-    vn = [i / norm_v for i in v]
+-
+-    # m sets the direction of the added vector, currently only works when adding one or two beads.
+-    m = 1
+-    for j in range(n):  # create two new beads
+-        bead_s = str(j + 1)
+-        new_name = f"SCD{bead_s}"  # set the name of the new bead
+-        new_bead_dic[new_name] = [i + (m * j) for i, j in zip(bead_list[-1][1], vn)]
+-        m *= -2
+-    return new_bead_dic
++    # Random direction, uniform on the unit sphere. Normalising a vector drawn
++    # from a cube would bias the direction towards the cube's corners; a
++    # Gaussian vector is isotropic, so normalising it is unbiased.
++    v = [rng.gauss(0.0, 1.0) for _ in range(3)]
++    scale = dist / norm(v)
++    vn = [i * scale for i in v]
++
++    parent_coord = bead_list[-1][1]
++    # The signs straddle the parent bead, and cap the layout at two beads.
++    return {
++        f"SCD{idx}": [coord + sign * offset for coord, offset in zip(parent_coord, vn)]
++        for idx, sign in enumerate((1, -1)[:n], start=1)
++    }
+ 
+ 
+-def map_cg(chain):
++def map_cg(chain, rng):
+     """
+ 
+     Args:
+         chain:
++        rng: ``random.Random`` instance used to orient the dummy beads.
+ 
+     Returns:
+ 
+@@ -500,13 +502,17 @@ def map_cg(chain):
+             m_dic[aares][bead_name] = bead_coord, code, restrain
+ 
+     # add dummy beads whenever its needed
++    # Distances are in angstrom, matching the SCd bond lengths of
++    # cns/toppar/protein-CG-Martini-2-2.param: a pair placed at +/-1.4 A is
++    # 2.8 A apart (BOND SCd SCd), and a lone bead sits at the 1.1 A
++    # parent-SCd bond length.
+     for r in m_dic:
+         if r.resname in polar:
+-            d = 0.14  # distance
++            d = 1.4  # distance
+             n = 2  # number of dummy beads to be placed
+ 
+         elif r.resname in charged:
+-            d = 0.11  # distance
++            d = 1.1  # distance
+             n = 1  # number of dummy beads to be placed
+ 
+         else:
+@@ -515,7 +521,7 @@ def map_cg(chain):
+         # add to data structure
+         # this special beads have no HADDOCK code
+         bead_list = [(b, m_dic[r][b][0]) for b in m_dic[r]]
+-        dummy_bead_dic = add_dummy(bead_list, dist=d, n=n)
++        dummy_bead_dic = add_dummy(bead_list, rng, dist=d, n=n)
+         for db in dummy_bead_dic:
+             db_coords = dummy_bead_dic[db]
+             # code should be the same as the residue
+@@ -733,66 +739,6 @@ def identify_pairing(ra, rb):
+     return pair
+ 
+ 
+-def output_cg_restraints(pair_list):
+-    """
+-
+-    Args:
+-        pair_list:
+-
+-    Returns:
+-
+-    """
+-    out = open("dna_restraints.def", "w")
+-    for i, e in enumerate(pair_list):
+-        idx = i + 1
+-        res_a = e[0][0]
+-        segid_a = e[0][1]
+-        res_b = e[1][0]
+-        segid_b = e[1][1]
+-        out.write(
+-            f"{{===>}} base_a_{idx}=(resid {res_a} and segid {segid_a});\n"
+-            f"{{===>}} base_b_{idx}=(resid {res_b} and segid {segid_b});\n\n"
+-        )
+-    out.close()
+-
+-
+-def extract_groups(pair_list):
+-    """
+-
+-    Args:
+-        pair_list:
+-
+-    Returns:
+-
+-    """
+-    # this will be used to define AA restraints
+-    out = open("dna-aa_groups.dat", "w")
+-    # extract groups
+-    group_a = [a[0][0] for a in pair_list]
+-    segid_a = list(set([a[0][1] for a in pair_list]))
+-
+-    group_b = [a[1][0] for a in pair_list]
+-    segid_b = list(set([a[0][1] for a in pair_list]))
+-
+-    if len(segid_a) != 1:
+-        emsg = "Something is wrong with SEGID A"
+-        raise ModuleError(emsg)
+-
+-    if len(segid_b) != 1:
+-        emsg = "Something is wrong with SEGID B"
+-        raise ModuleError(emsg)
+-
+-    segid_a = segid_a[0]
+-    segid_b = segid_b[0]
+-
+-    group_a.sort()
+-    group_b.sort()
+-    out.write(
+-        f"{group_a[0]}:{group_a[-1]}\n{segid_a}\n{group_b[0]}:{group_b[-1]}\n{segid_b}"
+-    )
+-    out.close()
+-
+-
+ def create_file_with_cryst(pdb_file: str) -> None:
+     """
+     This function creates a new pdb because the CRYST line is missing from the pdf file.
+@@ -930,6 +876,7 @@ def martinize(
+     input_pdb: str,
+     output_path: str,
+     skipss: bool,
++    seed: int = DEFAULT_SEED,
+ ) -> tuple[str, bool]:
+     """
+     Converts an all-atom (AA) PDB structure into a coarse-grained (CG) model
+@@ -947,6 +894,8 @@ def martinize(
+             If True, skips secondary structure assignment (DSSP step).
+             If False, assigns secondary structure and encodes it
+             into HADDOCK-compatible B-factors.
++        seed (int):
++            Pseudo-random seed used to orient the ``SCD*`` dummy beads.
+ 
+     Returns:
+         tuple[str, bool]:
+@@ -959,6 +908,11 @@ def martinize(
+         emsg = "No input file detected"
+         raise ModuleError(emsg)
+ 
++    # Dedicated generator, built fresh per call: never touch the global
++    # `random` state, which would make the result depend on whatever else ran
++    # first in this interpreter.
++    rng = random.Random(seed)
++
+     p = PDBParser()
+     io = PDBIO()
+ 
+@@ -984,10 +938,12 @@ def martinize(
+     # WARNING, THIS ASSUMES THAT INPUT DNA/RNA IS 3-LETTER CODE
+     rename_nucbases(aa_model)
+ 
+-    # Assign HADDOCK code for hydrogen bonding capable nucleotides (0-1)
+-    pair_list = determine_hbonds(aa_model)
+-    if pair_list:
+-        output_cg_restraints(pair_list)
++    # Assign HADDOCK code for hydrogen bonding capable nucleotides (0-1).
++    # The returned pair list is not used here: base-pair restraints for CG
++    # models are derived in CNS by `dna-rna_restraints.cns`. What matters is
++    # the side effect, marking the paired bases with bfactor 1 so that
++    # `patch-types-cg-hbond-dna-rna.cns` can patch their bead types.
++    determine_hbonds(aa_model)
+ 
+     # Map CG beads to AA structure
+     structure_builder = StructureBuilder()
+@@ -1003,7 +959,7 @@ def martinize(
+             structure_builder.init_chain(chain.id)
+             structure_builder.init_seg(chain.id)
+ 
+-            mapping_dic = map_cg(chain)
++            mapping_dic = map_cg(chain, rng)
+ 
+             for residue in mapping_dic:
+                 if residue.id[0] != " ":  # filter HETATMS
+diff --git a/src/haddock/modules/refinement/cgtoaa/__init__.py b/src/haddock/modules/refinement/cgtoaa/__init__.py
+index e978df841..abd964eb1 100644
+--- a/src/haddock/modules/refinement/cgtoaa/__init__.py
++++ b/src/haddock/modules/refinement/cgtoaa/__init__.py
+@@ -27,7 +27,7 @@
+ 
+ 
+ class HaddockModule(BaseCNSModule):
+-    """HADDOCK3 module energy minimization refinement."""
++    """HADDOCK3 module for CG to AA conversion."""
+ 
+     name = RECIPE_PATH.name
+ 
+@@ -45,11 +45,15 @@ def confirm_installation(cls) -> None:
+ 
+     def _run(self) -> None:
+         """Execute module."""
++        # Pool of jobs to be executed by the CNS engine
++        jobs: list[CNSJob] = []
++
+         # Get the models generated in previous step
+         try:
+             models_to_refine = self.previous_io.retrieve_models(individualize=True)
+         except Exception as e:
+             self.finish_with_error(e)
++
+         self.output_models = []
+         sampling_factor = self.params["sampling_factor"]
+         if sampling_factor == 0:
+@@ -67,8 +71,6 @@ def _run(self) -> None:
+                 " decrease the sampling_factor."
+             )
+ 
+-        # Pool of jobs to be executed by the CNS engine
+-        jobs: list[CNSJob] = []
+         idx = 1
+         for model in models_to_refine:
+             if isinstance(model, PDBFile):
+diff --git a/src/haddock/modules/refinement/cgtoaa/cns/cgtoaa.cns b/src/haddock/modules/refinement/cgtoaa/cns/cgtoaa.cns
+index 8af12c87c..7e9c9b044 100644
+--- a/src/haddock/modules/refinement/cgtoaa/cns/cgtoaa.cns
++++ b/src/haddock/modules/refinement/cgtoaa/cns/cgtoaa.cns
+@@ -25,7 +25,6 @@ evaluate ($ini_count    =1)
+ 
+ evaluate ($data.ncomponents=$ncomponents)
+ 
+-
+ ! non-bonded parameter set to use
+ evaluate ($toppar.par_nonbonded = "OPLSX" )
+ 
+@@ -90,6 +89,8 @@ else
+     set message=off echo=off end
+ end if
+ 
++! initialize random number generator
++set seed $seed end
+ 
+ {* Change segid of CG model and read AA pdb, psf files =========== *}
+ 
+diff --git a/src/haddock/modules/topology/topocg/__init__.py b/src/haddock/modules/topology/topocg/__init__.py
+index 38dd6e704..bd2489dd6 100644
+--- a/src/haddock/modules/topology/topocg/__init__.py
++++ b/src/haddock/modules/topology/topocg/__init__.py
+@@ -56,8 +56,13 @@ def generate_topology(
+     write_to_disk: Optional[bool] = True,
+     force_field: str = "martini2",
+     shape: bool = False,
++    seed: int = 916,
+ ) -> Union[Path, str]:
+-    """Generate a HADDOCK topology file from input_pdb."""
++    """Generate a HADDOCK topology file from input_pdb.
++
++    ``seed`` is the ``iniseed`` parameter; it seeds the placement of the CG
++    dummy beads so that the coarse-graining is reproducible across runs.
++    """
+     # generate params headers
+     general_param = load_workflow_params(**defaults)
+     input_mols_params = load_workflow_params(param_header="", **mol_params)
+@@ -70,7 +75,7 @@ def generate_topology(
+ 
+     if not shape:
+         # AA to CG
+-        cg_pdb_name = martinize(input_pdb, output_path, False)
++        cg_pdb_name = martinize(input_pdb, output_path, False, seed=seed)
+         output = prepare_output(
+             output_pdb_filename=f"{Path(cg_pdb_name).stem}_{force_field}{input_pdb.suffix}",
+             output_psf_filename=f"{Path(cg_pdb_name).stem}_{force_field}.{Format.TOPOLOGY}",
+@@ -262,6 +267,7 @@ def _run(self) -> None:
+                     write_to_disk=self.params["debug"],
+                     force_field=force_field,
+                     shape=shape_dic[i],
++                    seed=self.params["iniseed"],
+                 )
+                 self.log("Topology CNS input created")
+ 
+diff --git a/tests/test_cns_seeding.py b/tests/test_cns_seeding.py
+new file mode 100644
+index 000000000..859970bca
+--- /dev/null
++++ b/tests/test_cns_seeding.py
+@@ -0,0 +1,65 @@
++"""CNS recipes that sample must consume the seed handed to them by Python.
++
++``prepare_cns_input`` writes an ``evaluate ($seed=...)`` line into every ``.inp``
++it builds, and modules vary it per model (``iniseed + s_ind``) so that repeated
++sampling explores different trajectories. A recipe that draws random velocities
++but never runs ``set seed`` silently ignores that value: CNS falls back to its
++own default seed and every replica retraces the same trajectory, so
++``sampling_factor > 1`` costs CPU without producing new conformations.
++
++The check is per module rather than per file, because a module's stochastic step
++and its ``set seed`` usually live in different files: ``flexref`` anneals in
++``sa_ltad_*.cns`` but seeds in ``flexref.cns``, and ``rigidbody`` draws its
++rotations in ``get_random_rotation.cns``. ``cgtoaa``, which inlined its MD, is
++the exception rather than the rule.
++"""
++
++import re
++
++import pytest
++
++from haddock.modules import modules_category, modules_folder
++
++
++# Velocity assignment, molecular dynamics and CNS's own random() are the
++# operations that consume CNS's random number generator.
++STOCHASTIC = re.compile(
++    r"\bmaxwell\b|^\s*dynamics\b|\brandom\s*\(", re.IGNORECASE | re.MULTILINE
++)
++SET_SEED = re.compile(r"^\s*set\s+seed\b", re.IGNORECASE | re.MULTILINE)
++
++# Every module that ships CNS recipes, taken from the registry the workflow
++# engine itself validates against rather than from a filesystem glob.
++CNS_MODULES = sorted(
++    name
++    for name, category in modules_category.items()
++    if (modules_folder / category / name / "cns").is_dir()
++)
++
++
++def _recipes(module_name):
++    """All CNS files shipped by a module, entry point and includes alike."""
++    category = modules_category[module_name]
++    return sorted((modules_folder / category / module_name / "cns").glob("*.cns"))
++
++
++def test_cns_modules_are_discovered():
++    """Guard the discovery, so the checks below cannot pass on an empty set."""
++    assert {"cgtoaa", "flexref", "rigidbody", "mdref", "mdscoring"} <= set(CNS_MODULES)
++    assert all(_recipes(name) for name in CNS_MODULES)
++
++
++@pytest.mark.parametrize("module_name", CNS_MODULES)
++def test_sampling_modules_apply_the_seed(module_name):
++    """A module that draws random numbers must initialise the generator."""
++    recipes = _recipes(module_name)
++    sampling = [f for f in recipes if STOCHASTIC.search(f.read_text())]
++    if not sampling:
++        pytest.skip(f"{module_name} has no stochastic step")
++
++    assert any(SET_SEED.search(f.read_text()) for f in recipes), (
++        f"{module_name} samples in "
++        f"{', '.join(f.name for f in sampling)} but no recipe runs 'set seed', "
++        "so the seed prepared by Python is ignored and every replica produces "
++        "the same model"
++    )
+diff --git a/tests/test_module_topocg.py b/tests/test_module_topocg.py
+index c28901a0b..4176e6136 100644
+--- a/tests/test_module_topocg.py
++++ b/tests/test_module_topocg.py
+@@ -1,7 +1,9 @@
+ """Specific tests for topocg."""
+ 
++import random
+ import shutil
+ import tempfile
++import math
+ from math import isnan
+ from pathlib import Path
+ import warnings
+@@ -12,6 +14,7 @@
+ import haddock.modules.topology.topocg as topocg_mod
+ from haddock.gear.yaml2cfg import read_from_yaml_config
+ from haddock.libs import libpdb
++from haddock.libs.libaa2cg import DEFAULT_SEED, add_dummy, martinize
+ from haddock.libs.libontology import Format, PDBFile
+ from haddock.modules.topology.topocg import DEFAULT_CONFIG as topocg_params
+ from haddock.modules.topology.topocg import HaddockModule as Topocg
+@@ -32,6 +35,16 @@ def test_variable_defaults_are_nan_in_mol1(param):
+     assert isnan(DEFAULT_DICT["mol1"][param])
+ 
+ 
++def test_default_seed_matches_the_topocg_default():
++    """``libaa2cg`` hardcodes the fallback seed; keep it equal to the schema.
++
++    Callers without an ``iniseed`` of their own (``caprieval``, ``caprifilter``)
++    fall back to it, and should coarse-grain a reference the same way ``topocg``
++    coarse-grains the models.
++    """
++    assert DEFAULT_SEED == DEFAULT_DICT["iniseed"]
++
++
+ def test_there_is_only_one_mol():
+     """Test there is only one mol parameter in topocg."""
+     r = set(p for p in DEFAULT_DICT if p.startswith("mol") and p[3].isdigit())
+@@ -71,6 +84,7 @@ def test_generate_topology(topocg, protein):
+             mol_params=topocg.params.pop("mol1"),
+             default_params_path=None,
+             force_field=force_field,
++            seed=topocg.params["iniseed"],
+         )
+ 
+     assert observed_inp_out == Path(protein.name).with_suffix(f".{Format.CNS_INPUT}")
+@@ -95,6 +109,62 @@ def test_generate_topology(topocg, protein):
+     assert "BB" in contents, "CG markers not found in output PDB."
+ 
+ 
++class _FakeEngine:
++    """Stand-in for the CNS engine: accepts the jobs, runs nothing."""
++
++    def __init__(self, jobs):
++        self.jobs = jobs
++
++    def run(self):
++        return None
++
++
++def _prepared_topocg(monkeypatch, tempdir, protein, n_models):
++    """Wire up a topocg module over ``n_models`` presplit inputs, without CNS.
++
++    Returns ``(module, expected_inputs, captured)``, where ``captured`` collects
++    the keyword arguments handed to ``generate_topology`` for each model.
++    """
++    root = Path(tempdir)
++    prev_dir = root / "1_topoaa"
++    cwd = root / "2_topocg"
++    prev_dir.mkdir()
++    cwd.mkdir()
++
++    # Individual (already-split) models with their aa topologies, mimicking
++    # the output of the previous topoaa step.
++    prev_output = {}
++    expected_inputs = []
++    for idx in range(n_models):
++        pdb_name = f"mol_{idx + 1}.pdb"
++        shutil.copy(protein, prev_dir / pdb_name)
++        (prev_dir / f"mol_{idx + 1}.{Format.TOPOLOGY}").write_text("")
++        pdbfile = PDBFile(file_name=pdb_name, path=str(prev_dir))
++        prev_output[idx] = pdbfile
++        expected_inputs.append(pdbfile.rel_path)
++
++    monkeypatch.chdir(cwd)
++    module = Topocg(order=1, path=Path("."), initial_params=topocg_params)
++    module.envvars = {}
++
++    class _FakePreviousIO:
++        output = [prev_output]
++
++    module.previous_io = _FakePreviousIO()
++
++    # Capture what topology generation is asked for instead of running CNS,
++    # which also keeps the DSSP/martinize machinery out of these tests.
++    captured = []
++
++    def _fake_generate_topology(input_pdb, *args, **kwargs):
++        captured.append({"input_pdb": Path(input_pdb), **kwargs})
++        return Path(f"{Path(input_pdb).stem}.{Format.CNS_INPUT}")
++
++    monkeypatch.setattr(topocg_mod, "generate_topology", _fake_generate_topology)
++    monkeypatch.setattr(topocg_mod, "get_engine", lambda *a, **k: _FakeEngine)
++    return module, expected_inputs, captured
++
++
+ def test_run_uses_presplit_models_without_splitting(monkeypatch, protein):
+     """Models from the previous (topoaa) step are already split.
+ 
+@@ -102,32 +172,9 @@ def test_run_uses_presplit_models_without_splitting(monkeypatch, protein):
+     (the redundant ``libpdb.split_ensemble`` call that was removed).
+     """
+     with tempfile.TemporaryDirectory() as tempdir:
+-        root = Path(tempdir)
+-        prev_dir = root / "1_topoaa"
+-        cwd = root / "2_topocg"
+-        prev_dir.mkdir()
+-        cwd.mkdir()
+-
+-        # Two individual (already-split) models with their aa topologies,
+-        # mimicking the output of the previous topoaa step.
+-        prev_output = {}
+-        expected_inputs = []
+-        for idx in range(2):
+-            pdb_name = f"mol_{idx + 1}.pdb"
+-            shutil.copy(protein, prev_dir / pdb_name)
+-            (prev_dir / f"mol_{idx + 1}.{Format.TOPOLOGY}").write_text("")
+-            pdbfile = PDBFile(file_name=pdb_name, path=str(prev_dir))
+-            prev_output[idx] = pdbfile
+-            expected_inputs.append(pdbfile.rel_path)
+-
+-        monkeypatch.chdir(cwd)
+-        module = Topocg(order=1, path=Path("."), initial_params=topocg_params)
+-        module.envvars = {}
+-
+-        class _FakePreviousIO:
+-            output = [prev_output]
+-
+-        module.previous_io = _FakePreviousIO()
++        module, expected_inputs, captured = _prepared_topocg(
++            monkeypatch, tempdir, protein, n_models=2
++        )
+ 
+         # Guard against regressions: splitting must never happen here.
+         def _no_split(*args, **kwargs):
+@@ -135,26 +182,6 @@ def _no_split(*args, **kwargs):
+ 
+         monkeypatch.setattr(libpdb, "split_ensemble", _no_split)
+ 
+-        # Capture the model paths handed to topology generation instead of
+-        # running CNS, and avoid the DSSP/martinize machinery.
+-        captured_inputs = []
+-
+-        def _fake_generate_topology(input_pdb, *args, **kwargs):
+-            captured_inputs.append(Path(input_pdb))
+-            return Path(f"{Path(input_pdb).stem}.{Format.CNS_INPUT}")
+-
+-        monkeypatch.setattr(topocg_mod, "generate_topology", _fake_generate_topology)
+-
+-        # Neutralise the CNS engine.
+-        class _FakeEngine:
+-            def __init__(self, jobs):
+-                self.jobs = jobs
+-
+-            def run(self):
+-                return None
+-
+-        monkeypatch.setattr(topocg_mod, "get_engine", lambda *a, **k: _FakeEngine)
+-
+         # Skip the disk-dependent export step, just capture its input.
+         exported = {}
+ 
+@@ -166,7 +193,7 @@ def _fake_export(self, faulty_tolerance=0.0):
+         module._run()
+ 
+     # The presplit model paths were used verbatim (no split, no renaming).
+-    assert captured_inputs == expected_inputs
++    assert [c["input_pdb"] for c in captured] == expected_inputs
+     # One CNS job per input model was created.
+     assert len(module.output_models) == 1
+     assert len(module.output_models[0]) == 2
+@@ -188,3 +215,127 @@ def test_get_md5(topocg, ensemble_header_w_md5, protein):
+ 
+     observed_md5_dic = topocg.get_md5(protein)
+     assert observed_md5_dic == {}
++
++
++def _cg_pdb_text(pdb, output_dir, **kwargs):
++    """Coarse-grain ``pdb`` into ``output_dir`` and return the CG PDB text."""
++    Path(output_dir).mkdir(parents=True, exist_ok=True)
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", PDBConstructionWarning)
++        cg_pdb = martinize(pdb, str(output_dir), True, **kwargs)
++    return Path(cg_pdb).read_text()
++
++
++def test_martinize_is_reproducible(protein):
++    """Same seed must give the same CG model, run after run.
++
++    The ``SCD*`` dummy beads are placed along a random vector; an unseeded
++    generator made every ``topocg`` run produce different CG coordinates.
++    """
++    with tempfile.TemporaryDirectory() as tempdir:
++        first = _cg_pdb_text(protein, Path(tempdir, "a"))
++        second = _cg_pdb_text(protein, Path(tempdir, "b"))
++
++    assert first == second
++
++
++def test_martinize_seed_changes_dummy_beads(protein):
++    """A different seed must reorient the dummy beads."""
++    with tempfile.TemporaryDirectory() as tempdir:
++        first = _cg_pdb_text(protein, Path(tempdir, "a"), seed=1)
++        other = _cg_pdb_text(protein, Path(tempdir, "b"), seed=2)
++
++    assert first != other
++    # Only the dummy beads may move: everything else is deterministic mapping.
++    differing = {
++        line[12:16].strip()
++        for line, other_line in zip(first.splitlines(), other.splitlines())
++        if line.startswith("ATOM") and line != other_line
++    }
++    assert differing == {"SCD1", "SCD2"}
++
++
++def test_martinize_does_not_touch_global_random(protein):
++    """``martinize`` must use its own generator, not the global one.
++
++    Otherwise the result would depend on whatever else consumed the global
++    ``random`` stream earlier in the same interpreter.
++    """
++    random.seed(42)
++    expected = [random.random(), random.random()]
++
++    random.seed(42)
++    observed = [random.random()]
++    with tempfile.TemporaryDirectory() as tempdir:
++        _cg_pdb_text(protein, Path(tempdir))
++    # If martinize drew from the global stream, the next value would have moved.
++    observed.append(random.random())
++
++    assert observed == expected
++
++
++def test_martinize_is_order_independent(protein, ensemble_header_w_md5):
++    """Converting another structure first must not change the result."""
++    with tempfile.TemporaryDirectory() as tempdir:
++        alone = _cg_pdb_text(protein, Path(tempdir, "a"))
++        _cg_pdb_text(ensemble_header_w_md5, Path(tempdir, "b"))
++        after = _cg_pdb_text(protein, Path(tempdir, "c"))
++
++    assert alone == after
++
++
++def test_run_passes_iniseed_to_generate_topology(monkeypatch, protein):
++    """``_run`` must forward the ``iniseed`` parameter to the CG conversion."""
++    with tempfile.TemporaryDirectory() as tempdir:
++        module, _, captured = _prepared_topocg(
++            monkeypatch, tempdir, protein, n_models=1
++        )
++        module.params["iniseed"] = 4242
++        monkeypatch.setattr(Topocg, "export_io_models", lambda self, **k: None)
++
++        module._run()
++
++    assert captured[0]["seed"] == 4242
++
++
++def test_add_dummy_matches_force_field_distances():
++    """Dummy beads must be placed at the ``SCd`` bond lengths, in angstrom.
++
++    ``cns/toppar/protein-CG-Martini-2-2.param`` defines ``BOND * SCd = 1.100``
++    and ``BOND SCd SCd = 2.800``, so a pair at +/-1.4 A straddling the parent
++    is 2.8 A apart and a lone bead sits 1.1 A away.
++    """
++    rng = random.Random(0)
++    parent = (0.0, 0.0, 0.0)
++
++    pair = add_dummy([("SC1", parent)], rng, dist=1.4, n=2)
++    assert math.dist(parent, pair["SCD1"]) == pytest.approx(1.4)
++    assert math.dist(parent, pair["SCD2"]) == pytest.approx(1.4)
++    # The pair must straddle the parent, not sit on the same side of it.
++    assert math.dist(pair["SCD1"], pair["SCD2"]) == pytest.approx(2.8)
++
++    single = add_dummy([("SC1", parent)], rng, dist=1.1, n=1)
++    assert list(single) == ["SCD1"]
++    assert math.dist(parent, single["SCD1"]) == pytest.approx(1.1)
++
++
++def test_add_dummy_directions_are_isotropic():
++    """Bead orientations must be uniform on the sphere, not cube-biased.
++
++    Normalising a vector sampled from a cube pulls directions towards the
++    cube's corners and away from the axes. For a uniform distribution the
++    component along any axis is uniform on [-1, 1], so a fraction 0.1 of the
++    directions satisfies ``|z| > 0.9``; cube sampling gives roughly 0.06.
++    """
++    rng = random.Random(1)
++    n_samples = 20000
++    parent = (0.0, 0.0, 0.0)
++
++    near_axis = 0
++    for _ in range(n_samples):
++        bead = add_dummy([("SC1", parent)], rng, dist=1.0, n=1)
++        if abs(bead["SCD1"][2]) > 0.9:
++            near_axis += 1
++
++    # ~5 sigma for n_samples=20000; cube sampling (~0.06) fails this.
++    assert near_axis / n_samples == pytest.approx(0.1, abs=0.01)

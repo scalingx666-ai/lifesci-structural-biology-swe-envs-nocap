@@ -1,0 +1,863 @@
+diff --git a/sevenn/logger.py b/sevenn/logger.py
+new file mode 100644
+index 00000000..bf59ce88
+--- /dev/null
++++ b/sevenn/logger.py
+@@ -0,0 +1,338 @@
++import os
++import time
++import traceback
++from datetime import datetime
++from typing import Any, Dict, List, Optional
++
++from ase.data import atomic_numbers
++
++import sevenn._keys as KEY
++from sevenn import __version__
++
++CHEM_SYMBOLS = {v: k for k, v in atomic_numbers.items()}
++
++
++class Singleton(type):
++    _instances = {}
++
++    def __call__(cls, *args, **kwargs):
++        if cls not in cls._instances:
++            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
++        return cls._instances[cls]
++
++
++class Logger(metaclass=Singleton):
++    SCREEN_WIDTH = 120  # half size of my screen / changed due to stress output
++
++    def __init__(
++        self, filename: Optional[str] = None, screen: bool = False, rank: int = 0
++    ):
++        self.rank = rank
++        self._filename = filename
++        if rank == 0:
++            # if filename is not None:
++            #    self.logfile = open(filename, 'a', buffering=1)
++            self.logfile = None
++            self.files = {}
++            self.screen = screen
++        else:
++            self.logfile = None
++            self.screen = False
++        self.timer_dct = {}
++        self.active = True
++
++    def __enter__(self):
++        if self.rank != 0:
++            return self
++        if self.logfile is None and self._filename is not None:
++            try:
++                self.logfile = open(
++                    self._filename, 'a', buffering=1, encoding='utf-8'
++                )
++            except IOError as e:
++                print(f'Failed to re-open log file {self._filename}: {e}')
++                self.logfile = None
++            self.files = {}
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        if self.rank != 0:
++            return self
++        try:
++            if self.logfile is not None:
++                self.logfile.close()
++                self.logfile = None
++            for f in self.files.values():
++                f.close()
++        except IOError as e:
++            print(f'Failed to close log files: {e}')
++        finally:
++            self.logfile = None
++            self.files = {}
++
++    def switch_file(self, new_filename: str):
++        if self.rank != 0:
++            return self
++        if self.logfile is not None:
++            raise ValueError('Current logfile is not yet closed')
++        self._filename = new_filename
++        return self
++
++    def write(self, content: str):
++        if self.rank != 0:
++            return
++        # no newline!
++        if self.logfile is not None and self.active:
++            self.logfile.write(content)
++        if self.screen and self.active:
++            print(content, end='')
++
++    def writeline(self, content: str):
++        content = content + '\n'
++        self.write(content)
++
++    def init_csv(self, filename: str, header: list):
++        """
++        Deprecated
++        """
++        if self.rank == 0:
++            self.files[filename] = open(filename, 'w', buffering=1, encoding='utf-8')
++            self.files[filename].write(','.join(header) + '\n')
++        else:
++            pass
++
++    def append_csv(self, filename: str, content: list, decimal: int = 6):
++        """
++        Deprecated
++        """
++        if self.rank == 0:
++            if filename not in self.files:
++                self.files[filename] = open(filename, 'a', buffering=1)
++            str_content = []
++            for c in content:
++                if isinstance(c, float):
++                    str_content.append(f'{c:.{decimal}f}')
++                else:
++                    str_content.append(str(c))
++            self.files[filename].write(','.join(str_content) + '\n')
++        else:
++            pass
++
++    def natoms_write(self, natoms: Dict[str, Dict]):
++        content = ''
++        total_natom = {}
++        for label, natom in natoms.items():
++            content += self.format_k_v(label, natom)
++            for specie, num in natom.items():
++                try:
++                    total_natom[specie] += num
++                except KeyError:
++                    total_natom[specie] = num
++        content += self.format_k_v('Total, label wise', total_natom)
++        content += self.format_k_v('Total', sum(total_natom.values()))
++        self.write(content)
++
++    def statistic_write(self, statistic: Dict[str, Dict]):
++        content = ''
++        for label, dct in statistic.items():
++            if label.startswith('_'):
++                continue
++            if not isinstance(dct, dict):
++                continue
++            dct_new = {}
++            for k, v in dct.items():
++                if k.startswith('_'):
++                    continue
++                if isinstance(v, int):
++                    dct_new[k] = v
++                else:
++                    dct_new[k] = f'{v:.3f}'
++            content += self.format_k_v(label, dct_new)
++        self.write(content)
++
++    # TODO : refactoring!!!, this is not loss, rmse
++    def epoch_write_specie_wise_loss(self, train_loss, valid_loss):
++        lb_pad = 21
++        fs = 6
++        pad = 21 - fs
++        ln = '-' * fs
++        total_atom_type = train_loss.keys()
++        content = ''
++
++        for at in total_atom_type:
++            t_F = train_loss[at]
++            v_F = valid_loss[at]
++            at_sym = CHEM_SYMBOLS[at]
++            content += '{label:{lb_pad}}{t_E:<{pad}.{fs}s}{v_E:<{pad}.{fs}s}'.format(
++                label=at_sym, t_E=ln, v_E=ln, lb_pad=lb_pad, pad=pad, fs=fs
++            ) + '{t_F:<{pad}.{fs}f}{v_F:<{pad}.{fs}f}'.format(
++                t_F=t_F, v_F=v_F, pad=pad, fs=fs
++            )
++            content += '{t_S:<{pad}.{fs}s}{v_S:<{pad}.{fs}s}'.format(
++                t_S=ln, v_S=ln, pad=pad, fs=fs
++            )
++            content += '\n'
++        self.write(content)
++
++    def write_full_table(
++        self,
++        dict_list: List[Dict],
++        row_labels: List[str],
++        decimal_places: int = 6,
++        pad: int = 2,
++    ):
++        """
++        Assume data_list is list of dict with same keys
++        """
++        assert len(dict_list) == len(row_labels)
++        label_len = max(map(len, row_labels))
++        # Extract the column names and create a 2D array of values
++        col_names = list(dict_list[0].keys())
++
++        values = [list(d.values()) for d in dict_list]
++
++        # Format the numbers with the given decimal places
++        formatted_values = [
++            [f'{value:.{decimal_places}f}' for value in row] for row in values
++        ]
++
++        # Calculate padding lengths for each column (with extra padding)
++        max_col_lengths = [
++            max(len(str(value)) for value in col) + pad
++            for col in zip(col_names, *formatted_values)
++        ]
++
++        # Create header row and separator
++        header = ' ' * (label_len + pad) + ' '.join(
++            col_name.ljust(pad) for col_name, pad in zip(col_names, max_col_lengths)
++        )
++        separator = '-'.join('-' * pad for pad in max_col_lengths) + '-' * (
++            label_len + pad
++        )
++
++        # Print header and separator
++        self.writeline(header)
++        self.writeline(separator)
++
++        # Print the data rows with row labels
++        for row_label, row in zip(row_labels, formatted_values):
++            data_row = ' '.join(
++                value.rjust(pad) for value, pad in zip(row, max_col_lengths)
++            )
++            self.writeline(f'{row_label.ljust(label_len)}{data_row}')
++
++    def format_k_v(self, key: Any, val: Any, write: bool = False):
++        """
++        key and val should be str convertible
++        """
++        MAX_KEY_SIZE = 20
++        SEPARATOR = ', '
++        EMPTY_PADDING = ' ' * (MAX_KEY_SIZE + 3)
++        NEW_LINE_LEN = Logger.SCREEN_WIDTH - 5
++        key = str(key)
++        val = str(val)
++        content = f'{key:<{MAX_KEY_SIZE}}: {val}'
++        if len(content) > NEW_LINE_LEN:
++            content = f'{key:<{MAX_KEY_SIZE}}: '
++            # septate val by separator
++            val_list = val.split(SEPARATOR)
++            current_len = len(content)
++            for val_compo in val_list:
++                current_len += len(val_compo)
++                if current_len > NEW_LINE_LEN:
++                    newline_content = f'{EMPTY_PADDING}{val_compo}{SEPARATOR}'
++                    content += f'\\\n{newline_content}'
++                    current_len = len(newline_content)
++                else:
++                    content += f'{val_compo}{SEPARATOR}'
++
++        if content.endswith(f'{SEPARATOR}'):
++            content = content[: -len(SEPARATOR)]
++        content += '\n'
++
++        if write is False:
++            return content
++        else:
++            self.write(content)
++            return ''
++
++    def greeting(self):
++        LOGO_ASCII_FILE = f'{os.path.dirname(__file__)}/logo_ascii'
++        with open(LOGO_ASCII_FILE, 'r') as logo_f:
++            logo_ascii = logo_f.read()
++        content = 'SevenNet: Scalable EquVariance-Enabled Neural Network\n'
++        content += f'version {__version__}, {time.ctime()}\n'
++        content += f'this file: {self._filename}\n'
++        content += 'reading yaml config...'
++        self.write(content)
++        self.write(logo_ascii)
++
++    def bar(self):
++        content = '-' * Logger.SCREEN_WIDTH + '\n'
++        self.write(content)
++
++    def print_config(
++        self,
++        model_config: Dict[str, Any],
++        data_config: Dict[str, Any],
++        train_config: Dict[str, Any],
++    ):
++        """
++        print some important information from config
++        """
++        content = 'successfully read yaml config!\n\n' + 'from model configuration\n'
++        for k, v in model_config.items():
++            content += self.format_k_v(k, str(v))
++        content += '\nfrom train configuration\n'
++        for k, v in train_config.items():
++            content += self.format_k_v(k, str(v))
++        content += '\nfrom data configuration\n'
++        for k, v in data_config.items():
++            content += self.format_k_v(k, str(v))
++        self.write(content)
++
++    # TODO: This is not good make own exception
++    def error(self, e: Exception):
++        content = ''
++        if type(e) is ValueError:
++            content += 'Error occurred!\n'
++            content += str(e) + '\n'
++        else:
++            content += 'Unknown error occurred!\n'
++            content += traceback.format_exc()
++        self.write(content)
++
++    def timer_start(self, name: str):
++        self.timer_dct[name] = datetime.now()
++
++    def timer_end(self, name: str, message: str, remove: bool = True):
++        """
++        print f"{message}: {elapsed}"
++        """
++        elapsed = str(datetime.now() - self.timer_dct[name])
++        # elapsed = elapsed.strftime('%H-%M-%S')
++        if remove:
++            del self.timer_dct[name]
++        self.write(f'{message}: {elapsed[:-4]}\n')
++
++    # TODO: print it without config
++    # TODO: refactoring, readout part name :(
++    def print_model_info(self, model, config):
++        from functools import partial
++
++        kv_write = partial(self.format_k_v, write=True)
++        self.writeline('Irreps of features')
++        kv_write('edge_feature', model.get_irreps_in('edge_embedding', 'irreps_out'))
++        for i in range(config[KEY.NUM_CONVOLUTION]):
++            kv_write(
++                f'{i}th node',
++                model.get_irreps_in(f'{i}_self_interaction_1'),
++            )
++        i = config[KEY.NUM_CONVOLUTION] - 1
++        kv_write(
++            'readout irreps',
++            model.get_irreps_in(f'{i}_equivariant_gate', 'irreps_out'),
++        )
++
++        num_weights = sum(p.numel() for p in model.parameters() if p.requires_grad)
++        self.writeline(f'# learnable parameters: {num_weights}\n')
+diff --git a/sevenn/main/sevenn.py b/sevenn/main/sevenn.py
+index bad449ec..ba733827 100644
+--- a/sevenn/main/sevenn.py
++++ b/sevenn/main/sevenn.py
+@@ -32,9 +32,9 @@ def run(args):
+     import torch.distributed as dist
+ 
+     import sevenn._keys as KEY
++    from sevenn.logger import Logger
+     from sevenn.parse_input import read_config_yaml
+     from sevenn.scripts.train import train, train_v2
+-    from sevenn.sevenn_logger import Logger
+     from sevenn.util import unique_filepath
+ 
+     input_yaml = args.input_yaml
+diff --git a/sevenn/main/sevenn_graph_build.py b/sevenn/main/sevenn_graph_build.py
+index 48472b41..508bec83 100644
+--- a/sevenn/main/sevenn_graph_build.py
++++ b/sevenn/main/sevenn_graph_build.py
+@@ -24,7 +24,7 @@
+ 
+ def run(args):
+     import sevenn.scripts.graph_build as graph_build
+-    from sevenn.sevenn_logger import Logger
++    from sevenn.logger import Logger
+ 
+     source = glob.glob(args.source)
+     cutoff = args.cutoff
+diff --git a/sevenn/scripts/graph_build.py b/sevenn/scripts/graph_build.py
+index c1953d42..bc5c1733 100644
+--- a/sevenn/scripts/graph_build.py
++++ b/sevenn/scripts/graph_build.py
+@@ -1,7 +1,7 @@
+ import os
+ from typing import Optional
+ 
+-from sevenn.sevenn_logger import Logger
++from sevenn.logger import Logger
+ from sevenn.train.dataset import AtomGraphDataset
+ from sevenn.util import unique_filepath
+ 
+diff --git a/sevenn/scripts/processing_continue.py b/sevenn/scripts/processing_continue.py
+index 6671177e..2537684e 100644
+--- a/sevenn/scripts/processing_continue.py
++++ b/sevenn/scripts/processing_continue.py
+@@ -5,11 +5,11 @@
+ 
+ import sevenn._keys as KEY
+ import sevenn.util as util
++from sevenn.logger import Logger
+ from sevenn.scripts.convert_model_modality import (
+     append_modality_to_model_dct,
+     get_single_modal_model_dct,
+ )
+-from sevenn.sevenn_logger import Logger
+ 
+ 
+ def processing_continue_v2(config):  # simpler
+diff --git a/sevenn/scripts/processing_dataset.py b/sevenn/scripts/processing_dataset.py
+index 2d32c446..64e79617 100644
+--- a/sevenn/scripts/processing_dataset.py
++++ b/sevenn/scripts/processing_dataset.py
+@@ -5,7 +5,7 @@
+ 
+ import sevenn._const as CONST
+ import sevenn._keys as KEY
+-from sevenn.sevenn_logger import Logger
++from sevenn.logger import Logger
+ from sevenn.train.dataload import file_to_dataset, match_reader
+ from sevenn.train.dataset import AtomGraphDataset
+ from sevenn.util import chemical_species_preprocess, onehot_to_chem
+diff --git a/sevenn/scripts/processing_epoch.py b/sevenn/scripts/processing_epoch.py
+index fc70d9a3..ec2d7012 100644
+--- a/sevenn/scripts/processing_epoch.py
++++ b/sevenn/scripts/processing_epoch.py
+@@ -7,7 +7,7 @@
+ 
+ import sevenn._keys as KEY
+ from sevenn.error_recorder import ErrorRecorder
+-from sevenn.sevenn_logger import Logger
++from sevenn.logger import Logger
+ from sevenn.train.trainer import Trainer
+ 
+ 
+diff --git a/sevenn/scripts/train.py b/sevenn/scripts/train.py
+index e4716f43..d1976f58 100644
+--- a/sevenn/scripts/train.py
++++ b/sevenn/scripts/train.py
+@@ -5,11 +5,11 @@
+ from torch_geometric.loader import DataLoader
+ 
+ import sevenn._keys as KEY
++from sevenn.logger import Logger
+ from sevenn.model_build import build_E3_equivariant_model
+ from sevenn.scripts.processing_continue import (
+     convert_modality_of_checkpoint_state_dct,
+ )
+-from sevenn.sevenn_logger import Logger
+ from sevenn.train.trainer import Trainer
+ 
+ 
+diff --git a/sevenn/sevenn_logger.py b/sevenn/sevenn_logger.py
+index bf59ce88..7efea4af 100644
+--- a/sevenn/sevenn_logger.py
++++ b/sevenn/sevenn_logger.py
+@@ -1,338 +1,6 @@
+-import os
+-import time
+-import traceback
+-from datetime import datetime
+-from typing import Any, Dict, List, Optional
++import warnings
+ 
+-from ase.data import atomic_numbers
++from .logger import *  # noqa: F403
+ 
+-import sevenn._keys as KEY
+-from sevenn import __version__
+-
+-CHEM_SYMBOLS = {v: k for k, v in atomic_numbers.items()}
+-
+-
+-class Singleton(type):
+-    _instances = {}
+-
+-    def __call__(cls, *args, **kwargs):
+-        if cls not in cls._instances:
+-            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+-        return cls._instances[cls]
+-
+-
+-class Logger(metaclass=Singleton):
+-    SCREEN_WIDTH = 120  # half size of my screen / changed due to stress output
+-
+-    def __init__(
+-        self, filename: Optional[str] = None, screen: bool = False, rank: int = 0
+-    ):
+-        self.rank = rank
+-        self._filename = filename
+-        if rank == 0:
+-            # if filename is not None:
+-            #    self.logfile = open(filename, 'a', buffering=1)
+-            self.logfile = None
+-            self.files = {}
+-            self.screen = screen
+-        else:
+-            self.logfile = None
+-            self.screen = False
+-        self.timer_dct = {}
+-        self.active = True
+-
+-    def __enter__(self):
+-        if self.rank != 0:
+-            return self
+-        if self.logfile is None and self._filename is not None:
+-            try:
+-                self.logfile = open(
+-                    self._filename, 'a', buffering=1, encoding='utf-8'
+-                )
+-            except IOError as e:
+-                print(f'Failed to re-open log file {self._filename}: {e}')
+-                self.logfile = None
+-            self.files = {}
+-        return self
+-
+-    def __exit__(self, exc_type, exc_value, traceback):
+-        if self.rank != 0:
+-            return self
+-        try:
+-            if self.logfile is not None:
+-                self.logfile.close()
+-                self.logfile = None
+-            for f in self.files.values():
+-                f.close()
+-        except IOError as e:
+-            print(f'Failed to close log files: {e}')
+-        finally:
+-            self.logfile = None
+-            self.files = {}
+-
+-    def switch_file(self, new_filename: str):
+-        if self.rank != 0:
+-            return self
+-        if self.logfile is not None:
+-            raise ValueError('Current logfile is not yet closed')
+-        self._filename = new_filename
+-        return self
+-
+-    def write(self, content: str):
+-        if self.rank != 0:
+-            return
+-        # no newline!
+-        if self.logfile is not None and self.active:
+-            self.logfile.write(content)
+-        if self.screen and self.active:
+-            print(content, end='')
+-
+-    def writeline(self, content: str):
+-        content = content + '\n'
+-        self.write(content)
+-
+-    def init_csv(self, filename: str, header: list):
+-        """
+-        Deprecated
+-        """
+-        if self.rank == 0:
+-            self.files[filename] = open(filename, 'w', buffering=1, encoding='utf-8')
+-            self.files[filename].write(','.join(header) + '\n')
+-        else:
+-            pass
+-
+-    def append_csv(self, filename: str, content: list, decimal: int = 6):
+-        """
+-        Deprecated
+-        """
+-        if self.rank == 0:
+-            if filename not in self.files:
+-                self.files[filename] = open(filename, 'a', buffering=1)
+-            str_content = []
+-            for c in content:
+-                if isinstance(c, float):
+-                    str_content.append(f'{c:.{decimal}f}')
+-                else:
+-                    str_content.append(str(c))
+-            self.files[filename].write(','.join(str_content) + '\n')
+-        else:
+-            pass
+-
+-    def natoms_write(self, natoms: Dict[str, Dict]):
+-        content = ''
+-        total_natom = {}
+-        for label, natom in natoms.items():
+-            content += self.format_k_v(label, natom)
+-            for specie, num in natom.items():
+-                try:
+-                    total_natom[specie] += num
+-                except KeyError:
+-                    total_natom[specie] = num
+-        content += self.format_k_v('Total, label wise', total_natom)
+-        content += self.format_k_v('Total', sum(total_natom.values()))
+-        self.write(content)
+-
+-    def statistic_write(self, statistic: Dict[str, Dict]):
+-        content = ''
+-        for label, dct in statistic.items():
+-            if label.startswith('_'):
+-                continue
+-            if not isinstance(dct, dict):
+-                continue
+-            dct_new = {}
+-            for k, v in dct.items():
+-                if k.startswith('_'):
+-                    continue
+-                if isinstance(v, int):
+-                    dct_new[k] = v
+-                else:
+-                    dct_new[k] = f'{v:.3f}'
+-            content += self.format_k_v(label, dct_new)
+-        self.write(content)
+-
+-    # TODO : refactoring!!!, this is not loss, rmse
+-    def epoch_write_specie_wise_loss(self, train_loss, valid_loss):
+-        lb_pad = 21
+-        fs = 6
+-        pad = 21 - fs
+-        ln = '-' * fs
+-        total_atom_type = train_loss.keys()
+-        content = ''
+-
+-        for at in total_atom_type:
+-            t_F = train_loss[at]
+-            v_F = valid_loss[at]
+-            at_sym = CHEM_SYMBOLS[at]
+-            content += '{label:{lb_pad}}{t_E:<{pad}.{fs}s}{v_E:<{pad}.{fs}s}'.format(
+-                label=at_sym, t_E=ln, v_E=ln, lb_pad=lb_pad, pad=pad, fs=fs
+-            ) + '{t_F:<{pad}.{fs}f}{v_F:<{pad}.{fs}f}'.format(
+-                t_F=t_F, v_F=v_F, pad=pad, fs=fs
+-            )
+-            content += '{t_S:<{pad}.{fs}s}{v_S:<{pad}.{fs}s}'.format(
+-                t_S=ln, v_S=ln, pad=pad, fs=fs
+-            )
+-            content += '\n'
+-        self.write(content)
+-
+-    def write_full_table(
+-        self,
+-        dict_list: List[Dict],
+-        row_labels: List[str],
+-        decimal_places: int = 6,
+-        pad: int = 2,
+-    ):
+-        """
+-        Assume data_list is list of dict with same keys
+-        """
+-        assert len(dict_list) == len(row_labels)
+-        label_len = max(map(len, row_labels))
+-        # Extract the column names and create a 2D array of values
+-        col_names = list(dict_list[0].keys())
+-
+-        values = [list(d.values()) for d in dict_list]
+-
+-        # Format the numbers with the given decimal places
+-        formatted_values = [
+-            [f'{value:.{decimal_places}f}' for value in row] for row in values
+-        ]
+-
+-        # Calculate padding lengths for each column (with extra padding)
+-        max_col_lengths = [
+-            max(len(str(value)) for value in col) + pad
+-            for col in zip(col_names, *formatted_values)
+-        ]
+-
+-        # Create header row and separator
+-        header = ' ' * (label_len + pad) + ' '.join(
+-            col_name.ljust(pad) for col_name, pad in zip(col_names, max_col_lengths)
+-        )
+-        separator = '-'.join('-' * pad for pad in max_col_lengths) + '-' * (
+-            label_len + pad
+-        )
+-
+-        # Print header and separator
+-        self.writeline(header)
+-        self.writeline(separator)
+-
+-        # Print the data rows with row labels
+-        for row_label, row in zip(row_labels, formatted_values):
+-            data_row = ' '.join(
+-                value.rjust(pad) for value, pad in zip(row, max_col_lengths)
+-            )
+-            self.writeline(f'{row_label.ljust(label_len)}{data_row}')
+-
+-    def format_k_v(self, key: Any, val: Any, write: bool = False):
+-        """
+-        key and val should be str convertible
+-        """
+-        MAX_KEY_SIZE = 20
+-        SEPARATOR = ', '
+-        EMPTY_PADDING = ' ' * (MAX_KEY_SIZE + 3)
+-        NEW_LINE_LEN = Logger.SCREEN_WIDTH - 5
+-        key = str(key)
+-        val = str(val)
+-        content = f'{key:<{MAX_KEY_SIZE}}: {val}'
+-        if len(content) > NEW_LINE_LEN:
+-            content = f'{key:<{MAX_KEY_SIZE}}: '
+-            # septate val by separator
+-            val_list = val.split(SEPARATOR)
+-            current_len = len(content)
+-            for val_compo in val_list:
+-                current_len += len(val_compo)
+-                if current_len > NEW_LINE_LEN:
+-                    newline_content = f'{EMPTY_PADDING}{val_compo}{SEPARATOR}'
+-                    content += f'\\\n{newline_content}'
+-                    current_len = len(newline_content)
+-                else:
+-                    content += f'{val_compo}{SEPARATOR}'
+-
+-        if content.endswith(f'{SEPARATOR}'):
+-            content = content[: -len(SEPARATOR)]
+-        content += '\n'
+-
+-        if write is False:
+-            return content
+-        else:
+-            self.write(content)
+-            return ''
+-
+-    def greeting(self):
+-        LOGO_ASCII_FILE = f'{os.path.dirname(__file__)}/logo_ascii'
+-        with open(LOGO_ASCII_FILE, 'r') as logo_f:
+-            logo_ascii = logo_f.read()
+-        content = 'SevenNet: Scalable EquVariance-Enabled Neural Network\n'
+-        content += f'version {__version__}, {time.ctime()}\n'
+-        content += f'this file: {self._filename}\n'
+-        content += 'reading yaml config...'
+-        self.write(content)
+-        self.write(logo_ascii)
+-
+-    def bar(self):
+-        content = '-' * Logger.SCREEN_WIDTH + '\n'
+-        self.write(content)
+-
+-    def print_config(
+-        self,
+-        model_config: Dict[str, Any],
+-        data_config: Dict[str, Any],
+-        train_config: Dict[str, Any],
+-    ):
+-        """
+-        print some important information from config
+-        """
+-        content = 'successfully read yaml config!\n\n' + 'from model configuration\n'
+-        for k, v in model_config.items():
+-            content += self.format_k_v(k, str(v))
+-        content += '\nfrom train configuration\n'
+-        for k, v in train_config.items():
+-            content += self.format_k_v(k, str(v))
+-        content += '\nfrom data configuration\n'
+-        for k, v in data_config.items():
+-            content += self.format_k_v(k, str(v))
+-        self.write(content)
+-
+-    # TODO: This is not good make own exception
+-    def error(self, e: Exception):
+-        content = ''
+-        if type(e) is ValueError:
+-            content += 'Error occurred!\n'
+-            content += str(e) + '\n'
+-        else:
+-            content += 'Unknown error occurred!\n'
+-            content += traceback.format_exc()
+-        self.write(content)
+-
+-    def timer_start(self, name: str):
+-        self.timer_dct[name] = datetime.now()
+-
+-    def timer_end(self, name: str, message: str, remove: bool = True):
+-        """
+-        print f"{message}: {elapsed}"
+-        """
+-        elapsed = str(datetime.now() - self.timer_dct[name])
+-        # elapsed = elapsed.strftime('%H-%M-%S')
+-        if remove:
+-            del self.timer_dct[name]
+-        self.write(f'{message}: {elapsed[:-4]}\n')
+-
+-    # TODO: print it without config
+-    # TODO: refactoring, readout part name :(
+-    def print_model_info(self, model, config):
+-        from functools import partial
+-
+-        kv_write = partial(self.format_k_v, write=True)
+-        self.writeline('Irreps of features')
+-        kv_write('edge_feature', model.get_irreps_in('edge_embedding', 'irreps_out'))
+-        for i in range(config[KEY.NUM_CONVOLUTION]):
+-            kv_write(
+-                f'{i}th node',
+-                model.get_irreps_in(f'{i}_self_interaction_1'),
+-            )
+-        i = config[KEY.NUM_CONVOLUTION] - 1
+-        kv_write(
+-            'readout irreps',
+-            model.get_irreps_in(f'{i}_equivariant_gate', 'irreps_out'),
+-        )
+-
+-        num_weights = sum(p.numel() for p in model.parameters() if p.requires_grad)
+-        self.writeline(f'# learnable parameters: {num_weights}\n')
++warnings.warn('Please use sevenn.logger instead of sevenn.sevenn_logger',
++              DeprecationWarning, stacklevel=2)
+diff --git a/sevenn/train/atoms_dataset.py b/sevenn/train/atoms_dataset.py
+index adb028ed..675197d3 100644
+--- a/sevenn/train/atoms_dataset.py
++++ b/sevenn/train/atoms_dataset.py
+@@ -237,7 +237,7 @@ def from_config(
+     working_dir: str = os.getcwd(),
+     dataset_keys: Optional[list[str]] = None,
+ ):
+-    from sevenn.sevenn_logger import Logger
++    from sevenn.logger import Logger
+ 
+     log = Logger()
+     if dataset_keys is None:
+diff --git a/sevenn/train/graph_dataset.py b/sevenn/train/graph_dataset.py
+index 349ace4e..6884353e 100644
+--- a/sevenn/train/graph_dataset.py
++++ b/sevenn/train/graph_dataset.py
+@@ -21,7 +21,7 @@
+ from sevenn import __version__
+ from sevenn._const import NUM_UNIV_ELEMENT
+ from sevenn.atom_graph_data import AtomGraphData
+-from sevenn.sevenn_logger import Logger
++from sevenn.logger import Logger
+ 
+ if torch.__version__.split()[0] >= '2.4.0':
+     # load graph without error
+diff --git a/sevenn/train/modal_dataset.py b/sevenn/train/modal_dataset.py
+index d4ee4a29..03db5471 100644
+--- a/sevenn/train/modal_dataset.py
++++ b/sevenn/train/modal_dataset.py
+@@ -8,7 +8,7 @@
+ 
+ import sevenn._keys as KEY
+ import sevenn.util as util
+-from sevenn.sevenn_logger import Logger
++from sevenn.logger import Logger
+ 
+ 
+ def _arrange_paths_by_modality(paths: List[dict]):
+diff --git a/tests/unit_tests/test_cli.py b/tests/unit_tests/test_cli.py
+index f840bb98..b4b8acb1 100644
+--- a/tests/unit_tests/test_cli.py
++++ b/tests/unit_tests/test_cli.py
+@@ -10,11 +10,11 @@
+ from ase.build import bulk
+ 
+ from sevenn.calculator import SevenNetCalculator
++from sevenn.logger import Logger
+ from sevenn.main.sevenn import main as sevenn_main
+ from sevenn.main.sevenn_get_model import main as get_model_main
+ from sevenn.main.sevenn_graph_build import main as graph_build_main
+ from sevenn.main.sevenn_inference import main as inference_main
+-from sevenn.sevenn_logger import Logger
+ from sevenn.util import pretrained_name_to_path
+ 
+ main = os.path.abspath(f'{os.path.dirname(__file__)}/../../sevenn/main/')
+diff --git a/tests/unit_tests/test_train.py b/tests/unit_tests/test_train.py
+index 59eb493e..089fe821 100644
+--- a/tests/unit_tests/test_train.py
++++ b/tests/unit_tests/test_train.py
+@@ -9,9 +9,9 @@
+ import sevenn.train.graph_dataset as graph_ds
+ from sevenn._const import NUM_UNIV_ELEMENT
+ from sevenn.error_recorder import ErrorRecorder
++from sevenn.logger import Logger
+ from sevenn.scripts.processing_continue import processing_continue_v2
+ from sevenn.scripts.processing_epoch import processing_epoch_v2
+-from sevenn.sevenn_logger import Logger
+ from sevenn.train.dataload import graph_build
+ from sevenn.train.graph_dataset import from_config as dataset_from_config
+ from sevenn.train.loss import get_loss_functions_from_config

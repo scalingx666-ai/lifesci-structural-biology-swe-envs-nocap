@@ -1,0 +1,1494 @@
+diff --git a/data/pdb/unit_tests/index_page.bin b/data/pdb/unit_tests/index_page.bin
+new file mode 100644
+index 00000000..629a43ed
+Binary files /dev/null and b/data/pdb/unit_tests/index_page.bin differ
+diff --git a/src/main.rs b/src/main.rs
+index 684e4da2..12410ede 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,7 +9,7 @@
+ use binrw::BinRead;
+ use clap::{Parser, Subcommand};
+ use rekordcrate::anlz::ANLZ;
+-use rekordcrate::pdb::{DatabaseType, Header, PageType, PlainPageType, PlainRow, Row};
++use rekordcrate::pdb::{DatabaseType, Header, PageContent, PageType, PlainPageType, PlainRow, Row};
+ use rekordcrate::setting::Setting;
+ use rekordcrate::xml::Document;
+ use std::path::{Path, PathBuf};
+@@ -105,7 +105,8 @@ fn list_playlists(path: &PathBuf) -> rekordcrate::Result<()> {
+                 )
+                 .unwrap()
+                 .into_iter()
+-                .flat_map(|page| page.row_groups.into_iter())
++                .filter_map(|page| page.content.into_data())
++                .flat_map(|data_content| data_content.row_groups.into_iter())
+                 .flat_map(|row_group| {
+                     row_group
+                         .present_rows()
+@@ -154,12 +155,23 @@ fn dump_pdb(path: &PathBuf, typ: DatabaseType) -> rekordcrate::Result<()> {
+             .into_iter()
+         {
+             println!("  {:?}", page);
+-            page.row_groups.iter().for_each(|row_group| {
+-                println!("    {:?}", row_group);
+-                for row in row_group.present_rows() {
+-                    println!("      {:?}", row);
++            match page.content {
++                PageContent::Data(data_content) => {
++                    data_content.row_groups.iter().for_each(|row_group| {
++                        println!("    {:?}", row_group);
++                        for row in row_group.present_rows() {
++                            println!("      {:?}", row);
++                        }
++                    })
+                 }
+-            })
++                PageContent::Index(index_content) => {
++                    println!("    {:?}", index_content);
++                    for entry in index_content.entries {
++                        println!("      {:?}", entry);
++                    }
++                }
++                PageContent::Unknown => (),
++            }
+         }
+     }
+ 
+diff --git a/src/pdb/mod.rs b/src/pdb/mod.rs
+index 4e249fe6..c7f1ef00 100644
+--- a/src/pdb/mod.rs
++++ b/src/pdb/mod.rs
+@@ -28,6 +28,7 @@ use offset_array::OffsetArrayContainer;
+ mod test;
+ 
+ use std::convert::TryInto;
++use std::fmt;
+ 
+ use crate::pdb::ext::{ExtPageType, ExtRow};
+ use crate::pdb::offset_array::{OffsetArray, OffsetSize};
+@@ -38,6 +39,21 @@ use binrw::{
+     io::{Read, Seek, SeekFrom, Write},
+     BinRead, BinResult, BinWrite, Endian,
+ };
++use thiserror::Error;
++
++/// An error that can occur when parsing a PDB file.
++#[derive(Debug, Error)]
++pub enum PdbError {
++    /// An invalid value was passed when creating a `PageIndex`.
++    #[error("Invalid page index value: {0:#X}")]
++    InvalidPageIndex(u32),
++    /// Invalid flags were passed when creating an `IndexEntry`.
++    #[error("Invalid index flags (expected max 3 bits): {0:#b}")]
++    InvalidIndexFlags(u8),
++    /// A row was added to a full `RowGroup`.
++    #[error("Cannot add row to a full row group (max 16 rows)")]
++    RowGroupFull,
++}
+ 
+ /// Do not read anything, but the return the current stream position of `reader`.
+ fn current_offset<R: Read + Seek>(reader: &mut R, _: Endian, _: ()) -> BinResult<u64> {
+@@ -129,6 +145,18 @@ pub enum PlainPageType {
+ #[brw(little)]
+ pub struct PageIndex(u32);
+ 
++impl TryFrom<u32> for PageIndex {
++    type Error = PdbError;
++
++    fn try_from(value: u32) -> Result<Self, Self::Error> {
++        if value < 0x03FF_FFFF {
++            Ok(Self(value))
++        } else {
++            Err(PdbError::InvalidPageIndex(value))
++        }
++    }
++}
++
+ impl PageIndex {
+     /// Calculate the absolute file offset of the page in the PDB file for the given `page_size`.
+     #[must_use]
+@@ -166,10 +194,8 @@ pub struct Table {
+ #[brw(little)]
+ #[brw(import(db_type: DatabaseType))]
+ pub struct Header {
+-    /// Unknown purpose, perhaps an unoriginal signature, seems to always have the value 0.
+-    #[br(temp, assert(unknown1 == 0))]
+-    #[bw(calc = 0u32)]
+-    unknown1: u32,
++    // Unknown purpose, perhaps an unoriginal signature, seems to always have the value 0.
++    #[brw(magic = 0u32)]
+     /// Size of a single page in bytes.
+     ///
+     /// The byte offset of a page can be calculated by multiplying a page index with this value.
+@@ -186,10 +212,8 @@ pub struct Header {
+     unknown: u32,
+     /// Always incremented by at least one, sometimes by two or three.
+     pub sequence: u32,
+-    /// The gap seems to be always zero.
+-    #[br(temp, assert(gap == 0))]
+-    #[bw(calc = 0u32)]
+-    gap: u32,
++    // The gap seems to be always zero.
++    #[brw(magic = 0u32)]
+     /// Each table is a linked list of pages containing rows of a particular type.
+     #[br(count = num_tables, args {inner: (db_type,)})]
+     #[bw(args(db_type))]
+@@ -234,31 +258,206 @@ impl PageFlags {
+     pub fn page_has_data(&self) -> bool {
+         (self.0 & 0x40) == 0
+     }
++
++    #[must_use]
++    pub fn is_index_page(&self) -> bool {
++        self.0 == 0x64
++    }
++}
++
++/// An entry in an index page.
++#[binrw]
++#[derive(PartialEq, Eq, Clone, Copy)]
++#[brw(little)]
++pub struct IndexEntry(u32);
++
++impl TryFrom<(PageIndex, u8)> for IndexEntry {
++    type Error = PdbError;
++
++    fn try_from(value: (PageIndex, u8)) -> Result<Self, Self::Error> {
++        let (page_index, index_flags) = value;
++        if index_flags & 0b111 != index_flags {
++            return Err(PdbError::InvalidIndexFlags(index_flags));
++        }
++        Ok(Self((page_index.0 << 3) | (index_flags & 0b111) as u32))
++    }
+ }
+ 
+-fn write_page_contents<W: Write + Seek>(
+-    row_groups: &Vec<RowGroup>,
+-    writer: &mut W,
+-    endian: Endian,
+-    args: (u32,),
+-) -> BinResult<()> {
+-    let (page_size,) = args;
++impl IndexEntry {
++    /// Returns bits 31-3 as a `PageIndex` which points to a page containing
++    /// data rows, with `page_flags=0x34` and same `page_type` as this page.
++    pub fn page_index(&self) -> Result<PageIndex, PdbError> {
++        PageIndex::try_from(self.0 >> 3)
++    }
+ 
+-    let header_end_pos = writer.stream_position()?;
++    /// Returns the index flags from bits 2-0. Their meaning is currently
++    /// unknown.
++    #[must_use]
++    pub fn index_flags(&self) -> u8 {
++        (self.0 & 0b111) as u8
++    }
+ 
+-    let mut relative_row_offset: u64 = 0;
++    /// Returns `true` if the entry is an empty slot.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.0 == 0x1FFF_FFF8
++    }
+ 
+-    // Seek to the very end of the page
+-    writer.seek(SeekFrom::Current((page_size - Page::HEADER_SIZE).into()))?;
++    /// Creates a new empty `IndexEntry`.
++    #[must_use]
++    pub const fn empty() -> Self {
++        Self(0x1FFF_FFF8)
++    }
++}
+ 
+-    for row_group in row_groups {
+-        relative_row_offset = row_group.write_options_and_get_row_offset(
+-            writer,
+-            endian,
+-            (header_end_pos, relative_row_offset),
+-        )?;
++impl fmt::Debug for IndexEntry {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if self.is_empty() {
++            f.debug_struct("IndexEntry")
++                .field("is_empty", &self.is_empty())
++                .finish()
++        } else {
++            f.debug_struct("IndexEntry")
++                .field("is_empty", &self.is_empty())
++                .field("page_index", &self.page_index().unwrap())
++                .field("index_flags", &self.index_flags())
++                .finish()
++        }
++    }
++}
++
++/// The content of an index page.
++#[binread]
++#[derive(Debug, PartialEq, Eq, Clone)]
++#[br(little)]
++pub struct IndexPageContent {
++    /// Unknown field, usually `1fff` or `0001`.
++    pub unknown_a: u16,
++    /// Unknown field, usually `1fff` or `0000`.
++    pub unknown_b: u16,
++    // Magic value `0x03ec`.
++    #[br(magic = 0x03ecu16)]
++    /// Offset where the next index entry will be written from the beginning
++    /// of the entries array, i.e. if this is 4 it means the next entry should
++    /// be written at byte `entries+4*4`. We still do not know why this value
++    /// is sometimes different than num_entries.
++    pub next_offset: u16,
++    /// Redundant page index.
++    pub page_index: PageIndex,
++    /// Redundant next page index.
++    pub next_page: PageIndex,
++    // Magic value `0x0000000003ffffff`.
++    #[br(magic = 0x0000_0000_03ff_ffffu64)]
++    /// Number of index entries in this page.
++    #[br(temp)]
++    num_entries: u16,
++    /// Points to the first empty index entry, or `1fff` if none.
++    ///
++    /// In real databases, this has been found to be one of three things:
++    /// 1. The same value as `num_entries`.
++    /// 2. `0x1fff`. We assume this has the same meaning as **1.**
++    /// 3. A number smaller than `num_entries`, indicating the first empty
++    /// slot.
++    pub first_empty: u16,
++    /// The index entries.
++    #[br(count = num_entries)]
++    pub entries: Vec<IndexEntry>,
++}
++
++impl BinWrite for IndexPageContent {
++    type Args<'a> = (u32,);
++
++    fn write_options<W: Write + Seek>(
++        &self,
++        writer: &mut W,
++        endian: Endian,
++        (page_size,): Self::Args<'_>,
++    ) -> BinResult<()> {
++        let page_content_start_pos = writer.stream_position()?;
++
++        self.unknown_a.write_options(writer, endian, ())?;
++        self.unknown_b.write_options(writer, endian, ())?;
++        0x03ecu16.write_options(writer, endian, ())?;
++        self.next_offset.write_options(writer, endian, ())?;
++        self.page_index.write_options(writer, endian, ())?;
++        self.next_page.write_options(writer, endian, ())?;
++        0x0000_0000_03ff_ffffu64.write_options(writer, endian, ())?;
++        (self.entries.len() as u16).write_options(writer, endian, ())?;
++        self.first_empty.write_options(writer, endian, ())?;
++
++        for entry in &self.entries {
++            entry.write_options(writer, endian, ())?;
++        }
++
++        let after_entries_pos = writer.stream_position()?;
++        let written_bytes = after_entries_pos - page_content_start_pos;
++
++        let content_size = page_size - Page::HEADER_SIZE;
++        let padding_end_offset = content_size - 20;
++
++        // Fill with empty entries (0x1ffffff8) until the last 20 bytes, which
++        // are zeroes. If https://github.com/jam1garner/binrw/issues/205 was ever
++        // fixed, this entire BinWrite implementation could possibly be removed.
++
++        if written_bytes < u64::from(padding_end_offset) {
++            let empty_entries_to_write = (u64::from(padding_end_offset) - written_bytes) / 4;
++            let empty_entry = IndexEntry::empty();
++            for _ in 0..empty_entries_to_write {
++                empty_entry.write_options(writer, endian, ())?;
++            }
++        }
++
++        let after_padding_pos = writer.stream_position()?;
++        let final_padding_bytes =
++            content_size as u64 - (after_padding_pos - page_content_start_pos);
++
++        if final_padding_bytes > 0 {
++            let zero_padding = vec![0u8; final_padding_bytes as usize];
++            writer.write_all(&zero_padding)?;
++        }
++
++        Ok(())
++    }
++}
++
++/// The content of a page, which can be of different types.
++#[binrw]
++#[derive(Debug, PartialEq, Clone)]
++#[br(little, import { page_flags: PageFlags, page_start_pos: u64, page_size: u32, num_rows_small: u8, page_type: PageType })]
++#[bw(little, import { page_flags: PageFlags, page_size: u32, num_rows_small: u8, page_type: PageType })]
++pub enum PageContent {
++    /// The page contains data rows.
++    #[br(pre_assert(page_flags.page_has_data()))]
++    Data(
++        #[br(args { page_start_pos, page_size, num_rows_small, page_type })]
++        #[bw(args(page_size,))]
++        DataPageContent,
++    ),
++    /// The page is an index page.
++    #[br(pre_assert(page_flags.is_index_page()))]
++    Index(#[bw(args(page_size,))] IndexPageContent),
++    /// The page is of an unknown or unsupported format.
++    Unknown,
++}
++
++impl PageContent {
++    /// Returns the data content of the page if it is a data page.
++    #[must_use]
++    pub fn into_data(self) -> Option<DataPageContent> {
++        match self {
++            PageContent::Data(data) => Some(data),
++            _ => None,
++        }
++    }
++
++    /// Returns the index content of the page if it is an index page.
++    #[must_use]
++    pub fn into_index(self) -> Option<IndexPageContent> {
++        match self {
++            PageContent::Index(index) => Some(index),
++            _ => None,
++        }
+     }
+-    Ok(())
+ }
+ 
+ /// A table page.
+@@ -274,10 +473,8 @@ pub struct Page {
+     #[br(temp, parse_with = current_offset)]
+     #[bw(ignore)]
+     page_start_pos: u64,
+-    /// Magic signature for pages (must be 0).
+-    #[br(temp, assert(magic == 0u32))]
+-    #[bw(calc = 0u32)]
+-    magic: u32,
++    // Magic signature for pages (must be 0).
++    #[brw(magic = 0u32)]
+     /// Index of the page.
+     ///
+     /// Should match the index used for lookup and can be used to verify that the correct page was loaded.
+@@ -324,6 +521,17 @@ pub struct Page {
+     pub free_size: u16,
+     /// Used space in bytes in the data section of the page.
+     pub used_size: u16,
++    /// The content of the page.
++    #[br(args { page_flags, page_start_pos, page_size, num_rows_small, page_type })]
++    #[bw(args { page_flags: *page_flags, page_size, num_rows_small: self.num_rows_small, page_type: self.page_type })]
++    pub content: PageContent,
++}
++
++/// The data-containing part of a page.
++#[binread]
++#[derive(Debug, PartialEq, Clone)]
++#[br(little, import { page_start_pos: u64, page_size: u32, num_rows_small: u8, page_type: PageType })]
++pub struct DataPageContent {
+     /// Unknown field.
+     ///
+     /// According to [@flesniak](https://github.com/flesniak):
+@@ -348,53 +556,61 @@ pub struct Page {
+     ///
+     /// **Note:** This is a virtual field and not actually read from the file.
+     #[br(temp, calc = Self::calculate_num_rows(num_rows_small, num_rows_large))]
+-    #[bw(ignore)]
+     num_rows: u16,
+     /// Number of rows groups in this page.
+     ///
+     /// **Note:** This is a virtual field and not actually read from the file.
+     #[br(temp, calc = num_rows.div_ceil(RowGroup::MAX_ROW_COUNT as u16))]
+-    #[bw(ignore)]
+     num_row_groups: u16,
+     /// The offset at which the row data for this page are located.
+     ///
+     /// **Note:** This is a virtual field and not actually read from the file.
+-    #[br(temp, calc = page_start_pos + u64::from(Self::HEADER_SIZE))]
+-    #[bw(ignore)]
++    #[br(temp, calc = page_start_pos + u64::from(Page::HEADER_SIZE) + u64::from(Self::HEADER_SIZE))]
+     page_heap_offset: u64,
+     /// Row groups belonging to this page.
+-    #[br(seek_before(SeekFrom::Current(Self::heap_padding_size(page_size, num_row_groups).into())))]
++    #[br(seek_before(SeekFrom::Current(Page::heap_padding_size(page_size, num_row_groups).into())))]
+     #[br(args {count: num_row_groups.into(), inner: (page_type, page_heap_offset)})]
+     #[br(map(|mut vec: Vec<RowGroup>| {vec.reverse(); vec}))]
+-    #[br(if(num_row_groups > 0 && page_flags.page_has_data()))]
+-    #[bw(write_with = write_page_contents, args(page_size))]
+     pub row_groups: Vec<RowGroup>,
+ }
+ 
+-impl Page {
+-    /// Size of the page header in bytes.
+-    pub const HEADER_SIZE: u32 = 0x28;
++impl BinWrite for DataPageContent {
++    type Args<'a> = (u32,);
+ 
+-    /// Calculate the size of the empty space between the header and the footer.
+-    fn heap_padding_size(page_size: u32, num_row_groups: u16) -> u32 {
+-        // Size of all row offsets
+-        let row_groups_footer_size = u32::from(num_row_groups) * RowGroup::BINARY_SIZE;
+-        page_size - Self::HEADER_SIZE - row_groups_footer_size
+-    }
+-
+-    #[must_use]
+-    /// Returns `true` if the page actually contains row data.
+-    pub fn has_data(&self) -> bool {
+-        self.page_flags.page_has_data()
++    fn write_options<W: Write + Seek>(
++        &self,
++        writer: &mut W,
++        endian: Endian,
++        (page_size,): Self::Args<'_>,
++    ) -> BinResult<()> {
++        self.unknown5.write_options(writer, endian, ())?;
++        self.num_rows_large.write_options(writer, endian, ())?;
++        self.unknown6.write_options(writer, endian, ())?;
++        self.unknown7.write_options(writer, endian, ())?;
++
++        let header_end_pos = writer.stream_position()?;
++
++        let mut relative_row_offset: u64 = 0;
++
++        // Seek to the very end of the page
++        writer.seek(SeekFrom::Current(
++            (page_size - Page::HEADER_SIZE - DataPageContent::HEADER_SIZE).into(),
++        ))?;
++
++        for row_group in &self.row_groups {
++            relative_row_offset = row_group.write_options_and_get_row_offset(
++                writer,
++                endian,
++                (header_end_pos, relative_row_offset),
++            )?;
++        }
++        Ok(())
+     }
++}
+ 
+-    #[must_use]
+-    /// Number of rows on this page.
+-    ///
+-    /// Note that this number includes rows that have been flagged as missing by the row group.
+-    pub fn num_rows(&self) -> u16 {
+-        Self::calculate_num_rows(self.num_rows_small, self.num_rows_large)
+-    }
++impl DataPageContent {
++    /// Size of the page header in bytes.
++    pub const HEADER_SIZE: u32 = 0x8;
+ 
+     fn calculate_num_rows(num_rows_small: u8, num_rows_large: u16) -> u16 {
+         if num_rows_large > num_rows_small.into() && num_rows_large != 0x1fff {
+@@ -405,6 +621,18 @@ impl Page {
+     }
+ }
+ 
++impl Page {
++    /// Size of the page header in bytes.
++    pub const HEADER_SIZE: u32 = 0x20;
++
++    /// Calculate the size of the empty space between the header and the footer.
++    fn heap_padding_size(page_size: u32, num_row_groups: u16) -> u32 {
++        // Size of all row offsets
++        let row_groups_footer_size = u32::from(num_row_groups) * RowGroup::BINARY_SIZE;
++        page_size - Self::HEADER_SIZE - DataPageContent::HEADER_SIZE - row_groups_footer_size
++    }
++}
++
+ /// A group of row indices, which are built backwards from the end of the page. Holds up to sixteen
+ /// row offsets, along with a bit mask that indicates whether each row is actually present in the
+ /// table.
+@@ -441,13 +669,11 @@ impl RowGroup {
+     pub fn present_rows(&self) -> &[Row] {
+         &self.rows
+     }
+-    // TODO(Swiftb0y): Add a new error category for user APIs and add the correct
+-    // error herer
+-    #[allow(clippy::result_unit_err)]
++
+     /// Add a row to this rowgroup
+-    pub fn add_row(&mut self, row: Row) -> Result<(), ()> {
++    pub fn add_row(&mut self, row: Row) -> Result<(), PdbError> {
+         if self.rows.len() >= Self::MAX_ROW_COUNT {
+-            return Err(());
++            return Err(PdbError::RowGroupFull);
+         }
+         self.row_presence_flags |= 1 << self.rows.len() as u16;
+         self.rows.push(row);
+diff --git a/src/pdb/test.rs b/src/pdb/test.rs
+index 7806493a..548d6ec7 100644
+--- a/src/pdb/test.rs
++++ b/src/pdb/test.rs
+@@ -14,7 +14,7 @@ use std::num::NonZero;
+ fn empty_header() {
+     let header = Header {
+         page_size: 4096,
+-        next_unused_page: PageIndex(1),
++        next_unused_page: PageIndex::try_from(1).unwrap(),
+         unknown: 0,
+         sequence: 1,
+         tables: vec![],
+@@ -31,129 +31,129 @@ fn empty_header() {
+ fn demo_tracks_header() {
+     let header = Header {
+         page_size: 4096,
+-        next_unused_page: PageIndex(51),
++        next_unused_page: PageIndex::try_from(51).unwrap(),
+         unknown: 5,
+         sequence: 34,
+         tables: [
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Tracks),
+                 empty_candidate: 47,
+-                first_page: PageIndex(1),
+-                last_page: PageIndex(2),
++                first_page: PageIndex::try_from(1).unwrap(),
++                last_page: PageIndex::try_from(2).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Genres),
+                 empty_candidate: 4,
+-                first_page: PageIndex(3),
+-                last_page: PageIndex(3),
++                first_page: PageIndex::try_from(3).unwrap(),
++                last_page: PageIndex::try_from(3).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Artists),
+                 empty_candidate: 49,
+-                first_page: PageIndex(5),
+-                last_page: PageIndex(6),
++                first_page: PageIndex::try_from(5).unwrap(),
++                last_page: PageIndex::try_from(6).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Albums),
+                 empty_candidate: 8,
+-                first_page: PageIndex(7),
+-                last_page: PageIndex(7),
++                first_page: PageIndex::try_from(7).unwrap(),
++                last_page: PageIndex::try_from(7).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Labels),
+                 empty_candidate: 50,
+-                first_page: PageIndex(9),
+-                last_page: PageIndex(10),
++                first_page: PageIndex::try_from(9).unwrap(),
++                last_page: PageIndex::try_from(10).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Keys),
+                 empty_candidate: 46,
+-                first_page: PageIndex(11),
+-                last_page: PageIndex(12),
++                first_page: PageIndex::try_from(11).unwrap(),
++                last_page: PageIndex::try_from(12).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Colors),
+                 empty_candidate: 42,
+-                first_page: PageIndex(13),
+-                last_page: PageIndex(14),
++                first_page: PageIndex::try_from(13).unwrap(),
++                last_page: PageIndex::try_from(14).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::PlaylistTree),
+                 empty_candidate: 16,
+-                first_page: PageIndex(15),
+-                last_page: PageIndex(15),
++                first_page: PageIndex::try_from(15).unwrap(),
++                last_page: PageIndex::try_from(15).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::PlaylistEntries),
+                 empty_candidate: 18,
+-                first_page: PageIndex(17),
+-                last_page: PageIndex(17),
++                first_page: PageIndex::try_from(17).unwrap(),
++                last_page: PageIndex::try_from(17).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Unknown(9),
+                 empty_candidate: 20,
+-                first_page: PageIndex(19),
+-                last_page: PageIndex(19),
++                first_page: PageIndex::try_from(19).unwrap(),
++                last_page: PageIndex::try_from(19).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Unknown(10),
+                 empty_candidate: 22,
+-                first_page: PageIndex(21),
+-                last_page: PageIndex(21),
++                first_page: PageIndex::try_from(21).unwrap(),
++                last_page: PageIndex::try_from(21).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::HistoryPlaylists),
+                 empty_candidate: 24,
+-                first_page: PageIndex(23),
+-                last_page: PageIndex(23),
++                first_page: PageIndex::try_from(23).unwrap(),
++                last_page: PageIndex::try_from(23).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::HistoryEntries),
+                 empty_candidate: 26,
+-                first_page: PageIndex(25),
+-                last_page: PageIndex(25),
++                first_page: PageIndex::try_from(25).unwrap(),
++                last_page: PageIndex::try_from(25).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Artwork),
+                 empty_candidate: 28,
+-                first_page: PageIndex(27),
+-                last_page: PageIndex(27),
++                first_page: PageIndex::try_from(27).unwrap(),
++                last_page: PageIndex::try_from(27).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Unknown(14),
+                 empty_candidate: 30,
+-                first_page: PageIndex(29),
+-                last_page: PageIndex(29),
++                first_page: PageIndex::try_from(29).unwrap(),
++                last_page: PageIndex::try_from(29).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Unknown(15),
+                 empty_candidate: 32,
+-                first_page: PageIndex(31),
+-                last_page: PageIndex(31),
++                first_page: PageIndex::try_from(31).unwrap(),
++                last_page: PageIndex::try_from(31).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::Columns),
+                 empty_candidate: 43,
+-                first_page: PageIndex(33),
+-                last_page: PageIndex(34),
++                first_page: PageIndex::try_from(33).unwrap(),
++                last_page: PageIndex::try_from(34).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Unknown(17),
+                 empty_candidate: 44,
+-                first_page: PageIndex(35),
+-                last_page: PageIndex(36),
++                first_page: PageIndex::try_from(35).unwrap(),
++                last_page: PageIndex::try_from(36).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Unknown(18),
+                 empty_candidate: 45,
+-                first_page: PageIndex(37),
+-                last_page: PageIndex(38),
++                first_page: PageIndex::try_from(37).unwrap(),
++                last_page: PageIndex::try_from(38).unwrap(),
+             },
+             Table {
+                 page_type: PageType::Plain(PlainPageType::History),
+                 empty_candidate: 48,
+-                first_page: PageIndex(39),
+-                last_page: PageIndex(41),
++                first_page: PageIndex::try_from(39).unwrap(),
++                last_page: PageIndex::try_from(41).unwrap(),
+             },
+         ]
+         .to_vec(),
+@@ -777,9 +777,9 @@ fn track_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(2),
++        page_index: PageIndex::try_from(2).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Tracks),
+-        next_page: PageIndex(46),
++        next_page: PageIndex::try_from(46).unwrap(),
+         unknown1: 12,
+         unknown2: 0,
+         num_rows_small: 5,
+@@ -788,11 +788,13 @@ fn track_page() {
+         page_flags: PageFlags(36),
+         free_size: 2302,
+         used_size: 1740,
+-        unknown5: 1,
+-        num_rows_large: 4,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups: vec![row_groups],
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 4,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups: vec![row_groups],
++        }),
+     };
+ 
+     let page_size: u32 = 4096;
+@@ -931,9 +933,9 @@ fn genres_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(48),
++        page_index: PageIndex::try_from(48).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Genres),
+-        next_page: PageIndex(449),
++        next_page: PageIndex::try_from(449).unwrap(),
+         unknown1: 14405,
+         unknown2: 0,
+         num_rows_small: 18,
+@@ -942,11 +944,13 @@ fn genres_page() {
+         page_flags: PageFlags(36),
+         free_size: 3560,
+         used_size: 452,
+-        unknown5: 1,
+-        num_rows_large: 17,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 17,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -2696,9 +2700,9 @@ fn artists_page() {
+         })))
+         .unwrap();
+     let page = Page {
+-        page_index: PageIndex(6),
++        page_index: PageIndex::try_from(6).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Artists),
+-        next_page: PageIndex(47),
++        next_page: PageIndex::try_from(47).unwrap(),
+         unknown1: 855,
+         unknown2: 0,
+         num_rows_small: 120,
+@@ -2707,11 +2711,13 @@ fn artists_page() {
+         page_flags: PageFlags(36),
+         free_size: 12,
+         used_size: 3772,
+-        unknown5: 1,
+-        num_rows_large: 119,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 119,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -2818,9 +2824,9 @@ fn artist_page_long() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(6),
++        page_index: PageIndex::try_from(6).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Artists),
+-        next_page: PageIndex(46),
++        next_page: PageIndex::try_from(46).unwrap(),
+         unknown1: 16,
+         unknown2: 0,
+         num_rows_small: 6,
+@@ -2829,12 +2835,13 @@ fn artist_page_long() {
+         page_flags: PageFlags(36),
+         free_size: 2624,
+         used_size: 1416,
+-        unknown5: 1,
+-        num_rows_large: 5,
+-        unknown6: 0,
+-        unknown7: 0,
+-
+-        row_groups: vec![rowgroup],
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 5,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups: vec![rowgroup],
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -4260,9 +4267,9 @@ fn albums_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(8),
++        page_index: PageIndex::try_from(8).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Albums),
+-        next_page: PageIndex(49),
++        next_page: PageIndex::try_from(49).unwrap(),
+         unknown1: 772,
+         unknown2: 0,
+         num_rows_small: 82,
+@@ -4271,11 +4278,13 @@ fn albums_page() {
+         page_flags: PageFlags(36),
+         free_size: 36,
+         used_size: 3832,
+-        unknown5: 1,
+-        num_rows_large: 81,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 81,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size: u32 = 4096;
+@@ -5374,9 +5383,9 @@ fn labels_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(10),
++        page_index: PageIndex::try_from(10).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Labels),
+-        next_page: PageIndex(50),
++        next_page: PageIndex::try_from(50).unwrap(),
+         unknown1: 4627,
+         unknown2: 0,
+         num_rows_small: 177,
+@@ -5385,11 +5394,13 @@ fn labels_page() {
+         page_flags: PageFlags(36),
+         free_size: 2,
+         used_size: 3652,
+-        unknown5: 1,
+-        num_rows_large: 176,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 176,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -5784,9 +5795,9 @@ fn keys_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(12),
++        page_index: PageIndex::try_from(12).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Keys),
+-        next_page: PageIndex(51),
++        next_page: PageIndex::try_from(51).unwrap(),
+         unknown1: 13484,
+         unknown2: 0,
+         num_rows_small: 52,
+@@ -5795,11 +5806,13 @@ fn keys_page() {
+         page_flags: PageFlags(36),
+         free_size: 3188,
+         used_size: 748,
+-        unknown5: 1,
+-        num_rows_large: 51,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 51,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -5894,9 +5907,9 @@ fn colors_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(14),
++        page_index: PageIndex::try_from(14).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Colors),
+-        next_page: PageIndex(42),
++        next_page: PageIndex::try_from(42).unwrap(),
+         unknown1: 2,
+         unknown2: 0,
+         num_rows_small: 8,
+@@ -5905,11 +5918,13 @@ fn colors_page() {
+         page_flags: PageFlags(36),
+         free_size: 3912,
+         used_size: 124,
+-        unknown5: 8,
+-        num_rows_large: 0,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 8,
++            num_rows_large: 0,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -6208,9 +6223,9 @@ fn playlist_tree_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(16),
++        page_index: PageIndex::try_from(16).unwrap(),
+         page_type: PageType::Plain(PlainPageType::PlaylistTree),
+-        next_page: PageIndex(46),
++        next_page: PageIndex::try_from(46).unwrap(),
+         unknown1: 36,
+         unknown2: 0,
+         num_rows_small: 27,
+@@ -6219,11 +6234,13 @@ fn playlist_tree_page() {
+         page_flags: PageFlags(36),
+         free_size: 3238,
+         used_size: 756,
+-        unknown5: 1,
+-        num_rows_large: 26,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 26,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -8256,9 +8273,9 @@ fn playlist_entries_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(18),
++        page_index: PageIndex::try_from(18).unwrap(),
+         page_type: PageType::Plain(PlainPageType::PlaylistEntries),
+-        next_page: PageIndex(54),
++        next_page: PageIndex::try_from(54).unwrap(),
+         unknown1: 1420,
+         unknown2: 0,
+         num_rows_small: 28,
+@@ -8267,11 +8284,13 @@ fn playlist_entries_page() {
+         page_flags: PageFlags(36),
+         free_size: 8,
+         used_size: 3408,
+-        unknown5: 1,
+-        num_rows_large: 283,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 283,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -8941,9 +8960,9 @@ fn artworks_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(28),
++        page_index: PageIndex::try_from(28).unwrap(),
+         page_type: PageType::Plain(PlainPageType::Artwork),
+-        next_page: PageIndex(53),
++        next_page: PageIndex::try_from(53).unwrap(),
+         unknown1: 1019,
+         unknown2: 0,
+         num_rows_small: 106,
+@@ -8952,11 +8971,13 @@ fn artworks_page() {
+         page_flags: PageFlags(36),
+         free_size: 0,
+         used_size: 3816,
+-        unknown5: 1,
+-        num_rows_large: 105,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 105,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -9446,9 +9467,9 @@ fn tag_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(8),
++        page_index: PageIndex::try_from(8).unwrap(),
+         page_type: PageType::Ext(ExtPageType::Tag),
+-        next_page: PageIndex(20),
++        next_page: PageIndex::try_from(20).unwrap(),
+         unknown1: 2,
+         unknown2: 0,
+         num_rows_small: 23,
+@@ -9457,11 +9478,13 @@ fn tag_page() {
+         page_flags: PageFlags(36),
+         free_size: 2770,
+         used_size: 1232,
+-        unknown5: 23,
+-        num_rows_large: 0,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 23,
++            num_rows_large: 0,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -9856,9 +9879,9 @@ fn track_tag_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(10),
++        page_index: PageIndex::try_from(10).unwrap(),
+         page_type: PageType::Ext(ExtPageType::TrackTag),
+-        next_page: PageIndex(21),
++        next_page: PageIndex::try_from(21).unwrap(),
+         unknown1: 54,
+         unknown2: 0,
+         num_rows_small: 52,
+@@ -9867,11 +9890,13 @@ fn track_tag_page() {
+         page_flags: PageFlags(36),
+         free_size: 3104,
+         used_size: 832,
+-        unknown5: 1,
+-        num_rows_large: 51,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 51,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -9906,9 +9931,9 @@ fn history_playlists_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(24),
++        page_index: PageIndex::try_from(24).unwrap(),
+         page_type: PageType::Plain(PlainPageType::HistoryPlaylists),
+-        next_page: PageIndex(59),
++        next_page: PageIndex::try_from(59).unwrap(),
+         unknown1: 240,
+         unknown2: 0,
+         num_rows_small: 1,
+@@ -9917,11 +9942,13 @@ fn history_playlists_page() {
+         page_flags: PageFlags(36),
+         free_size: 4034,
+         used_size: 16,
+-        unknown5: 1,
+-        num_rows_large: 0,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 0,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -9998,9 +10025,9 @@ fn history_entries_page() {
+         .unwrap();
+ 
+     let page = Page {
+-        page_index: PageIndex(60),
++        page_index: PageIndex::try_from(60).unwrap(),
+         page_type: PageType::Plain(PlainPageType::HistoryEntries),
+-        next_page: PageIndex(62),
++        next_page: PageIndex::try_from(62).unwrap(),
+         unknown1: 254,
+         unknown2: 0,
+         num_rows_small: 7,
+@@ -10009,11 +10036,13 @@ fn history_entries_page() {
+         page_flags: PageFlags(36),
+         free_size: 3954,
+         used_size: 84,
+-        unknown5: 1,
+-        num_rows_large: 6,
+-        unknown6: 0,
+-        unknown7: 0,
+-        row_groups,
++        content: PageContent::Data(DataPageContent {
++            unknown5: 1,
++            num_rows_large: 6,
++            unknown6: 0,
++            unknown7: 0,
++            row_groups,
++        }),
+     };
+ 
+     let page_size = 4096;
+@@ -10024,3 +10053,312 @@ fn history_entries_page() {
+         (page_size, DatabaseType::Plain),
+     );
+ }
++
++#[test]
++fn index_page() {
++    let entries = vec![
++        IndexEntry::try_from((PageIndex::try_from(604).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(371).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(441).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(471).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(210).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(412).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(327).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(434).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(251).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(238).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(574).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(141).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(234).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(67).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(162).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(486).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(61).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(116).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(585).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(501).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(691).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(164).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(235).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(692).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(243).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(481).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(174).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(246).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(566).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(653).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(480).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(168).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(575).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(552).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(170).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(182).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(155).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(59).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(548).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(249).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(250).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(707).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(248).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(121).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(484).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(253).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(670).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(153).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(255).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(108).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(258).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(259).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(485).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(555).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(583).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(637).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(658).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(125).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(714).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(618).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(84).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(678).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(662).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(528).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(482).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(535).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(586).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(470).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(213).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(157).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(627).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(161).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(705).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(611).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(292).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(710).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(711).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(641).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(706).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(712).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(98).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(551).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(700).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(57).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(474).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(487).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(540).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(642).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(646).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(564).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(159).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(546).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(130).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(708).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(716).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(683).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(247).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(625).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(257).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(506).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(60).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(527).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(516).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(416).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(601).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(623).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(114).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(69).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(460).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(577).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(584).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(600).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(431).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(571).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(149).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(541).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(699).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(680).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(518).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(2).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(438).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(358).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(179).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(147).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(587).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(190).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(617).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(56).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(226).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(201).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(135).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(652).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(543).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(422).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(94).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(86).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(205).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(687).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(671).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(644).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(688).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(513).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(240).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(560).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(215).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(214).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(624).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(224).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(614).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(689).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(703).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(427).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(171).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(158).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(589).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(193).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(647).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(163).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(549).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(633).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(694).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(68).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(204).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(519).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(545).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(561).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(695).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(85).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(616).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(88).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(718).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(440).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(241).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(638).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(442).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(380).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(634).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(488).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(697).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(603).unwrap(), 5)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(572).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(675).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(677).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(361).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(520).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(423).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(439).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(160).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(580).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(146).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(631).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(630).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(398).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(417).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(682).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(558).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(245).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(458).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(701).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(599).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(628).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(684).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(459).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(648).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(650).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(645).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(690).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(456).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(229).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(109).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(286).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(531).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(632).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(185).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(303).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(651).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(696).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(239).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(620).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(639).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(192).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(411).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(154).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(212).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(483).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(282).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(490).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(476).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(609).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(508).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(279).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(194).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(570).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(172).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(233).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(588).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(504).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(491).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(505).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(507).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(151).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(523).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(360).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(525).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(370).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(595).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(668).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(579).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(655).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(660).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(679).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(394).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(661).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(278).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(659).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(713).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(698).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(715).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(309).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(252).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(615).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(702).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(717).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(685).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(665).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(673).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(521).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(550).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(622).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(704).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(709).unwrap(), 0)).unwrap(),
++        IndexEntry::try_from((PageIndex::try_from(603).unwrap(), 3)).unwrap(),
++    ];
++
++    let page = Page {
++        page_index: PageIndex::try_from(1).unwrap(),
++        page_type: PageType::Plain(PlainPageType::Tracks),
++        next_page: PageIndex::try_from(2).unwrap(),
++        unknown1: 29871,
++        unknown2: 0,
++        num_rows_small: 0,
++        unknown3: 0,
++        unknown4: 0,
++        page_flags: PageFlags(100),
++        free_size: 0,
++        used_size: 0,
++        content: PageContent::Index(IndexPageContent {
++            unknown_a: 2,
++            unknown_b: 179,
++            next_offset: 272,
++            page_index: PageIndex::try_from(1).unwrap(),
++            next_page: PageIndex::try_from(2).unwrap(),
++            first_empty: 8191,
++            entries,
++        }),
++    };
++
++    let page_size = 4096;
++    test_roundtrip_with_args(
++        include_bytes!("../../data/pdb/unit_tests/index_page.bin"),
++        page,
++        (page_size, DatabaseType::Plain),
++        (page_size, DatabaseType::Plain),
++    );
++}
+diff --git a/tests/test_pdb_num_rows.rs b/tests/test_pdb_num_rows.rs
+index d68d508d..a12b3fe7 100644
+--- a/tests/test_pdb_num_rows.rs
++++ b/tests/test_pdb_num_rows.rs
+@@ -30,7 +30,8 @@ fn assert_pdb_row_count(page_type: PlainPageType, expected_row_count: usize) {
+ 
+     let actual_row_count: usize = pages
+         .into_iter()
+-        .flat_map(|page| page.row_groups.into_iter())
++        .filter_map(|page| page.content.into_data())
++        .flat_map(|data_content| data_content.row_groups.into_iter())
+         .map(|row_group| row_group.present_rows().len())
+         .sum();
+     assert_eq!(

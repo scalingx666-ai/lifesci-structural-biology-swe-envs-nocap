@@ -1,0 +1,432 @@
+diff --git a/jax_md/_nn/e3nn_layer.py b/jax_md/_nn/e3nn_layer.py
+index 95299158..38e96699 100644
+--- a/jax_md/_nn/e3nn_layer.py
++++ b/jax_md/_nn/e3nn_layer.py
+@@ -208,10 +208,12 @@
+ 
+ from typing import Optional
+ 
++import e3nn_jax as e3nn
+ from e3nn_jax import Irreps
+ from e3nn_jax import IrrepsArray
+-from e3nn_jax import FunctionalLinear
+ from e3nn_jax.legacy import FunctionalFullyConnectedTensorProduct
++from e3nn_jax import FunctionalLinear 
++from e3nn_jax.utils import vmap
+ 
+ import flax.linen as nn
+ 
+@@ -221,24 +223,10 @@
+ from jax.nn import initializers
+ from jax import tree_util
+ from jax import jit
+-from jax import vmap
+ from jax import tree_map
+ 
+ import numpy as onp
+ 
+-
+-def naive_broadcast_decorator(func):
+-  def wrapper(*args):
+-      leading_shape = jnp.broadcast_shapes(*(arg.shape[:-1] for arg in args))
+-      args = [arg.broadcast_to(leading_shape + (-1,)) for arg in args]
+-      f = func
+-      for _ in range(len(leading_shape)):
+-          f = jax.vmap(f)
+-      return f(*args)
+-
+-  return wrapper
+-
+-
+ class FullyConnectedTensorProductE3nn(nn.Module):
+   """Flax module of an equivariant Fully-Connected Tensor Product."""
+   irreps_out: Irreps
+@@ -246,8 +234,7 @@ class FullyConnectedTensorProductE3nn(nn.Module):
+   irreps_in2: Optional[Irreps] = None
+ 
+   @nn.compact
+-  def __call__(self, x1: IrrepsArray, x2: IrrepsArray) -> IrrepsArray:
+-
++  def __call__(self, x1: IrrepsArray, x2: IrrepsArray, **kwargs) -> IrrepsArray:
+     irreps_out = Irreps(self.irreps_out)
+     irreps_in1 = Irreps(
+         self.irreps_in1
+@@ -256,19 +243,24 @@ def __call__(self, x1: IrrepsArray, x2: IrrepsArray) -> IrrepsArray:
+         self.irreps_in2
+         ) if self.irreps_in2 is not None else None
+ 
++    x1 = e3nn.as_irreps_array(x1)
++    x2 = e3nn.as_irreps_array(x2)
++
++    leading_shape = jnp.broadcast_shapes(x1.shape[:-1], x2.shape[:-1])
++    x1 = x1.broadcast_to(leading_shape + (-1,))
++    x2 = x2.broadcast_to(leading_shape + (-1,))
++
+     if irreps_in1 is not None:
+-      x1 = IrrepsArray(irreps_in1, x1)
++        x1 = x1.rechunk(irreps_in1)
+     if irreps_in2 is not None:
+-      x2 = IrrepsArray(irreps_in2, x2)
++        x2 = x2.rechunk(irreps_in2)
+ 
+-    x1 = x1.remove_nones().simplify()
+-    x2 = x2.remove_nones().simplify()
++    x1 = x1.remove_zero_chunks().simplify()
++    x2 = x2.remove_zero_chunks().simplify()
+ 
+     tp = FunctionalFullyConnectedTensorProduct(
+-        x1.irreps,
+-        x2.irreps,
+-        irreps_out.simplify()
+-        )
++        x1.irreps, x2.irreps, irreps_out.simplify()
++    )
+ 
+     ws = [
+         self.param(
+@@ -283,14 +275,16 @@ def __call__(self, x1: IrrepsArray, x2: IrrepsArray) -> IrrepsArray:
+         for ins in tp.instructions
+     ]
+ 
+-    f = naive_broadcast_decorator(lambda x1, x2: tp.left_right(ws, x1, x2))
++    f = lambda x1, x2: tp.left_right(ws, x1, x2, **kwargs)
++
++    for _ in range(len(leading_shape)):
++        f = e3nn.utils.vmap(f)
++
+     output = f(x1, x2)
+-    output = tree_map(lambda x: x.astype(x1.dtype), output)
+     return output.rechunk(irreps_out)
+ 
+ 
+ class Linear(nn.Module):
+-  """Flax module of an equivariant Linear."""
+   irreps_out: Irreps
+   irreps_in: Optional[Irreps] = None
+ 
+@@ -329,7 +323,5 @@ def __call__(self, x: IrrepsArray) -> IrrepsArray:
+     f = lambda x: lin(w, x)
+     for _ in range(x.ndim - 1):
+       f = vmap(f)
+-    output = f(x)
+-    output = tree_map(lambda y: y.astype(x.dtype), output)
+-    return output
++    return f(x)
+ 
+diff --git a/jax_md/_nn/nequip.py b/jax_md/_nn/nequip.py
+index 7f85f732..d9dc3da8 100644
+--- a/jax_md/_nn/nequip.py
++++ b/jax_md/_nn/nequip.py
+@@ -54,7 +54,7 @@
+ 
+ get_nonlinearity_by_name = nn_util.get_nonlinearity_by_name
+ partial = functools.partial
+-
++tree_map = partial(jax.tree_map, is_leaf=lambda x: isinstance(x, e3nn.IrrepsArray))
+ 
+ # Code
+ 
+@@ -180,8 +180,6 @@ def __call__(
+     if self.use_sc:
+       self_connection = FullyConnectedTensorProductE3nn(
+           h_out_irreps,
+-          # node_features.irreps,
+-          # node_attributes.irreps
+           )(node_features, node_attributes)
+ 
+     h = node_features
+@@ -190,7 +188,7 @@ def __call__(
+     h = Linear(node_features.irreps)(h)
+ 
+     # map node features onto edges for tp
+-    edge_features = jax.tree_map(lambda x: x[edge_src], h)
++    edge_features = tree_map(lambda x: x[edge_src], h)
+ 
+     # we gather the instructions for the tp as well as the tp output irreps
+     mode = 'uvu'
+@@ -258,19 +256,17 @@ def __call__(
+ 
+     # tp between node features that have been mapped onto edges and edge RSH
+     # weighted by FC weight, we vmap over the dimension of the edges
+-    edge_features = jax.vmap(tp.left_right)(weight, edge_features, edge_sh)
++    edge_features = e3nn.utils.vmap(tp.left_right)(weight, edge_features, edge_sh)
+     # TODO: It's not great that e3nn_jax automatically upcasts internally,
+     # but this would need to be fixed at the e3nn level.
+-    edge_features = jax.tree_map(lambda x: x.astype(h.dtype), edge_features)
++    edge_features = tree_map(lambda x: x.astype(h.dtype), edge_features)
+ 
+     # aggregate edges onto nodes after tp using e3nn-jax's index_add
+     h_type = h.dtype
+-    h = jax.tree_map(
+-        lambda x: e3nn.index_add(edge_dst, x, out_dim=h.shape[0]),
+-        edge_features
+-        )
+-    # TODO: Remove this once e3nn_jax doesn't upcast inputs.
+-    h = jax.tree_map(lambda x: x.astype(h_type), h)
++
++    e = edge_features.remove_zero_chunks().simplify()
++    h = e3nn.index_add(edge_dst, e, out_dim=h.shape[0])
++    h = h.astype(h_type)
+ 
+     # normalize by the average (not local) number of neighbors
+     h = h / self.n_neighbors
+@@ -298,7 +294,7 @@ def __call__(
+ 
+     h = gate_fn(h)
+     # TODO: Remove this once e3nn_jax doesn't upcast inputs.
+-    h = jax.tree_map(lambda x: x.astype(h_type), h)
++    h = tree_map(lambda x: x.astype(h_type), h)
+ 
+     return h
+ 
+@@ -417,7 +413,7 @@ def __call__(self, graph):
+     # this aggregation follows jraph/_src/models.py
+     n_graph = graph.n_node.shape[0]
+     graph_idx = jnp.arange(n_graph)
+-    sum_n_node = tree_util.tree_leaves(graph.nodes)[0].shape[0]
++    sum_n_node = tree_util.tree_leaves(graph.nodes, is_leaf=lambda x: isinstance(x, e3nn.IrrepsArray))[0].shape[0]
+     node_gr_idx = jnp.repeat(
+         graph_idx,
+         graph.n_node,
+@@ -425,7 +421,7 @@ def __call__(self, graph):
+         total_repeat_length=sum_n_node
+         )
+ 
+-    global_output = tree_util.tree_map(
++    global_output = tree_map(
+         lambda n: jraph.segment_sum(
+             n,
+             node_gr_idx,
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index 4c45963b..87014414 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -1018,12 +1018,12 @@ def _ters_bij(R, D, c, d, h, lam3, beta, n, m,
+   drij = space.distance(dRij)
+   drik = space.distance(dRik)
+ 
+-  mask_ijk *= (1 - jnp.eye(mask_ijk.shape[-1]))[None, :, :]
++  mask_ijk *= (1 - jnp.eye(mask_ijk.shape[-1], dtype=dRij.dtype))[None, :, :]
+ 
+   # compute g_ijk - angle penalty value
+   costheta = quantity.cosine_angles(dRij)
+   gijk = 1.0 + (c**2 / d**2) - (c**2 / (d**2 + (h - costheta)**2))
+-
++  
+   # compute exponential term - distance penalty value
+   dr_diff = drij[:, None, :] - drik[:, :, None]
+   dr_diff = jnp.where(mask_ijk, dr_diff, 0)
+@@ -1146,7 +1146,9 @@ def compute_fn(R, **kwargs):
+     dR = space.map_product(d)(R, R)
+     dr = space.distance(dR)
+     N = R.shape[0]
+-    mask = jnp.where(1 - jnp.eye(N), dr < params['R'] + params['D'], 0)
++    mask = jnp.where(1 - jnp.eye(N), 
++                     dr < params['R'] + params['D'], 0)
++    mask = mask.astype(R.dtype)
+     mask_ijk = mask[:, None, :] * mask[:, :, None]
+     repulsive = util.safe_mask(mask, repulsive_fn, dr)
+     attractive = attractive_fn(dR, dR, mask_ijk) * mask
+@@ -1314,23 +1316,23 @@ def _edip_angle_interaction(lam: f64, gamma: f64, Q_0: f64, cutoff: f64,
+   return jnp.where(within_cutoff, lam * term1 * term2, 0)
+ 
+ def edip(displacement: DisplacementFn,
+-           u1: f64 = -0.165799,
+-           u2: f64 = 32.557,
+-           u3: f64 = 0.286198,
+-           u4: f64 = 0.66,
+-           rho: f64 = 1.2085196,
+-           eta: f64 = 0.2523244,
+-           Q_0: f64 = 312.1341346,
+-           mu: f64 = 0.6966326,
+-           beta: f64 = 0.0070975,
+-           alpha: f64 = 3.1083847,
+-           A: f64 = 7.9821730,
+-           lam: f64 = 1.4533108,
+-           B: f64 = 1.5075463,
+-           gamma: f64 = 1.1247945,
+-           sigma: f64 = 0.5774108,
+-           c: f64 = 2.5609104,
+-           cutoff: f64 = 3.1213820) -> Callable[[Array], Array]:
++         u1: f64 = -0.165799,
++         u2: f64 = 32.557,
++         u3: f64 = 0.286198,
++         u4: f64 = 0.66,
++         rho: f64 = 1.2085196,
++         eta: f64 = 0.2523244,
++         Q_0: f64 = 312.1341346,
++         mu: f64 = 0.6966326,
++         beta: f64 = 0.0070975,
++         alpha: f64 = 3.1083847,
++         A: f64 = 7.9821730,
++         lam: f64 = 1.4533108,
++         B: f64 = 1.5075463,
++         gamma: f64 = 1.1247945,
++         sigma: f64 = 0.5774108,
++         c: f64 = 2.5609104,
++         cutoff: f64 = 3.1213820) -> Callable[[Array], Array]:
+     """
+     Computes the the Environment-dependent interatomic potential (EDIP).
+     The parameter values are for bulk Silicon [1,2]. The EDIP potential is a bond
+@@ -1375,7 +1377,7 @@ def compute_fn(R, **kwargs):
+       dR = space.map_product(d)(R, R)
+       dr = space.distance(dR)
+       N = R.shape[0]
+-      mask = (1 - jnp.eye(N)) * (dr < cutoff)
++      mask = (1 - jnp.eye(N, dtype=R.dtype)) * (dr < cutoff)
+       first_term = util.high_precision_sum(two_body_fn(mask, dr))
+       second_term = util.high_precision_sum(_three_body_fn(mask, dR, dR)) / 2.0
+       return first_term + second_term
+diff --git a/jax_md/partition.py b/jax_md/partition.py
+index 23a69648..ac27cf70 100644
+--- a/jax_md/partition.py
++++ b/jax_md/partition.py
+@@ -33,7 +33,7 @@
+ from jax import lax
+ from jax import ops
+ from jax import jit, vmap, eval_shape
+-from jax.abstract_arrays import ShapedArray
++from jax.core import ShapedArray
+ from jax.interpreters import partial_eval as pe
+ from jax import tree_map
+ import jax.numpy as jnp
+@@ -294,7 +294,7 @@ def cell_list(box_size: Box,
+   if util.is_array(box_size):
+     box_size = onp.array(box_size)
+     if len(box_size.shape) == 1:
+-      box_size = jnp.reshape(box_size, (1, -1))
++      box_size = onp.reshape(box_size, (1, -1))
+ 
+   if util.is_array(minimum_cell_size):
+     minimum_cell_size = onp.array(minimum_cell_size)
+@@ -590,7 +590,7 @@ def is_box_valid(box: Array) -> bool:
+ 
+ 
+ @dataclasses.dataclass
+-class NeighborList(object):
++class NeighborList:
+   """A struct containing the state of a Neighbor List.
+ 
+   Attributes:
+diff --git a/tests/.energy_test.py.swp b/tests/.energy_test.py.swp
+new file mode 100644
+index 00000000..26666d6b
+Binary files /dev/null and b/tests/.energy_test.py.swp differ
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index 7421cc2d..3e0f1827 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -21,6 +21,7 @@
+ from jax import random
+ import jax
+ from jax import jit, vmap, grad
++from jax import tree_map
+ import jax.numpy as np
+ 
+ import numpy as onp
+@@ -773,13 +774,14 @@ def test_tersoff(self, dtype):
+     box_size = np.linalg.det(lattice_vectors) ** (1 / 3)
+     with open('tests/data/Si.tersoff', 'r') as fh:
+       tersoff_parameters = energy.load_lammps_tersoff_parameters(fh)
++    if dtype == f32:
++      tersoff_parameters = tree_map(lambda x: f32(x) if isinstance(x, Array) else x, tersoff_parameters)
+     energy_fn = energy.tersoff(displacement, tersoff_parameters)
+     E = energy_fn(atoms)
+-    print(quantity.force(energy_fn)(atoms))
+     if dtype is f64:
+-      self.assertAllClose(E, -296.3463784635968, atol=1e-5, rtol=2e-8)
++      self.assertAllClose(E, dtype(-296.3463784635968), atol=1e-5, rtol=2e-8)
+     else:
+-      self.assertAllClose(E, -296.3463784635968, atol=1e-5, rtol=2e-8)
++      self.assertAllClose(E, dtype(-296.3463784635968))
+ 
+     self.assertAllClose(quantity.force(energy_fn)(atoms), jnp.zeros_like(atoms))
+ 
+@@ -808,15 +810,17 @@ def test_tersoff_neighbor_list(self, dtype):
+     box_size = np.linalg.det(lattice_vectors) ** (1 / 3)
+     with open('tests/data/Si.tersoff', 'r') as fh:
+       tersoff_parameters = energy.load_lammps_tersoff_parameters(fh)
++    if dtype == f32:
++      tersoff_parameters = tree_map(lambda x: f32(x) if isinstance(x, Array) else x, tersoff_parameters)
+     neighbor_fn, energy_fn = energy.tersoff_neighbor_list(displacement,
+                                                           box_size,
+                                                           tersoff_parameters)
+     nbrs = neighbor_fn.allocate(atoms)
+     E = energy_fn(atoms, nbrs)
+     if dtype is f64:
+-      self.assertAllClose(E, -296.3463784635968, atol=1e-5, rtol=2e-8)
++      self.assertAllClose(E, dtype(-296.3463784635968), atol=1e-5, rtol=2e-8)
+     else:
+-      self.assertAllClose(E, -296.3463784635968, atol=1e-5, rtol=2e-8)
++      self.assertAllClose(E, dtype(-296.3463784635968))
+ 
+     self.assertAllClose(quantity.force(energy_fn)(atoms, nbrs),
+                         jnp.zeros_like(atoms))
+@@ -846,10 +850,11 @@ def test_edip(self, dtype):
+     box_size = np.linalg.det(lattice_vectors) ** (1 / 3)
+     energy_fn = energy.edip(displacement)
+     E = energy_fn(atoms)
++    
+     if dtype is f64:
+-      self.assertAllClose(E, -297.597013492761, atol=1e-5, rtol=2e-8)
++      self.assertAllClose(E, dtype(-297.597013492761), atol=1e-5, rtol=2e-8)
+     else:
+-      self.assertAllClose(E, -297.597013492761, atol=9e-7, rtol=3e-9)
++      self.assertAllClose(E, dtype(-297.597013492761))
+ 
+     self.assertAllClose(quantity.force(energy_fn)(atoms), jnp.zeros_like(atoms))
+ 
+@@ -1044,9 +1049,6 @@ def update(params, opt_state, R):
+           'dtype': dtype,
+       } for dtype in POSITION_DTYPE))
+   def test_nequip_silicon(self, dtype):
+-    # TODO: fix this test.
+-    if True:
+-        self.skipTest('Something is wrong with the data stored in tests/data/nequip_silicon_test.')
+     position = jnp.array([[0.262703, 0.752304, 0.243743],
+                           [0.018137, 0.002302, 0.491184],
+                           [0.248363, 0.237012, 0.776354],
+diff --git a/tests/partition_test.py b/tests/partition_test.py
+index 673ad783..3a42c18f 100644
+--- a/tests/partition_test.py
++++ b/tests/partition_test.py
+@@ -464,12 +464,14 @@ def test_issue191_1(self):
+       [(0.12, True, 1.5), (0.25, False, 1.5),
+        (0.31, False, 1.5), (0.31, False, 1.0)]) for ms in [False, True]
+       for fmt in [partition.Dense, partition.Sparse, partition.OrderedSparse]))
++
+   def test_issue191_2(self, r_cut, disable_cell_list, capacity_multiplier,
+                       mask_self, format):
+-    box = jnp.ones(3)
++    box = onp.ones(3)
++    # box = 1.0
+     if format is partition.Dense:
+       desired_shape = (20, 19) if mask_self else (20, 20)
+-      _positions = jnp.linspace(0.5, 0.7, 20)
++      _positions = jnp.ones((20,)) * 0.5
+     elif format is partition.Sparse:
+       desired_shape = (2, 20 * 19) if mask_self else (2, 20**2)
+       _positions = jnp.ones((20,)) * 0.5
+@@ -486,11 +488,13 @@ def test_issue191_2(self, r_cut, disable_cell_list, capacity_multiplier,
+       disable_cell_list=disable_cell_list,
+       mask_self=mask_self,
+       format=format)
++    
+     nbrs = neighbor_fn.allocate(positions)
+ 
+     self.assertFalse(nbrs.did_buffer_overflow)
+     self.assertEqual(nbrs.idx.shape, desired_shape)
+-    new_nbrs = nbrs.update(positions)
++    
++    new_nbrs = nbrs.update(positions + 0.1)
+     self.assertFalse(new_nbrs.did_buffer_overflow)
+     self.assertEqual(new_nbrs.idx.shape, desired_shape)
+ 
+@@ -597,6 +601,7 @@ def cell(key, a, b, c, alpha, beta, gamma):
+       nbrs = neighbor_fn.allocate(R)
+       nbrs = nbrs.update(R, box=cl * factor)
+       E_target = E_exact(R, box=cl * factor)
++
+       if factor > 1:
+         self.assertTrue(jnp.any(jnp.abs(E_target) > 0.25))
+         self.assertAllClose(E_target, E(R, neighbor=nbrs, box=cl * factor))

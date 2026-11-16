@@ -1,0 +1,292 @@
+diff --git a/include/glob.nelembuffer.h b/include/glob.nelembuffer.h
+new file mode 100644
+index 000000000..c197b83d6
+--- /dev/null
++++ b/include/glob.nelembuffer.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include "macro.h"
++
++
++namespace tinker {
++TINKER_EXTERN int nelem_buffer;
++}
+diff --git a/include/mdpq.h b/include/mdpq.h
+index 9de635c31..eb8ca695b 100644
+--- a/include/mdpq.h
++++ b/include/mdpq.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "glob.nelembuffer.h"
+ #include "mdprec.h"
+ #include "tool/rc_man.h"
+ #include <istream>
+@@ -33,7 +34,6 @@ extern int rc_flag;
+ extern int n;
+ extern int padded_n;
+ extern int trajn;
+-extern int nelem_buffer;
+ 
+ 
+ void n_data(rc_op);
+diff --git a/include/seq_damp_hippo.h b/include/seq_damp_hippo.h
+index 6e93baaf0..470126179 100644
+--- a/include/seq_damp_hippo.h
++++ b/include/seq_damp_hippo.h
+@@ -83,7 +83,7 @@ inline void damp_pole_v1(real* restrict dmpik, real* restrict dmpi,
+             expi;
+       dmpik[4] = 1 -
+          ((1 + dampi + 0.5f * dampi2 + dampi3 * div6) +
+-          ((dampi4 + +dampi5 * div5) +
++          ((dampi4 + dampi5 * div5) +
+            0.1f * (dampi6 * div3 + dampi7 * div21)) *
+              div24) *
+             expi;
+diff --git a/include/spatial2.h b/include/spatial2.h
+index df4ec406d..f90f581ca 100644
+--- a/include/spatial2.h
++++ b/include/spatial2.h
+@@ -51,7 +51,7 @@ namespace tinker {
+  *       - <a href="https://stackoverflow.com/a/10384110">
+  *       Paul Chernoch (stackoverflow question 499166, answer 10384110)
+  *       </a>
+- *       corrected the typo in `TransposetoAxes()`, which should have been
++ *       corrected the typo in `TransposetoAxes()`, which should read
+  *    ```
+  *    for(i=n-1; i>0; i--) X[i] ^= X[i-1];
+  *    ```
+diff --git a/include/syntax/cu/launch.h b/include/syntax/cu/launch.h
+index 9911770aa..7a09f91fe 100644
+--- a/include/syntax/cu/launch.h
++++ b/include/syntax/cu/launch.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "glob.gpucard.h"
++#include "glob.nelembuffer.h"
+ #include "tool/cudalib.h"
+ #include "tool/error.h"
+ 
+@@ -14,6 +15,7 @@ namespace tinker {
+  * \param np  Hint to determine the grid dimension (often is the loop limit).
+  * \param k   CUDA `__global__` kernel.
+  * \param a   Arguments of the kernel.
++ * \see launch_k4b
+  */
+ template <class K, class... Ts>
+ void launch_k4(cudaStream_t st, size_t sh, int bs, int np, K k, Ts&&... a)
+@@ -23,6 +25,27 @@ void launch_k4(cudaStream_t st, size_t sh, int bs, int np, K k, Ts&&... a)
+ }
+ 
+ 
++/**
++ * \ingroup cuda_syntax
++ * Launch a non-blocking CUDA kernel with energy, virial, and/or count buffer
++ * parameters.
++ * \param st  CUDA stream.
++ * \param sh  Dynamic shared memory (bytes per block).
++ * \param bs  Thread block size.
++ * \param np  Hint to determine the grid dimension (often is the loop limit).
++ * \param k   CUDA `__global__` kernel.
++ * \param a   Arguments of the kernel.
++ * \see launch_k4
++ */
++template <class K, class... Ts>
++void launch_k4b(cudaStream_t st, size_t sh, int bs, int np, K k, Ts&&... a)
++{
++   np = std::min(np, nelem_buffer);
++   int gs = (np + bs - 1) / bs;
++   k<<<gs, bs, sh, st>>>(std::forward<Ts>(a)...);
++}
++
++
+ /**
+  * \ingroup cuda_syntax
+  * Launch a non-blocking CUDA kernel with 0 dynamic shared memory.
+@@ -36,6 +59,19 @@ void launch_k2s(cudaStream_t st, int bs, int np, K k, Ts&&... a)
+ }
+ 
+ 
++/**
++ * \ingroup cuda_syntax
++ * Launch a non-blocking CUDA kernel with 0 dynamic shared memory.
++ * \see launch_k4b
++ */
++template <class K, class... Ts>
++void launch_k2b(cudaStream_t st, int bs, int np, K k, Ts&&... a)
++{
++   const size_t sh = 0;
++   launch_k4b(st, sh, bs, np, k, std::forward<Ts>(a)...);
++}
++
++
+ /**
+  * \ingroup cuda_syntax
+  * Launch a non-blocking CUDA kernel with 0 dynamic shared memory and the
+@@ -48,4 +84,18 @@ void launch_k1s(cudaStream_t st, int np, K k, Ts&&... a)
+    const int bs = BLOCK_DIM;
+    launch_k2s(st, bs, np, k, std::forward<Ts>(a)...);
+ }
++
++
++/**
++ * \ingroup cuda_syntax
++ * Launch a non-blocking CUDA kernel with 0 dynamic shared memory and the
++ * default block size (#BLOCK_DIM).
++ * \see BLOCK_DIM, launch_k2b, launch_k4b
++ */
++template <class K, class... Ts>
++void launch_k1b(cudaStream_t st, int np, K k, Ts&&... a)
++{
++   const int bs = BLOCK_DIM;
++   launch_k2b(st, bs, np, k, std::forward<Ts>(a)...);
++}
+ }
+diff --git a/src-cu/echarge_cu.cu b/src-cu/echarge_cu.cu
+index b41865c75..1ebceaf5f 100644
+--- a/src-cu/echarge_cu.cu
++++ b/src-cu/echarge_cu.cu
+@@ -574,13 +574,13 @@ void echarge_fphi_self_cu()
+       stream = g::spme;
+    if (st.bsorder == 5) {
+       auto ker = echarge_cu3<Ver, 5>;
+-      launch_k2s(stream, PME_BLOCKDIM, n, ker, //
++      launch_k2b(stream, PME_BLOCKDIM, n, ker, //
+                  nec, ec, pchg, f, aewald, n,  //
+                  nfft1, nfft2, nfft3, x, y, z, st.qgrid, recipa, recipb, recipc,
+                  decx, decy, decz);
+    } else if (st.bsorder == 4) {
+       auto ker = echarge_cu3<Ver, 4>;
+-      launch_k2s(stream, PME_BLOCKDIM, n, ker, //
++      launch_k2b(stream, PME_BLOCKDIM, n, ker, //
+                  nec, ec, pchg, f, aewald, n,  //
+                  nfft1, nfft2, nfft3, x, y, z, st.qgrid, recipa, recipb, recipc,
+                  decx, decy, decz);
+diff --git a/src-cu/edisp_cu.cu b/src-cu/edisp_cu.cu
+index 0e0febf5b..1939859df 100644
+--- a/src-cu/edisp_cu.cu
++++ b/src-cu/edisp_cu.cu
+@@ -558,7 +558,7 @@ void edisp_cu4()
+ 
+    assert(st.bsorder == 4);
+    auto ker = edisp_cu3<Ver, 4>;
+-   launch_k2s(g::s0, PME_BLOCKDIM, n, ker, //
++   launch_k2b(g::s0, PME_BLOCKDIM, n, ker, //
+               ndisp, edsp, csix, aewald, n, nfft1, nfft2, nfft3, x, y, z,
+               st.qgrid, recipa, recipb, recipc, dedspx, dedspy, dedspz);
+ }
+diff --git a/src-cu/elj_cu.cu b/src-cu/elj_cu.cu
+index 0a779eaec..528deb882 100644
+--- a/src-cu/elj_cu.cu
++++ b/src-cu/elj_cu.cu
+@@ -506,7 +506,7 @@ void elj_cu5()
+       const real off = switch_off(switch_vdw);
+ 
+ 
+-      launch_k1s(g::s0, nvdw14, elj_cu2<Ver>, //
++      launch_k1b(g::s0, nvdw14, elj_cu2<Ver>, //
+                  nev, ev, vir_ev, devx, devy, devz, TINKER_IMAGE_ARGS, cut, off,
+                  st.x, st.y, st.z,             //
+                  njvdw, radmin, epsilon, jvdw, //
+diff --git a/src-cu/emplar_cu.cu b/src-cu/emplar_cu.cu
+index 594e32f9f..9c49c9577 100644
+--- a/src-cu/emplar_cu.cu
++++ b/src-cu/emplar_cu.cu
+@@ -1283,7 +1283,7 @@ void emplar_cu(const real (*uind)[3], const real (*uinp)[3])
+ 
+       if CONSTEXPR (Ver::e) {
+          auto ker0 = empole_self_cu<Ver::a>;
+-         launch_k1s(g::s0, n, ker0, //
++         launch_k1b(g::s0, n, ker0, //
+                     nullptr, em, rpole, n, f, aewald);
+       }
+    }
+diff --git a/src-cu/empole_chgpen_cu.cu b/src-cu/empole_chgpen_cu.cu
+index 412b6c9d9..15c3132f9 100644
+--- a/src-cu/empole_chgpen_cu.cu
++++ b/src-cu/empole_chgpen_cu.cu
+@@ -593,7 +593,7 @@ void empole_chgpen_cu()
+    if CONSTEXPR (eq<ETYP, EWALD>()) {
+       PMEUnit pu = epme_unit;
+       aewald = pu->aewald;
+-      launch_k1s(g::s0, n, empole_chgpen_self_cu<do_a, do_e, CFLX>, //
++      launch_k1b(g::s0, n, empole_chgpen_self_cu<do_a, do_e, CFLX>, //
+                  nem, em, rpole, pot, n, f, aewald);
+    }
+ 
+diff --git a/src-cu/empole_cu.cu b/src-cu/empole_cu.cu
+index 6408fd9db..fefdd5ab4 100644
+--- a/src-cu/empole_cu.cu
++++ b/src-cu/empole_cu.cu
+@@ -469,7 +469,7 @@ void empole_cu()
+ 
+ 
+       if CONSTEXPR (do_e) {
+-         launch_k1s(g::s0, n, empole_self_cu<do_a>, //
++         launch_k1b(g::s0, n, empole_self_cu<do_a>, //
+                     nem, em, rpole, n, f, aewald);
+       }
+    }
+diff --git a/src-cu/rattle_cu.cu b/src-cu/rattle_cu.cu
+index fe4c50900..03e8da519 100644
+--- a/src-cu/rattle_cu.cu
++++ b/src-cu/rattle_cu.cu
+@@ -396,12 +396,12 @@ void constrain2_methyl_cu1(int nratch2, const int (*restrict iratch2)[3],
+          xtermc *= vterm;
+          ytermc *= vterm;
+          ztermc *= vterm;
+-         vxx -= (xb3 * xtermb + xc3 * xtermc + +xd3 * xtermd);
+-         vyx -= (yb3 * xtermb + yc3 * xtermc + +yd3 * xtermd);
+-         vzx -= (zb3 * xtermb + zc3 * xtermc + +zd3 * xtermd);
+-         vyy -= (yb3 * ytermb + yc3 * ytermc + +yd3 * ytermd);
+-         vzz -= (zb3 * ztermb + zc3 * ztermc + +zd3 * ztermd);
+-         vzy -= (zb3 * ytermb + zc3 * ytermc + +zd3 * ytermd);
++         vxx -= (xb3 * xtermb + xc3 * xtermc + xd3 * xtermd);
++         vyx -= (yb3 * xtermb + yc3 * xtermc + yd3 * xtermd);
++         vzx -= (zb3 * xtermb + zc3 * xtermc + zd3 * xtermd);
++         vyy -= (yb3 * ytermb + yc3 * ytermc + yd3 * ytermd);
++         vzz -= (zb3 * ztermb + zc3 * ztermc + zd3 * ztermd);
++         vzy -= (zb3 * ytermb + zc3 * ytermc + zd3 * ytermd);
+       }
+    }
+ 
+@@ -422,7 +422,7 @@ void rattle2_methyl_cu(time_prec dt, bool do_v)
+ 
+    if (do_v) {
+       auto ker = constrain2_methyl_cu1<true>;
+-      launch_k2s(g::s0, 64, n23, ker,
++      launch_k2b(g::s0, 64, n23, ker,
+ 
+                  nratch2, iratch2, nratch3, iratch3,
+ 
+@@ -431,7 +431,7 @@ void rattle2_methyl_cu(time_prec dt, bool do_v)
+                  xpos, ypos, zpos, massinv);
+    } else {
+       auto ker = constrain2_methyl_cu1<false>;
+-      launch_k2s(g::s0, 64, n23, ker,
++      launch_k2b(g::s0, 64, n23, ker,
+ 
+                  nratch2, iratch2, nratch3, iratch3,
+ 
+diff --git a/src/mdpq.cpp b/src/mdpq.cpp
+index c7a33bf78..576e0ee59 100644
+--- a/src/mdpq.cpp
++++ b/src/mdpq.cpp
+@@ -24,7 +24,6 @@ int rc_flag = 0;
+ int n;
+ int padded_n;
+ int trajn;
+-int nelem_buffer;
+ 
+ 
+ void n_data(rc_op op)
+diff --git a/src/mod.cpp b/src/mod.cpp
+index 213333b99..75a991b5f 100644
+--- a/src/mod.cpp
++++ b/src/mod.cpp
+@@ -51,5 +51,6 @@
+ #include "glob.molecule.h"
+ #include "glob.mplar.h"
+ #include "glob.nblist.h"
++#include "glob.nelembuffer.h"
+ #include "glob.pme.h"
+ #include "glob.spatial.h"

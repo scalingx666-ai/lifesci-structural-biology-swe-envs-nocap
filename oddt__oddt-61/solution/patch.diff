@@ -1,0 +1,345 @@
+diff --git a/oddt/interactions.py b/oddt/interactions.py
+index acbe7f7b..31d8ee5c 100644
+--- a/oddt/interactions.py
++++ b/oddt/interactions.py
+@@ -12,7 +12,7 @@
+ """
+ 
+ import numpy as np
+-from oddt.spatial import dihedral, angle, angle_2v, distance
++from oddt.spatial import angle, angle_2v, distance
+ 
+ __all__ = ['close_contacts',
+            'hbond_acceptor_donor',
+@@ -28,8 +28,10 @@
+            'pi_metal']
+ 
+ 
+-def close_contacts(x, y, cutoff, x_column='coords', y_column='coords'):
+-    """ Returns pairs of atoms which are within close contac distance cutoff.
++def close_contacts(x, y, cutoff, x_column='coords', y_column='coords',
++                   cutoff_low=0.):
++    """Returns pairs of atoms which are within close contac distance cutoff.
++    The cutoff is semi-inclusive, i.e (cutoff_low, cutoff].
+ 
+         Parameters
+         ----------
+@@ -43,6 +45,9 @@ def close_contacts(x, y, cutoff, x_column='coords', y_column='coords'):
+                 Column containing coordinates of atoms (or pseudo-atoms,
+                 i.e. ring centroids)
+ 
++            cutoff_low : float (default=0.)
++                Lower bound of contacts to find (exclusive). Zero by default.
++
+         Returns
+         -------
+             x_, y_ : atom_dict-type numpy array
+@@ -50,7 +55,7 @@ def close_contacts(x, y, cutoff, x_column='coords', y_column='coords'):
+     """
+     if len(x[x_column]) > 0 and len(x[x_column]) > 0:
+         d = distance(x[x_column], y[y_column])
+-        index = np.argwhere((d > 0) & (d <= cutoff))
++        index = np.argwhere((d > cutoff_low) & (d <= cutoff))
+         return x[index[:, 0]], y[index[:, 1]]
+     else:
+         return x[[]], y[[]]
+diff --git a/oddt/scoring/descriptors/__init__.py b/oddt/scoring/descriptors/__init__.py
+index 36e90eae..81e39db9 100644
+--- a/oddt/scoring/descriptors/__init__.py
++++ b/oddt/scoring/descriptors/__init__.py
+@@ -4,7 +4,7 @@
+ from oddt.docking import autodock_vina
+ from oddt.docking.internal import vina_docking
+ 
+-__all__ = ['close_contacts',
++__all__ = ['close_contacts_descriptor',
+            'fingerprints',
+            'autodock_vina_descriptor',
+            'oddt_vina_descriptor']
+@@ -77,7 +77,7 @@ def atoms_by_type(atom_dict, types, mode='atomic_nums'):
+     return out
+ 
+ 
+-class close_contacts(object):
++class close_contacts_descriptor(object):
+     def __init__(self,
+                  protein=None,
+                  cutoff=4,
+@@ -111,13 +111,14 @@ def __init__(self,
+                 Flag indicating should permutation of types should be done,
+                 otherwise the atoms are treated as aligned pairs.
+         """
+-        if isinstance(cutoff, (int, float)):
+-            self.cutoff = np.array([cutoff])
+-        elif len(cutoff) > 1 and len(np.array(cutoff).shape) == 1:
+-            self.cutoff = np.vstack((np.array(cutoff)[:-1],
+-                                     np.array(cutoff)[1:])).T
+-        else:
+-            self.cutoff = np.array(cutoff)
++        self.cutoff = np.atleast_1d(cutoff)
++        # Cutoffs in fomr of continuous intervals (0,2,4,6,...)
++        if len(self.cutoff) > 1 and self.cutoff.ndim == 1:
++            self.cutoff = np.vstack((self.cutoff[:-1],
++                                     self.cutoff[1:])).T
++        elif self.cutoff.ndim > 2:
++            raise ValueError('Unsupported shape of cutoff: %s' % self.cutoff.shape)
++
+         # for pickle save original value
+         self.original_cutoff = cutoff
+ 
+@@ -201,12 +202,12 @@ def __len__(self):
+             return len(self.ligand_types) * len(self.protein_types) * len(self.cutoff)
+ 
+     def __reduce__(self):
+-        return close_contacts, (self.protein,
+-                                self.original_cutoff,
+-                                self.mode,
+-                                self.ligand_types,
+-                                self.protein_types,
+-                                self.aligned_pairs)
++        return close_contacts_descriptor, (self.protein,
++                                           self.original_cutoff,
++                                           self.mode,
++                                           self.ligand_types,
++                                           self.protein_types,
++                                           self.aligned_pairs)
+ 
+ 
+ # TODO: we don't use toolkit. should we?
+@@ -273,9 +274,7 @@ def build(self, ligands, protein=None, single=False):
+                 desc = vec
+             else:
+                 desc = np.vstack((desc, vec))
+-        if len(desc.shape) == 1:
+-            desc = desc.reshape(1, -1)
+-        return desc
++        return np.atleast_2d(desc)
+ 
+     def __len__(self):
+         """ Returns the dimensions of descriptors """
+@@ -347,9 +346,7 @@ def build(self, ligands, protein=None, single=False):
+                 desc = vec
+             else:
+                 desc = np.vstack((desc, vec))
+-        if len(desc.shape) == 1:
+-            desc = desc.reshape(1, -1)
+-        return desc
++        return np.atleast_2d(desc)
+ 
+     def __len__(self):
+         """ Returns the dimensions of descriptors """
+diff --git a/oddt/scoring/descriptors/binana.py b/oddt/scoring/descriptors/binana.py
+index 78936d1d..b70d8152 100644
+--- a/oddt/scoring/descriptors/binana.py
++++ b/oddt/scoring/descriptors/binana.py
+@@ -5,10 +5,10 @@
+ 
+ import numpy as np
+ from oddt.scoring.descriptors import (atoms_by_type,
+-                                      close_contacts,
+-                                      oddt_vina_descriptor,
+-                                      autodock_vina_descriptor)
+-from oddt import interactions
++                                      close_contacts_descriptor,
++                                      oddt_vina_descriptor)
++from oddt.interactions import (close_contacts, hbonds, hydrophobic_contacts,
++                               pi_cation, pi_stacking, salt_bridges)
+ 
+ 
+ class binana_descriptor(object):
+@@ -59,12 +59,12 @@ def __init__(self, protein=None):
+                       ('A', 'CU'), ('C', 'CD'))
+         cc_4_rec_types, cc_4_lig_types = zip(*cc_4_types)
+         self.titles += ['cc_%s.%s_4' % (t1, t2) for t1, t2 in cc_4_types]
+-        self.cc_4 = cc_4_nn = close_contacts(protein,
+-                                             cutoff=4,
+-                                             protein_types=cc_4_rec_types,
+-                                             ligand_types=cc_4_lig_types,
+-                                             mode='atom_types_ad4',
+-                                             aligned_pairs=True)
++        self.cc_4 = close_contacts_descriptor(protein,
++                                              cutoff=4,
++                                              protein_types=cc_4_rec_types,
++                                              ligand_types=cc_4_lig_types,
++                                              mode='atom_types_ad4',
++                                              aligned_pairs=True)
+ 
+         self.ele_types = (('A', 'A'), ('A', 'C'), ('A', 'CL'), ('A', 'F'),
+                           ('A', 'FE'), ('A', 'HD'), ('A', 'MG'), ('A', 'MN'),
+@@ -118,12 +118,12 @@ def __init__(self, protein=None):
+                        ('NA', 'ZN'), ('OA', 'OA'), ('OA', 'SA'), ('OA', 'ZN'),
+                        ('S', 'ZN'), ('SA', 'ZN')]
+         cc_25_rec_types, cc_25_lig_types = zip(*cc_25_types)
+-        self.cc_25 = close_contacts(protein,
+-                                    cutoff=2.5,
+-                                    protein_types=cc_25_rec_types,
+-                                    ligand_types=cc_25_lig_types,
+-                                    mode='atom_types_ad4',
+-                                    aligned_pairs=True)
++        self.cc_25 = close_contacts_descriptor(protein,
++                                               cutoff=2.5,
++                                               protein_types=cc_25_rec_types,
++                                               ligand_types=cc_25_lig_types,
++                                               mode='atom_types_ad4',
++                                               aligned_pairs=True)
+         self.titles += ['cc_%s.%s_2.5' % (t1, t2) for t1, t2 in cc_25_types]
+         # H-Bonds (<4A)
+         self.titles += ['hb_4_mol_backbone_alpha',
+@@ -235,7 +235,7 @@ def build(self, ligands, protein=None):
+             ele_rec_atoms = atoms_by_type(protein_dict, ele_rec_types, 'atom_types_ad4')
+             ele = tuple()
+             for r_t, m_t in self.ele_types:
+-                mol_ele_dict, rec_ele_dict = interactions.close_contacts(ele_mol_atoms[m_t], ele_rec_atoms[r_t], 4)
++                mol_ele_dict, rec_ele_dict = close_contacts(ele_mol_atoms[m_t], ele_rec_atoms[r_t], 4)
+                 if len(mol_ele_dict) and len(rec_ele_dict):
+                     ele += (mol_ele_dict['charge'] *
+                             rec_ele_dict['charge'] /
+@@ -254,7 +254,7 @@ def build(self, ligands, protein=None):
+             vec += tuple(self.cc_25.build(mol, single=True).flatten())
+ 
+             # H-Bonds (<4A)
+-            hbond_mol, hbond_rec, strict = interactions.hbonds(mol, protein, 4)
++            hbond_mol, hbond_rec, strict = hbonds(mol, protein, 4)
+             # Retain only strict hbonds
+             hbond_mol = hbond_mol[strict]
+             hbond_rec = hbond_rec[strict]
+@@ -279,7 +279,7 @@ def build(self, ligands, protein=None):
+             vec += tuple(hbond_vec)
+ 
+             # Hydrophobic contacts (<4A)
+-            hydrophobic = interactions.hydrophobic_contacts(mol, protein, 4)[1]
++            hydrophobic = hydrophobic_contacts(mol, protein, 4)[1]
+             backbone = hydrophobic['isbackbone']
+             alpha = hydrophobic['isalpha']
+             beta = hydrophobic['isbeta']
+@@ -294,7 +294,7 @@ def build(self, ligands, protein=None):
+             vec += tuple(hyd_vec)
+ 
+             # Pi-stacking (<7.5A)
+-            pi_mol, pi_rec, pi_paralel, pi_tshaped = interactions.pi_stacking(mol, protein, 7.5)
++            pi_mol, pi_rec, pi_paralel, pi_tshaped = pi_stacking(mol, protein, 7.5)
+             alpha = pi_rec['isalpha'] & pi_paralel
+             beta = pi_rec['isbeta'] & pi_paralel
+             other = ~alpha & ~beta & pi_paralel
+@@ -308,13 +308,13 @@ def build(self, ligands, protein=None):
+             pi_t_vec = (alpha.sum(), beta.sum(), other.sum())
+ 
+             # Pi-cation (<6A)
+-            pi_rec, cat_mol, strict = interactions.pi_cation(protein, mol, 6)
++            pi_rec, cat_mol, strict = pi_cation(protein, mol, 6)
+             alpha = pi_rec['isalpha'] & strict
+             beta = pi_rec['isbeta'] & strict
+             other = ~alpha & ~beta & strict
+             pi_cat_vec = (alpha.sum(), beta.sum(), other.sum())
+ 
+-            pi_mol, cat_rec, strict = interactions.pi_cation(mol, protein, 6)
++            pi_mol, cat_rec, strict = pi_cation(mol, protein, 6)
+             alpha = cat_rec['isalpha'] & strict
+             beta = cat_rec['isbeta'] & strict
+             other = ~alpha & ~beta & strict
+@@ -326,9 +326,9 @@ def build(self, ligands, protein=None):
+             vec += tuple(pi_t_vec)
+ 
+             # Active site flexibility (<4A)
+-            acitve_site = interactions.close_contacts(mol_dict[mol_dict['atomicnum'] != 1],
+-                                                      protein_dict[protein_dict['atomicnum'] != 1],
+-                                                      cutoff=4)[1]
++            acitve_site = close_contacts(mol_dict[mol_dict['atomicnum'] != 1],
++                                         protein_dict[protein_dict['atomicnum'] != 1],
++                                         cutoff=4)[1]
+             backbone = acitve_site['isbackbone']
+             alpha = acitve_site['isalpha']
+             beta = acitve_site['isbeta']
+@@ -343,11 +343,11 @@ def build(self, ligands, protein=None):
+             vec += tuple(as_flex)
+ 
+             # Salt bridges (<5.5)
+-            salt_bridges = interactions.salt_bridges(mol, protein, 5.5)[1]
+-            vec += (salt_bridges['isalpha'].sum(),
+-                    salt_bridges['isbeta'].sum(),
+-                    (~salt_bridges['isalpha'] & ~salt_bridges['isbeta']).sum(),
+-                    len(salt_bridges))
++            salt_bridge_dict = salt_bridges(mol, protein, 5.5)[1]
++            vec += (salt_bridge_dict['isalpha'].sum(),
++                    salt_bridge_dict['isbeta'].sum(),
++                    (~salt_bridge_dict['isalpha'] & ~salt_bridge_dict['isbeta']).sum(),
++                    len(salt_bridge_dict))
+ 
+             # Rotatable bonds
+             vec += mol.num_rotors,
+diff --git a/oddt/scoring/functions/RFScore.py b/oddt/scoring/functions/RFScore.py
+index 8182a089..fc7e7f76 100644
+--- a/oddt/scoring/functions/RFScore.py
++++ b/oddt/scoring/functions/RFScore.py
+@@ -14,7 +14,8 @@
+ from oddt.metrics import rmse
+ from oddt.scoring import scorer, ensemble_descriptor
+ from oddt.scoring.models.regressors import randomforest
+-from oddt.scoring.descriptors import close_contacts, oddt_vina_descriptor
++from oddt.scoring.descriptors import (close_contacts_descriptor,
++                                      oddt_vina_descriptor)
+ 
+ 
+ # numpy after pickling gives Runtime Warnings
+@@ -35,24 +36,27 @@ def __init__(self, protein=None, n_jobs=-1, version=1, spr=0, **kwargs):
+         if version == 1:
+             cutoff = 12
+             mtry = 6
+-            descriptors = close_contacts(protein,
+-                                         cutoff=cutoff,
+-                                         protein_types=protein_atomic_nums,
+-                                         ligand_types=ligand_atomic_nums)
++            descriptors = close_contacts_descriptor(
++                protein,
++                cutoff=cutoff,
++                protein_types=protein_atomic_nums,
++                ligand_types=ligand_atomic_nums)
+         elif version == 2:
+             cutoff = np.array([0, 2, 4, 6, 8, 10, 12])
+             mtry = 14
+-            descriptors = close_contacts(protein,
+-                                         cutoff=cutoff,
+-                                         protein_types=protein_atomic_nums,
+-                                         ligand_types=ligand_atomic_nums)
++            descriptors = close_contacts_descriptor(
++                protein,
++                cutoff=cutoff,
++                protein_types=protein_atomic_nums,
++                ligand_types=ligand_atomic_nums)
+         elif version == 3:
+             cutoff = 12
+             mtry = 6
+-            cc = close_contacts(protein,
+-                                cutoff=cutoff,
+-                                protein_types=protein_atomic_nums,
+-                                ligand_types=ligand_atomic_nums)
++            cc = close_contacts_descriptor(
++                protein,
++                cutoff=cutoff,
++                protein_types=protein_atomic_nums,
++                ligand_types=ligand_atomic_nums)
+             vina_scores = ['vina_gauss1',
+                            'vina_gauss2',
+                            'vina_repulsion',
+diff --git a/tests/test_descriptors.py b/tests/test_descriptors.py
+index 371cc3b0..1592ebd9 100644
+--- a/tests/test_descriptors.py
++++ b/tests/test_descriptors.py
+@@ -36,7 +36,7 @@ def test_atoms_by_type():
+             assert_equal(len(types_dict[t]), n)
+ 
+ 
+-def test_close_contacts():
++def test_close_contacts_descriptor():
+     ligands = list(oddt.toolkit.readfile('sdf', actives_sdf))
+     rec = next(oddt.toolkit.readfile('pdb', receptor_pdb))
+     rec.protein = True
+@@ -44,7 +44,7 @@ def test_close_contacts():
+ 
+     for cutoff, num_contacts in ((4, 6816), ([4], 6816), ([2, 4], 6816),
+                                  ([[1, 2], [3, 4]], 6304)):
+-        contacts_descriptor = descriptors.close_contacts(
++        contacts_descriptor = descriptors.close_contacts_descriptor(
+             cutoff=cutoff,
+             ligand_types=[6, 7, 8],
+             protein_types=[6, 7, 8])

@@ -1,0 +1,169 @@
+diff --git a/e2e/ssao-quality.spec.ts b/e2e/ssao-quality.spec.ts
+index 4f139110..c4ec9729 100644
+--- a/e2e/ssao-quality.spec.ts
++++ b/e2e/ssao-quality.spec.ts
+@@ -11,13 +11,11 @@ test("SSAO quality is applied to the real pass and survives saved settings", asy
+ }) => {
+   await gotoApp(page);
+   await createBlankProject(page, "Occlusion quality", "occlusion-quality");
+-  await page
+-    .getByTestId("upload-input")
+-    .setInputFiles({
+-      name: "in.ao",
+-      mimeType: "text/plain",
+-      buffer: Buffer.from(FAST_LJ_SCRIPT.replace("run 400", "run 100000")),
+-    });
++  await page.getByTestId("upload-input").setInputFiles({
++    name: "in.ao",
++    mimeType: "text/plain",
++    buffer: Buffer.from(FAST_LJ_SCRIPT.replace("run 400", "run 100000")),
++  });
+   await waitForEngine(page);
+   await page.getByTestId("run-file-in.ao").click();
+   const passConfig = () =>
+@@ -35,36 +33,39 @@ test("SSAO quality is applied to the real pass and survives saved settings", asy
+         }
+       );
+     });
++  // Put the pass in the pixel-radius state so each settings change below has
++  // to reset it: the world-space value it must restore is also N8AO's default.
++  const usePixelRadius = () =>
++    page.evaluate(async () => {
++      const path = "/atomify/src/store/index.ts";
++      const store = (await import(path)).default;
++      store.getActions().simulation.setPaused(true);
++      const v = store.getState().render.visualizer;
++      v.renderer.postProcessingManager.n8aoPass.configuration.screenSpaceRadius = true;
++      v.forceRender = true;
++    });
+   await expect
+     .poll(passConfig, { timeout: 60_000 })
++    .toEqual({ samples: 64, denoise: 16, pixels: false });
++  await usePixelRadius();
++  await expect
++    .poll(passConfig)
+     .toEqual({ samples: 64, denoise: 16, pixels: true });
+-  await page.evaluate(async () => {
+-    const path = "/atomify/src/store/index.ts";
+-    const store = (await import(path)).default;
+-    store.getActions().simulation.setPaused(true);
+-    const v = store.getState().render.visualizer;
+-    const pass = v.renderer.postProcessingManager.n8aoPass;
+-    pass.configuration.screenSpaceRadius = false;
+-    pass.setQualityMode("Medium");
+-    v.forceRender = true;
+-  });
+-  const canvas = page.getByTestId("run-detail").locator("canvas").first();
+-  await canvas.screenshot({ path: "/tmp/atomify-ssao-old.png" });
+   await page.getByRole("button", { name: "Settings", exact: true }).click();
+   await page.getByTestId("settings-tab-rendering").click();
+   await page.getByTestId("render-ssao-quality").selectOption("fast");
+   await expect
+     .poll(passConfig)
+-    .toEqual({ samples: 16, denoise: 8, pixels: true });
++    .toEqual({ samples: 16, denoise: 8, pixels: false });
++  await usePixelRadius();
+   await page.getByTestId("render-ssao-quality").selectOption("detailed");
+   await expect
+     .poll(passConfig)
+-    .toEqual({ samples: 64, denoise: 16, pixels: true });
++    .toEqual({ samples: 64, denoise: 16, pixels: false });
+   await page
+     .getByTestId("settings-modal")
+     .getByRole("button", { name: "Close", exact: true })
+     .click();
+-  await canvas.screenshot({ path: "/tmp/atomify-ssao-detailed.png" });
+   await page.getByRole("button", { name: "Stop", exact: true }).click();
+   await page.reload();
+   await page.getByRole("button", { name: "Settings", exact: true }).click();
+diff --git a/src/store/settings.test.ts b/src/store/settings.test.ts
+index a32e30f2..111a019b 100644
+--- a/src/store/settings.test.ts
++++ b/src/store/settings.test.ts
+@@ -34,6 +34,14 @@ describe("loadRenderSettingsFromStorage", () => {
+     );
+   });
+ 
++  it("ignores a persisted occlusion radius and intensity", () => {
++    vi.mocked(Storage.prototype.getItem).mockReturnValue(
++      JSON.stringify({ ssao: true, ssaoRadius: 1, ssaoIntensity: 30 }),
++    );
++
++    expect(loadRenderSettingsFromStorage()).toEqual({ ssao: true });
++  });
++
+   it("should return empty object when key is missing", () => {
+     vi.mocked(Storage.prototype.getItem).mockReturnValue(null);
+ 
+diff --git a/src/store/settings.ts b/src/store/settings.ts
+index dba8a7b0..e3f8a258 100644
+--- a/src/store/settings.ts
++++ b/src/store/settings.ts
+@@ -22,7 +22,14 @@ export const loadRenderSettingsFromStorage = (): Partial<RenderSettings> => {
+     if (stored) {
+       const parsed = JSON.parse(stored);
+       if (typeof parsed === "object" && parsed !== null) {
+-        return parsed;
++        // The legacy settings dialog persisted a user-editable occlusion
++        // radius and intensity. Neither has a control any more and the
++        // ambient occlusion pass is tuned around the defaults, so a stale
++        // stored value must not change the look.
++        const settings = { ...parsed };
++        delete settings.ssaoRadius;
++        delete settings.ssaoIntensity;
++        return settings;
+       }
+     }
+   } catch (e) {
+diff --git a/src/utils/ambientOcclusion.test.ts b/src/utils/ambientOcclusion.test.ts
+index 27e7204f..df3f8fc5 100644
+--- a/src/utils/ambientOcclusion.test.ts
++++ b/src/utils/ambientOcclusion.test.ts
+@@ -2,9 +2,9 @@ import { expect, it, vi } from "vitest";
+ import type { Visualizer } from "omovi";
+ import { applyAmbientOcclusion } from "./ambientOcclusion";
+ 
+-it("uses screen-space occlusion and a denoised default, retaining the faster option", () => {
++it("uses a world-space radius and a denoised default, retaining the faster option", () => {
+   const pass = {
+-    configuration: { screenSpaceRadius: false },
++    configuration: { screenSpaceRadius: true },
+     setQualityMode: vi.fn(),
+   };
+   const v = {
+@@ -12,7 +12,7 @@ it("uses screen-space occlusion and a denoised default, retaining the faster opt
+     forceRender: false,
+   } as unknown as Visualizer;
+   applyAmbientOcclusion(v, {});
+-  expect(pass.configuration.screenSpaceRadius).toBe(true);
++  expect(pass.configuration.screenSpaceRadius).toBe(false);
+   expect(pass.setQualityMode).toHaveBeenLastCalledWith("Ultra");
+   expect(v.forceRender).toBe(true);
+   applyAmbientOcclusion(v, { ssaoQuality: "fast" });
+diff --git a/src/utils/ambientOcclusion.ts b/src/utils/ambientOcclusion.ts
+index 17b02aea..59092de8 100644
+--- a/src/utils/ambientOcclusion.ts
++++ b/src/utils/ambientOcclusion.ts
+@@ -16,11 +16,17 @@ export function applyAmbientOcclusion(
+       };
+     }
+   ).postProcessingManager.n8aoPass;
+-  // A world-space radius of 10 can cover the whole model in LJ units and
+-  // amplify sampling lines. Keep the occlusion neighborhood in screen pixels.
+-  pass.configuration.screenSpaceRadius = true;
+-  // More hemisphere and denoising samples suppress the visible stippling.
+-  // The faster mode remains available for phones and larger viewports.
++  // Keep the occlusion radius in simulation units (also N8AO's default, set
++  // here as a deliberate guard). Occlusion is a property of the geometry:
++  // atoms buried in a cluster should stay dark however far the camera is.
++  // The previous pixel-radius mode was mis-sized for the 10-unit radius
++  // (N8AO wants 16-64 px and a 0.2 falloff there), so the pass degraded to a
++  // faint edge detector and the effect looked absent.
++  pass.configuration.screenSpaceRadius = false;
++  // The grain seen with a large world radius comes from too few samples, so
++  // suppress it with more hemisphere and denoising samples instead of a
++  // smaller neighborhood. The faster mode remains available for phones and
++  // larger viewports.
+   pass.setQualityMode(settings.ssaoQuality === "fast" ? "Medium" : "Ultra");
+   visualizer.forceRender = true;
+ }

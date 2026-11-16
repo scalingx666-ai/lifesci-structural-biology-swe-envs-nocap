@@ -1,0 +1,258 @@
+diff --git a/Project.toml b/Project.toml
+index 8482974a4..e4f236aab 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -1,11 +1,8 @@
+ name = "NQCDynamics"
+ uuid = "36248dfb-79eb-4f4d-ab9c-e29ea5f33e14"
+ authors = ["James <james.gardner1421@gmail.com>"]
+-
+-
+ version = "0.15.1"
+ 
+-
+ [deps]
+ AdvancedHMC = "0bf59076-c3b1-5ca4-86bd-e02cd72cde3d"
+ AdvancedMH = "5b7e9947-ddc0-4b3f-9b55-0d8042f74170"
+@@ -38,6 +35,7 @@ RingPolymerArrays = "81cd853e-d334-476c-b156-f95acc8a32dc"
+ Roots = "f2b01f46-fcfa-551c-844a-d8ac1e96c665"
+ Rotations = "6038ab10-8711-5258-84ad-4b1120ba62dc"
+ SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
++SciMLOperators = "c0aeaf25-5076-4817-a8d5-81caf7dfa961"
+ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+@@ -81,6 +79,7 @@ RingPolymerArrays = "0.1"
+ Roots = "1, 2"
+ Rotations = "1"
+ SciMLBase = "1, 2"
++SciMLOperators = "<0.3.13"
+ StaticArrays = "1"
+ Statistics = "1"
+ StatsBase = "0.33, 0.34"
+diff --git a/docs/src/ensemble_simulations.md b/docs/src/ensemble_simulations.md
+index 7ffc0bd0a..d21336236 100644
+--- a/docs/src/ensemble_simulations.md
++++ b/docs/src/ensemble_simulations.md
+@@ -107,6 +107,11 @@ we can provide a function to the output argument as described in the
+ The advantage of this approach is that memory can be saved by reducing the data as the trajectories accumulate,
+ it also allows greater flexibility when modifying the output.
+ 
++!!! note Optimising performance
++
++    Due to how Julia's code precompilation works, running a function for the first time will take longer than subsequent calls to it. As a result, it's advantageous to run dynamics for a single time step to force the Julia compiler to precompile everything needed to propagate dynamics. 
++    NQCDynamics does this automatically, and you can disable this for shorter simulations by setting `precompile_dynamics=false` in the `run_dynamics` command. 
++
+ Inside the [`Ensembles`](@ref) submodule we define a few premade functions of this sort, but here
+ we can demonstrate how to reformulate the previous simulation using the alternative format.
+ ```@example ensemble
+diff --git a/src/DynamicsMethods/IntegrationAlgorithms/steps.jl b/src/DynamicsMethods/IntegrationAlgorithms/steps.jl
+index ccdd09352..2f6a317f3 100644
+--- a/src/DynamicsMethods/IntegrationAlgorithms/steps.jl
++++ b/src/DynamicsMethods/IntegrationAlgorithms/steps.jl
+@@ -110,7 +110,7 @@ function step_O!(friction::LangevinCache, integrator, v::RingPolymerArray, r::Ri
+     @unpack W, p, dt, sqdt = integrator
+     @unpack c1, c2, sqrtmass, σ = friction
+ 
+-    σ = repeat(sqrt.(get_ring_polymer_temperature(p, t)) .* sqrtmass;inner=ndofs(p))
++    σ = repeat(sqrt.(get_ring_polymer_temperature(p, t)) .* sqrtmass;inner=(1,ndofs(p)))
+ 
+     for i in axes(r, 3)
+         for j in RingPolymerArrays.quantumindices(v)
+diff --git a/src/Ensembles/Ensembles.jl b/src/Ensembles/Ensembles.jl
+index aa993b156..c083c46c4 100644
+--- a/src/Ensembles/Ensembles.jl
++++ b/src/Ensembles/Ensembles.jl
+@@ -12,9 +12,7 @@ using Dictionaries: Dictionary
+ using UnitfulAtomic: austrip
+ 
+ using NQCBase: NQCBase
+-using NQCDynamics:
+-    AbstractSimulation,
+-    DynamicsMethods
++using NQCDynamics: AbstractSimulation, DynamicsMethods
+ 
+ export run_dynamics
+ 
+@@ -82,33 +80,78 @@ Run trajectories for timespan `tspan` sampling from `distribution`.
+ * `kwargs...` any additional keywords are passed to DifferentialEquations `solve``.
+ """
+ function run_dynamics(
+-    sim::AbstractSimulation, tspan, distribution;
++    sim::AbstractSimulation,
++    tspan,
++    distribution;
+     output,
+-    selection::Union{Nothing,AbstractVector}=nothing,
+-    reduction=AppendReduction(),
+-    ensemble_algorithm=SciMLBase.EnsembleSerial(),
+-    algorithm=DynamicsMethods.select_algorithm(sim),
+-    trajectories=1,
+-    savetime=true,
+-    kwargs...
++    selection::Union{Nothing,AbstractVector} = nothing,
++    reduction = AppendReduction(),
++    ensemble_algorithm = SciMLBase.EnsembleSerial(),
++    algorithm = DynamicsMethods.select_algorithm(sim),
++    trajectories = 1,
++    savetime = true,
++    precompile_dynamics = true,
++    kwargs...,
+ )
+ 
+-    if !(output isa Tuple)
+-        output = (output,)
++    """
++    Due to how Julia compiles code, running the same dynamics for a single time step forces precompilation, which will make subsequent simulations faster. 
++    This effect is negligible for smaller models, but begins to matter for more computationally intensive dynamics. 
++    
++    See this GitHub issue for discussion: https://github.com/NQCD/NQCDynamics.jl/issues/365
++    """
++    function dynamics(tspan)
++        @debug "Setting up dynamics with" tspan = tspan
++        if !(output isa Tuple)
++            output = (output,)
++        end
++        
++        kwargs = NQCBase.austrip_kwargs(; kwargs...)
++        trajectories = convert(Int, trajectories)
++        tspan = austrip.(tspan)
++        prob_func = Selection(distribution, selection, trajectories)
++        
++        u0 = sample_distribution(sim, distribution)
++        problem = DynamicsMethods.create_problem(u0, tspan, sim)
++        
++        output_func = EnsembleSaver(output, savetime)
++        
++        ensemble_problem = SciMLBase.EnsembleProblem(
++            problem;
++            prob_func = prob_func,
++            output_func = output_func,
++            reduction = deepcopy(reduction), # deepcopy reduction function because it's used twice
++        )
++        return @timed SciMLBase.solve(
++            ensemble_problem,
++            algorithm,
++            ensemble_algorithm;
++            trajectories,
++            kwargs...,
++        )
+     end
+ 
+-    kwargs = NQCBase.austrip_kwargs(;kwargs...)
+-    trajectories = convert(Int, trajectories)
+-    tspan = austrip.(tspan)
+-
+-    prob_func = Selection(distribution, selection, trajectories)
+-
+-    u0 = sample_distribution(sim, distribution)
+-    problem = DynamicsMethods.create_problem(u0, tspan, sim)
+-
+-    output_func = EnsembleSaver(output, savetime)
+-
+-    ensemble_problem = SciMLBase.EnsembleProblem(problem; prob_func, output_func, reduction)
++    if precompile_dynamics
++        @debug "Beginning to precompile dynamics"
++        # Get a short time limit that runs through saving at least one time step of data
++        short_time = get( 
++            kwargs, 
++            :saveat, # Saveat will be an interval or a list. 
++            get(
++                kwargs,
++                :dt,
++                1.0 # dt should be a number / unitful qty
++            )
++        ) |> first # Get the number or the first list entry. 
++        tspan_short = (0.0, short_time)
++        precompile_time = dynamics(tspan_short)
++        @debug "Reduction is" reduction=reduction
++        if isa(reduction, FileReduction)
++            @debug "FileReduction wrote files, which will now be deleted. "
++            rm(reduction.filename)
++        end
++        @info "Pre-compiled dynamics in $(precompile_time.time) seconds."
++    end
+ 
+     if trajectories == 1
+         @info "Performing 1 trajectory."
+@@ -116,7 +159,7 @@ function run_dynamics(
+         @info "Performing $trajectories trajectories."
+     end
+ 
+-    stats = @timed SciMLBase.solve(ensemble_problem, algorithm, ensemble_algorithm; trajectories, kwargs...)
++    stats = dynamics(tspan)
+     log_simulation_duration(stats.time)
+ 
+     if trajectories == 1
+@@ -142,7 +185,6 @@ run_ensemble(args...; kwargs...) = throw(error("""
+ `run_ensemble` has been replaced, use `run_dynamics` instead.
+ `run_dynamics` unifies single trajectory and ensemble simulations into one function.
+ Refer to the `run_dynamics` docstring for more information.
+-"""
+-))
++"""))
+ 
+ end # module
+diff --git a/src/Ensembles/reductions.jl b/src/Ensembles/reductions.jl
+index 40bf62b13..6f5b04d8d 100644
+--- a/src/Ensembles/reductions.jl
++++ b/src/Ensembles/reductions.jl
+@@ -25,7 +25,8 @@ end
+ 
+ function sum_outputs!(u, batch)
+     for b in batch
+-        u .+= b
++        mergewith!(+, u, b)
++        # u .+= b
+     end
+ end
+ 
+diff --git a/src/NQCDistributions-convenience.jl b/src/NQCDistributions-convenience.jl
+index 0a1b4bf20..feef9b615 100644
+--- a/src/NQCDistributions-convenience.jl
++++ b/src/NQCDistributions-convenience.jl
+@@ -33,6 +33,10 @@ function NQCDistributions.DynamicalDistribution(velocities, positions, simulatio
+     mobile_atoms = NQCModels.mobileatoms(simulation.calculator.model, 1)
+     simulation_dims = size(simulation)
+     frozen_indices = symdiff(1:simulation_dims[2], mobile_atoms)
+-    return NQCDistributions.DynamicalDistribution(velocities, positions, simulation_dims; frozen_atoms=frozen_indices, classical=classical)
++    if isempty(classical)
++        return NQCDistributions.DynamicalDistribution(velocities, positions, simulation_dims; frozen_atoms=frozen_indices)
++    else
++        return NQCDistributions.DynamicalDistribution(velocities, positions, simulation_dims; frozen_atoms=frozen_indices, classical = classical)
++    end
+ 
+ end
+diff --git a/test/Core/simulations.jl b/test/Core/simulations.jl
+index 86778f25f..065519be9 100644
+--- a/test/Core/simulations.jl
++++ b/test/Core/simulations.jl
+@@ -1,8 +1,8 @@
+ using Test
+ using NQCDynamics
+-using Unitful
++using Unitful, UnitfulAtomic
+ using Distributions
+-using PyCall
++using PythonCall
+ 
+ atoms = Atoms([:C, :H])
+ cell = InfiniteCell()
+diff --git a/test/Ensembles/outputs.jl b/test/Ensembles/outputs.jl
+index 75a704a16..3f3b27d6c 100644
+--- a/test/Ensembles/outputs.jl
++++ b/test/Ensembles/outputs.jl
+@@ -22,10 +22,9 @@ end
+ end
+ 
+ @testset "OutputQuantisedDiatomic" begin
+-    sim = Simulation(Atoms(1), Harmonic())
+-    output = OutputQuantisedDiatomic(sim; height=1, normal_vector = [1, 1, 1])
+-    output = OutputQuantisedDiatomic(sim)
+-    u = DynamicsVariables(sim, hcat(1), hcat(1))
++    # Maybe tack this onto a dynamics unit test. 
++    output = OutputQuantisedDiatomic(; height=1, normal_vector = [1, 1, 1])
++    output = OutputQuantisedDiatomic()
+ end
+ 
+ @testset "PopulationCorrelationFunction" begin

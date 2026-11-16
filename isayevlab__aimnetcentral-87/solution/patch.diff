@@ -1,0 +1,415 @@
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index d1ad059..a06cef2 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -17,9 +17,7 @@
+ from aimnet.modules import DFTD3, LRCoulomb
+ from aimnet.modules.lr import ExternalDerivativeTerms
+ 
+-from .model_registry import get_model_path, get_registry_model_family
+-
+-_WB97M_D3_PARAMS = {"s6": 1.0, "s8": 0.3908, "a1": 0.566, "a2": 3.128}
++from .model_registry import get_family_policy, get_model_path, get_registry_model_family
+ 
+ # Sentinel for "attribute did not exist" when snapshotting/restoring instance state.
+ _SENTINEL = object()
+@@ -70,17 +68,22 @@ def _apply_family_defaults(metadata: Mapping[str, Any], registry_family: str | N
+                 f"'{metadata_family}'. Refusing to load ambiguous energy scale."
+             )
+ 
+-    if metadata.get("family") == "rxn":
++    policy = get_family_policy(metadata.get("family"))
++
++    if policy.supports_charged_systems is not None:
+         supports_charged = metadata.get("supports_charged_systems")
+         if supports_charged is None:
+-            metadata["supports_charged_systems"] = False
+-        elif supports_charged is not False:
+-            raise ValueError("aimnet2-rxn models must declare supports_charged_systems=False.")
+-
+-        if not metadata.get("has_embedded_d3ts", False):
+-            metadata["needs_dispersion"] = True
+-            if metadata.get("d3_params") is None:
+-                metadata["d3_params"] = dict(_WB97M_D3_PARAMS)
++            metadata["supports_charged_systems"] = policy.supports_charged_systems
++        elif supports_charged is not policy.supports_charged_systems:
++            raise ValueError(
++                f"aimnet2-{policy.family} models must declare "
++                f"supports_charged_systems={policy.supports_charged_systems}."
++            )
++
++    if policy.posthoc_d3_params is not None and not metadata.get("has_embedded_d3ts", False):
++        metadata["needs_dispersion"] = True
++        if metadata.get("d3_params") is None:
++            metadata["d3_params"] = dict(policy.posthoc_d3_params)
+ 
+     return metadata
+ 
+diff --git a/aimnet/calculators/hf_hub.py b/aimnet/calculators/hf_hub.py
+index 6870c7c..c606550 100644
+--- a/aimnet/calculators/hf_hub.py
++++ b/aimnet/calculators/hf_hub.py
+@@ -116,20 +116,18 @@ def _fetch_pt_metadata_from_registry(
+     if member_names and ensemble_member < len(member_names):
+         member_name = member_names[ensemble_member]
+     else:
+-        # Best-effort: derive from family_name or repo slug
++        # Best-effort: derive from family_name or repo slug via the registry's
++        # family policy (repo slugs carry the "aimnet2-" prefix, family tags don't).
+         family_name = config.get("family_name") or Path(repo_id_or_path).name
+         member_name = None
+-        try:
+-            from aimnet.calculators.model_registry import load_model_registry
+-
+-            registry = load_model_registry()
+-            family_slug = family_name.replace("-", "_")
+-            all_models = list(registry.get("models", {}).keys())
+-            candidates = [k for k in all_models if family_slug in k]
+-            if candidates:
+-                member_name = candidates[ensemble_member] if ensemble_member < len(candidates) else candidates[0]
+-        except (ImportError, KeyError, IndexError):
+-            pass
++        from aimnet.calculators.model_registry import get_family_policy
++
++        policy = get_family_policy(family_name)
++        if not policy.members:
++            policy = get_family_policy(family_name.removeprefix("aimnet2-"))
++        candidates = policy.members
++        if candidates:
++            member_name = candidates[ensemble_member] if ensemble_member < len(candidates) else candidates[0]
+         if member_name is None:
+             raise ValueError(
+                 f"config.json in '{repo_id_or_path}' has no 'model_yaml' field and "
+diff --git a/aimnet/calculators/model_registry.py b/aimnet/calculators/model_registry.py
+index 8f17af0..4729800 100644
+--- a/aimnet/calculators/model_registry.py
++++ b/aimnet/calculators/model_registry.py
+@@ -2,6 +2,7 @@
+ import os
+ import shutil
+ import tempfile
++from dataclasses import dataclass, field
+ from hashlib import sha256
+ from pathlib import Path
+ from typing import Any
+@@ -13,6 +14,62 @@
+ logging.basicConfig(level=logging.INFO)
+ 
+ 
++@dataclass(frozen=True)
++class FamilyPolicy:
++    """Calculator-side policy for a released model family.
++
++    Sourced from the ``families:`` section of ``model_registry.yaml``. The neutral
++    policy (all fields None/empty) applies no defaults and is returned for unknown
++    or undeclared families, so raw ``nn.Module`` loads and third-party checkpoints
++    are unaffected.
++
++    Attributes
++    ----------
++    family : str | None
++        Canonical family tag, or None for the neutral policy.
++    supports_charged_systems : bool | None
++        Required charge-support declaration for the family. The calculator defaults
++        undeclared model metadata to this value and rejects conflicting declarations.
++        None means the family imposes no constraint.
++    posthoc_d3_params : dict[str, float] | None
++        DFT-D3(BJ) parameters applied post-hoc when the model does not embed
++        dispersion. None means no post-hoc dispersion policy.
++    members : tuple[str, ...]
++        Registry model keys belonging to the family, in ensemble-member order.
++    """
++
++    family: str | None = None
++    supports_charged_systems: bool | None = None
++    posthoc_d3_params: dict[str, float] | None = None
++    members: tuple[str, ...] = field(default_factory=tuple)
++
++
++_NEUTRAL_FAMILY_POLICY = FamilyPolicy()
++
++
++def get_family_policy(family: str | None) -> FamilyPolicy:
++    """Return the calculator-side policy for a model family.
++
++    Unknown or missing families return the neutral policy (no defaults applied)
++    rather than raising, so calculators built from raw ``nn.Module`` inputs or
++    third-party checkpoints keep working.
++    """
++    if family is None:
++        return _NEUTRAL_FAMILY_POLICY
++    model_registry = load_model_registry()
++    block = model_registry.get("families", {}).get(family)
++    if block is None:
++        return _NEUTRAL_FAMILY_POLICY
++    members = tuple(name for name, cfg in model_registry["models"].items() if cfg.get("family") == family)
++    posthoc_d3_params = block.get("posthoc_d3_params")
++    return FamilyPolicy(
++        family=family,
++        supports_charged_systems=block.get("supports_charged_systems"),
++        posthoc_d3_params=dict(posthoc_d3_params) if posthoc_d3_params is not None else None,
++        members=members,
++    )
++
++
+ def load_model_registry(registry_file: str | None = None) -> dict[str, Any]:
+     registry_file = registry_file or os.path.join(os.path.dirname(__file__), "model_registry.yaml")
+     with open(registry_file) as f:
+@@ -48,10 +105,11 @@ def resolve_registry_model_name(model_name: str) -> str:
+ def get_registry_model_family(model_name: str) -> str:
+     """Return the canonical family tag for a registered model name or alias."""
+     model_name = resolve_registry_model_name(model_name)
+-    family_key, member = model_name.rsplit("_", 1)
+-    if not member.isdigit() or not family_key.startswith("aimnet2-"):
+-        raise ValueError(f"Model {model_name} does not follow the canonical registry naming convention.")
+-    return family_key.removeprefix("aimnet2-")
++    model_registry = load_model_registry()
++    family = model_registry["models"][model_name].get("family")
++    if family is None:
++        raise ValueError(f"Model {model_name} does not declare a family in the registry.")
++    return family
+ 
+ 
+ def get_registry_model_path(model_name: str) -> str:
+@@ -59,7 +117,7 @@ def get_registry_model_path(model_name: str) -> str:
+     create_assets_dir()
+     model_name = resolve_registry_model_name(model_name)
+     cfg = model_registry["models"][model_name]  # type: ignore
+-    model_path = _maybe_download_asset(**cfg)  # type: ignore
++    model_path = _maybe_download_asset(file=cfg["file"], url=cfg["url"], sha256=cfg.get("sha256"))
+     return model_path
+ 
+ 
+diff --git a/aimnet/calculators/model_registry.yaml b/aimnet/calculators/model_registry.yaml
+index 76f63b7..796e08b 100644
+--- a/aimnet/calculators/model_registry.yaml
++++ b/aimnet/calculators/model_registry.yaml
+@@ -2,88 +2,142 @@
+ # Convention for `models:` keys:  aimnet2-<family>_<ensemble-member>
+ #   - dash separates "aimnet2" from the family tag and is the only separator inside the family tag
+ #   - trailing `_<int>` is reserved for the ensemble member index
+-#   - family tags must NOT contain `_` and must NOT end in `_<int>` (so `key.rsplit("_", 1)`
+-#     unambiguously yields (family, member))
+-#   - convention applies to entries under `models:` only; entries under `aliases:` are not parsed
++#   - the key convention is documentation only: the family tag is never parsed from the
++#     key — every entry declares an explicit `family:` field, which must name a block
++#     under `families:` below
++#   - entries under `aliases:` are not parsed and carry no fields
+ # File names on the GCS bucket are unchanged; the key→file mapping below absorbs
+ # the historical naming so consumers never need to track the bucket layout.
++
++# Per-family calculator policy, consumed by
++# aimnet.calculators.model_registry.get_family_policy(). Recognized keys:
++#   supports_charged_systems: required charge-support declaration for the family;
++#       the calculator defaults undeclared model metadata to this value and rejects
++#       conflicting declarations.
++#   posthoc_d3_params: DFT-D3(BJ) parameters the calculator applies post-hoc when the
++#       model does not embed dispersion (forces needs_dispersion=true and provides
++#       default d3_params).
++# A family with an empty block carries all of its policy inside the .pt metadata.
++# Models not in the registry (raw nn.Module loads, third-party checkpoints) get a
++# neutral policy: no defaults applied.
++families:
++    wb97m-d3: {}
++    b973c-d3: {}
++    b973c-2025-d3: {}
++    nse: {}
++    pd: {}
++    rxn:
++        supports_charged_systems: false
++        # AIMNet2 wB97M D3(BJ) parameters — rxn models are trained on a dispersion-free
++        # wB97M energy scale, so the calculator adds this correction post-hoc unless the
++        # model embeds D3TS dispersion.
++        posthoc_d3_params:
++            s6: 1.0
++            s8: 0.3908
++            a1: 0.566
++            a2: 3.128
++
+ models:
+     aimnet2-wb97m-d3_0:
++        family: wb97m-d3
+         file: aimnet2_wb97m_d3_0.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_wb97m_d3_0.pt
+         sha256: f0f7c054539ad3261bd36f9b11c56d12f87cb723e25bea7521755bbd3ec24e28
+     aimnet2-wb97m-d3_1:
++        family: wb97m-d3
+         file: aimnet2_wb97m_d3_1.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_wb97m_d3_1.pt
+     aimnet2-wb97m-d3_2:
++        family: wb97m-d3
+         file: aimnet2_wb97m_d3_2.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_wb97m_d3_2.pt
+     aimnet2-wb97m-d3_3:
++        family: wb97m-d3
+         file: aimnet2_wb97m_d3_3.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_wb97m_d3_3.pt
+     aimnet2-b973c-d3_0:
++        family: b973c-d3
+         file: aimnet2_b973c_d3_0.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_b973c_d3_0.pt
+         sha256: 7ec7a3db67bd3a393ad59647d4020398deeb041c07dba1c9cf212d226268e549
+     aimnet2-b973c-d3_1:
++        family: b973c-d3
+         file: aimnet2_b973c_d3_1.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_b973c_d3_1.pt
+     aimnet2-b973c-d3_2:
++        family: b973c-d3
+         file: aimnet2_b973c_d3_2.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_b973c_d3_2.pt
+     aimnet2-b973c-d3_3:
++        family: b973c-d3
+         file: aimnet2_b973c_d3_3.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_b973c_d3_3.pt
+     aimnet2-b973c-2025-d3_0:
++        family: b973c-2025-d3
+         file: aimnet2_2025_b973c_d3_0.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_2025_b973c_d3_0.pt
+         sha256: 043ed5418a104e31f79462f8e5ebeca64a2d24422174f5d29f894d32271981b5
+     aimnet2-b973c-2025-d3_1:
++        family: b973c-2025-d3
+         file: aimnet2_2025_b973c_d3_1.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_2025_b973c_d3_1.pt
+     aimnet2-b973c-2025-d3_2:
++        family: b973c-2025-d3
+         file: aimnet2_2025_b973c_d3_2.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_2025_b973c_d3_2.pt
+     aimnet2-b973c-2025-d3_3:
++        family: b973c-2025-d3
+         file: aimnet2_2025_b973c_d3_3.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_2025_b973c_d3_3.pt
+     aimnet2-nse_0:
++        family: nse
+         file: aimnet2nse_wb97m_0.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2NSE/aimnet2nse_wb97m_0.pt
+         sha256: b98b3449b2a3765de6a188edff9344a38cc72df75f9d9bf68f4b898a253c5864
+     aimnet2-nse_1:
++        family: nse
+         file: aimnet2nse_wb97m_1.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2NSE/aimnet2nse_wb97m_1.pt
+     aimnet2-nse_2:
++        family: nse
+         file: aimnet2nse_wb97m_2.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2NSE/aimnet2nse_wb97m_2.pt
+     aimnet2-nse_3:
++        family: nse
+         file: aimnet2nse_wb97m_3.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2NSE/aimnet2nse_wb97m_3.pt
+     aimnet2-pd_0:
++        family: pd
+         file: aimnet2-pd_0.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2Pd/aimnet2-pd_0.pt
+         sha256: 93f10dd5522e187d7d6aaf3b18d54c07746f5452c2e8063cf77fd0420dc39ebd
+     aimnet2-pd_1:
++        family: pd
+         file: aimnet2-pd_1.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2Pd/aimnet2-pd_1.pt
+     aimnet2-pd_2:
++        family: pd
+         file: aimnet2-pd_2.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2Pd/aimnet2-pd_2.pt
+     aimnet2-pd_3:
++        family: pd
+         file: aimnet2-pd_3.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2Pd/aimnet2-pd_3.pt
+     aimnet2-rxn_0:
++        family: rxn
+         file: aimnet2_rxn_0.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2rxn/aimnet2_rxn_0.pt
+         sha256: ce8bc2a4cc6fcb5ebaa1bc8897fcd75104e5a00fe86e9d5fc6a020d572174894
+     aimnet2-rxn_1:
++        family: rxn
+         file: aimnet2_rxn_1.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2rxn/aimnet2_rxn_1.pt
+     aimnet2-rxn_2:
++        family: rxn
+         file: aimnet2_rxn_2.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2rxn/aimnet2_rxn_2.pt
+     aimnet2-rxn_3:
++        family: rxn
+         file: aimnet2_rxn_3.pt
+         url: https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2rxn/aimnet2_rxn_3.pt
+ 
+diff --git a/tests/test_model_registry.py b/tests/test_model_registry.py
+index e86947d..652ffb4 100644
+--- a/tests/test_model_registry.py
++++ b/tests/test_model_registry.py
+@@ -1,7 +1,9 @@
+ import yaml
+ 
+ from aimnet.calculators.model_registry import (
++    FamilyPolicy,
+     get_cache_dir,
++    get_family_policy,
+     get_registry_model_family,
+     load_model_registry,
+     resolve_registry_model_name,
+@@ -170,3 +172,68 @@ def test_registry_sha256_entries_are_valid_hex():
+             continue
+         assert len(digest) == 64, key
+         int(digest, 16)
++
++
++def test_every_yaml_family_resolves_to_a_policy():
++    """Every family block in the registry YAML must resolve via get_family_policy
++    to a non-neutral policy that carries its own tag and at least one member."""
++    registry = load_model_registry()
++    for family in registry["families"]:
++        policy = get_family_policy(family)
++        assert policy.family == family
++        assert policy.members, f"family {family!r} has no registry members"
++
++
++def test_unknown_family_returns_neutral_policy():
++    """Unknown or undeclared families must get the neutral policy, not raise —
++    raw nn.Module loads and third-party checkpoints rely on this."""
++    for family in ("no-such-family", None):
++        policy = get_family_policy(family)
++        assert policy == FamilyPolicy()
++        assert policy.family is None
++        assert policy.supports_charged_systems is None
++        assert policy.posthoc_d3_params is None
++        assert policy.members == ()
++
++
++def test_every_registry_model_has_a_family_policy_block():
++    """Every model entry must declare a family that names a block under `families:`,
++    and get_registry_model_family must return exactly that declared tag."""
++    registry = load_model_registry()
++    for key, entry in registry["models"].items():
++        family = entry.get("family")
++        assert family is not None, f"model {key!r} does not declare a family"
++        assert family in registry["families"], f"model {key!r} family {family!r} has no policy block"
++        assert get_registry_model_family(key) == family
++
++
++def test_family_policy_members_are_in_ensemble_order():
++    """FamilyPolicy.members must list the family's registry keys in member order,
++    so ensemble_member indices map onto the correct checkpoints."""
++    registry = load_model_registry()
++    for family in registry["families"]:
++        members = get_family_policy(family).members
++        expected = tuple(k for k, v in registry["models"].items() if v.get("family") == family)
++        assert members == expected
++        for i, member in enumerate(members):
++            assert member.endswith(f"_{i}"), f"{member} is not ensemble member {i}"
++
++
++def test_rxn_family_policy_pins_posthoc_wb97m_d3():
++    """The rxn family policy must carry the AIMNet2 wB97M D3(BJ) parameters and the
++    charged-systems restriction previously hardcoded in the calculator."""
++    policy = get_family_policy("rxn")
++    assert policy.supports_charged_systems is False
++    assert policy.posthoc_d3_params == {"s6": 1.0, "s8": 0.3908, "a1": 0.566, "a2": 3.128}
++
++
++def test_non_rxn_family_policies_are_permissive():
++    """All non-rxn released families carry their policy inside the .pt metadata:
++    no charge restriction and no post-hoc dispersion defaults."""
++    registry = load_model_registry()
++    for family in registry["families"]:
++        if family == "rxn":
++            continue
++        policy = get_family_policy(family)
++        assert policy.supports_charged_systems is None, family
++        assert policy.posthoc_d3_params is None, family

@@ -1,0 +1,238 @@
+diff --git a/e2e/ssao-quality.spec.ts b/e2e/ssao-quality.spec.ts
+new file mode 100644
+index 00000000..4f139110
+--- /dev/null
++++ b/e2e/ssao-quality.spec.ts
+@@ -0,0 +1,73 @@
++import { expect, test } from "@playwright/test";
++import {
++  createBlankProject,
++  FAST_LJ_SCRIPT,
++  gotoApp,
++  waitForEngine,
++} from "./helpers";
++
++test("SSAO quality is applied to the real pass and survives saved settings", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  await createBlankProject(page, "Occlusion quality", "occlusion-quality");
++  await page
++    .getByTestId("upload-input")
++    .setInputFiles({
++      name: "in.ao",
++      mimeType: "text/plain",
++      buffer: Buffer.from(FAST_LJ_SCRIPT.replace("run 400", "run 100000")),
++    });
++  await waitForEngine(page);
++  await page.getByTestId("run-file-in.ao").click();
++  const passConfig = () =>
++    page.evaluate(async () => {
++      const path = "/atomify/src/store/index.ts";
++      const s = (await import(path)).default.getState();
++      const c =
++        s.render.visualizer?.renderer.postProcessingManager?.n8aoPass
++          .configuration;
++      return (
++        c && {
++          samples: c.aoSamples,
++          denoise: c.denoiseSamples,
++          pixels: c.screenSpaceRadius,
++        }
++      );
++    });
++  await expect
++    .poll(passConfig, { timeout: 60_000 })
++    .toEqual({ samples: 64, denoise: 16, pixels: true });
++  await page.evaluate(async () => {
++    const path = "/atomify/src/store/index.ts";
++    const store = (await import(path)).default;
++    store.getActions().simulation.setPaused(true);
++    const v = store.getState().render.visualizer;
++    const pass = v.renderer.postProcessingManager.n8aoPass;
++    pass.configuration.screenSpaceRadius = false;
++    pass.setQualityMode("Medium");
++    v.forceRender = true;
++  });
++  const canvas = page.getByTestId("run-detail").locator("canvas").first();
++  await canvas.screenshot({ path: "/tmp/atomify-ssao-old.png" });
++  await page.getByRole("button", { name: "Settings", exact: true }).click();
++  await page.getByTestId("settings-tab-rendering").click();
++  await page.getByTestId("render-ssao-quality").selectOption("fast");
++  await expect
++    .poll(passConfig)
++    .toEqual({ samples: 16, denoise: 8, pixels: true });
++  await page.getByTestId("render-ssao-quality").selectOption("detailed");
++  await expect
++    .poll(passConfig)
++    .toEqual({ samples: 64, denoise: 16, pixels: true });
++  await page
++    .getByTestId("settings-modal")
++    .getByRole("button", { name: "Close", exact: true })
++    .click();
++  await canvas.screenshot({ path: "/tmp/atomify-ssao-detailed.png" });
++  await page.getByRole("button", { name: "Stop", exact: true }).click();
++  await page.reload();
++  await page.getByRole("button", { name: "Settings", exact: true }).click();
++  await page.getByTestId("settings-tab-rendering").click();
++  await expect(page.getByTestId("render-ssao-quality")).toHaveValue("detailed");
++});
+diff --git a/src/containers/View.test.tsx b/src/containers/View.test.tsx
+index 14d7b9a6..c61fd71f 100644
+--- a/src/containers/View.test.tsx
++++ b/src/containers/View.test.tsx
+@@ -10,6 +10,10 @@ import type { StoreModel } from "../store/model";
+ import type { Compute, Fix, Variable, Wall } from "../types";
+ import type Modifier from "../modifiers/modifier";
+ 
++vi.mock("../utils/ambientOcclusion", () => ({
++  applyAmbientOcclusion: vi.fn(),
++}));
++
+ // Mock omovi: prevents WebGL/canvas errors in jsdom
+ vi.mock("omovi", () => ({
+   Visualizer: vi.fn(),
+diff --git a/src/containers/View.tsx b/src/containers/View.tsx
+index 592ca873..3a9bd834 100644
+--- a/src/containers/View.tsx
++++ b/src/containers/View.tsx
+@@ -1,3 +1,4 @@
++import { applyAmbientOcclusion } from "../utils/ambientOcclusion";
+ import { useEffect, useState, useRef, useCallback } from "react";
+ import { Layout, Row, Col, Progress, Modal, Button } from "antd";
+ 
+@@ -287,6 +288,7 @@ const View = ({ visible, pane = false }: ViewProps) => {
+       });
+ 
+       // Apply lighting settings
++      applyAmbientOcclusion(newVisualizer, renderSettings);
+       applyLighting(newVisualizer, renderSettings);
+ 
+       // Check for WebXR support and show VR button if available
+@@ -383,6 +385,9 @@ const View = ({ visible, pane = false }: ViewProps) => {
+         });
+       }
+ 
++      if (visualizer.isPostProcessingEnabled())
++        applyAmbientOcclusion(visualizer, renderSettings);
++
+       // Update lighting
+       applyLighting(visualizer, renderSettings);
+ 
+diff --git a/src/shell/modals/SettingsModal.tsx b/src/shell/modals/SettingsModal.tsx
+index 07b8a8f7..8086c803 100644
+--- a/src/shell/modals/SettingsModal.tsx
++++ b/src/shell/modals/SettingsModal.tsx
+@@ -304,6 +304,41 @@ const SettingsModal = ({
+               }}
+             >
+               {checkboxRow("ssao", "Ambient occlusion (SSAO)")}
++              <label
++                style={{
++                  display: "flex",
++                  justifyContent: "space-between",
++                  alignItems: "center",
++                  gap: 12,
++                  padding: "8px 0",
++                  color: "var(--text)",
++                  fontSize: 14,
++                }}
++              >
++                Occlusion quality
++                <select
++                  data-testid="render-ssao-quality"
++                  disabled={!renderSettings.ssao}
++                  value={renderSettings.ssaoQuality ?? "detailed"}
++                  onChange={(event) =>
++                    setRenderSettings({
++                      ...renderSettings,
++                      ssaoQuality:
++                        event.target.value === "fast" ? "fast" : "detailed",
++                    })
++                  }
++                  style={{
++                    background: "var(--surface-2)",
++                    color: "var(--text)",
++                    border: "1px solid var(--border)",
++                    borderRadius: 6,
++                    padding: 8,
++                  }}
++                >
++                  <option value="detailed">Detailed — smoother shadows</option>
++                  <option value="fast">Faster — fewer samples</option>
++                </select>
++              </label>
+               {checkboxRow("showSimulationBox", "Show simulation box")}
+               {checkboxRow("showWalls", "Show walls")}
+               {checkboxRow("orthographic", "Orthographic camera")}
+diff --git a/src/store/settings.ts b/src/store/settings.ts
+index 7e456ca8..dba8a7b0 100644
+--- a/src/store/settings.ts
++++ b/src/store/settings.ts
+@@ -3,6 +3,8 @@ import { setSyncFrequency } from "../wasm/wasmInstance";
+ 
+ export interface RenderSettings {
+   ssao: boolean;
++  /** Defaults to detailed when loading older saved settings. */
++  ssaoQuality?: "detailed" | "fast";
+   ssaoRadius: number;
+   ssaoIntensity: number;
+   ambientLightIntensity: number;
+diff --git a/src/utils/ambientOcclusion.test.ts b/src/utils/ambientOcclusion.test.ts
+new file mode 100644
+index 00000000..27e7204f
+--- /dev/null
++++ b/src/utils/ambientOcclusion.test.ts
+@@ -0,0 +1,20 @@
++import { expect, it, vi } from "vitest";
++import type { Visualizer } from "omovi";
++import { applyAmbientOcclusion } from "./ambientOcclusion";
++
++it("uses screen-space occlusion and a denoised default, retaining the faster option", () => {
++  const pass = {
++    configuration: { screenSpaceRadius: false },
++    setQualityMode: vi.fn(),
++  };
++  const v = {
++    renderer: { postProcessingManager: { n8aoPass: pass } },
++    forceRender: false,
++  } as unknown as Visualizer;
++  applyAmbientOcclusion(v, {});
++  expect(pass.configuration.screenSpaceRadius).toBe(true);
++  expect(pass.setQualityMode).toHaveBeenLastCalledWith("Ultra");
++  expect(v.forceRender).toBe(true);
++  applyAmbientOcclusion(v, { ssaoQuality: "fast" });
++  expect(pass.setQualityMode).toHaveBeenLastCalledWith("Medium");
++});
+diff --git a/src/utils/ambientOcclusion.ts b/src/utils/ambientOcclusion.ts
+new file mode 100644
+index 00000000..17b02aea
+--- /dev/null
++++ b/src/utils/ambientOcclusion.ts
+@@ -0,0 +1,26 @@
++import type { Visualizer } from "omovi";
++import type { RenderSettings } from "../store/settings";
++
++/** omovi 0.25 does not yet expose N8AO's quality/radius-space controls. */
++export function applyAmbientOcclusion(
++  visualizer: Visualizer,
++  settings: Pick<RenderSettings, "ssaoQuality">,
++): void {
++  const pass = (
++    visualizer.renderer as unknown as {
++      postProcessingManager: {
++        n8aoPass: {
++          configuration: { screenSpaceRadius: boolean };
++          setQualityMode: (mode: "Medium" | "Ultra") => void;
++        };
++      };
++    }
++  ).postProcessingManager.n8aoPass;
++  // A world-space radius of 10 can cover the whole model in LJ units and
++  // amplify sampling lines. Keep the occlusion neighborhood in screen pixels.
++  pass.configuration.screenSpaceRadius = true;
++  // More hemisphere and denoising samples suppress the visible stippling.
++  // The faster mode remains available for phones and larger viewports.
++  pass.setQualityMode(settings.ssaoQuality === "fast" ? "Medium" : "Ultra");
++  visualizer.forceRender = true;
++}

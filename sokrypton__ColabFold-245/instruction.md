@@ -1,0 +1,12 @@
+# Issue
+
+**Title:** Update AlphaFold-colabfold to 2.1.11
+
+## Description
+
+- Fix jax warnings by merging AlphaFold upstream
+- Add safe_keys to folding_multimer.py
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `e1979fa769bc`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

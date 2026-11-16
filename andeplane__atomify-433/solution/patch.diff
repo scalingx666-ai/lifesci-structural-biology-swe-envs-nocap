@@ -1,0 +1,505 @@
+diff --git a/e2e/atom-radii.spec.ts b/e2e/atom-radii.spec.ts
+new file mode 100644
+index 00000000..44fe2d83
+--- /dev/null
++++ b/e2e/atom-radii.spec.ts
+@@ -0,0 +1,40 @@
++import { expect, test } from "@playwright/test";
++import { createBlankProject, gotoApp, waitForEngine } from "./helpers";
++
++test("sphere radii are streamed in native units and update during a run", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  await createBlankProject(page, "Atom radii", "atom-radii");
++  const script =
++    "units lj\natom_style sphere 1\nregion box block 0 8 0 8 0 8\ncreate_box 1 box\ncreate_atoms 1 single 2 2 2\ncreate_atoms 1 single 5 5 5\nset atom 1 diameter 1\nset atom 2 diameter 3\npair_style zero 1\npair_coeff * *\ngroup first id 1\nvariable d equal 1+step/1000\nfix grow first adapt 1 atom diameter v_d\nrun 100000\n";
++  await page.getByTestId("upload-input").setInputFiles({
++    name: "in.radii",
++    mimeType: "text/plain",
++    buffer: Buffer.from(script),
++  });
++  await waitForEngine(page);
++  await page.getByTestId("run-file-in.radii").click();
++  await expect
++    .poll(
++      () =>
++        page.evaluate(async () => {
++          const path = "/atomify/src/store/index.ts";
++          const s = (await import(path)).default.getState();
++          const v = s.render.visualizer;
++          if (!v || s.simulationStatus.timesteps < 2) return false;
++          const step = s.simulationStatus.timesteps;
++          return (
++            Math.abs(v.radiusTexture.getFloat(1) - (1 + step / 1000) / 2) <
++              1 / 255 &&
++            Math.abs(v.radiusTexture.getFloat(2) - 1.5) < 1 / 255 &&
++            !Object.keys(s.simulationStatus.variables).some((name) =>
++              name.startsWith("atomify_radius_flag_"),
++            )
++          );
++        }),
++      { timeout: 60_000 },
++    )
++    .toBe(true);
++  await page.getByRole("button", { name: "Stop", exact: true }).click();
++});
+diff --git a/src/modifiers/colormodifier.ts b/src/modifiers/colormodifier.ts
+index 349fa3a6..5714a4ca 100644
+--- a/src/modifiers/colormodifier.ts
++++ b/src/modifiers/colormodifier.ts
+@@ -261,6 +261,7 @@ class ColorModifier extends Modifier {
+     const particles = output.particles;
+     const particleStyles = input.renderState.particleStyles;
+     const visualizer = input.renderState.visualizer;
++    const nativeRadii = input.lammps.getParticleRadii?.();
+ 
+     for (let i = 0; i < particles.count; i++) {
+       const realIndex = particles.indices[i];
+@@ -269,7 +270,9 @@ class ColorModifier extends Modifier {
+       if (!atomType) {
+         atomType = defaultAtomTypes[type % defaultAtomTypes.length];
+       }
+-      const radius = 0.33 * input.renderState.particleRadius * atomType.radius;
++      const radius = nativeRadii
++        ? nativeRadii[i] * input.renderState.particleRadius
++        : 0.33 * input.renderState.particleRadius * atomType.radius;
+       visualizer.setRadius(realIndex, radius);
+       visualizer.setColor(realIndex, {
+         r: atomType.color.r,
+diff --git a/src/modifiers/syncmodifiers.test.ts b/src/modifiers/syncmodifiers.test.ts
+index 1afca4a7..f8bd2e8d 100644
+--- a/src/modifiers/syncmodifiers.test.ts
++++ b/src/modifiers/syncmodifiers.test.ts
+@@ -47,6 +47,30 @@ describe("SyncParticlesModifier", () => {
+     };
+   });
+ 
++  it("applies native radii to persistent IDs with the user's size scale", () => {
++    const setRadius = vi.fn();
++    input.lammps!.getParticleRadii = () => new Float32Array([0.5, 1, 2]);
++    input.renderState = {
++      visualizer: { setRadius },
++      particleRadius: 2,
++    } as unknown as ModifierInput["renderState"];
++    modifier.run(input as ModifierInput, output as ModifierOutput);
++    expect(setRadius.mock.calls).toEqual([
++      [10, 1],
++      [20, 2],
++      [30, 4],
++    ]);
++    input.wasm!.HEAP32.set([30, 10, 20], 13);
++    input.lammps!.getParticleRadii = () => new Float32Array([2, 0.5, 1]);
++    setRadius.mockClear();
++    modifier.run(input as ModifierInput, output as ModifierOutput);
++    expect(setRadius.mock.calls).toEqual([
++      [30, 4],
++      [10, 1],
++      [20, 2],
++    ]);
++  });
++
+   it("should set particle count to 0 and mesh count to 0 when inactive", () => {
+     modifier.active = false;
+     const mockMesh = { count: 5 };
+@@ -117,10 +141,9 @@ describe("SyncParticlesModifier", () => {
+ 
+     // Add a mock mesh
+     const mockMesh = { count: 0 };
+-    output.particles!.mesh =
+-      mockMesh as Partial<ModifierOutput["particles"]> as NonNullable<
+-        ModifierOutput["particles"]
+-      >["mesh"];
++    output.particles!.mesh = mockMesh as Partial<
++      ModifierOutput["particles"]
++    > as NonNullable<ModifierOutput["particles"]>["mesh"];
+ 
+     // Run again
+     modifier.run(input as ModifierInput, output as ModifierOutput);
+@@ -150,7 +173,9 @@ describe("SyncBondsModifier", () => {
+       } as Partial<AtomifyWasmModule> as AtomifyWasmModule,
+       renderState: {
+         bondRadius: 0.5,
+-      } as Partial<ModifierInput["renderState"]> as ModifierInput["renderState"],
++      } as Partial<
++        ModifierInput["renderState"]
++      > as ModifierInput["renderState"],
+     };
+ 
+     // Bond positions1: 2 bonds × 3 floats at byte 0 → index 0
+@@ -208,10 +233,9 @@ describe("SyncBondsModifier", () => {
+     modifier.run(input as ModifierInput, output as ModifierOutput);
+ 
+     const mockMesh = { count: 0 };
+-    output.bonds!.mesh =
+-      mockMesh as Partial<ModifierOutput["bonds"]> as NonNullable<
+-        ModifierOutput["bonds"]
+-      >["mesh"];
++    output.bonds!.mesh = mockMesh as Partial<
++      ModifierOutput["bonds"]
++    > as NonNullable<ModifierOutput["bonds"]>["mesh"];
+ 
+     modifier.run(input as ModifierInput, output as ModifierOutput);
+ 
+@@ -364,9 +388,7 @@ describe("SyncComputesModifier", () => {
+     vi.mocked(input.lammps!.getComputeNames).mockReturnValue(
+       createMockCPPArray(["c_rdf"]),
+     );
+-    vi.mocked(input.lammps!.getCompute).mockReturnValue(
+-      mockLmpCompute,
+-    );
++    vi.mocked(input.lammps!.getCompute).mockReturnValue(mockLmpCompute);
+ 
+     // Set syncDataPoints to trigger data reading via the "everything" param
+     modifier.run(input as ModifierInput, output as ModifierOutput, true);
+@@ -375,7 +397,11 @@ describe("SyncComputesModifier", () => {
+     expect(compute).toBeDefined();
+     expect(compute.hasData1D).toBe(true);
+     expect(compute.data1D).toBeDefined();
+-    expect(compute.data1D!.data).toEqual([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]);
++    expect(compute.data1D!.data).toEqual([
++      [1.0, 10.0],
++      [2.0, 20.0],
++      [3.0, 30.0],
++    ]);
+     expect(compute.data1D!.labels).toEqual(["x", "g(r)"]);
+   });
+ });
+@@ -405,9 +431,7 @@ describe("SyncFixesModifier", () => {
+       lammps: createMockLammps({
+         syncFixes: vi.fn(),
+         getFixNames: vi.fn(() => createMockCPPArray(["f_ave"])),
+-        getFix: vi.fn(
+-          () => mockLmpFix,
+-        ),
++        getFix: vi.fn(() => mockLmpFix),
+       }),
+       wasm: {} as Partial<AtomifyWasmModule> as AtomifyWasmModule,
+       hasSynchronized: true,
+@@ -505,9 +529,7 @@ describe("SyncVariablesModifier", () => {
+       lammps: createMockLammps({
+         syncVariables: vi.fn(),
+         getVariableNames: vi.fn(() => createMockCPPArray(["v_temp"])),
+-        getVariable: vi.fn(
+-          () => mockLmpVariable,
+-        ),
++        getVariable: vi.fn(() => mockLmpVariable),
+       }),
+       wasm: {} as Partial<AtomifyWasmModule> as AtomifyWasmModule,
+       hasSynchronized: true,
+@@ -568,8 +590,7 @@ describe("SyncVariablesModifier", () => {
+         scalarValue: 273.15,
+         syncDataPoints: false,
+         hasData1D: false,
+-        lmpVariable:
+-          existingLmpVariable,
++        lmpVariable: existingLmpVariable,
+       },
+     };
+ 
+@@ -615,25 +636,24 @@ describe("SyncVariablesModifier", () => {
+     vi.mocked(input.lammps!.getVariableNames).mockReturnValue(
+       createMockCPPArray(["v_data"]),
+     );
+-    vi.mocked(input.lammps!.getVariable).mockReturnValue(
+-      mockLmpVariable,
+-    );
++    vi.mocked(input.lammps!.getVariable).mockReturnValue(mockLmpVariable);
+ 
+     modifier.run(input as ModifierInput, output as ModifierOutput, true);
+ 
+     const variable = output.variables!["v_data"];
+     expect(variable.hasData1D).toBe(true);
+     expect(variable.data1D).toBeDefined();
+-    expect(variable.data1D!.data).toEqual([[0.0, 100.0], [1.0, 200.0]]);
++    expect(variable.data1D!.data).toEqual([
++      [0.0, 100.0],
++      [1.0, 200.0],
++    ]);
+     expect(variable.data1D!.labels).toEqual(["x", "series1"]);
+   });
+ });
+ 
+ // --- Helper functions ---
+ 
+-function createMockLammps(
+-  overrides: Partial<LammpsWeb> = {},
+-): LammpsWeb {
++function createMockLammps(overrides: Partial<LammpsWeb> = {}): LammpsWeb {
+   return {
+     getNumAtoms: vi.fn(() => 0),
+     computeParticles: vi.fn(() => 0),
+diff --git a/src/modifiers/syncparticlesmodifier.ts b/src/modifiers/syncparticlesmodifier.ts
+index 92133174..c5dceebf 100644
+--- a/src/modifiers/syncparticlesmodifier.ts
++++ b/src/modifiers/syncparticlesmodifier.ts
+@@ -69,6 +69,15 @@ class SyncParticlesModifier extends Modifier {
+       newParticles.mesh.count = numParticles;
+     }
+ 
++    const radii = input.lammps.getParticleRadii?.();
++    if (radii && input.renderState.visualizer) {
++      for (let i = 0; i < numParticles; i++) {
++        input.renderState.visualizer.setRadius(
++          idSubarray[i],
++          radii[i] * input.renderState.particleRadius,
++        );
++      }
++    }
+     newParticles.markNeedsUpdate();
+   };
+ }
+diff --git a/src/types.ts b/src/types.ts
+index 6702e0fa..a865158f 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -47,6 +47,7 @@ export type LammpsWeb = {
+   }>;
+   getMemoryUsage: () => number;
+ 
++  getParticleRadii?: () => Float32Array | null;
+   getPositionsPointer: () => number;
+   getIdPointer: () => number;
+   getTypePointer: () => number;
+diff --git a/src/wasm/LammpsWorkerProxy.ts b/src/wasm/LammpsWorkerProxy.ts
+index 22072511..677b8376 100644
+--- a/src/wasm/LammpsWorkerProxy.ts
++++ b/src/wasm/LammpsWorkerProxy.ts
+@@ -1,4 +1,10 @@
+-import { LammpsWeb, LMPModifier, LMPData1D, ModifierType, Wall } from "../types";
++import {
++  LammpsWeb,
++  LMPModifier,
++  LMPData1D,
++  ModifierType,
++  Wall,
++} from "../types";
+ import type { ModifierCategory } from "lammps.js";
+ import { AtomifyWasmModule } from "./types";
+ import { getCancel, setCancel } from "./wasmInstance";
+@@ -93,6 +99,7 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   private seriesPointers = new Map<string, SeriesPointers[]>();
+ 
+   // --- Cached state, refreshed from worker step / runFinished events ---
++  private cRadii: Float32Array | null = null;
+   private cCount = 0;
+   private cBondCount = 0;
+   private cStep = 0;
+@@ -123,10 +130,9 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   private readonly moduleBridge: AtomifyWasmModule;
+ 
+   constructor() {
+-    this.worker = new Worker(
+-      new URL("./lammps.worker.ts", import.meta.url),
+-      { type: "module" },
+-    );
++    this.worker = new Worker(new URL("./lammps.worker.ts", import.meta.url), {
++      type: "module",
++    });
+     this.worker.onmessage = (ev: MessageEvent<WorkerEvent>) =>
+       this.handleEvent(ev.data);
+     this.allocate(4096, 4096, 4096);
+@@ -271,6 +277,7 @@ export class LammpsWorkerProxy implements LammpsWeb {
+     }
+     this.ingestModifiers(step);
+ 
++    this.cRadii = step.radii ? new Float32Array(step.radii) : null;
+     this.cCount = step.count;
+     this.cBondCount = step.bondCount;
+     this.cStep = step.step;
+@@ -312,7 +319,10 @@ export class LammpsWorkerProxy implements LammpsWeb {
+           numPoints: series.x.length,
+         });
+       }
+-      this.seriesPointers.set(`${modifier.category}:${modifier.name}`, pointers);
++      this.seriesPointers.set(
++        `${modifier.category}:${modifier.name}`,
++        pointers,
++      );
+     }
+ 
+     // Per-atom float64 values for the active coloring compute.
+@@ -582,6 +592,9 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   computeParticles() {
+     return this.cCount;
+   }
++  getParticleRadii() {
++    return this.cRadii;
++  }
+   getPositionsPointer() {
+     return this.posPtr;
+   }
+diff --git a/src/wasm/lammps.worker.ts b/src/wasm/lammps.worker.ts
+index c8dc5637..6cc25d4d 100644
+--- a/src/wasm/lammps.worker.ts
++++ b/src/wasm/lammps.worker.ts
+@@ -193,9 +193,9 @@ function streamStep() {
+ 
+   // Computes / fixes / variables (+ per-atom coloring data). Also runs inside
+   // this safe step window, since it invokes computes and reads the heap.
+-  const { modifiers, perAtom } = adapter
++  const { modifiers, perAtom, radii } = adapter
+     ? adapter.snapshotModifiers(perAtomTarget)
+-    : { modifiers: [], perAtom: null };
++    : { modifiers: [], perAtom: null, radii: null };
+ 
+   const transfer: Transferable[] = [
+     positions.buffer,
+@@ -207,6 +207,7 @@ function streamStep() {
+     origin.buffer,
+   ];
+   if (perAtom) transfer.push(perAtom.values);
++  if (radii) transfer.push(radii.buffer);
+ 
+   post(
+     {
+@@ -227,6 +228,7 @@ function streamStep() {
+       runStepsTotal: native.getRunStepsTotal(),
+       modifiers,
+       perAtom,
++      radii: radii ? (radii.buffer as ArrayBuffer) : null,
+       memoryUsage: native.getMemoryUsage(),
+       timestepsPerSecond: native.getThermo("spcpu"),
+       cpuRemain: native.getThermo("cpuremain"),
+diff --git a/src/wasm/lammpsAdapter.ts b/src/wasm/lammpsAdapter.ts
+index 3aa41046..f82a7682 100644
+--- a/src/wasm/lammpsAdapter.ts
++++ b/src/wasm/lammpsAdapter.ts
+@@ -1,3 +1,4 @@
++import { v4 as uuidv4 } from "uuid";
+ import type {
+   LAMMPSWeb as NativeLammps,
+   ParticleSnapshot,
+@@ -6,7 +7,13 @@ import type {
+   ModifierInfo,
+   ModifierSnapshot,
+ } from "lammps.js";
+-import { LammpsWeb, LMPModifier, LMPData1D, ModifierType, Wall } from "../types";
++import {
++  LammpsWeb,
++  LMPModifier,
++  LMPData1D,
++  ModifierType,
++  Wall,
++} from "../types";
+ import { KOKKOS_THREADS } from "../utils/kokkos";
+ import { AtomifyWasmModule } from "./types";
+ import { getCancel, setCancel, getPausedFlag } from "./wasmInstance";
+@@ -146,6 +153,11 @@ export class LammpsAdapter implements LammpsWeb {
+   private readonly module: AtomifyWasmModule;
+   private readonly native: NativeLammps;
+ 
++  // Private atom variables expose optional native properties without parsing
++  // atom_style commands (hybrid styles and read_restart work too).
++  private readonly radiusFlagName = `atomify_radius_flag_${uuidv4().replaceAll("-", "")}`;
++  private readonly radiusName = `${this.radiusFlagName}_values`;
++
+   private particleSnapshot?: ParticleSnapshot;
+   private bondSnapshot?: BondSnapshot;
+   // Refreshed once per sync cycle in syncComputes; modifierNames/makeModifier
+@@ -367,6 +379,13 @@ export class LammpsAdapter implements LammpsWeb {
+     // leaves the global cancel flag set; don't let it abort this run.
+     setCancel(false);
+ 
++    // Definitions survive LAMMPS clear and evaluate against the current atom
++    // style. Define them before execution: commands are forbidden mid-run.
++    this.native.runCommand(
++      `variable ${this.radiusFlagName} equal extract_setting(radius_flag)`,
++    );
++    this.native.runCommand(`variable ${this.radiusName} atom radius`);
++
+     // Installed globally (works before the box exists), so every run in
+     // every include'd file fires the step callback — no script injection.
+     this.native.installAsyncFix(SYNC_FIX_ID, this.syncFrequency);
+@@ -584,9 +603,26 @@ export class LammpsAdapter implements LammpsWeb {
+    */
+   snapshotModifiers(
+     perAtomTarget: { category: ModifierCategory; name: string } | null,
+-  ): { modifiers: WorkerModifierData[]; perAtom: WorkerPerAtomData | null } {
++  ): {
++    modifiers: WorkerModifierData[];
++    perAtom: WorkerPerAtomData | null;
++    radii: Float32Array | null;
++  } {
+     this.native.syncModifiers();
+-    const infos = this.native.listModifiers();
++    let infos = this.native.listModifiers();
++    const hasNativeRadii =
++      this.native.syncModifier("variable", this.radiusFlagName)?.scalar === 1;
++    let radii: Float32Array | null = null;
++    if (hasNativeRadii) {
++      this.native.syncModifier("variable", this.radiusName);
++      const view = this.native.getModifierPerAtom("variable", this.radiusName);
++      radii = new Float32Array(
++        this.module.HEAPF64.subarray(view.ptr / 8, view.ptr / 8 + view.length),
++      );
++    }
++    infos = infos.filter(
++      (i) => i.name !== this.radiusFlagName && i.name !== this.radiusName,
++    );
+     this.modifierInfos = infos;
+ 
+     const modifiers: WorkerModifierData[] = infos.map((info) => {
+@@ -597,8 +633,12 @@ export class LammpsAdapter implements LammpsWeb {
+         return {
+           name: s.name,
+           label: s.label,
+-          x: Array.from(this.module.HEAPF32.subarray(xBase, xBase + s.x.length)),
+-          y: Array.from(this.module.HEAPF32.subarray(yBase, yBase + s.y.length)),
++          x: Array.from(
++            this.module.HEAPF32.subarray(xBase, xBase + s.x.length),
++          ),
++          y: Array.from(
++            this.module.HEAPF32.subarray(yBase, yBase + s.y.length),
++          ),
+         };
+       });
+       return {
+@@ -640,7 +680,7 @@ export class LammpsAdapter implements LammpsWeb {
+       }
+     }
+ 
+-    return { modifiers, perAtom };
++    return { modifiers, perAtom, radii };
+   }
+ 
+   getCompute(name: string): LMPModifier {
+diff --git a/src/wasm/workerMessages.ts b/src/wasm/workerMessages.ts
+index a8f9c3a3..497588c0 100644
+--- a/src/wasm/workerMessages.ts
++++ b/src/wasm/workerMessages.ts
+@@ -35,14 +35,23 @@ export type WorkerCommand =
+   // Which per-atom compute (if any) the main thread is coloring by. The worker
+   // streams that compute's per-atom values each step so color-by-compute works;
+   // null streams none (the common case), avoiding needless per-atom invocation.
+-  | { type: "setPerAtomModifier"; category: ModifierCategory; name: string | null }
++  | {
++      type: "setPerAtomModifier";
++      category: ModifierCategory;
++      name: string | null;
++    }
+   | { type: "runCommand"; command: string }
+   // Read the files under `dir` out of the worker's wasm FS (the run-outputs
+   // data path, ADR-001 §5). MEMFS reads are pure JS, so this is safe even
+   // while the module is asyncify-suspended mid-run; files larger than
+   // maxBytes are listed in `skipped` instead of transferred (the caller sends
+   // maxBytes: undefined for the final end-of-run snapshot).
+-  | { type: "snapshotWorkdir"; requestId: number; dir: string; maxBytes?: number };
++  | {
++      type: "snapshotWorkdir";
++      requestId: number;
++      dir: string;
++      maxBytes?: number;
++    };
+ 
+ /** One compute/fix/variable's streamed snapshot (scalar + 1D series). */
+ export interface WorkerModifierData {
+@@ -83,6 +92,8 @@ export interface WorkerStepData {
+   types: ArrayBuffer;
+   /** count int32 atom ids. */
+   ids: ArrayBuffer;
++  /** Native radii in simulation length units, ordered with positions; absent for atomic styles. */
++  radii?: ArrayBuffer | null;
+   /** Number of rendered bonds this step (0 when none). */
+   bondCount: number;
+   /** 3 * bondCount float32 xyz of each bond's first endpoint. */

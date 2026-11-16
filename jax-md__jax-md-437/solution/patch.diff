@@ -1,0 +1,174 @@
+diff --git a/jax_md/_energy/electrostatics.py b/jax_md/_energy/electrostatics.py
+index d1801297..debec47e 100644
+--- a/jax_md/_energy/electrostatics.py
++++ b/jax_md/_energy/electrostatics.py
+@@ -50,7 +50,9 @@
+ 
+ 
+ def coulomb_direct(dr: Array, charge_sq: Array, alpha: float) -> Array:
+-  return charge_sq * erfc(alpha * dr) / dr
++  mask = dr > 0
++  dr = jnp.where(mask, dr, 1)
++  return jnp.where(mask, charge_sq * erfc(alpha * dr) / dr, 0)
+ 
+ 
+ def coulomb_direct_pair(
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index b78b704c..88b564c1 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -640,13 +640,15 @@ def bks(
+   .. [#liu] Liu, Han, et al. "Machine learning Forcefield for silicate glasses."
+     arXiv preprint arXiv:1902.03486 (2019).
+   """
++  mask = (dr > 0) & (dr < cutoff)
++  dr = jnp.where(dr > 0, dr, 1)
+   energy = (
+     dsf_coulomb(dr, Q_sq, coulomb_alpha, cutoff)
+     + exp_coeff * jnp.exp(-dr / exp_decay)
+     + attractive_coeff / dr**6
+     + repulsive_coeff / dr**24
+   )
+-  return jnp.where(dr < cutoff, energy, 0.0)
++  return jnp.where(mask, energy, 0.0)
+ 
+ 
+ def bks_pair(
+@@ -669,7 +671,7 @@ def bks_pair(
+ 
+   return smap.pair(
+     bks,
+-    displacement_or_metric,
++    space.canonicalize_displacement_or_metric(displacement_or_metric),
+     species=species,
+     ignore_unused_parameters=True,
+     Q_sq=Q_sq,
+diff --git a/jax_md/minimize.py b/jax_md/minimize.py
+index ba2cb9e2..7040ab57 100644
+--- a/jax_md/minimize.py
++++ b/jax_md/minimize.py
+@@ -187,11 +187,8 @@ def apply_fn(state: FireDescentState, **kwargs) -> FireDescentState:
+     state = nve_step_fn(state, dt=state.dt, **kwargs)
+     R, P, F, M, dt, alpha, n_pos = dataclasses.unpack(state)
+ 
+-    # NOTE(schsam): This will be wrong if F_norm ~< 1e-8.
+-    # TODO(schsam): We should check for forces below 1e-6. @ErrorChecking
+-    F_norm = jnp.sqrt(
+-      tree_reduce(lambda accum, f: accum + jnp.sum(f**2) + 1e-6, F, 0.0)
+-    )
++    F_norm_sq = tree_reduce(lambda accum, f: accum + jnp.sum(f**2), F, 0.0)
++    F_norm = jnp.sqrt(jnp.where(F_norm_sq > 0, F_norm_sq, 1))
+     P_norm = jnp.sqrt(
+       tree_reduce(lambda accum, p: accum + jnp.sum(p**2), P, 0.0)
+     )
+@@ -983,7 +980,8 @@ def apply_fn(
+     # FIRE: combined power check
+     F_dot_V = jnp.sum(F * P / M) + jnp.sum(F_b * P_b / M_b)
+ 
+-    F_norm = jnp.sqrt(jnp.sum(F**2) + jnp.sum(F_b**2) + 1e-6)
++    F_norm_sq = jnp.sum(F**2) + jnp.sum(F_b**2)
++    F_norm = jnp.sqrt(jnp.where(F_norm_sq > 0, F_norm_sq, 1))
+     P_norm = jnp.sqrt(jnp.sum(P**2) + jnp.sum(P_b**2))
+ 
+     # FIRE: momentum mixing
+diff --git a/jax_md/smap.py b/jax_md/smap.py
+index 715f96f0..4663a51c 100644
+--- a/jax_md/smap.py
++++ b/jax_md/smap.py
+@@ -291,7 +291,7 @@ def mapped_fn(
+ 
+ 
+ def _get_species_parameters(
+-  params: Parameter, species: Array | Tuple[int, int]
++  params: Parameter, species: Array | Tuple[int, int] | Tuple[Array, Array]
+ ) -> Parameter:
+   """Get parameters for interactions between species pairs."""
+   # TODO(schsam): We should do better error checking here.
+@@ -368,7 +368,7 @@ def _get_matrix_parameters(
+ 
+ 
+ def _kwargs_to_parameters(
+-  species: Array | Tuple[int, int] | None,
++  species: Array | Tuple[int, int] | Tuple[Array, Array] | None,
+   kwargs: Dict[str, Parameter],
+   combinators: Dict[str, Callable],
+ ) -> Dict[str, Parameter]:
+@@ -570,9 +570,7 @@ def pair(
+       be None (in which case it is assumed that all the particles have the same
+       species), an integer ndarray of shape `[n]` with species data, or an
+       integer in which case the species data will be specified dynamically with
+-      `species` giving the maximum number of types of particles. Note: that
+-      dynamic species specification is less efficient, because we cannot
+-      specialize shape information.
++      `species` giving the maximum number of types of particles.
+     reduce_axis: A list of axes to reduce over. This is supplied to `jnp.sum`
+       and so the same convention is used.
+     keepdims: A boolean specifying whether the empty dimensions should be kept
+@@ -639,49 +637,37 @@ def fn_mapped(R: Array, **dynamic_kwargs) -> Array:
+   elif util.is_array(species):
+     species = onp.array(species)
+     _check_species_dtype(species)
+-    species_count = int(onp.max(species))
+     if reduce_axis is not None or keepdims:
+       # TODO(schsam): Support reduce_axis with static species.
+       raise ValueError
+ 
+     def fn_mapped(R, **dynamic_kwargs):
+-      U = f32(0.0)
+       d = space.map_product(partial(displacement_or_metric, **dynamic_kwargs))
+-      for i in range(species_count + 1):
+-        for j in range(i, species_count + 1):
+-          _kwargs = merge_dicts(kwargs, dynamic_kwargs)
+-          s_kwargs = _kwargs_to_parameters((i, j), _kwargs, param_combinators)
+-          Ra = R[species == i]
+-          Rb = R[species == j]
+-          dr = d(Ra, Rb)
+-          if j == i:
+-            dU = high_precision_sum(_diagonal_mask(fn(dr, **s_kwargs)))
+-            U = U + f32(0.5) * dU
+-          else:
+-            dU = high_precision_sum(fn(dr, **s_kwargs))
+-            U = U + dU
+-      return U
++      _kwargs = merge_dicts(kwargs, dynamic_kwargs)
++      s = jnp.asarray(species)
++      s_kwargs = _kwargs_to_parameters(
++        (s[None, :], s[:, None]), _kwargs, param_combinators
++      )
++      weight = jnp.where(
++        s[None, :] == s[:, None], 0.5, jnp.where(s[None, :] < s[:, None], 1, 0)
++      )
++      dU = _diagonal_mask(fn(d(R, R), **s_kwargs))
++      weight = jnp.reshape(weight, weight.shape + (1,) * (dU.ndim - 2))
++      return high_precision_sum(dU * weight)
+   elif isinstance(species, int):
+-    species_count = species
+ 
+     def fn_mapped(R, species, **dynamic_kwargs):
+       _check_species_dtype(species)
+-      U = f32(0.0)
+-      N = R.shape[0]
+       d = space.map_product(partial(displacement_or_metric, **dynamic_kwargs))
+       _kwargs = merge_dicts(kwargs, dynamic_kwargs)
++      s = jnp.reshape(species, (R.shape[0],))
++      s_kwargs = _kwargs_to_parameters(
++        (s[:, None], s[None, :]), _kwargs, param_combinators
++      )
+       dr = d(R, R)
+-      for i in range(species_count):
+-        for j in range(species_count):
+-          s_kwargs = _kwargs_to_parameters((i, j), _kwargs, param_combinators)
+-          mask_a = jnp.array(jnp.reshape(species == i, (N,)), dtype=R.dtype)
+-          mask_b = jnp.array(jnp.reshape(species == j, (N,)), dtype=R.dtype)
+-          mask = mask_a[:, jnp.newaxis] * mask_b[jnp.newaxis, :]
+-          if i == j:
+-            mask = mask * _diagonal_mask(mask)
+-          dU = mask * fn(dr, **s_kwargs)
+-          U = U + high_precision_sum(dU, axis=reduce_axis, keepdims=keepdims)
+-      return U / f32(2.0)
++      return high_precision_sum(
++        _diagonal_mask(fn(dr, **s_kwargs)), axis=reduce_axis, keepdims=keepdims
++      ) * f32(0.5)
+   else:
+     raise ValueError(
+       'Species must be None, an ndarray, or an integer. Found {}.'.format(

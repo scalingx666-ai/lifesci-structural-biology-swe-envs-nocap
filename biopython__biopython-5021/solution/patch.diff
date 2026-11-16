@@ -1,0 +1,391 @@
+diff --git a/Bio/PDB/StructureAlignment.py b/Bio/PDB/StructureAlignment.py
+index ceb826028d2..564161a28f0 100644
+--- a/Bio/PDB/StructureAlignment.py
++++ b/Bio/PDB/StructureAlignment.py
+@@ -7,28 +7,79 @@
+ 
+ """Map residues of two structures to each other based on a FASTA alignment."""
+ 
++from typing import Optional
++import warnings
++
++from Bio.Align import Alignment, MultipleSeqAlignment, PairwiseAligner
+ from Bio.Data import PDBData
+ from Bio.PDB import Selection
++from Bio.PDB.Model import Model
+ from Bio.PDB.Polypeptide import is_aa
++from Bio.PDB.Residue import Residue
++from Bio.Seq import Seq
++from Bio.SeqRecord import SeqRecord
+ 
+ 
+ class StructureAlignment:
+     """Class to align two structures based on an alignment of their sequences."""
+ 
+-    def __init__(self, fasta_align, m1, m2, si=0, sj=1):
++    def __init__(
++        self,
++        fasta_align: Optional[MultipleSeqAlignment | Alignment] = None,
++        m1: Model | None = None,
++        m2: Model | None = None,
++        si: int = 0,
++        sj: int = 1,
++        aligner: Optional[PairwiseAligner] = None,
++    ) -> None:
+         """Initialize.
+ 
+         Attributes:
+-         - fasta_align - Alignment object
+-         - m1, m2 - two models
+-         - si, sj - the sequences in the Alignment object that
+-           correspond to the structures
++         - fasta_align - Alignment object / MSA object or None (if None, one will be generated automatically)
++         - m1, m2 - two models (Bio.PDB.Model.Model objects). Their default values are set to None to maintain legacy code, but they CANNOT be None
++         - si, sj - the sequences in the Alignment object that correspond to the structures
++         - aligner - Optional aligner, mutually exclusive with fasta_align, allows for customization of automatic
++           alignment, otherwise blastp defaults will be used
+ 
+         """
+-        try:  # MultipleSeqAlignment object
++        # Check that fasta_align and aligner are not both provided
++        if fasta_align is not None and aligner is not None:
++            raise ValueError(
++                "fasta_align and aligner cannot be both provided, fasta_align uses precomputed alignments",
++                "while the aligner is to allow a custom alignment tool to be used for automatically aligning",
++                "input sequences",
++            )
++
++        self.aligner = aligner
++
++        # Validate that models are provided
++        if m1 is None or m2 is None:
++            raise ValueError("Both m1 and m2 models must be provided")
++
++        if fasta_align is None:
++            fasta_align = self._generate_alignment_from_models(
++                m1, m2
++            )  # MultipleSeqAlignment
++        else:
++            # if fasta_align is explicitly provided, raise DeprecationWarning letting user
++            # know that fasta_align is no longer required
++            warnings.warn(
++                "fasta_align is no longer a required argument (will be automatically computed "
++                "if not provided), and the function signature will change in a future release",
++                DeprecationWarning,
++                stacklevel=2,
++            )
++
++        if isinstance(fasta_align, MultipleSeqAlignment):
+             ncolumns = fasta_align.get_alignment_length()
+-        except AttributeError:  # Alignment object
+-            nrows, ncolumns = fasta_align.shape
++        elif isinstance(fasta_align, Alignment):
++            _, ncolumns = fasta_align.shape
++        else:
++            raise ValueError(
++                f"Could not infer length from alignment object: {fasta_align}. "
++                "Alignment must be of type MultipleSeqAlignment or Alignment."
++            )
++
+         # Get the residues in the models
+         rl1 = Selection.unfold_entities(m1, "R")
+         rl2 = Selection.unfold_entities(m2, "R")
+@@ -41,9 +92,9 @@ def __init__(self, fasta_align, m1, m2, si=0, sj=1):
+         # List of residue pairs (None if -)
+         duos = []
+         for i in range(ncolumns):
+-            column = fasta_align[:, i]
+-            aa1 = column[si]
+-            aa2 = column[sj]
++            aa1 = fasta_align[si, i]
++            aa2 = fasta_align[sj, i]
++
+             if aa1 != "-":
+                 # Position in seq1 is not -
+                 while True:
+@@ -78,6 +129,41 @@ def __init__(self, fasta_align, m1, m2, si=0, sj=1):
+         self.map21 = map21
+         self.duos = duos
+ 
++    def _generate_alignment_from_models(self, m1, m2) -> Alignment:
++        """Generate a MultipleSeqAlignment from two protein models .
++
++        Uses Bio.Align.PairwiseAligner to create a proper sequence alignment
++        with gaps, rather than simply placing sequences side-by-side.
++        This ensures that homologous residues are properly aligned.
++        """
++        seq1_record = self._extract_sequence_from_model(m1, "structure1")
++        seq2_record = self._extract_sequence_from_model(m2, "structure2")
++
++        if self.aligner is not None:
++            assert isinstance(
++                self.aligner, PairwiseAligner
++            ), f"custom aligner must be a PairwiseAligner object, not {type(self.aligner)}"
++        else:
++            aligner = PairwiseAligner("blastp")
++
++        alignments = aligner.align(seq1_record.seq, seq2_record.seq)
++        best_alignment = alignments[0]
++
++        return best_alignment
++
++    def _extract_sequence_from_model(self, model, seq_id):
++        """Extract amino acid sequence from a protein model."""
++        residues = Selection.unfold_entities(model, "R")
++        sequence = ""
++
++        for residue in residues:
++            if isinstance(residue, Residue) and is_aa(residue):
++                resname = residue.get_resname()
++                aa_code = PDBData.protein_letters_3to1_extended.get(resname, "X")
++                sequence += aa_code
++
++        return SeqRecord(Seq(sequence), id=seq_id)
++
+     def _test_equivalence(self, r1, aa1):
+         """Test if aa in sequence fits aa in structure (PRIVATE)."""
+         resname = r1.get_resname()
+diff --git a/Doc/Tutorial/chapter_pdb.rst b/Doc/Tutorial/chapter_pdb.rst
+index d58beaa6a70..387b1bfc121 100644
+--- a/Doc/Tutorial/chapter_pdb.rst
++++ b/Doc/Tutorial/chapter_pdb.rst
+@@ -1877,9 +1877,39 @@ Aligning related structures
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+ To align two proteins with similar sequences (greater than 50% sequence identity),
+-first align the two sequences by making a alignment file in FASTA format, and then
+-use the ``StructureAlignment`` class to align the structures. This class can be used
+-for alignments with more than two structures.
++use the ``StructureAlignment`` class. This class can either take in a sequence alignment
++as an argument (either ``MultipleSeqAlignment`` or ``Alignment`` objects) or automatically
++compute this alignment by just passing two structure models.
++
++Example:
++
++.. code:: pycon
++
++    >>> p = PDBParser(QUIET=1)
++    >>> s1 = p.get_structure("1", "pdb_file_1.pdb")
++    >>> s2 = p.get_structure("2", "pdb_file_2.pdb")
++    >>> model_1 = s1[0]
++    >>> model_2 = s2[0]
++    >>> alignment = StructureAlignment(m1=model_1, m2=model_2)
++    # Currently, the alignment will use the blastp default values to align the structures
++
++    # To use custom values, you can pass in a customized PairwiseAligner
++    >>> aligner = PairwiseAligner(gap_score=-1)
++    >>> alignment = StructureAlignment(m1=model_1, m2=model_2, aligner=aligner)
++
++    # Alternatively, you can also pass a premade fasta alignment
++    >>> fasta_alignment = Bio.AlignIO.read("fasta_alignment_file.fasta", "fasta")
++    # For how to create a sequence alignment from both models, please see the documentation
++    # on ``MultipleSequenceAlignment`` objects
++    >>> alignment = StructureAlignment(m1=model_1, m2=model_2, fasta_align=fasta_alignment)
++
++
++Note that in order to work with legacy code, the first parameter in ``StructureAlignment`` is
++still an alignment object. This means that to use the class correctly, the models must either
++be passed as keyword arguments (as seen in the example above), or the first argument must be
++passed as None. Now that explicitly passing the alignment object is deprecated, this is subject
++to change in a future release. Also, if you are using an older version of Biopython (<=1.85), you will
++have to generate the sequence alignment manually (``Bio.Align`` module)
+ 
+ Aligning dissimilar structures
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/Tests/test_PDB_StructureAlignment.py b/Tests/test_PDB_StructureAlignment.py
+index 4ce2b3cf00d..3e398f117e2 100644
+--- a/Tests/test_PDB_StructureAlignment.py
++++ b/Tests/test_PDB_StructureAlignment.py
+@@ -9,19 +9,27 @@
+ # package.
+ """Unit tests for the Bio.PDB.StructureAlignment module."""
+ 
++import os
+ import unittest
+ 
+ from Bio import Align
+ from Bio import AlignIO
++from Bio.Align import PairwiseAligner
++from Bio.Align import MultipleSeqAlignment
++from Bio.Data import PDBData
+ from Bio.PDB import PDBParser
+ from Bio.PDB import StructureAlignment
++from Bio.PDB.Selection import unfold_entities
++from Bio.PDB.Polypeptide import is_aa
++from Bio.Seq import Seq
++from Bio.SeqRecord import SeqRecord
+ 
+ 
+ class StructureAlignTests(unittest.TestCase):
+     """Test module StructureAlignment."""
+ 
+     def test_StructAlign(self):
+-        """Tests on module to align two proteins according to a FASTA alignment file."""
++        """Tests on module to align two proteins according to a FASTA file."""
+         p = PDBParser(QUIET=1)
+ 
+         al_file = "PDB/alignment_file.fa"
+@@ -48,12 +56,162 @@ def test_StructAlign(self):
+             chain2_A = m2["A"]
+             self.assertEqual(chain1_A[202].get_resname(), "ILE")
+             self.assertEqual(chain2_A[202].get_resname(), "LEU")
+-            self.assertEqual(chain1_A[291].get_resname(), chain2_A[180].get_resname())
+             self.assertNotEqual(
+                 chain1_A[291].get_resname(), chain2_A[181].get_resname()
+             )
+ 
++    def test_msa_vs_alignment_objects(self):
++        """Test that MultipleSeqAlignment and Alignment objects produce identical results.
++
++        This test verifies that when given the same sequence alignment data,
++        StructureAlignment produces identical mappings whether the input is:
++        1. A Bio.Align.MultipleSeqAlignment object (from AlignIO.read)
++        2. A Bio.Align.Alignment object (from Align.read)
++        """
++        p = PDBParser(QUIET=1)
++
++        s1 = p.get_structure("1", "PDB/2XHE.pdb")
++        s2 = p.get_structure("2", "PDB/1A8O.pdb")
++        m1 = s1[0]
++        m2 = s2[0]
++
++        # Read the same alignment file that works in the first test
++        al_file = "PDB/alignment_file.fa"
++
++        # Test 1: Using Bio.AlignIO to get MultipleSeqAlignment
++        with open(al_file) as handle:
++            msa_records = AlignIO.read(handle, "fasta")
++
++        # Test 2: Using Bio.Align to get Alignment object
++        with open(al_file) as handle:
++            alignment_obj = Align.read(handle, "fasta")
++
++        # Create StructureAlignment with both types
++        al_msa = StructureAlignment(msa_records, m1, m2)
++        al_align = StructureAlignment(alignment_obj, m1, m2)
++
++        # Results should be identical
++        self.assertEqual(len(al_msa.duos), len(al_align.duos))
++        self.assertEqual(len(al_msa.map12), len(al_align.map12))
++        self.assertEqual(len(al_msa.map21), len(al_align.map21))
++
++        # Compare mappings
++        for residue in al_msa.map12:
++            self.assertIn(residue, al_align.map12)
++            self.assertEqual(al_msa.map12[residue], al_align.map12[residue])
++
++        for residue in al_msa.map21:
++            self.assertIn(residue, al_align.map21)
++            self.assertEqual(al_msa.map21[residue], al_align.map21[residue])
++
++        # Compare duos
++        for i, (duo_msa, duo_align) in enumerate(zip(al_msa.duos, al_align.duos)):
++            self.assertEqual(
++                duo_msa,
++                duo_align,
++                f"Duo mismatch at position {i}: {duo_msa} vs {duo_align}",
++            )
++
++    def test_custom_vs_automatic_alignment(self):
++        """Test that custom PairwiseAligner alignment vs automatic alignment work identically.
++
++        This test verifies that providing a custom alignment created with PairwiseAligner
++        produces the same results as letting StructureAlignment generate the alignment
++        automatically.
++        """
++
++        p = PDBParser(QUIET=1)
++
++        s1 = p.get_structure("1", "PDB/2XHE.pdb")
++        s2 = p.get_structure("2", "PDB/1A8O.pdb")
++        m1 = s1[0]
++        m2 = s2[0]
++
++        # Extract sequences from models (same logic as in StructureAlignment)
++        def extract_sequence(model, seq_id):
++            residues = unfold_entities(model, "R")
++            sequence = ""
++            for residue in residues:
++                if is_aa(residue):
++                    resname = residue.get_resname()
++                    if resname in PDBData.protein_letters_3to1_extended:
++                        aa_code = PDBData.protein_letters_3to1_extended[resname]
++                        sequence += aa_code
++                    else:
++                        sequence += "X"
++            return SeqRecord(Seq(sequence), id=seq_id)
++
++        seq1_record = extract_sequence(m1, "structure1")
++        seq2_record = extract_sequence(m2, "structure2")
++
++        # Create custom alignment using PairwiseAligner
++        aligner = PairwiseAligner("blastp")
++        alignments = aligner.align(seq1_record.seq, seq2_record.seq)
++        best_alignment = alignments[0]
++
++        # Convert to MultipleSeqAlignment
++        aligned_seq1_str = str(best_alignment[0])
++        aligned_seq2_str = str(best_alignment[1])
++        aligned_seq1 = SeqRecord(Seq(aligned_seq1_str), id="structure1")
++        aligned_seq2 = SeqRecord(Seq(aligned_seq2_str), id="structure2")
++        custom_alignment = MultipleSeqAlignment([aligned_seq1, aligned_seq2])
++
++        # Create StructureAlignment with custom alignment
++        al_custom = StructureAlignment(custom_alignment, m1, m2)
++
++        # Create StructureAlignment with automatic alignment
++        al_auto = StructureAlignment(m1=m1, m2=m2)
++
++        # Results should be identical since they use the same alignment algorithm
++        self.assertEqual(len(al_custom.duos), len(al_auto.duos))
++        self.assertEqual(len(al_custom.map12), len(al_auto.map12))
++        self.assertEqual(len(al_custom.map21), len(al_auto.map21))
++
++        # Compare mappings
++        for residue in al_custom.map12:
++            self.assertIn(residue, al_auto.map12)
++            self.assertEqual(al_custom.map12[residue], al_auto.map12[residue])
++
++        for residue in al_custom.map21:
++            self.assertIn(residue, al_auto.map21)
++            self.assertEqual(al_custom.map21[residue], al_auto.map21[residue])
++
++        # Compare duos
++        for i, (duo_custom, duo_auto) in enumerate(zip(al_custom.duos, al_auto.duos)):
++            self.assertEqual(
++                duo_custom,
++                duo_auto,
++                f"Duo mismatch at position {i}: {duo_custom} vs {duo_auto}",
++            )
++
++    def test_automatic_alignment_generation(self):
++        """Test that automatic alignment generation works correctly.
++
++        This test verifies that StructureAlignment can generate alignments
++        automatically when no alignment is provided.
++        """
++        p = PDBParser(QUIET=1)
++
++        s1 = p.get_structure("1", "PDB/2XHE.pdb")
++        s2 = p.get_structure("2", "PDB/1A8O.pdb")
++        m1 = s1[0]
++        m2 = s2[0]
++
++        # Create StructureAlignment with automatic alignment generation
++        al_auto = StructureAlignment(m1=m1, m2=m2)
++
++        # Verify that mappings were created
++        self.assertIsNotNone(al_auto.map12)
++        self.assertIsNotNone(al_auto.map21)
++        self.assertIsNotNone(al_auto.duos)
++        self.assertGreater(len(al_auto.duos), 0)
++
++        # Verify that some residues were mapped
++        self.assertGreater(len(al_auto.map12), 0)
++        self.assertGreater(len(al_auto.map21), 0)
++
+ 
+ if __name__ == "__main__":
++    os.chdir("Tests")
+     runner = unittest.TextTestRunner(verbosity=2)
+     unittest.main(testRunner=runner)

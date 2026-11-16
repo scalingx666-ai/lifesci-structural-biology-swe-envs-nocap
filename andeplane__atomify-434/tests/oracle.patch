@@ -1,0 +1,550 @@
+diff --git a/e2e/atom-radii.spec.ts b/e2e/atom-radii.spec.ts
+index 44fe2d83..c3516f88 100644
+--- a/e2e/atom-radii.spec.ts
++++ b/e2e/atom-radii.spec.ts
+@@ -24,10 +24,12 @@ test("sphere radii are streamed in native units and update during a run", async
+           const v = s.render.visualizer;
+           if (!v || s.simulationStatus.timesteps < 2) return false;
+           const step = s.simulationStatus.timesteps;
++          const p = s.render.particles;
++          const radii = p.geometry.getAttribute("atomRadius");
+           return (
+-            Math.abs(v.radiusTexture.getFloat(1) - (1 + step / 1000) / 2) <
+-              1 / 255 &&
+-            Math.abs(v.radiusTexture.getFloat(2) - 1.5) < 1 / 255 &&
++            Math.abs(radii.getX(p.indices.indexOf(1)) - (1 + step / 1000) / 2) <
++              0.0001 &&
++            Math.abs(radii.getX(p.indices.indexOf(2)) - 1.5) < 0.0001 &&
+             !Object.keys(s.simulationStatus.variables).some((name) =>
+               name.startsWith("atomify_radius_flag_"),
+             )
+diff --git a/e2e/data-viewer.spec.ts b/e2e/data-viewer.spec.ts
+index bb89dfcb..0064684e 100644
+--- a/e2e/data-viewer.spec.ts
++++ b/e2e/data-viewer.spec.ts
+@@ -51,6 +51,24 @@ for (const [style, data] of [
+     });
+     const source = await readContentsRecord(page, "data-viewer/sample.data");
+     expect(source?.content).toBe(data);
++    // A finished run produces no more snapshots. Reopening its viewport must
++    // restore populated attributes and the same atom styles from cached data.
++    const readStyles = () =>
++      page.evaluate(async () => {
++        const path = "/atomify/src/store/index.ts";
++        const p = (await import(path)).default.getState().render.particles;
++        return {
++          radius: Array.from(p.geometry.getAttribute("atomRadius").array),
++          color: Array.from(p.geometry.getAttribute("atomColor").array),
++        };
++      });
++    const styles = await readStyles();
++    expect(styles.radius).toHaveLength(2);
++    expect(styles.radius.every((r) => Number(r) > 0)).toBe(true);
++    await page.getByTestId("run-detail-back").click();
++    await page.getByTestId("run-row-run-001").click();
++    await expect(canvas).toBeVisible();
++    await expect.poll(readStyles).toEqual(styles);
+     const before = await canvas.screenshot();
+     const box = (await canvas.boundingBox())!;
+     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+diff --git a/e2e/particle-attributes.spec.ts b/e2e/particle-attributes.spec.ts
+new file mode 100644
+index 00000000..55ca4f71
+--- /dev/null
++++ b/e2e/particle-attributes.spec.ts
+@@ -0,0 +1,107 @@
++import { expect, test } from "@playwright/test";
++import { createBlankProject, gotoApp, waitForEngine } from "./helpers";
++
++test("instance radius controls both drawing and off-center GPU picking", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  await createBlankProject(page, "Particle attributes", "particle-attributes");
++  await page.getByTestId("upload-input").setInputFiles([
++    {
++      name: "one.data",
++      mimeType: "text/plain",
++      buffer: Buffer.from(
++        "Sparse atom\n\n1 atoms\n1 atom types\n\n0 8 xlo xhi\n0 8 ylo yhi\n0 8 zlo zhi\n\nAtoms # atomic\n\n42 1 4 4 4\n",
++      ),
++    },
++    {
++      name: "in.attrs",
++      mimeType: "text/plain",
++      buffer: Buffer.from(
++        "units lj\natom_style atomic\nread_data one.data\nmass * 1\npair_style zero 1\npair_coeff * *\nrun 100000\n",
++      ),
++    },
++  ]);
++  await waitForEngine(page);
++  await page.getByTestId("run-file-in.attrs").click();
++  await expect
++    .poll(
++      () =>
++        page.evaluate(async () => {
++          const path = "/atomify/src/store/index.ts";
++          const s = (await import(path)).default.getState();
++          return (
++            s.render.particles?.geometry?.getAttribute("atomRadius")?.count ?? 0
++          );
++        }),
++      { timeout: 60_000 },
++    )
++    .toBe(1);
++  const point = await page.evaluate(async () => {
++    const path = "/atomify/src/store/index.ts";
++    const threePath = "/atomify/node_modules/three/build/three.module.js";
++    const store = (await import(path)).default;
++    const THREE = await import(threePath);
++    store.getActions().simulation.setPaused(true);
++    const s = store.getState(),
++      v = s.render.visualizer,
++      p = s.render.particles;
++    v.setRadius(42, 1.23456);
++    v.setColor(42, { r: 255, g: 0, b: 0 });
++    const radius = p.geometry.getAttribute("atomRadius").getX(0);
++    const color = Array.from(p.geometry.getAttribute("atomColor").array);
++    const center = new THREE.Vector3(4, 4, 4).applyMatrix4(p.mesh.matrixWorld);
++    const right = new THREE.Vector3().setFromMatrixColumn(
++      v.camera.matrixWorld,
++      0,
++    );
++    const target = center.addScaledVector(right, 0.8).project(v.camera);
++    const rect = v.canvas.getBoundingClientRect();
++    return {
++      radius,
++      color,
++      x: rect.left + ((target.x + 1) * rect.width) / 2,
++      y: rect.top + ((1 - target.y) * rect.height) / 2,
++    };
++  });
++  expect(point.radius).toBeCloseTo(1.23456, 6);
++  expect(point.color).toEqual([1, 0, 0]);
++  const png = await page
++    .getByTestId("run-detail")
++    .locator("canvas")
++    .first()
++    .screenshot();
++  const redPixels = await page.evaluate(async (base64) => {
++    const image = new Image();
++    image.src = `data:image/png;base64,${base64}`;
++    await image.decode();
++    const canvas = document.createElement("canvas");
++    canvas.width = image.width;
++    canvas.height = image.height;
++    const context = canvas.getContext("2d")!;
++    context.drawImage(image, 0, 0);
++    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
++    let count = 0;
++    for (let i = 0; i < pixels.length; i += 4) {
++      if (
++        pixels[i] > 30 &&
++        pixels[i] > pixels[i + 1] * 2 &&
++        pixels[i] > pixels[i + 2] * 2
++      )
++        count++;
++    }
++    return count;
++  }, png.toString("base64"));
++  expect(redPixels).toBeGreaterThan(100);
++  await page.mouse.click(point.x, point.y);
++  await expect
++    .poll(() =>
++      page.evaluate(async () => {
++        const path = "/atomify/src/store/index.ts";
++        const v = (await import(path)).default.getState().render.visualizer;
++        return v.selectionTexture.getRGBA(42).r;
++      }),
++    )
++    .toBe(255);
++  await page.getByRole("button", { name: "Stop", exact: true }).click();
++});
+diff --git a/src/containers/View.test.tsx b/src/containers/View.test.tsx
+index c61fd71f..18024f71 100644
+--- a/src/containers/View.test.tsx
++++ b/src/containers/View.test.tsx
+@@ -10,6 +10,10 @@ import type { StoreModel } from "../store/model";
+ import type { Compute, Fix, Variable, Wall } from "../types";
+ import type Modifier from "../modifiers/modifier";
+ 
++vi.mock("../rendering/particleAttributes", () => ({
++  installParticleAttributes: vi.fn(),
++  syncParticleAttributes: vi.fn(),
++}));
+ vi.mock("../utils/ambientOcclusion", () => ({
+   applyAmbientOcclusion: vi.fn(),
+ }));
+@@ -526,7 +530,9 @@ function createDefaultMockState() {
+ 
+ function createDefaultMockActions() {
+   return {
++    processing: { runPostTimestepRendering: vi.fn() },
+     render: {
++      setParticleStylesUpdated: vi.fn(),
+       // Mirrors the real action: updates mockState so subsequent renders
+       // see the newly created visualizer and don't re-trigger creation.
+       setVisualizer: vi.fn(
+diff --git a/src/containers/View.tsx b/src/containers/View.tsx
+index 3a9bd834..224064e6 100644
+--- a/src/containers/View.tsx
++++ b/src/containers/View.tsx
+@@ -1,3 +1,7 @@
++import {
++  installParticleAttributes,
++  syncParticleAttributes,
++} from "../rendering/particleAttributes";
+ import { applyAmbientOcclusion } from "../utils/ambientOcclusion";
+ import { useEffect, useState, useRef, useCallback } from "react";
+ import { Layout, Row, Col, Progress, Modal, Button } from "antd";
+@@ -122,6 +126,14 @@ const View = ({ visible, pane = false }: ViewProps) => {
+     (actions) => actions.render.setVisualizer,
+   );
+ 
++  const refreshParticleStyles = useStoreActions(
++    (actions) => actions.render.setParticleStylesUpdated,
++  );
++  const refreshRendering = useStoreActions(
++    (actions) => actions.processing.runPostTimestepRendering,
++  );
++  const styledVisualizer = useRef<Visualizer | null>(null);
++
+   const renderSettings = useStoreState((state) => state.settings.render);
+   const setRenderSettings = useStoreActions(
+     (actions) => actions.settings.setRender,
+@@ -274,6 +286,7 @@ const View = ({ visible, pane = false }: ViewProps) => {
+           });
+         },
+       });
++      installParticleAttributes(newVisualizer);
+       setVisualizer(newVisualizer);
+       setLoading(false);
+       newVisualizer.materials.particles.shininess = 50;
+@@ -358,6 +371,14 @@ const View = ({ visible, pane = false }: ViewProps) => {
+     }
+ 
+     if (particles) {
++      // A completed run can predate this viewport. Bind attributes and restore
++      // styles from the cached frame even when no further timestep will arrive.
++      syncParticleAttributes(visualizer, particles);
++      if (styledVisualizer.current !== visualizer) {
++        styledVisualizer.current = visualizer;
++        refreshParticleStyles(true);
++        refreshRendering();
++      }
+       visualizer.add(particles);
+     }
+ 
+@@ -369,7 +390,15 @@ const View = ({ visible, pane = false }: ViewProps) => {
+     if (bonds) {
+       visualizer.add(bonds);
+     }
+-  }, [particles, prevParticles, prevBonds, bonds, visualizer]);
++  }, [
++    particles,
++    prevParticles,
++    prevBonds,
++    bonds,
++    visualizer,
++    refreshParticleStyles,
++    refreshRendering,
++  ]);
+ 
+   // Apply render settings when they change
+   useEffect(() => {
+diff --git a/src/modifiers/syncparticlesmodifier.ts b/src/modifiers/syncparticlesmodifier.ts
+index c5dceebf..13528319 100644
+--- a/src/modifiers/syncparticlesmodifier.ts
++++ b/src/modifiers/syncparticlesmodifier.ts
+@@ -1,3 +1,4 @@
++import { syncParticleAttributes } from "../rendering/particleAttributes";
+ import Modifier, { ModifierProps } from "./modifier";
+ import { ModifierInput, ModifierOutput } from "./types";
+ import { Particles } from "omovi";
+@@ -69,6 +70,14 @@ class SyncParticlesModifier extends Modifier {
+       newParticles.mesh.count = numParticles;
+     }
+ 
++    syncParticleAttributes(input.renderState?.visualizer, newParticles);
++    // Only positions and IDs stream every frame. Style attributes mark
++    // themselves dirty when styles or the ID-to-instance mapping change.
++    const geometry = newParticles.geometry;
++    if (geometry) {
++      geometry.getAttribute("particlePosition").needsUpdate = true;
++      geometry.getAttribute("particleIndex").needsUpdate = true;
++    }
+     const radii = input.lammps.getParticleRadii?.();
+     if (radii && input.renderState.visualizer) {
+       for (let i = 0; i < numParticles; i++) {
+@@ -78,7 +87,6 @@ class SyncParticlesModifier extends Modifier {
+         );
+       }
+     }
+-    newParticles.markNeedsUpdate();
+   };
+ }
+ 
+diff --git a/src/rendering/particleAttributes.test.ts b/src/rendering/particleAttributes.test.ts
+new file mode 100644
+index 00000000..bf2c9299
+--- /dev/null
++++ b/src/rendering/particleAttributes.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, it, vi } from "vitest";
++import {
++  InstancedBufferGeometry,
++  InstancedBufferAttribute,
++  MeshPhongMaterial,
++  ShaderMaterial,
++} from "three";
++import type { Particles, Visualizer } from "omovi";
++import {
++  installParticleAttributes,
++  syncParticleAttributes,
++  useRadiusAttribute,
++} from "./particleAttributes";
++
++const radiusShader =
++  "uniform sampler2D radiusTexture;\nvoid main() { float particleRadius = unpack(texture2D(radiusTexture, textureIndex)); }";
++function fixture() {
++  const material = new MeshPhongMaterial();
++  const picking = new ShaderMaterial({ vertexShader: radiusShader });
++  const oldColor = vi.fn(),
++    oldRadius = vi.fn();
++  const visualizer = {
++    materials: { particles: material },
++    pickingHandler: { pickingMaterial: picking },
++    setColor: oldColor,
++    setRadius: oldRadius,
++  } as unknown as Visualizer;
++  installParticleAttributes(visualizer);
++  const geometry = new InstancedBufferGeometry();
++  const particles = {
++    capacity: 3,
++    count: 2,
++    indices: new Float32Array([42, 900001, 0]),
++    getGeometry: () => geometry,
++  } as unknown as Particles;
++  return { visualizer, particles, geometry, oldColor, oldRadius, picking };
++}
++
++describe("instance styles", () => {
++  it("keeps sparse IDs, exact radii, and colors attached when instances reorder", () => {
++    const {
++      visualizer: v,
++      particles: p,
++      geometry: g,
++      oldColor,
++      oldRadius,
++    } = fixture();
++    syncParticleAttributes(v, p);
++    v.setColor(42, { r: 255, g: 0, b: 0 });
++    v.setRadius(42, 0.001);
++    v.setColor(900001, { r: 0, g: 255, b: 0 });
++    v.setRadius(900001, 3.75);
++    p.indices.set([900001, 42]);
++    syncParticleAttributes(v, p);
++    expect(Array.from(g.getAttribute("atomColor").array)).toEqual([
++      0, 1, 0, 1, 0, 0, 0, 0, 0,
++    ]);
++    expect(g.getAttribute("atomRadius").getX(0)).toBe(3.75);
++    expect(g.getAttribute("atomRadius").getX(1)).toBeCloseTo(0.001, 8);
++    expect(oldColor).not.toHaveBeenCalled();
++    expect(oldRadius).not.toHaveBeenCalled();
++  });
++  it("does not dirty style buffers when only positions change", () => {
++    const { visualizer: v, particles: p, geometry: g } = fixture();
++    syncParticleAttributes(v, p);
++    const color = g.getAttribute("atomColor") as InstancedBufferAttribute;
++    const radius = g.getAttribute("atomRadius") as InstancedBufferAttribute;
++    const versions = [color.version, radius.version];
++    syncParticleAttributes(v, p);
++    expect([color.version, radius.version]).toEqual(versions);
++    p.count = 1;
++    syncParticleAttributes(v, p);
++    expect(radius.version).toBeGreaterThan(versions[1]);
++  });
++  it("uses attributes for GPU picking and rejects incompatible upstream shaders", () => {
++    const { picking } = fixture();
++    expect(picking.vertexShader).toContain("attribute float atomRadius;");
++    expect(picking.vertexShader).not.toContain("texture2D(radiusTexture");
++    expect(() => useRadiusAttribute("void main() {}")).toThrow(
++      "Unsupported omovi",
++    );
++  });
++});
+diff --git a/src/rendering/particleAttributes.ts b/src/rendering/particleAttributes.ts
+new file mode 100644
+index 00000000..6b9ada8d
+--- /dev/null
++++ b/src/rendering/particleAttributes.ts
+@@ -0,0 +1,169 @@
++import type { Particles, Visualizer } from "omovi";
++import {
++  DynamicDrawUsage,
++  InstancedBufferAttribute,
++  type ShaderMaterial,
++} from "three";
++
++type Color = { r: number; g: number; b: number };
++type Style = { color: Color; radius: number };
++type AttributeState = {
++  styles: Map<number, Style>;
++  slots: Map<number, number>;
++  particles?: Particles;
++  ids?: Float32Array;
++  count?: number;
++  color?: InstancedBufferAttribute;
++  radius?: InstancedBufferAttribute;
++};
++const states = new WeakMap<Visualizer, AttributeState>();
++const patchedMaterials = new WeakSet<object>();
++
++function replaceRequired(
++  source: string,
++  before: string,
++  after: string,
++): string {
++  if (!source.includes(before))
++    throw new Error(
++      "Unsupported omovi particle shader: update the attribute adapter.",
++    );
++  return source.replace(before, after);
++}
++
++/** omovi 0.25 uses the same radius expression for drawing and GPU picking. */
++export function useRadiusAttribute(source: string): string {
++  return replaceRequired(
++    replaceRequired(
++      source,
++      "uniform sampler2D radiusTexture;",
++      "attribute float atomRadius;",
++    ),
++    "unpack(texture2D(radiusTexture, textureIndex))",
++    "atomRadius",
++  );
++}
++
++/**
++ * Keep this compatibility boundary in one place until omovi exposes instance
++ * styles itself. Drawing and picking must consume the same radius attribute.
++ * Fail explicitly on incompatible shader changes instead of rendering wrong
++ * sizes or leaving click targets on the old texture path.
++ */
++export function installParticleAttributes(visualizer: Visualizer): void {
++  if (states.has(visualizer)) return;
++  const material = visualizer.materials.particles;
++  const picking = (
++    visualizer as unknown as {
++      pickingHandler: { pickingMaterial: ShaderMaterial };
++    }
++  ).pickingHandler.pickingMaterial;
++  if (!patchedMaterials.has(material)) {
++    const originalCompile = material.onBeforeCompile;
++    material.onBeforeCompile = (shader, renderer) => {
++      originalCompile.call(material, shader, renderer);
++      shader.vertexShader = useRadiusAttribute(shader.vertexShader);
++      shader.vertexShader =
++        "attribute vec3 atomColor;\nvarying vec3 vAtomColor;\n" +
++        replaceRequired(
++          shader.vertexShader,
++          "void main() {",
++          "void main() {\n vAtomColor = atomColor;",
++        );
++      shader.fragmentShader =
++        "varying vec3 vAtomColor;\n" +
++        replaceRequired(
++          shader.fragmentShader,
++          "texture2D(colorTexture, textureIndex)",
++          "vec4(vAtomColor, 1.0)",
++        );
++      shader.fragmentShader = shader.fragmentShader.replace(
++        "uniform sampler2D colorTexture;",
++        "",
++      );
++      delete shader.uniforms.colorTexture;
++      delete shader.uniforms.radiusTexture;
++    };
++    material.customProgramCacheKey = () => "atomify-particle-attributes-v1";
++    patchedMaterials.add(material);
++  }
++  picking.vertexShader = useRadiusAttribute(picking.vertexShader);
++  material.needsUpdate = true;
++  picking.needsUpdate = true;
++  const state: AttributeState = { styles: new Map(), slots: new Map() };
++  states.set(visualizer, state);
++  const styleFor = (id: number) => {
++    let style = state.styles.get(id);
++    if (!style) {
++      style = { color: { r: 255, g: 255, b: 255 }, radius: 0.33 };
++      state.styles.set(id, style);
++    }
++    return style;
++  };
++  visualizer.setColor = (id, color) => {
++    styleFor(id).color = color;
++    const slot = state.slots.get(id);
++    if (slot !== undefined && state.color) {
++      state.color.setXYZ(slot, color.r / 255, color.g / 255, color.b / 255);
++      state.color.needsUpdate = true;
++    }
++    visualizer.forceRender = true;
++  };
++  visualizer.setRadius = (id, radius) => {
++    styleFor(id).radius = radius;
++    const slot = state.slots.get(id);
++    if (slot !== undefined && state.radius) {
++      state.radius.setX(slot, radius);
++      state.radius.needsUpdate = true;
++    }
++    visualizer.forceRender = true;
++  };
++}
++
++/** Refresh the ID-to-instance mapping before modifiers apply styles. */
++export function syncParticleAttributes(
++  visualizer: Visualizer | undefined,
++  particles: Particles,
++): void {
++  const state = visualizer && states.get(visualizer);
++  if (!state) return;
++  if (state.particles !== particles) {
++    state.particles = particles;
++    state.ids = new Float32Array(particles.capacity);
++    state.count = -1;
++    state.color = new InstancedBufferAttribute(
++      new Float32Array(particles.capacity * 3),
++      3,
++    ).setUsage(DynamicDrawUsage);
++    state.radius = new InstancedBufferAttribute(
++      new Float32Array(particles.capacity),
++      1,
++    ).setUsage(DynamicDrawUsage);
++    const geometry = particles.getGeometry();
++    geometry.setAttribute("atomColor", state.color);
++    geometry.setAttribute("atomRadius", state.radius);
++  }
++  if (
++    state.count === particles.count &&
++    particles.indices
++      .subarray(0, particles.count)
++      .every((id, i) => id === state.ids![i])
++  )
++    return;
++  state.ids!.set(particles.indices.subarray(0, particles.count));
++  state.count = particles.count;
++  state.slots.clear();
++  for (let i = 0; i < particles.count; i++) {
++    const id = particles.indices[i];
++    state.slots.set(id, i);
++    const style = state.styles.get(id);
++    const color = style?.color ?? { r: 255, g: 255, b: 255 };
++    state.color!.setXYZ(i, color.r / 255, color.g / 255, color.b / 255);
++    state.radius!.setX(i, style?.radius ?? 0.33);
++  }
++  // Remove disappeared IDs so repeated runs don't retain unbounded style maps.
++  for (const id of state.styles.keys())
++    if (!state.slots.has(id)) state.styles.delete(id);
++  state.color!.needsUpdate = true;
++  state.radius!.needsUpdate = true;
++}

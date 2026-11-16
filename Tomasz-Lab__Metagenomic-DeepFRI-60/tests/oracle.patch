@@ -1,0 +1,256 @@
+diff --git a/mDeepFRI/cli.py b/mDeepFRI/cli.py
+index 055fa5b..cea03c7 100644
+--- a/mDeepFRI/cli.py
++++ b/mDeepFRI/cli.py
+@@ -141,9 +141,18 @@ def get_models(ctx, output):
+     help="Minimum identity for contact map alignment.",
+ )
+ @click.option(
+-    "--keep-intermediate/--no-keep-intermediate",
+-    default=True,
+-    help="Keep intermediate files. Default is True.",
++    "--remove-intermediate",
++    default=False,
++    type=bool,
++    is_flag=True,
++    help="Remove intermediate files.",
++)
++@click.option(
++    "--overwrite",
++    default=False,
++    type=bool,
++    is_flag=True,
++    help="Overwrite existing files.",
+ )
+ @click.option(
+     "-t",
+@@ -158,7 +167,7 @@ def predict_function(ctx, input, db_path, weights, output, processing_modes,
+                      mmseqs_min_bit_score, mmseqs_max_evalue,
+                      mmseqs_min_identity, top_k, alignment_gap_open,
+                      alignment_gap_extend, alignment_min_identity,
+-                     keep_intermediate, threads):
++                     remove_intermediate, overwrite, threads):
+     """Predict protein function from sequence."""
+     logger.info("Starting Metagenomic-DeepFRI.")
+ 
+@@ -180,9 +189,6 @@ def predict_function(ctx, input, db_path, weights, output, processing_modes,
+         alignment_gap_open=alignment_gap_open,
+         alignment_gap_continuation=alignment_gap_extend,
+         identity_threshold=alignment_min_identity,
+-        keep_intermediate=keep_intermediate,
++        remove_intermediate=remove_intermediate,
++        overwrite=overwrite,
+         threads=threads)
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/mDeepFRI/database.py b/mDeepFRI/database.py
+index c961503..d15ee49 100644
+--- a/mDeepFRI/database.py
++++ b/mDeepFRI/database.py
+@@ -3,7 +3,8 @@
+ from pathlib import Path
+ 
+ from mDeepFRI import MERGED_SEQUENCES, TARGET_MMSEQS_DB_NAME
+-from mDeepFRI.mmseqs import create_target_database, extract_fasta_foldcomp
++from mDeepFRI.mmseqs import (check_mmseqs_database, create_target_database,
++                             extract_fasta_foldcomp)
+ 
+ logging.basicConfig(
+     level=logging.DEBUG,
+@@ -16,6 +17,7 @@
+ def build_database(
+     input_path: str,
+     output_path: str,
++    overwrite: bool,
+     threads: int,
+ ) -> None:
+     """
+@@ -24,6 +26,7 @@ def build_database(
+     Args:
+         input_path (str): path to a FoldComp database with compressed structures.
+         output_path (str): path to folder where the database for DeepFRI will be created.
++        overwrite (bool): overwrite existing database.
+         threads (int): number of threads to use.
+ 
+     Returns:
+@@ -36,7 +39,7 @@ def build_database(
+     output_path.mkdir(parents=True, exist_ok=True)
+     output_sequences = output_path / MERGED_SEQUENCES
+     # check if files exist in output directory
+-    if output_sequences.exists():
++    if output_sequences.exists() and not overwrite:
+         logging.info("Found %s in %s", MERGED_SEQUENCES, output_path)
+         logging.info(
+             "Skipping extraction of FASTA file from FoldComp database.")
+@@ -45,7 +48,9 @@ def build_database(
+         extract_fasta_foldcomp(input_path, output_sequences, threads)
+         logging.info("FASTA file extracted to %s", output_sequences)
+ 
+-    if (output_path / TARGET_MMSEQS_DB_NAME).exists():
++    # create mmseqs db
++    target_db = check_mmseqs_database(output_path / TARGET_MMSEQS_DB_NAME)
++    if not target_db and not overwrite:
+         logging.info("Found %s in %s", TARGET_MMSEQS_DB_NAME, output_path)
+         logging.info("Skipping creation of MMSeqs2 database.")
+     else:
+diff --git a/mDeepFRI/mmseqs.py b/mDeepFRI/mmseqs.py
+index 03a0ae5..9877008 100644
+--- a/mDeepFRI/mmseqs.py
++++ b/mDeepFRI/mmseqs.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ import tempfile
+ from functools import partial
+ from multiprocessing.pool import ThreadPool
+@@ -7,7 +8,7 @@
+ import numpy as np
+ 
+ import mDeepFRI
+-from mDeepFRI import MMSEQS_SEARCH_RESULTS
++from mDeepFRI import MMSEQS_SEARCH_RESULTS, TARGET_MMSEQS_DB_NAME
+ from mDeepFRI.utils import run_command
+ 
+ MMSEQS_COLUMN_NAMES = [
+@@ -89,6 +90,36 @@ def create_target_database(foldcomp_fasta_path: str,
+     createindex(mmseqs_db_path)
+ 
+ 
++def check_mmseqs_database(database: Path):
++    """
++    Check if MMSeqs2 database is intact.
++
++    Args:
++        query_file (pathlib.Path): Path to a query file with protein sequences.
++        database (pathlib.Path): Path to a directory with a pre-built database.
++        output_path (pathlib.Path): Path to a directory where results will be saved.
++
++    Raises:
++        FileNotFoundError: MMSeqs2 database appears to be corrupted.
++
++    Returns:
++        target_db (pathlib.Path): Path to MMSeqs2 database.
++    """
++
++    # Verify all the files for MMSeqs2 database
++    mmseqs2_ext = [
++        ".index", ".dbtype", "_h", "_h.index", "_h.dbtype", ".idx",
++        ".idx.index", ".idx.dbtype", ".lookup", ".source"
++    ]
++
++    target_db = Path(database / TARGET_MMSEQS_DB_NAME)
++    for ext in mmseqs2_ext:
++        if not os.path.isfile(f"{target_db}{ext}"):
++            target_db = None
++
++    return target_db
++
++
+ def run_mmseqs_search(query_file: str,
+                       target_db: str,
+                       output_path: str,
+diff --git a/mDeepFRI/pipeline.py b/mDeepFRI/pipeline.py
+index 7075571..7840b5b 100644
+--- a/mDeepFRI/pipeline.py
++++ b/mDeepFRI/pipeline.py
+@@ -1,7 +1,6 @@
+ import csv
+ import json
+ import logging
+-import os
+ import pathlib
+ from functools import partial
+ from multiprocessing import Pool
+@@ -9,12 +8,13 @@
+ 
+ import numpy as np
+ 
+-from mDeepFRI import MERGED_SEQUENCES, TARGET_MMSEQS_DB_NAME
++from mDeepFRI import MERGED_SEQUENCES
+ from mDeepFRI.alignment import align_query
+ from mDeepFRI.bio_utils import (load_fasta_as_dict, retrieve_align_contact_map,
+                                 retrieve_fasta_entries_as_dict)
+ from mDeepFRI.database import build_database
+-from mDeepFRI.mmseqs import filter_mmseqs_results, run_mmseqs_search
++from mDeepFRI.mmseqs import (check_mmseqs_database, filter_mmseqs_results,
++                             run_mmseqs_search)
+ from mDeepFRI.predict import Predictor
+ from mDeepFRI.utils import remove_temporary
+ 
+@@ -80,39 +80,6 @@ def load_query_sequences(query_file, output_path) -> Dict[str, str]:
+     return query_seqs
+ 
+ 
+-def check_mmseqs_database(database: pathlib.Path):
+-    """
+-    Check if MMSeqs2 database is intact.
+-
+-    Args:
+-        query_file (pathlib.Path): Path to a query file with protein sequences.
+-        database (pathlib.Path): Path to a directory with a pre-built database.
+-        output_path (pathlib.Path): Path to a directory where results will be saved.
+-
+-    Raises:
+-        FileNotFoundError: MMSeqs2 database appears to be corrupted.
+-
+-    Returns:
+-        target_db (pathlib.Path): Path to MMSeqs2 database.
+-    """
+-
+-    # Verify all the files for MMSeqs2 database
+-    mmseqs2_ext = [
+-        ".index", ".dbtype", "_h", "_h.index", "_h.dbtype", ".idx",
+-        ".idx.index", ".idx.dbtype", ".lookup", ".source"
+-    ]
+-
+-    if os.path.isfile(database / TARGET_MMSEQS_DB_NAME):
+-        target_db = pathlib.Path(database / TARGET_MMSEQS_DB_NAME)
+-        for ext in mmseqs2_ext:
+-            assert os.path.isfile(f"{target_db}{ext}")
+-    else:
+-        raise FileNotFoundError(
+-            "MMSeqs2 database appears to be corrupted. Please, rebuild it.")
+-
+-    return target_db
+-
+-
+ def load_deepfri_config(weights: pathlib.Path) -> pathlib.Path:
+     """
+     Check if DeepFRI weights are valid and load config.
+@@ -165,18 +132,21 @@ def predict_protein_function(
+         alignment_gap_open: float = 10,
+         alignment_gap_continuation: float = 1,
+         identity_threshold: float = 0.3,
+-        keep_intermediate=True,
++        remove_intermediate=False,
++        overwrite=False,
+         threads: int = 1):
+-    """
+-
+ 
+-    """
+     MAX_SEQ_LEN = 1000
+     query_file = pathlib.Path(query_file)
+     database = pathlib.Path(database)
++
++    # design solution
++    # database is built in the same directory
++    # where the structure database is stored
+     intermediate = build_database(
+         input_path=database,
+         output_path=database.parent,
++        overwrite=overwrite,
+         threads=threads,
+     )
+ 
+@@ -283,7 +253,7 @@ def predict_protein_function(
+ 
+     output_buffer.close()
+ 
+-    if not keep_intermediate:
++    if remove_intermediate:
+         remove_temporary(intermediate)
+ 
+     logging.info("meta-DeepFRI finished successfully.")

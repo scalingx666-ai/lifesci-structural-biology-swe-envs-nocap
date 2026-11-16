@@ -1,0 +1,460 @@
+diff --git a/environment.yml b/environment.yml
+index 0dfb9db4a..b8a20825b 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -27,4 +27,5 @@ dependencies:
+       - typing-extensions==3.10.0.2
+       - pytorch_lightning==1.5.10
+       - wandb==0.12.21
++      - modelcif==0.7
+       - git+https://github.com/NVIDIA/dllogger.git
+diff --git a/openfold/np/protein.py b/openfold/np/protein.py
+index af8739c9b..72bb87a17 100644
+--- a/openfold/np/protein.py
++++ b/openfold/np/protein.py
+@@ -23,6 +23,13 @@
+ from openfold.np import residue_constants
+ from Bio.PDB import PDBParser
+ import numpy as np
++import modelcif
++import modelcif.model
++import modelcif.dumper
++import modelcif.reference
++import modelcif.protocol
++import modelcif.alignment
++import modelcif.qa_metric
+ 
+ 
+ FeatureDict = Mapping[str, np.ndarray]
+@@ -56,7 +63,7 @@ class Protein:
+     # Chain indices for multi-chain predictions
+     chain_index: Optional[np.ndarray] = None
+ 
+-    # Optional remark about the protein. Included as a comment in output PDB 
++    # Optional remark about the protein. Included as a comment in output PDB
+     # files
+     remark: Optional[str] = None
+ 
+@@ -75,8 +82,7 @@ def from_pdb_string(pdb_str: str, chain_id: Optional[str] = None) -> Protein:
+ 
+     Args:
+       pdb_str: The contents of the pdb file
+-      chain_id: If None, then the pdb file must contain a single chain (which
+-        will be parsed). If chain_id is specified (e.g. A), then only that chain
++      chain_id: If None, then the whole pdb file is parsed. If chain_id is specified (e.g. A), then only that chain
+         is parsed.
+ 
+     Returns:
+@@ -171,7 +177,7 @@ def from_proteinnet_string(proteinnet_str: str) -> Protein:
+         tag.strip() for tag in re.split(tag_re, proteinnet_str) if len(tag) > 0
+     ]
+     groups = zip(tags[0::2], [l.split('\n') for l in tags[1::2]])
+-   
++
+     atoms = ['N', 'CA', 'C']
+     aatype = None
+     atom_positions = None
+@@ -246,7 +252,7 @@ def add_pdb_headers(prot: Protein, pdb_str: str) -> str:
+     """
+     out_pdb_lines = []
+     lines = pdb_str.split('\n')
+-    
++
+     remark = prot.remark
+     if(remark is not None):
+         out_pdb_lines.append(f"REMARK {remark}")
+@@ -341,7 +347,7 @@ def to_pdb(prot: Protein) -> str:
+                 0
+             ]  # Protein supports only C, N, O, S, this works.
+             charge = ""
+-    
++
+             chain_tag = "A"
+             if(chain_index is not None):
+                 chain_tag = chain_tags[chain_index[i]]
+@@ -385,6 +391,134 @@ def to_pdb(prot: Protein) -> str:
+     return "\n".join(pdb_lines)
+ 
+ 
++def to_modelcif(prot: Protein) -> str:
++    """
++    Converts a `Protein` instance to a ModelCIF string. Chains with identical modelled coordinates
++    will be treated as the same polymer entity. But note that if chains differ in modelled regions,
++    no attempt is made at identifying them as a single polymer entity.
++
++    Args:
++      prot: The protein to convert to PDB.
++
++    Returns:
++      ModelCIF string.
++    """
++
++    restypes = residue_constants.restypes + ["X"]
++    atom_types = residue_constants.atom_types
++
++    atom_mask = prot.atom_mask
++    aatype = prot.aatype
++    atom_positions = prot.atom_positions
++    residue_index = prot.residue_index.astype(np.int32)
++    b_factors = prot.b_factors
++    chain_index = prot.chain_index
++
++    n = aatype.shape[0]
++    if chain_index is None:
++        chain_index = [0 for i in range(n)]
++
++    system = modelcif.System(title='OpenFold prediction')
++
++    # Finding chains and creating entities
++    seqs = {}
++    seq = []
++    last_chain_idx = None
++    for i in range(n):
++        if last_chain_idx is not None and last_chain_idx != chain_index[i]:
++            seqs[last_chain_idx] = seq
++            seq = []
++        seq.append(restypes[aatype[i]])
++        last_chain_idx = chain_index[i]
++    # finally add the last chain
++    seqs[last_chain_idx] = seq
++
++    # now reduce sequences to unique ones (note this won't work if different asyms have different unmodelled regions)
++    unique_seqs = {}
++    for chain_idx, seq_list in seqs.items():
++        seq = "".join(seq_list)
++        if seq in unique_seqs:
++            unique_seqs[seq].append(chain_idx)
++        else:
++            unique_seqs[seq] = [chain_idx]
++
++    # adding 1 entity per unique sequence
++    entities_map = {}
++    for key, value in unique_seqs.items():
++        model_e = modelcif.Entity(key, description='Model subunit')
++        for chain_idx in value:
++            entities_map[chain_idx] = model_e
++
++    chain_tags = string.ascii_uppercase
++    asym_unit_map = {}
++    for chain_idx in set(chain_index):
++        # Define the model assembly
++        chain_id = chain_tags[chain_idx]
++        asym = modelcif.AsymUnit(entities_map[chain_idx], details='Model subunit %s' % chain_id, id=chain_id)
++        asym_unit_map[chain_idx] = asym
++    modeled_assembly = modelcif.Assembly(asym_unit_map.values(), name='Modeled assembly')
++
++    class _LocalPLDDT(modelcif.qa_metric.Local, modelcif.qa_metric.PLDDT):
++        name = "pLDDT"
++        software = None
++        description = "Predicted lddt"
++
++    class _GlobalPLDDT(modelcif.qa_metric.Global, modelcif.qa_metric.PLDDT):
++        name = "pLDDT"
++        software = None
++        description = "Global pLDDT, mean of per-residue pLDDTs"
++
++    class _MyModel(modelcif.model.AbInitioModel):
++        def get_atoms(self):
++            # Add all atom sites.
++            for i in range(n):
++                for atom_name, pos, mask, b_factor in zip(
++                        atom_types, atom_positions[i], atom_mask[i], b_factors[i]
++                ):
++                    if mask < 0.5:
++                        continue
++                    element = atom_name[0]  # Protein supports only C, N, O, S, this works.
++                    yield modelcif.model.Atom(
++                        asym_unit=asym_unit_map[chain_index[i]], type_symbol=element,
++                        seq_id=residue_index[i], atom_id=atom_name,
++                        x=pos[0], y=pos[1], z=pos[2],
++                        het=False, biso=b_factor, occupancy=1.00)
++
++        def add_scores(self):
++            # local scores
++            plddt_per_residue = {}
++            for i in range(n):
++                for mask, b_factor in zip(atom_mask[i], b_factors[i]):
++                    if mask < 0.5:
++                        continue
++                    # add 1 per residue, not 1 per atom
++                    if chain_index[i] not in plddt_per_residue:
++                        # first time a chain index is seen: add the key and start the residue dict
++                        plddt_per_residue[chain_index[i]] = {residue_index[i]: b_factor}
++                    if residue_index[i] not in plddt_per_residue[chain_index[i]]:
++                        plddt_per_residue[chain_index[i]][residue_index[i]] = b_factor
++            plddts = []
++            for chain_idx in plddt_per_residue:
++                for residue_idx in plddt_per_residue[chain_idx]:
++                    plddt = plddt_per_residue[chain_idx][residue_idx]
++                    plddts.append(plddt)
++                    self.qa_metrics.append(
++                        _LocalPLDDT(asym_unit_map[chain_idx].residue(residue_idx), plddt))
++            # global score
++            self.qa_metrics.append((_GlobalPLDDT(np.mean(plddts))))
++
++    # Add the model and modeling protocol to the file and write them out:
++    model = _MyModel(assembly=modeled_assembly, name='Best scoring model')
++    model.add_scores()
++
++    model_group = modelcif.model.ModelGroup([model], name='All models')
++    system.model_groups.append(model_group)
++
++    fh = io.StringIO()
++    modelcif.dumper.write(fh, [system])
++    return fh.getvalue()
++
++
+ def ideal_atom_mask(prot: Protein) -> np.ndarray:
+     """Computes an ideal atom mask.
+ 
+diff --git a/openfold/np/relax/amber_minimize.py b/openfold/np/relax/amber_minimize.py
+index dfc098495..6448e157a 100644
+--- a/openfold/np/relax/amber_minimize.py
++++ b/openfold/np/relax/amber_minimize.py
+@@ -524,9 +524,6 @@ def run_pipeline(
+     _check_residues_are_well_defined(prot)
+     pdb_string = clean_protein(prot, checks=checks)
+ 
+-    # We keep the input around to restore metadata deleted by the relaxer
+-    input_prot = prot
+-
+     exclude_residues = exclude_residues or []
+     exclude_residues = set(exclude_residues)
+     violations = np.inf
+diff --git a/openfold/np/relax/relax.py b/openfold/np/relax/relax.py
+index 155e37938..2711c760c 100644
+--- a/openfold/np/relax/relax.py
++++ b/openfold/np/relax/relax.py
+@@ -57,7 +57,7 @@ def __init__(
+         self._use_gpu = use_gpu
+ 
+     def process(
+-        self, *, prot: protein.Protein
++        self, *, prot: protein.Protein, cif_output: bool
+     ) -> Tuple[str, Dict[str, Any], np.ndarray]:
+         """Runs Amber relax on a prediction, adds hydrogens, returns PDB string."""
+         out = amber_minimize.run_pipeline(
+@@ -89,5 +89,11 @@ def process(
+         ]
+ 
+         min_pdb = protein.add_pdb_headers(prot, min_pdb)
++        output_str = min_pdb
++        if cif_output:
++            # TODO the model cif will be missing some metadata like headers (PARENTs and
++            #      REMARK with some details of the run, like num of recycles)
++            final_prot = protein.from_pdb_string(min_pdb)
++            output_str = protein.to_modelcif(final_prot)
+ 
+-        return min_pdb, debug_data, violations
++        return output_str, debug_data, violations
+diff --git a/openfold/utils/script_utils.py b/openfold/utils/script_utils.py
+index 38de08bc2..eaa054e76 100644
+--- a/openfold/utils/script_utils.py
++++ b/openfold/utils/script_utils.py
+@@ -228,7 +228,7 @@ def prep_output(out, batch, feature_dict, feature_processor, config_preset, mult
+     return unrelaxed_protein
+ 
+ 
+-def relax_protein(config, model_device, unrelaxed_protein, output_directory, output_name):
++def relax_protein(config, model_device, unrelaxed_protein, output_directory, output_name, cif_output):
+     amber_relaxer = relax.AmberRelaxation(
+         use_gpu=(model_device != "cpu"),
+         **config.relax,
+@@ -239,7 +239,8 @@ def relax_protein(config, model_device, unrelaxed_protein, output_directory, out
+     if "cuda" in model_device:
+         device_no = model_device.split(":")[-1]
+         os.environ["CUDA_VISIBLE_DEVICES"] = device_no
+-    relaxed_pdb_str, _, _ = amber_relaxer.process(prot=unrelaxed_protein)
++    # the struct_str will contain either a PDB-format or a ModelCIF format string
++    struct_str, _, _ = amber_relaxer.process(prot=unrelaxed_protein, cif_output=cif_output)
+     os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+     relaxation_time = time.perf_counter() - t
+ 
+@@ -247,10 +248,13 @@ def relax_protein(config, model_device, unrelaxed_protein, output_directory, out
+     update_timings({"relaxation": relaxation_time}, os.path.join(output_directory, "timings.json"))
+ 
+     # Save the relaxed PDB.
++    suffix = "_relaxed.pdb"
++    if cif_output:
++        suffix = "_relaxed.cif"
+     relaxed_output_path = os.path.join(
+-        output_directory, f'{output_name}_relaxed.pdb'
++        output_directory, f'{output_name}{suffix}'
+     )
+     with open(relaxed_output_path, 'w') as fp:
+-        fp.write(relaxed_pdb_str)
++        fp.write(struct_str)
+ 
+     logger.info(f"Relaxed output written to {relaxed_output_path}...")
+\ No newline at end of file
+diff --git a/run_pretrained_openfold.py b/run_pretrained_openfold.py
+index 7bd99be4f..2393ab321 100644
+--- a/run_pretrained_openfold.py
++++ b/run_pretrained_openfold.py
+@@ -1,6 +1,6 @@
+ # Copyright 2021 AlQuraishi Laboratory
+ # Copyright 2021 DeepMind Technologies Limited
+-# 
++#
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+ # You may obtain a copy of the License at
+@@ -35,7 +35,7 @@
+ torch_major_version = int(torch_versions[0])
+ torch_minor_version = int(torch_versions[1])
+ if(
+-    torch_major_version > 1 or 
++    torch_major_version > 1 or
+     (torch_major_version == 1 and torch_minor_version >= 12)
+ ):
+     # Gives a large speedup on Ampere-class GPUs
+@@ -70,7 +70,7 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
+         local_alignment_dir = os.path.join(alignment_dir, tag)
+         if(args.use_precomputed_alignments is None and not os.path.isdir(local_alignment_dir)):
+             logger.info(f"Generating alignments for {tag}...")
+-                
++
+             os.makedirs(local_alignment_dir)
+ 
+             alignment_runner = data_pipeline.AlignmentRunner(
+@@ -141,13 +141,13 @@ def main(args):
+     os.makedirs(args.output_dir, exist_ok=True)
+ 
+     config = model_config(args.config_preset, long_sequence_inference=args.long_sequence_inference)
+-    
++
+     if(args.trace_model):
+         if(not config.data.predict.fixed_size):
+             raise ValueError(
+                 "Tracing requires that fixed_size mode be enabled in the config"
+             )
+-    
++
+     template_featurizer = templates.TemplateHitFeaturizer(
+         mmcif_dir=args.template_mmcif_dir,
+         max_template_date=args.max_template_date,
+@@ -165,10 +165,10 @@ def main(args):
+     random_seed = args.data_random_seed
+     if random_seed is None:
+         random_seed = random.randrange(2**32)
+-    
++
+     np.random.seed(random_seed)
+     torch.manual_seed(random_seed + 1)
+-    
++
+     feature_processor = feature_pipeline.FeaturePipeline(config.data)
+     if not os.path.exists(output_dir_base):
+         os.makedirs(output_dir_base)
+@@ -183,7 +183,7 @@ def main(args):
+         # Gather input sequences
+         with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
+             data = fp.read()
+-    
++
+         tags, seqs = parse_fasta(data)
+         # assert len(tags) == len(set(tags)), "All FASTA tags must be unique"
+         tag = '-'.join(tags)
+@@ -206,10 +206,10 @@ def main(args):
+             output_name = f'{tag}_{args.config_preset}'
+             if args.output_postfix is not None:
+                 output_name = f'{output_name}_{args.output_postfix}'
+-    
++
+             # Does nothing if the alignments have already been computed
+             precompute_alignments(tags, seqs, alignment_dir, args)
+-        
++
+             feature_dict = feature_dicts.get(tag, None)
+             if(feature_dict is None):
+                 feature_dict = generate_feature_dict(
+@@ -234,7 +234,7 @@ def main(args):
+             )
+ 
+             processed_feature_dict = {
+-                k:torch.as_tensor(v, device=args.model_device) 
++                k:torch.as_tensor(v, device=args.model_device)
+                 for k,v in processed_feature_dict.items()
+             }
+ 
+@@ -255,34 +255,40 @@ def main(args):
+ 
+             # Toss out the recycling dimensions --- we don't need them anymore
+             processed_feature_dict = tensor_tree_map(
+-                lambda x: np.array(x[..., -1].cpu()), 
++                lambda x: np.array(x[..., -1].cpu()),
+                 processed_feature_dict
+             )
+             out = tensor_tree_map(lambda x: np.array(x.cpu()), out)
+ 
+             unrelaxed_protein = prep_output(
+-                out, 
+-                processed_feature_dict, 
+-                feature_dict, 
+-                feature_processor, 
++                out,
++                processed_feature_dict,
++                feature_dict,
++                feature_processor,
+                 args.config_preset,
+                 args.multimer_ri_gap,
+                 args.subtract_plddt
+             )
+ 
++            unrelaxed_file_suffix = "_unrelaxed.pdb"
++            if args.cif_output:
++                unrelaxed_file_suffix = "_unrelaxed.cif"
+             unrelaxed_output_path = os.path.join(
+-                output_directory, f'{output_name}_unrelaxed.pdb'
++                output_directory, f'{output_name}{unrelaxed_file_suffix}'
+             )
+ 
+             with open(unrelaxed_output_path, 'w') as fp:
+-                fp.write(protein.to_pdb(unrelaxed_protein))
++                if args.cif_output:
++                    fp.write(protein.to_modelcif(unrelaxed_protein))
++                else:
++                    fp.write(protein.to_pdb(unrelaxed_protein))
+ 
+             logger.info(f"Output written to {unrelaxed_output_path}...")
+-            
++
+             if not args.skip_relaxation:
+                 # Relax the prediction.
+                 logger.info(f"Running relaxation on {unrelaxed_output_path}...")
+-                relax_protein(config, args.model_device, unrelaxed_protein, output_directory, output_name)
++                relax_protein(config, args.model_device, unrelaxed_protein, output_directory, output_name, args.cif_output)
+ 
+             if args.save_outputs:
+                 output_dict_path = os.path.join(
+@@ -373,12 +379,16 @@ def main(args):
+         "--long_sequence_inference", action="store_true", default=False,
+         help="""enable options to reduce memory usage at the cost of speed, helps longer sequences fit into GPU memory, see the README for details"""
+     )
++    parser.add_argument(
++        "--cif_output", action="store_true", default=False,
++        help="Output predicted models in ModelCIF format instead of PDB format (default)"
++    )
+     add_data_args(parser)
+     args = parser.parse_args()
+ 
+     if(args.jax_param_path is None and args.openfold_checkpoint_path is None):
+         args.jax_param_path = os.path.join(
+-            "openfold", "resources", "params", 
++            "openfold", "resources", "params",
+             "params_" + args.config_preset + ".npz"
+         )
+ 
+diff --git a/thread_sequence.py b/thread_sequence.py
+index e67fcdd82..48b409f13 100644
+--- a/thread_sequence.py
++++ b/thread_sequence.py
+@@ -106,7 +106,7 @@ def main(args):
+         logger.info(f"Output written to {unrelaxed_output_path}...")
+ 
+         logger.info(f"Running relaxation on {unrelaxed_output_path}...")
+-        relax_protein(config, args.model_device, unrelaxed_protein, output_directory, output_name)
++        relax_protein(config, args.model_device, unrelaxed_protein, output_directory, output_name, False)
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()

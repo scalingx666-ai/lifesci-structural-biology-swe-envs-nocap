@@ -1,0 +1,579 @@
+diff --git a/Project.toml b/Project.toml
+index f1a405d0cf..39a8bc1b48 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -7,6 +7,7 @@ version = "0.6.19"
+ BlackBoxOptim = "a134a8b2-14d6-55f6-9291-3336d3ab0209"
+ CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+ DiffResults = "163ba53b-c6d8-5494-b064-1a9d43ac40c5"
++DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+ Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+ FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
+ ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+@@ -40,7 +41,7 @@ Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+ 
+ [extensions]
+-ClapeyronCoolPropExt = ["CoolProp","CoolProp_jll"]
++ClapeyronCoolPropExt = ["CoolProp", "CoolProp_jll"]
+ ClapeyronJutulDarcyExt = "JutulDarcy"
+ ClapeyronMetaheuristicsExt = "Metaheuristics"
+ ClapeyronMultiComponentFlashExt = "MultiComponentFlash"
+@@ -55,6 +56,7 @@ CSV = "0.10"
+ CoolProp = "0.2"
+ CoolProp_jll = "7.2.0"
+ DiffResults = "^1.1"
++DifferentiationInterface = "0.6, 0.7"
+ Downloads = "1"
+ EoSSuperancillaries = "1.2.3"
+ FillArrays = "^0.12, 0.13, 1"
+diff --git a/docs/make.jl b/docs/make.jl
+index bcf15cce87..05f5982204 100755
+--- a/docs/make.jl
++++ b/docs/make.jl
+@@ -42,8 +42,9 @@ warnonly = Documenter.except(),
+                   "Macros" => "api/macros.md",
+                   "Association" => "api/association.md",
+                   "Parameter Estimation" => "api/estimation.md"],
+-        "To-do list" => "to-do_list.md"]
+-                  )
++        "To-do list" => "to-do_list.md",
++        "Advanced Topics" => ["Implicit differentiation of Properties"=>"implicit_differentiation.md"]
++                  ])
+ 
+         deploydocs(;
+     repo="github.com/ClapeyronThermo/Clapeyron.jl.git",
+diff --git a/docs/src/implicit_differentiation.md b/docs/src/implicit_differentiation.md
+new file mode 100644
+index 0000000000..f38fc52fa0
+--- /dev/null
++++ b/docs/src/implicit_differentiation.md
+@@ -0,0 +1,15 @@
++# Implicit differentiation of root solvers
++
++## Implicit function theorem
++Given an implicit variable $x$ defined through the root $F(x(\theta),\theta)=0$, one can apply the implicit function theorem (IFT) to obtain the gradients of $x$ wrt $\theta$
++
++```math
++\frac{d F}{d \theta} = \frac{\partial F}{\partial x} \frac{d x}{d \theta} + \frac{\partial F}{\partial \theta} = 0 \implies \frac{d x}{d \theta} = - \left(\frac{\partial F}{\partial x}\right)^{-1} \frac{\partial F}{\partial \theta}
++```
++
++To avoid the unrolling of iterations, computing the derivative at each iteration and hence populating the AD stack unnecessarily, `Clapeyron` currently implements the IFT using `ForwardDiff.jl` through the manual manipulation of Duals. Currently only first order AD is supported. Higher order derivatives through nested Duals or Duals with different tags will error. The current AD implementation is:
++```@docs
++Clapeyron.__gradients_for_root_finders
++```
++
++`Clapeyron` previously implemented a final Newton step to propagate first order derivatives, which is also limited to first order AD. Although this method does produce numeric values for nested Duals, these higher order derivatives are incorrect as it neglects the indirect effects from lower order gradients. For a more complete explanation see [this discussion](https://github.com/ClapeyronThermo/Clapeyron.jl/issues/502).
+\ No newline at end of file
+diff --git a/src/Clapeyron.jl b/src/Clapeyron.jl
+index 74924cfe53..7afc46bce2 100755
+--- a/src/Clapeyron.jl
++++ b/src/Clapeyron.jl
+@@ -15,6 +15,7 @@ import BlackBoxOptim
+ using StaticArrays
+ 
+ using DiffResults, ForwardDiff
++import DifferentiationInterface # keep function local
+ using Downloads #for bibtex
+ using StableTasks #for multithreaded volume
+ #compatibility and raw julia utilities
+diff --git a/src/base/errors.jl b/src/base/errors.jl
+index ffed5f4773..d709d0b532 100644
+--- a/src/base/errors.jl
++++ b/src/base/errors.jl
+@@ -86,4 +86,14 @@ end
+ 
+ function moles_positivity(x::T) where T<:Real
+     @assert x >= 0 "Moles non-positive values! Contains values $x"
+-end
+\ No newline at end of file
++end
++
++struct NestedADError <: Exception
++    msg::String
++end
++NestedADError() = NestedADError("")
++
++struct MultipleTagError <: Exception
++    msg::String
++end
++MultipleTagError() = MultipleTagError("")
+\ No newline at end of file
+diff --git a/src/methods/differentials.jl b/src/methods/differentials.jl
+index 3b57d3d99e..9b7ea5051f 100755
+--- a/src/methods/differentials.jl
++++ b/src/methods/differentials.jl
+@@ -210,4 +210,98 @@ function _primalval(model::EoSModel,::Type{T}) where T <: ForwardDiff.Dual
+     return Solvers.primalval_struct(model)
+ end
+ 
+-_primalval(model::EoSModel,::T) where T = model
+\ No newline at end of file
++_primalval(model::EoSModel,::T) where T = model
++
++"""
++    `__gradients_for_root_finders(x::AbstractVector{T},tups::Tuple,f::Function) where T<:Real`
++Computes the gradients of `x` with respect to the relevant parameters in `tups` under the condition that
++`x` is implicitly defined through the root finding problem `f(x,tups) = 0`. The function uses the implicit 
++function theorem to compute the gradients efficiently through the reconstruction of Duals.
++
++Note: Currently only supports first order AD. Trying to differentiate nested Duals or Duals with different tags will throw an error.
++"""
++function __gradients_for_root_finders(x::AbstractVector{T},tups::Tuple,f::Function) where T<:Real
++    # check and return primal of no duals
++    !any(map(has_dual,tups)) && return x
++    
++    # Checks
++    implicit_ad_check(tups)
++
++    # compute partials
++    tups_primal = Clapeyron.primalval.(tups)
++    ∂f_∂x = DifferentiationInterface.jacobian(f,DifferentiationInterface.AutoForwardDiff(),x,DifferentiationInterface.Constant(tups_primal))
++    @assert size(∂f_∂x,1) == size(∂f_∂x,2) "Number of equations must equal number of variables for implicit function theorem to hold." 
++    ∂f_∂θ_dual = f(x,tups)
++    # get dual
++    T_dual = eltype(∂f_∂θ_dual)
++    n_params = ForwardDiff.npartials(T_dual)
++    primal_type = ForwardDiff.valtype(T_dual)
++    T_partials = ForwardDiff.Partials{n_params,primal_type}
++    n_equations = length(x)
++    # preallocate to be efficient?
++    ∂f_∂θ = Matrix{primal_type}(undef, n_equations, n_params)
++    for i in 1:n_equations
++        ∂f_∂θ[i,:] .= ∂f_∂θ_dual[i].partials
++    end
++    # gradient through implicit function theorem
++    dx_dθ = - ∂f_∂x \ ∂f_∂θ
++    x_dual = Vector{T_dual}(undef, n_equations) # preallocate
++    for i in 1:n_equations
++        x_dual[i] = T_dual(x[i],T_partials(Tuple(@view dx_dθ[i,:])))
++    end
++    return x_dual
++end
++
++function __gradients_for_root_finders(x::T,tups::Tuple,f::Function) where T<:Real
++    x_vec = [x]
++    f_vec(x_vec,tups) = [f(x_vec[1],tups)]
++    x_dual_vec = __gradients_for_root_finders(x_vec,tups,f_vec)
++    return x_dual_vec[1]
++end
++
++__gradients_for_root_finders(::Union{AbstractArray{T},T},::Tuple,::Function) where T<:ForwardDiff.Dual = error("Input `x` cannot be a dual")
++
++function nested_ad_check(a::A) where A
++    AT = eltype(a)
++    if AT <: ForwardDiff.Dual
++        V = ForwardDiff.valtype(AT)
++        V isa ForwardDiff.Dual && throw(NestedADError("Found nested Duals of type $AT. This is currently not supported in implicit differentiation."))
++    end
++    return nothing
++end
++
++nested_ad_check(a::Tuple) = foreach(nested_ad_check,a)
++
++function multiple_tag_ad_check(a::T) where T <: Tuple
++    f(x) = eltype(x) <: ForwardDiff.Dual
++    n_dual = count(f,a)
++    if n_dual == 1
++        return nothing
++    end
++
++    #TODO write as @generated so it does not allocate
++    tag(x) = ForwardDiff.tagtype(eltype(x))
++    duals = findall(map(f,a))
++    tags = map(tag,a)
++    valid_tags = tags[duals]
++    t1 = first(valid_tags)
++    t = Base.tail(valid_tags)
++    for ti in t
++        if t1 != ti
++            msg = "Found multiple Dual tags: $t1 and $ti. This is currently not supported in implicit differentiation."
++            throw(MultipleTagError(msg))
++        end
++    end
++    return nothing
++end
++
++multiple_tag_ad_check(a) = nothing
++
++function implicit_ad_check(a)
++    nested_ad_check(a)
++end
++
++function implicit_ad_check(a::Tuple)
++    nested_ad_check(a)
++    multiple_tag_ad_check(a)
++end
+\ No newline at end of file
+diff --git a/src/methods/property_solvers/Pproperty.jl b/src/methods/property_solvers/Pproperty.jl
+index 71ffffa23e..4e2806f653 100644
+--- a/src/methods/property_solvers/Pproperty.jl
++++ b/src/methods/property_solvers/Pproperty.jl
+@@ -354,18 +354,17 @@ end
+ 
+ 
+ function Pproperty_ad(model,T,prop,z,property::F,p_primal,phase) where F
+-  if has_dual(model) || has_dual(T) || has_dual(prop) || has_dual(z)
+-    #=
+-    we know that p_primal is the solution to
+-    property(model,p_primal,t,z,phase = phase,threaded = threaded) - prop = 0
+-    =#
+-    _property(_p) = property(model,_p,T,z,phase = phase)
+-    fprop,∂prop∂p = Solvers.f∂f(_property,p_primal)
+-    p = p_primal + (prop - fprop)/∂prop∂p
++    tups = (model,T,z,prop)
++    f(p,tups) = begin
++      #=
++      we know that p_primal is the solution to
++      property(model,p_primal,t,z,phase = phase,threaded = threaded) - prop = 0
++      =#
++      model,T,z,prop = tups
++      property(model,p,T,z,phase = phase) - prop
++    end
++    p = __gradients_for_root_finders(p_primal,tups,f)
+     return p
+-  else
+-    return p_primal
+-  end
+ end
+ #=
+ model = PCSAFT(["propane","dodecane"])
+diff --git a/src/methods/property_solvers/Tproperty.jl b/src/methods/property_solvers/Tproperty.jl
+index 1f11f3f17b..6b65b3892c 100644
+--- a/src/methods/property_solvers/Tproperty.jl
++++ b/src/methods/property_solvers/Tproperty.jl
+@@ -480,18 +480,17 @@ function __Tproperty(model,p,prop,property::F,rootsolver,phase,abstol,reltol,thr
+ end
+ 
+ function Tproperty_ad(model,p,prop,z,property::F,T_primal,phase) where F
+-  if has_dual(model) || has_dual(p) || has_dual(prop) || has_dual(z)
+-    #=
+-    we know that T_primal is the solution to
+-    property(model,p,T_primal,z,phase = phase,threaded = threaded) - prop = 0
+-    =#
+-    _property(_T) = property(model,p,_T,z,phase = phase)
+-    fprop,∂prop∂T = Solvers.f∂f(_property,T_primal)
+-    T = T_primal + (prop - fprop)/∂prop∂T
++    tups = (model,p,z,prop)
++    f(T,tups) = begin 
++        #=
++        we know that T_primal is the solution to
++        property(model,p,T_primal,z,phase = phase,threaded = threaded) - prop = 0
++        =#
++        model,p,z,prop = tups
++        property(model,p,T,z,phase = phase) - prop
++    end
++    T = __gradients_for_root_finders(T_primal,tups,f)
+     return T
+-  else
+-    return T_primal
+-  end
+ end
+ 
+ # model = PCSAFT(["propane","dodecane"])
+diff --git a/src/methods/property_solvers/multicomponent/multicomponent.jl b/src/methods/property_solvers/multicomponent/multicomponent.jl
+index 8e6b4008c8..e6ec7919da 100755
+--- a/src/methods/property_solvers/multicomponent/multicomponent.jl
++++ b/src/methods/property_solvers/multicomponent/multicomponent.jl
+@@ -269,90 +269,65 @@ function near_candidate_fractions(n,k = 0.5*minimum(n))
+ end
+ 
+ function bubbledew_pressure_ad(model,T,z,result,_bubble)
+-    if has_dual(model) || has_dual(T) || has_dual(z)
+-        p_primal,vl_primal,vv_primal,w_primal = result
+-        if _bubble
+-            _x,_y = z,w_primal
+-        else
+-            _x,_y = w_primal,z
+-        end
+-        Δg = eos(model, vv_primal, T, _y) - eos(model,vl_primal, T, _x)  + p_primal*(vv_primal - vl_primal)
+-        Δv = vv_primal - vl_primal
+-        p = p_primal - Δg/Δv
+-        #=
+-        for volume, we use a volume update
+-        =#
+-
+-        vl = volume_ad(model,vl_primal,T,_x,p)
+-        vv = volume_ad(model,vv_primal,T,_y,p)
+-
+-        RT = Rgas(model)*T
+-
+-        #for w, we do an ss update
+-        lnϕl = VT_chemical_potential_res(model, vl, T, _x)
+-        lnϕl .= lnϕl ./ RT .- log(p*vl/RT/sum(_x))
+-        lnϕv = VT_chemical_potential_res(model, vv, T, _y)
+-        lnϕv .= lnϕv ./ RT .- log(p*vv/RT/sum(_y))
+-        K = exp.(lnϕl .- lnϕv)
+-        if _bubble
+-            K .= z .* K
+-        else
+-            K .= z ./ K
++    if has_dual(model) || has_dual(T) || has_dual(z) # check here to avoid recomputation of pressure if no AD
++        tups = (model,T,z)
++        x = vcat(result[2:end]...)
++        f(x,tups) = begin
++            model,T,z = tups
++            vl = x[1]
++            vv = x[2]
++            w = @view x[3:end]
++            if _bubble
++                _x,_y = z,w
++            else
++                _x,_y = w,z
++            end
++            lnfl,pl = lnf(model,vl,T,_x)
++            lnfv,pv = lnf(model,vv,T,_y)
++            
++            F1 = pl - pv
++            F2 = sum(w) - 1.0 # can exclude this restriction, but would then need additional logic to parse w (excluding one component)
++            F3 = lnfl - lnfv
++            vcat(F1,F2,F3) # can probably be efficient with preallocation and @view but requires the common Dual type between tups and x, otherwise __gradients_for_root_finders will have the incorrect Dual type
+         end
+-        w = K
+-        w ./= sum(w)
++        x_dual = __gradients_for_root_finders(x,tups,f)
++        vl,vv = x_dual[1:2]
++        w = x_dual[3:end]
++        p = _bubble ? pressure(model,vl,T,z) : pressure(model,vv,T,z) # don't use dual w for efficiency
+         return p,vl,vv,w
+-    else
+-        return result
+     end
++    return result
+ end
+ 
+ bubble_pressure_ad(model,T,z,result) = bubbledew_pressure_ad(model,T,z,result,true)
+ dew_pressure_ad(model,T,z,result) = bubbledew_pressure_ad(model,T,z,result,false)
+ 
+ function bubbledew_temperature_ad(model,p,z,result,_bubble)
+-    if has_dual(model) || has_dual(p) || has_dual(z)
+-        T_primal,vl_primal,vv_primal,w_primal = result
++    tups = (model,p,z)
++    x = vcat(result...)
++    f(x,tups) = begin
++        model,p,z = tups
++        T = x[1]
++        vl = x[2]
++        vv = x[3]
++        w = @view x[4:end]
+         if _bubble
+-            _x,_y = z,w_primal
++            _x,_y = z,w
+         else
+-            _x,_y = w_primal,z
++            _x,_y = w,z
+         end
+-
+-        p_primal,∂p∂V = p∂p∂V(model,vv_primal,T_primal,_y)
+-        vv = vv_primal - (p_primal - p)/∂p∂V
+-
+-        #for T, we use a dlnpdTinv step, a dpdT step is fine too
+-        dpdT = dpdT_saturation(model,vv_primal,vl_primal,T_primal)
+-        dTinvdlnp = -p_primal/(dpdT*T_primal*T_primal)
+-        Δlnp = log(p/p_primal)
+-        Tinv0 = 1/T_primal
+-        Tinv = Tinv0 + dTinvdlnp*Δlnp
+-        dT = T_primal - 1/Tinv
+-        T = 1/Tinv
+-        T = T_primal - (p_primal - p)/dpdT
+-
+-        vl = volume_ad(model,vl_primal,T,_x,p)
+-
+-        RT = Rgas(model)*T
+-
+-       #for w, we do an ss update
+-       lnϕl = VT_chemical_potential_res(model, vl, T, _x)
+-       lnϕl .= lnϕl ./ RT .- log(p*vl/RT/sum(_x))
+-       lnϕv = VT_chemical_potential_res(model, vv, T, _y)
+-       lnϕv .= lnϕv ./ RT .- log(p*vv/RT/sum(_y))
+-       K = exp.(lnϕl .- lnϕv)
+-       if _bubble
+-           K .= z .* K
+-       else
+-           K .= z ./ K
+-       end
+-       w = K
+-       w ./= sum(w)
+-        return T,vl,vv,w
+-    else
+-        return result
++        pl,lnfl = lnf(model,vl,T,_x)
++        pv,lnfv = lnf(model,vv,T,_y)
++        F1 = pl - p
++        F2 = pv - p
++        F3 = sum(w) - 1.0 # can exclude this restriction, but would then need additional logic to parse w (excluding one component)
++        F4 = lnfl - lnfv
++        vcat(F1,F2,F3,F4) # can probably be efficient with preallocation and @view but requires the common Dual type between tups and x, otherwise __gradients_for_root_finders will have the incorrect Dual type
+     end
++    x_dual = __gradients_for_root_finders(x,tups,f)
++    T,vl,vv = x_dual[1:3]
++    w = x_dual[4:end]
++    return T,vl,vv,w
+ end
+ 
+ bubble_temperature_ad(model,p,z,result) = bubbledew_temperature_ad(model,p,z,result,true)
+diff --git a/src/methods/property_solvers/singlecomponent/crit_pure.jl b/src/methods/property_solvers/singlecomponent/crit_pure.jl
+index 5084353eda..aaeeee29f0 100755
+--- a/src/methods/property_solvers/singlecomponent/crit_pure.jl
++++ b/src/methods/property_solvers/singlecomponent/crit_pure.jl
+@@ -50,15 +50,15 @@ function crit_pure(model::EoSModel,x0,z = SA[1.0];options = NEqOptions())
+     Tx0 = primalval(x01)
+     vc0 = exp10(primalval(x02))
+     x0 = vec2(Tx0,crit_v_to_x(lbv0,vc0),_1)
+-    zz = z/sum(z)
++    zz = zp/sum(zp)
+     f!(F,x) = ObjCritPure(primalmodel,F,primalval(T̄),x,zz)
+     solver_res = Solvers.nlsolve(f!, x0, TrustRegion(Newton(), NLSolvers.NWI()), options)
+     r  = Solvers.x_sol(solver_res)
+     !all(<(solver_res.options.f_abstol),solver_res.info.best_residual) && (r .= NaN)
+     T_c = r[1]*T̄
+-    lbv = lb_volume(primalmodel,T_c,z)
++    lbv = lb_volume(primalmodel,T_c,zp)
+     V_c = crit_x_to_v(lbv,r[2])
+-    p_c = pressure(model, V_c, T_c, zz)
++    p_c = pressure(primalmodel, V_c, T_c, zp)
+     if p_c < 0
+         p_c *= NaN
+         V_c *= NaN
+@@ -69,17 +69,16 @@ function crit_pure(model::EoSModel,x0,z = SA[1.0];options = NEqOptions())
+ end
+ 
+ function crit_pure_ad(model,crit,z)
+-    if has_dual(model) || has_dual(z)
+-        T_c_primal, p_c_primal, V_c_primal = crit
+-        T̄  = T_scale(model)
+-        lbv = lb_volume(model,T̄,z)
+-        x = SVector(T_c_primal/T̄,crit_v_to_x(lbv,V_c_primal))
+-        f(zz) = __ObjCritPure(model,T̄,z,zz,lbv)
+-        F,J = Solvers.J2(f,x)
+-        ∂x = J\F
+-        r = x .- ∂x
+-        T_c = r[1]*T̄
+-        V_c = crit_x_to_v(lbv,r[2])
++    if has_dual(model) || has_dual(z) # do check here to avoid recomputation of pressure if no AD
++        tups = (model,z)
++        x = SVector(crit[1],crit[3])
++        f(x,tups) = begin
++            model,z = tups
++            Tc,Vc = x
++            _,F1,F2 = p∂p∂2p(model, Vc, Tc, z)
++            return SVector(F1,F2)
++        end
++        T_c,V_c = __gradients_for_root_finders(x,tups,f)
+         P_c = pressure(model,V_c,T_c,z)
+         return (T_c,P_c,V_c)
+     else
+@@ -94,7 +93,7 @@ function ObjCritPure(model::T,F,T̄,x,z) where T
+     return F
+ end
+ 
+-function __ObjCritPure(model::T,T̄,x,z,) where T
++function __ObjCritPure(model::T,T̄,x,z) where T
+     T_c = x[1]*T̄
+     lbv = lb_volume(model,T_c,z)
+     V_c = crit_x_to_v(lbv,x[2])
+diff --git a/src/methods/property_solvers/singlecomponent/saturation/saturation.jl b/src/methods/property_solvers/singlecomponent/saturation/saturation.jl
+index e72aab501f..4b221a957d 100755
+--- a/src/methods/property_solvers/singlecomponent/saturation/saturation.jl
++++ b/src/methods/property_solvers/singlecomponent/saturation/saturation.jl
+@@ -82,24 +82,19 @@ function saturation_pressure(model::EoSModel,T,V0::Union{Tuple,Vector})
+ end
+ 
+ function saturation_pressure_ad(model,T,result)
+-    if has_dual(model) || has_dual(T)
+-        p_primal,vl_primal,vv_primal = result
+-
+-        #=
+-        update step from https://github.com/lucpaoli/SAFT_ML/blob/f22648055bdf4cd244cf427a596fc7b1c03e6383/saftvrmienn.jl#L138-L157
+-        =#
+-        Δg = eos(model, vv_primal, T) - eos(model,vl_primal, T) + p_primal*(vv_primal - vl_primal)
+-        Δv = vv_primal - vl_primal
+-        p = p_primal - Δg/Δv
+-        #=
+-        for volume, we use a volume update
+-        =#
+-        vl = volume_ad(model,vl_primal,T,SA[1.0],p)
+-        vv = volume_ad(model,vv_primal,T,SA[1.0],p)
++    if has_dual(model) || has_dual(T) # do check here to avoid recomputation of pressure if no AD
++        tups = (model,T)
++        x = SVector(result[2],result[3])
++        f(x,tups) = begin
++            model,T = tups
++            vl,vv = x
++            return μp_equality1_p(model,model,vl,vv,T,1.0,1.0)
++        end
++        vl,vv = __gradients_for_root_finders(x,tups,f)
++        p = pressure(model,vl,T)
+         return p,vl,vv
+-    else
+-        return result
+     end
++    return result
+ end
+ 
+ function derivx(f,i)
+@@ -175,27 +170,16 @@ function saturation_temperature(model::EoSModel, p, T0::Number)
+ end
+ 
+ function saturation_temperature_ad(model,p,result)
+-    if has_dual(model) || has_dual(p)
+-        T_primal,vl_primal,vv_primal = result
+-        vl = volume_ad(model,vl_primal,T_primal,SA[1.0],p)
+-
+-        #manual volume_ad for vapour volume, we reuse p_primal for the calculation of the T step.
+-        p_primal,∂p∂V = p∂p∂V(model,vv_primal,T_primal,SA[1.0])
+-        vv = vv_primal - (p_primal - p)/∂p∂V
+-
+-        #for T, we use a dlnpdTinv step, a dpdT step is fine too
+-        dpdT = dpdT_saturation(model,vv_primal,vl_primal,T_primal)
+-        dTinvdlnp = -p_primal/(dpdT*T_primal*T_primal)
+-        Δlnp = log(p/p_primal)
+-        Tinv0 = 1/T_primal
+-        Tinv = Tinv0 + dTinvdlnp*Δlnp
+-        dT = T_primal - 1/Tinv
+-        T = 1/Tinv
+-        T = T_primal - (p_primal - p)/dpdT
+-        return T,vl,vv
+-    else
+-        return result
++    tups = (model,p)
++    T_primal,vl_primal,vv_primal = result
++    x = SVector(T_primal,vl_primal,vv_primal)
++    f(x,tups) = begin
++        model,p = tups
++        T,vl,vv = x
++        return μp_equality1_T(model,model,vl,vv,p,T,1.0,1.0)
+     end
++    T,vl,vv = __gradients_for_root_finders(x,tups,f)
++    return T,vl,vv
+ end
+ 
+ include("ChemPotV.jl")
+diff --git a/src/methods/property_solvers/volume.jl b/src/methods/property_solvers/volume.jl
+index 95940c7626..f251819611 100755
+--- a/src/methods/property_solvers/volume.jl
++++ b/src/methods/property_solvers/volume.jl
+@@ -296,17 +296,13 @@ function _volume(model::EoSModel,p,T,z::AbstractVector=SA[1.0],phase=:unknown, t
+ end
+ 
+ function volume_ad(model,v,T,z,p)
+-    if has_dual(model) || has_dual(p) || has_dual(T) || has_dual(z)
+-        #netwon step to recover derivative information:
+-        #V = V - (p(V) - p)/(dpdV(V))
+-        #dVdP = -1/dpdV
+-        #dVdT = dpdT/dpdV
+-        #dVdn = dpdn/dpdV
+-        psol,dpdVsol = p∂p∂V(model,v,T,z)
+-        return v - (psol - p)/dpdVsol
+-    else
+-        return v
++    tups = (model,p,T,z)
++    f(v,tups) = begin
++        model,p,T,z = tups
++        pressure(model,v,T,z) - p
+     end
++    v = __gradients_for_root_finders(v,tups,f) # does dual checks internally, else returns v_primal
++    return v
+ end
+ 
+ #comprises solid and liquid phases.

@@ -1,0 +1,202 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa9c5688..567ac73d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -34,6 +34,7 @@
+ * Build the docs with a GitHub Actions workflow (`.github/workflows/docs.yaml`) on every PR and deploy them to GitHub Pages on pushes to `master`, replacing manual pushes to the `gh-pages` branch (last updated in 2022). Notebooks are rendered from their saved outputs. Fixes the docs build with Sphinx 9 (`NewTypeDataDocumenter` removed, duplicate intersphinx URLs rejected) and `rdkit.Mol` annotations in `graphein.molecule.graphs` (now `Chem.Mol`), which broke `sphinx_codeautolink`.
+ * Remove `.gitattributes`, whose only rule (`export-subst` for versioneer's `graphein/_version.py`) targeted a file deleted in [#276](https://github.com/a-r-j/graphein/pull/276).
+ * Speed up `graphein.protein.tensor` helpers by replacing per-atom and per-residue tensor loops with single `.tolist()` calls and dict lookups: `to_dataframe` (~6x on 4hhb), `infer_residue_types` and `is_complete_structure` (~7x), `protein_df_to_tensor`, and the sidechain torsion atom indexing used by `sidechain_torsion`. Output is unchanged. Adds tests for `is_complete_structure` and `has_complete_residue`. [#472](https://github.com/a-r-j/graphein/pull/472)
++* Find atom pairs with a KD-tree (`scipy.spatial.cKDTree.query_pairs`, via the new `get_interacting_atom_pairs`) instead of a dense O(N²) distance matrix in `add_hydrophobic_interactions`, `add_disulfide_interactions`, `add_ionic_interactions`, `add_aromatic_sulphur_interactions`, `add_cation_pi_interactions`, `add_vdw_interactions`/`add_vdw_clashes`, `add_backbone_carbonyl_carbonyl_interactions`, `add_salt_bridges`, `add_distance_threshold` and `add_distance_window`. On an atom graph of 4hhb (4,779 atoms) `add_vdw_interactions` goes from 0.31 s to 0.06 s and `add_distance_threshold` from 0.22 s to 0.03 s, and large structures no longer need N² memory (~180 MB for 4hhb's atoms). Edges are unchanged. [#509](https://github.com/a-r-j/graphein/issues/509) [#516](https://github.com/a-r-j/graphein/pull/516)
+ * Allow NumPy 2 (`numpy<3`, was `numpy<2`). The `<2` pin blocked installing graphein next to packages that need NumPy 2; graphein no longer uses any API NumPy 2 removed. [#475](https://github.com/a-r-j/graphein/pull/475)
+ * Drop support for Python 3.10, which has reached end of life. Minimum supported version is now Python 3.11.
+ * Use `tqdm.auto` in `graphein.protein.tensor.dataset`, the remaining module still importing plain `tqdm`, so its progress bars render as widgets in Jupyter instead of printing a new line per update. [#422](https://github.com/a-r-j/graphein/pull/422)
+diff --git a/graphein/protein/edges/distance.py b/graphein/protein/edges/distance.py
+index 6f16bbd4..28849a2c 100644
+--- a/graphein/protein/edges/distance.py
++++ b/graphein/protein/edges/distance.py
+@@ -342,8 +342,7 @@ def add_hydrophobic_interactions(
+     )
+     hydrophobics_df = assign_atoms_to_nodes(G, hydrophobics_df)
+     if hydrophobics_df.shape[0] > 0:
+-        distmat = compute_distmat(hydrophobics_df)
+-        interacting_atoms = get_interacting_atoms(5, distmat)
++        interacting_atoms = get_interacting_atom_pairs(5, hydrophobics_df)
+         add_interacting_resis(
+             G, interacting_atoms, hydrophobics_df, ["hydrophobic"]
+         )
+@@ -385,8 +384,7 @@ def add_disulfide_interactions(
+     # Ensure only residues in the graph are kept
+     disulfide_df = assign_atoms_to_nodes(G, disulfide_df)
+     if disulfide_df.shape[0] > 0:
+-        distmat = compute_distmat(disulfide_df)
+-        interacting_atoms = get_interacting_atoms(2.2, distmat)
++        interacting_atoms = get_interacting_atom_pairs(2.2, disulfide_df)
+         add_interacting_resis(
+             G, interacting_atoms, disulfide_df, ["disulfide"]
+         )
+@@ -641,8 +639,7 @@ def add_ionic_interactions(
+     ionic_df = filter_dataframe(rgroup_df, "residue_name", IONIC_RESIS, True)
+     ionic_df = assign_atoms_to_nodes(G, ionic_df)
+     if ionic_df.shape[0] > 0:
+-        distmat = compute_distmat(ionic_df)
+-        interacting_atoms = get_interacting_atoms(6, distmat)
++        interacting_atoms = get_interacting_atom_pairs(6, ionic_df)
+         add_interacting_resis(G, interacting_atoms, ionic_df, ["ionic"])
+         # Check that the interacting residues are of opposite charges
+         for r1, r2 in get_edges_by_bond_type(G, "ionic"):
+@@ -740,8 +737,9 @@ def add_aromatic_sulphur_interactions(
+     aromatic_sulphur_df = assign_atoms_to_nodes(G, aromatic_sulphur_df)
+ 
+     if aromatic_sulphur_df.shape[0] > 0:
+-        distmat = compute_distmat(aromatic_sulphur_df)
+-        interacting_atoms = get_interacting_atoms(5.3, distmat)
++        interacting_atoms = get_interacting_atom_pairs(
++            5.3, aromatic_sulphur_df
++        )
+         interacting_atoms = list(
+             zip(interacting_atoms[0], interacting_atoms[1])
+         )
+@@ -781,8 +779,7 @@ def add_cation_pi_interactions(
+     cation_pi_df = assign_atoms_to_nodes(G, cation_pi_df)
+ 
+     if cation_pi_df.shape[0] > 0:
+-        distmat = compute_distmat(cation_pi_df)
+-        interacting_atoms = get_interacting_atoms(6, distmat)
++        interacting_atoms = get_interacting_atom_pairs(6, cation_pi_df)
+         interacting_atoms = list(
+             zip(interacting_atoms[0], interacting_atoms[1])
+         )
+@@ -821,14 +818,16 @@ def add_vdw_interactions(
+     df = g.graph["raw_pdb_df"]
+     df = filter_dataframe(df, "atom_name", ["H"], boolean=False)
+     df = assign_atoms_to_nodes(g, df)
+-    dist_mat = compute_distmat(df)
+-
+-    radii = df["element_symbol"].map(VDW_RADII).values
+-    radii = np.expand_dims(radii, axis=1)
+-    radii = radii + radii.T
++    radii = df["element_symbol"].map(VDW_RADII).to_numpy()
++    coords = df[["x_coord", "y_coord", "z_coord"]].to_numpy()
+ 
+-    dist_mat = dist_mat - radii
+-    interacting_atoms = get_interacting_atoms(threshold, dist_mat)
++    # No pair can be further apart than the two largest radii + threshold
++    i, j = get_interacting_atom_pairs(
++        threshold + 2 * np.nanmax(radii, initial=0), df
++    )
++    dists = np.linalg.norm(coords[i] - coords[j], axis=1)
++    keep = dists - (radii[i] + radii[j]) <= threshold
++    interacting_atoms = (i[keep], j[keep])
+     add_interacting_resis(g, interacting_atoms, df, [name])
+ 
+     if remove_intraresidue:
+@@ -1025,8 +1024,7 @@ def add_backbone_carbonyl_carbonyl_interactions(
+     df = G.graph["raw_pdb_df"]
+     df = filter_dataframe(df, "atom_name", ["C", "O"], boolean=True)
+     df = assign_atoms_to_nodes(G, df)
+-    distmat = compute_distmat(df)
+-    interacting_atoms = get_interacting_atoms(threshold, distmat)
++    interacting_atoms = get_interacting_atom_pairs(threshold, df)
+ 
+     # Filter out O-O and C-C edges
+     atom_1 = df.iloc[interacting_atoms[0]]["atom_name"]
+@@ -1084,8 +1082,9 @@ def add_salt_bridges(
+     )
+     salt_bridge_df = assign_atoms_to_nodes(G, salt_bridge_df)
+     if salt_bridge_df.shape[0] > 0:
+-        distmat = compute_distmat(salt_bridge_df)
+-        interacting_atoms = get_interacting_atoms(threshold, distmat)
++        interacting_atoms = get_interacting_atom_pairs(
++            threshold, salt_bridge_df
++        )
+         add_interacting_resis(
+             G, interacting_atoms, salt_bridge_df, ["salt_bridge"]
+         )
+@@ -1119,6 +1118,26 @@ def get_interacting_atoms(
+     return np.where(distmat <= angstroms)
+ 
+ 
++def get_interacting_atom_pairs(
++    angstroms: float, df: pd.DataFrame
++) -> Tuple[np.ndarray, np.ndarray]:
++    """Find the pairs of atoms that are within a radius of one another.
++
++    Unlike :func:`get_interacting_atoms`, this uses a KD-tree rather than a
++    dense distance matrix, and gives each pair once (``i < j``).
++
++    :param angstroms: The radius in angstroms.
++    :type angstroms: float
++    :param df: Dataframe with columns ``["x_coord", "y_coord", "z_coord"]``.
++    :type df: pd.DataFrame
++    :return: Positional indices of the first and second atom of each pair.
++    :rtype: Tuple[np.ndarray, np.ndarray]
++    """
++    coords = df[["x_coord", "y_coord", "z_coord"]].to_numpy()
++    pairs = cKDTree(coords).query_pairs(angstroms, output_type="ndarray")
++    return pairs[:, 0], pairs[:, 1]
++
++
+ def add_delaunay_triangulation(
+     G: nx.Graph, allowable_nodes: Optional[List[str]] = None
+ ):
+@@ -1201,8 +1220,7 @@ def add_distance_threshold(
+     pdb_df = filter_dataframe(
+         G.graph["pdb_df"], "node_id", list(G.nodes()), True
+     )
+-    dist_mat = compute_distmat(pdb_df)
+-    interacting_nodes = get_interacting_atoms(threshold, distmat=dist_mat)
++    interacting_nodes = get_interacting_atom_pairs(threshold, pdb_df)
+     interacting_nodes = list(zip(interacting_nodes[0], interacting_nodes[1]))
+ 
+     log.info(f"Found: {len(interacting_nodes)} distance edges")
+@@ -1249,12 +1267,11 @@ def add_distance_window(
+     pdb_df = filter_dataframe(
+         G.graph["pdb_df"], "node_id", list(G.nodes()), True
+     )
+-    dist_mat = compute_distmat(pdb_df)
+     # Nodes less than the minimum distance
+-    less_than_min = get_interacting_atoms(min, distmat=dist_mat)
++    less_than_min = get_interacting_atom_pairs(min, pdb_df)
+     less_than_min = list(zip(less_than_min[0], less_than_min[1]))
+ 
+-    interacting_nodes = get_interacting_atoms(max, distmat=dist_mat)
++    interacting_nodes = get_interacting_atom_pairs(max, pdb_df)
+     interacting_nodes = list(zip(interacting_nodes[0], interacting_nodes[1]))
+     less_than_min = set(less_than_min)
+     interacting_nodes = [
+diff --git a/tests/protein/edges/test_distance.py b/tests/protein/edges/test_distance.py
+index ca20eb71..9d1f4b86 100644
+--- a/tests/protein/edges/test_distance.py
++++ b/tests/protein/edges/test_distance.py
+@@ -34,8 +34,11 @@
+     add_sequence_distance_edges,
+     add_vdw_clashes,
+     add_vdw_interactions,
++    compute_distmat,
+     filter_distmat,
+     get_edges_by_bond_type,
++    get_interacting_atom_pairs,
++    get_interacting_atoms,
+     get_ring_atoms,
+     get_ring_centroids,
+ )
+@@ -1188,3 +1191,19 @@ def test_hbond_residue_variants_derived_from_parent_table():
+     assert NON_STANDARD_RESIS_PARENT["DTR"] == "TRP"
+     for modified in ("SEP", "TPO", "PTR", "TYS", "STY"):
+         assert modified not in distance.HBOND_RESIDUE_VARIANTS
++
++
++@pytest.mark.parametrize("angstroms", [0.0, 2.2, 5.0])
++def test_get_interacting_atom_pairs_matches_distance_matrix(angstroms):
++    df = read_pdb_to_dataframe(
++        path=str(Path(__file__).parent.parent / "test_data" / "4hhb.pdb")
++    ).head(1000)
++    rows, cols = get_interacting_atoms(angstroms, compute_distmat(df))
++    expected = {(i, j) for i, j in zip(rows, cols) if i < j}
++
++    i, j = get_interacting_atom_pairs(angstroms, df)
++    assert set(zip(i, j)) == expected
++    assert len(i) == len(expected)
++
++    i, j = get_interacting_atom_pairs(angstroms, df.iloc[:0])
++    assert len(i) == len(j) == 0

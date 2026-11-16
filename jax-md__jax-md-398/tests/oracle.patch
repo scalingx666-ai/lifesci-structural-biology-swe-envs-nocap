@@ -1,0 +1,390 @@
+diff --git a/jax_md/a2c/a2c_workflow.py b/jax_md/a2c/a2c_workflow.py
+index 06274b75..9f99754b 100644
+--- a/jax_md/a2c/a2c_workflow.py
++++ b/jax_md/a2c/a2c_workflow.py
+@@ -128,8 +128,11 @@ def step_fn(i, state_and_log):
+   )
+   print('Amorphous structure is ready:', amorphous_structure)
+ 
+-  subcells = crystallizer_utils.get_subcells_to_crystallize(
+-    amorphous_structure, 0.1, 2, 8
++  subcells = crystallizer_utils.get_subcells_to_crystallize_parallel(
++    structure=amorphous_structure,
++    d_frac=0.1,
++    nmin=2,
++    nmax=8,
+   )
+   print('Created %d subcells from a-Si' % len(subcells))
+ 
+diff --git a/jax_md/a2c/crystallizer_utils.py b/jax_md/a2c/crystallizer_utils.py
+index f0dc088e..a9b6cc7d 100644
+--- a/jax_md/a2c/crystallizer_utils.py
++++ b/jax_md/a2c/crystallizer_utils.py
+@@ -16,6 +16,8 @@
+ 
+ import itertools
+ import os
++import math
++from concurrent.futures import ProcessPoolExecutor
+ from typing import Sequence, Any, List, Tuple, Optional, Union
+ import numpy as onp
+ from pymatgen.core.structure import Structure
+@@ -121,6 +123,180 @@ def get_subcells_to_crystallize(
+   return candidates
+ 
+ 
++def _valid_axis_pairs(bins: int) -> List[Tuple[int, int]]:
++  """Return (l_index, h_index) pairs with h_1d[j] > l_1d[i] for each axis.
++
++  Args:
++    bins: number of bins on each axis
++
++  Returns:
++    List of valid (l_index, h_index) pairs
++  """
++  return [(i, j) for i in range(bins) for j in range(i, bins)]
++
++
++def _get_subcells_from_axis_triple_range(
++  args: Tuple[
++    int,
++    int,
++    onp.ndarray,
++    onp.ndarray,
++    onp.ndarray,
++    onp.ndarray,
++    Sequence[Tuple[int, int]],
++    int,
++    int,
++    frozenset[str] | None,
++  ],
++) -> List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]]:
++  """Scan axis-triple indices [start, end) and return matching subcells.
++
++  Args:
++    args: tuple of arguments to the function
++      start: start index of the axis-triple range
++      end: end index of the axis-triple range
++      position: fractional coordinates of the atoms in the original structure
++      species: species of the atoms in the original structure
++      l_1d: lower 1D coordinates
++      h_1d: upper 1D coordinates
++      axis_pairs: list of valid (l_index, h_index) pairs
++      nmin: minimum number of atoms allowed in a subcell
++
++  Returns:
++    List of tuples where the elements are indices of atoms corrresponding to
++      the subcell, the lower and upper fractional coords forming the subcell.
++  """
++  # Unpack the arguments
++  (
++    start,
++    end,
++    position,
++    species,
++    l_1d,
++    h_1d,
++    axis_pairs,
++    nmin,
++    nmax,
++    restrict_to_compositions,
++  ) = args
++  n_axis_pairs = len(axis_pairs)
++  n_sq = n_axis_pairs * n_axis_pairs
++  frac = position % 1
++  candidates: List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]] = []
++  for idx in range(start, end):
++    i0 = idx // n_sq
++    rem = idx % n_sq
++    i1 = rem // n_axis_pairs
++    i2 = rem % n_axis_pairs
++    (l0, h0), (l1, h1), (l2, h2) = (
++      axis_pairs[i0],
++      axis_pairs[i1],
++      axis_pairs[i2],
++    )
++    l = onp.array([l_1d[l0], l_1d[l1], l_1d[l2]])
++    h = onp.array([h_1d[h0], h_1d[h1], h_1d[h2]])
++    mask = onp.logical_and(
++      onp.all(h >= frac, axis=1), onp.all(l <= frac, axis=1)
++    )
++    ids = onp.argwhere(mask).flatten()
++    if nmin <= len(ids) <= nmax:
++      if restrict_to_compositions is not None:
++        if (
++          Composition(''.join(species[ids])).reduced_formula
++          not in restrict_to_compositions
++        ):
++          continue
++      candidates.append((ids, l, h))
++  return candidates
++
++
++def get_subcells_to_crystallize_parallel(
++  structure: Structure,
++  d_frac: float = 0.05,
++  nmin: int = 1,
++  nmax: int = 48,
++  restrict_to_compositions: Sequence[str] | None = None,
++  max_coef: int | None = None,
++  elements: Sequence[str] | None = None,
++  n_workers: int | None = None,
++) -> List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]]:
++  """Get subcell structures to relax out of a large structure (e.g. amorphous)
++  via parallelized search over valid subcell slices.
++
++  Args:
++    structure: pymatgen Structure object to extract subcells from
++    d_frac: fractional grid spacing to use for subcell slices
++    nmin: minimum number of atoms allowed in a subcell
++    nmax: maximum number of atoms allowed in a subcell
++    restrict_to_compositions: limit search to subcells with these compositions
++    max_coef: maximum coefficient in the formula. If supplied, we restrict
++      formulas to stoich. of max_coef e.g. for 2, A, B, AB2, A2B.
++    elements: list of elements to use in the subcell search. Required if
++      max_coef is provided.
++    n_workers: number of processes; defaults to ``os.cpu_count()``. Use 1 to
++      run sequentially without spawning a process pool.
++
++  Returns:
++    List of tuples where the elements are indices of atoms corrresponding to
++      the subcell, the lower and upper fractional coords forming the subcell.
++  """
++  position = structure.frac_coords
++  species = onp.array([i.symbol for i in structure.species])
++
++  if max_coef:
++    stoichs = list(itertools.product(range(max_coef + 1), repeat=len(elements)))
++    stoichs.pop(0)
++    comps = []
++    for stoich in stoichs:
++      comp = dict(zip(elements, stoich))
++      comps.append(Composition.from_dict(comp).reduced_formula)
++    restrict_to_compositions = set(comps)
++
++  if restrict_to_compositions:
++    restrict_to_compositions = frozenset(
++      Composition(i).reduced_formula for i in restrict_to_compositions
++    )
++  else:
++    restrict_to_compositions = None
++
++  bins = int(1 / d_frac)
++  l_1d = onp.linspace(0, 1 - d_frac, bins)
++  h_1d = onp.linspace(d_frac, 1, bins)
++  axis_pairs = _valid_axis_pairs(bins)
++  n_axis_pairs = len(axis_pairs)
++  total = n_axis_pairs**3
++
++  if n_workers is None:
++    n_workers = os.cpu_count() or 1
++  n_workers = max(1, n_workers)
++
++  worker_args = (
++    position,
++    species,
++    l_1d,
++    h_1d,
++    axis_pairs,
++    nmin,
++    nmax,
++    restrict_to_compositions,
++  )
++
++  if n_workers == 1:
++    return _get_subcells_from_axis_triple_range((0, total, *worker_args))
++
++  chunk_size = math.ceil(total / n_workers)
++  ranges = [
++    (i, min(i + chunk_size, total)) for i in range(0, total, chunk_size)
++  ]
++  tasks = [(start, end, *worker_args) for start, end in ranges]
++
++  candidates: List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]] = []
++  with ProcessPoolExecutor(max_workers=n_workers) as executor:
++    for chunk in executor.map(_get_subcells_from_axis_triple_range, tasks):
++      candidates.extend(chunk)
++  return candidates
++
++
+ def subcells_to_structures(
+   candidates: List[Tuple[Sequence[int], onp.ndarray, onp.ndarray]],
+   position: onp.ndarray,
+diff --git a/tests/a2c_test.py b/tests/a2c_test.py
+new file mode 100644
+index 00000000..e4492862
+--- /dev/null
++++ b/tests/a2c_test.py
+@@ -0,0 +1,76 @@
++import os
++
++import jax
++import pymatgen as mg
++from absl.testing import absltest, parameterized
++
++from jax_md.a2c.crystallizer_utils import (
++  get_subcells_to_crystallize,
++  get_subcells_to_crystallize_parallel,
++)
++
++jax.config.update('jax_enable_x64', True)
++
++DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
++AMORPHOUS_SI64_PATH = os.path.join(DATA_DIR, 'amorphous_si64.cif')
++
++
++class A2CTest(parameterized.TestCase):
++  """Test the A2C workflow."""
++
++  def test_subcells_to_crystallize_parallel(self):
++    """Test the parallel version of the subcells to crystallize function."""
++    amorphous_structure = mg.core.Structure.from_file(AMORPHOUS_SI64_PATH)
++
++    # Run both versions of the crystallize function, timing each, and compare the results
++    d_frac = 0.2
++    nmin = 1
++    nmax = 12
++    n_workers = os.cpu_count() - 1
++
++    orig = get_subcells_to_crystallize(
++      amorphous_structure, d_frac=d_frac, nmin=nmin, nmax=nmax
++    )
++    orig = sorted(orig, key=lambda x: (tuple(x[0]), tuple(x[1]), tuple(x[2])))
++
++    improved_subcell_generation_results = get_subcells_to_crystallize_parallel(
++      amorphous_structure, d_frac=d_frac, nmin=nmin, nmax=nmax, n_workers=1
++    )
++    improved_subcell_generation_results = sorted(
++      improved_subcell_generation_results,
++      key=lambda x: (tuple(x[0]), tuple(x[1]), tuple(x[2])),
++    )
++
++    if n_workers > 1:
++      parallel_and_improved_crystallize_results = (
++        get_subcells_to_crystallize_parallel(
++          amorphous_structure,
++          d_frac=d_frac,
++          nmin=nmin,
++          nmax=nmax,
++          n_workers=n_workers,
++        )
++      )
++      parallel_and_improved_crystallize_results = sorted(
++        parallel_and_improved_crystallize_results,
++        key=lambda x: (tuple(x[0]), tuple(x[1]), tuple(x[2])),
++      )
++
++    # Compare results to confirm consistency between original and improved subcell generation functions
++    self.assertEqual(
++      len(orig),
++      len(improved_subcell_generation_results),
++      f'Original function and improved subcell generation function returned different number of subcells: {len(orig)} != {len(improved_subcell_generation_results)}',
++    )
++    if n_workers > 1:
++      self.assertEqual(
++        len(orig),
++        len(parallel_and_improved_crystallize_results),
++        f'Original function and parallel & improved crystallize function returned different number of subcells: {len(orig)} != {len(parallel_and_improved_crystallize_results)}',
++      )
++    else:
++      print('Parallel function not tested because n_workers <= 1')
++
++
++if __name__ == '__main__':
++  absltest.main()
+diff --git a/tests/data/amorphous_si64.cif b/tests/data/amorphous_si64.cif
+new file mode 100644
+index 00000000..80cf607f
+--- /dev/null
++++ b/tests/data/amorphous_si64.cif
+@@ -0,0 +1,90 @@
++# generated using pymatgen
++data_Si
++_symmetry_space_group_name_H-M   'P 1'
++_cell_length_a   11.10000000
++_cell_length_b   11.10000000
++_cell_length_c   11.10000000
++_cell_angle_alpha   90.00000000
++_cell_angle_beta   90.00000000
++_cell_angle_gamma   90.00000000
++_symmetry_Int_Tables_number   1
++_chemical_formula_structural   Si
++_chemical_formula_sum   Si64
++_cell_volume   1367.63100000
++_cell_formula_units_Z   64
++loop_
++ _symmetry_equiv_pos_site_id
++ _symmetry_equiv_pos_as_xyz
++  1  'x, y, z'
++loop_
++ _atom_site_type_symbol
++ _atom_site_label
++ _atom_site_symmetry_multiplicity
++ _atom_site_fract_x
++ _atom_site_fract_y
++ _atom_site_fract_z
++ _atom_site_occupancy
++  Si  Si0  1  0.72616585  0.77581893  0.27200012  1
++  Si  Si1  1  0.29464769  0.12112099  0.07136043  1
++  Si  Si2  1  0.22291883  0.11977911  0.56121213  1
++  Si  Si3  1  0.55889253  0.41141861  0.38639244  1
++  Si  Si4  1  0.75715189  0.71067681  0.59801044  1
++  Si  Si5  1  0.61251607  0.32552651  0.70235980  1
++  Si  Si6  1  0.39608018  0.13284676  0.26400978  1
++  Si  Si7  1  0.87874832  0.40090398  0.34264115  1
++  Si  Si8  1  0.41404356  0.40990537  0.68871783  1
++  Si  Si9  1  0.87275406  0.56169897  0.05551182  1
++  Si  Si10  1  0.00709707  0.24194443  0.25382984  1
++  Si  Si11  1  0.88129597  0.11427939  0.16776439  1
++  Si  Si12  1  0.70573821  0.28204775  0.49074842  1
++  Si  Si13  1  0.28297482  0.31704117  0.53590003  1
++  Si  Si14  1  0.28318160  0.42674740  0.18403716  1
++  Si  Si15  1  1.21035932  0.86683201  0.34080894  1
++  Si  Si16  1  1.07050003  0.65453933  0.06366366  1
++  Si  Si17  1  0.77208434  0.55549056  0.22343133  1
++  Si  Si18  1  0.16887333  0.58022126  0.24737607  1
++  Si  Si19  1  0.66842181  0.08837260  0.40998544  1
++  Si  Si20  1  0.72395399  0.00306163  0.79258781  1
++  Si  Si21  1  0.10809937  0.86202658  0.12198043  1
++  Si  Si22  1  0.85922002  0.36909264  0.96645319  1
++  Si  Si23  1  0.37178865  0.32947498  0.34480501  1
++  Si  Si24  1  0.05866185  0.63329168  0.81210903  1
++  Si  Si25  1  0.44003339  0.80704766  0.09468553  1
++  Si  Si26  1  0.03056754  0.53591835  0.40838237  1
++  Si  Si27  1  0.59114915  0.10201139  0.22015494  1
++  Si  Si28  1  1.05068168  0.11379933  0.85527975  1
++  Si  Si29  1  0.52428033  0.67378361  0.95336831  1
++  Si  Si30  1  0.33551491  1.00646956  0.42290284  1
++  Si  Si31  1  0.69948288  0.23866909  1.06781848  1
++  Si  Si32  1  0.28268639  0.90515867  1.01720020  1
++  Si  Si33  1  -0.03269741  0.99148895  0.02314767  1
++  Si  Si34  1  0.36137043  0.72748884  1.27454738  1
++  Si  Si35  1  0.43888449  0.48967567  1.04264384  1
++  Si  Si36  1  -0.00171732  1.02474830  0.52614570  1
++  Si  Si37  1  0.24202248  0.08633898  0.76668923  1
++  Si  Si38  1  -0.24769969  0.68601063  0.93244847  1
++  Si  Si39  1  -0.09648595  0.30189092  0.62070674  1
++  Si  Si40  1  0.78152748  0.89743166  0.96572418  1
++  Si  Si41  1  0.28973446  0.88697658  0.80074869  1
++  Si  Si42  1  0.62514200  0.87111176  0.66779292  1
++  Si  Si43  1  0.40129259  0.62215268  0.63323144  1
++  Si  Si44  1  0.62754453  0.90516942  1.12804558  1
++  Si  Si45  1  0.54483351  0.76268323  0.38154559  1
++  Si  Si46  1  0.53799418  0.94873678  0.49973127  1
++  Si  Si47  1  1.04363361  0.31069463  0.94014671  1
++  Si  Si48  1  0.85311429  0.62082889  0.76055044  1
++  Si  Si49  1  0.07926503  -0.17615652  0.49991935  1
++  Si  Si50  1  0.37982651  1.19016976  -0.10842498  1
++  Si  Si51  1  0.57210599  0.60705238  0.50635884  1
++  Si  Si52  1  -0.09195033  0.09911230  0.70141648  1
++  Si  Si53  1  0.60440214  0.17492788  0.86675699  1
++  Si  Si54  1  0.84618216  -0.00887675  0.35829181  1
++  Si  Si55  1  0.60883773  0.42335542  0.17260041  1
++  Si  Si56  1  0.79736565  0.41946042  0.77011799  1
++  Si  Si57  1  0.90946455  0.71937860  0.44252529  1
++  Si  Si58  1  0.14931594  0.28010782  0.11241677  1
++  Si  Si59  1  0.13530565  0.43820846  0.79990270  1
++  Si  Si60  1  0.46812360  0.76694076  0.76981973  1
++  Si  Si61  1  0.09863899  0.40866067  0.58951727  1
++  Si  Si62  1  0.33731345  0.38530267  -0.12896999  1
++  Si  Si63  1  0.17781312  0.74280989  0.67604772  1

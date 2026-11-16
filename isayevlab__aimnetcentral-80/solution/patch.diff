@@ -1,0 +1,266 @@
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 4f4ec81..60a870c 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -59,6 +59,59 @@ jobs:
+               with:
+                   flags: core
+ 
++    # Probes torch-core API + CPU-numerics drift across the supported range.
++    # NOT a dependency-graph test: torch is reinstalled on top of the locked
++    # warp-lang/nvalchemiops (which do not pin torch), and CI is CPU-only so the
++    # Warp execution kernels never run. The warp/nvalchemiops coupling is
++    # validated on GPU (see the GPU validation task).
++    #
++    # torch.compile/inductor is DISABLED here (TORCHDYNAMO_DISABLE=1): reinstalling
++    # torch alone leaves a mismatched triton, so the inductor path cannot be tested
++    # coherently via reinstall-on-top (it breaks with `triton_key` ImportError on
++    # torch 2.8). The compile path's cross-version validation belongs in a
++    # resolver-coherent env, not this eager API/numerics probe.
++    tests-torch:
++        runs-on: ubuntu-latest
++        timeout-minutes: 20
++        strategy:
++            matrix:
++                torch-version: ["2.8.*", "2.9.*", "2.10.*", "2.11.*", "2.12.*"]
++            fail-fast: false
++        defaults:
++            run:
++                shell: bash
++        steps:
++            - name: Check out
++              uses: actions/checkout@v6
++              with:
++                  fetch-depth: 0
++
++            - name: Set up the environment
++              uses: ./.github/actions/setup-uv-env
++              with:
++                  python-version: "3.11"
++                  groups: dev
++
++            - name: Override torch (CPU wheel) — desyncs from uv.lock, intentional
++              env:
++                  TORCH_VERSION: ${{ matrix.torch-version }}
++                  UV_NO_SYNC: "1"
++              run: |
++                  set -e
++                  uv pip install --python .venv/bin/python --reinstall-package torch \
++                      "torch==${TORCH_VERSION}" \
++                      --index-url https://download.pytorch.org/whl/cpu
++                  uv run --no-sync python -c "import torch; print('torch', torch.__version__)"
++
++            - name: Run core tests against torch ${{ matrix.torch-version }}
++              env:
++                  UV_NO_SYNC: "1"
++                  # Eager only: see job comment — inductor/triton can't be tested via reinstall-on-top.
++                  TORCHDYNAMO_DISABLE: "1"
++              run: |
++                  uv run --no-sync pytest tests \
++                      -m "not gpu and not network and not ase and not pysis and not train and not hf and not torch_sim and not slow"
++
+     tests-ase:
+         runs-on: ubuntu-latest
+         timeout-minutes: 20
+@@ -295,6 +348,7 @@ jobs:
+             [
+                 quality,
+                 tests-core,
++                tests-torch,
+                 tests-ase,
+                 tests-train,
+                 tests-pysis,
+diff --git a/aimnet/ops.py b/aimnet/ops.py
+index 4177762..47d7c06 100644
+--- a/aimnet/ops.py
++++ b/aimnet/ops.py
+@@ -72,7 +72,7 @@ def calc_distances(data: dict[str, Tensor], suffix: str = "", pad_value: float =
+         coord_j = coord_j + shifts
+     r_ij = coord_j - coord_i
+     r_ij = nbops.mask_ij_(r_ij, data, mask_value=pad_value, inplace=False, suffix=suffix)
+-    d_ij = torch.norm(r_ij, p=2, dim=-1)
++    d_ij = torch.linalg.vector_norm(r_ij, ord=2, dim=-1)
+     return d_ij, r_ij
+ 
+ 
+diff --git a/aimnet/train/train.py b/aimnet/train/train.py
+index d7cce10..3f8c4c6 100644
+--- a/aimnet/train/train.py
++++ b/aimnet/train/train.py
+@@ -120,7 +120,9 @@ def run(local_rank, world_size, model_cfg, train_cfg, load, save):
+     if load is not None:
+         device = next(model.parameters()).device  # type: ignore[attr-defined]
+         logging.info(f"Loading weights from file {load}")
+-        sd = torch.load(load, map_location=device)
++        # state_dicts are pure tensors; weights_only=True matches the 2.6+ default
++        # and the rest of the repo. Full pickled checkpoints must be pre-extracted.
++        sd = torch.load(load, map_location=device, weights_only=True)
+         logging.info(utils.unwrap_module(model).load_state_dict(sd, strict=False))
+ 
+     # data loaders
+diff --git a/aimnet/train/utils.py b/aimnet/train/utils.py
+index 6ecc0fc..5084dd2 100644
+--- a/aimnet/train/utils.py
++++ b/aimnet/train/utils.py
+@@ -18,12 +18,20 @@
+ 
+ 
+ def enable_tf32(enable=True):
+-    if enable:
+-        torch.backends.cuda.matmul.allow_tf32 = True
+-        torch.backends.cudnn.allow_tf32 = True
+-    else:
+-        torch.backends.cuda.matmul.allow_tf32 = False
+-        torch.backends.cudnn.allow_tf32 = False
++    """Toggle TF32 reduced-precision float32 matmul (training-throughput knob).
++
++    NOTE: this sets *process-global* float32 matmul precision. Never call it
++    from inference/calculator code paths used for thermochemistry — those must
++    run at full precision ("highest"). The deliberate float64 energy
++    accumulation in aimnet.modules.lr is unaffected (TF32 governs float32 GEMM
++    only).
++    """
++    # set_float32_matmul_precision is the forward-compatible control; the
++    # allow_tf32 booleans are its deprecated alias from torch 2.9 onward.
++    torch.set_float32_matmul_precision("high" if enable else "highest")
++    # cudnn keeps a dedicated flag not covered by set_float32_matmul_precision.
++    if hasattr(torch.backends.cudnn, "allow_tf32"):
++        torch.backends.cudnn.allow_tf32 = enable
+ 
+ 
+ def make_seed(all_reduce=True):
+diff --git a/docs/getting_started.md b/docs/getting_started.md
+index b47767f..c19162f 100644
+--- a/docs/getting_started.md
++++ b/docs/getting_started.md
+@@ -57,6 +57,10 @@ pip install torch --index-url https://download.pytorch.org/whl/cu126
+ 
+ Check [pytorch.org](https://pytorch.org/get-started/locally/) for other CUDA versions.
+ 
++### PyTorch & CUDA compatibility
++
++AIMNet2 is tested against PyTorch 2.8–2.12 (CPU API + numerics in CI; the GPU/kernel path is validated separately). Across this range PyTorch's default CUDA wheel advanced through the CUDA 12.x series to CUDA 13. Older GPUs (Volta/Pascal/Maxwell) may not be supported on the newest default wheels — consult the current [PyTorch install matrix](https://pytorch.org/get-started/locally/) to pick the right CUDA channel for your hardware rather than relying on the default. The Warp + nvalchemiops accelerated kernel path is GPU-only and is validated manually; it is not exercised in CPU CI.
++
+ ## Verify Your Installation
+ 
+ After installing, confirm that AIMNet2 loads correctly:
+diff --git a/tests/test_kernel_registration.py b/tests/test_kernel_registration.py
+new file mode 100644
+index 0000000..b323641
+--- /dev/null
++++ b/tests/test_kernel_registration.py
+@@ -0,0 +1,36 @@
++"""CPU smoke test: custom ops register correctly across torch versions.
++
++Registration of op schema + fake kernel happens at import time regardless of
++device (the kernels are gated to CUDA only for *execution*, and wp.init() does
++not require a GPU), so this runs on a CPU CI runner and catches torch-version
++drift in torch.library schema inference.
++"""
++
++import torch
++
++EXPECTED_OPS = {
++    "aimnet::conv_sv_2d_sp_fwd",
++    "aimnet::conv_sv_2d_sp_bwd",
++    "aimnet::conv_sv_2d_sp_bwd_bwd",
++}
++
++
++def test_torch_version_is_supported():
++    major, minor = (int(x) for x in torch.__version__.split(".")[:2])
++    assert (major, minor) >= (2, 8), f"torch {torch.__version__} below supported floor 2.8"
++
++
++def test_custom_ops_register_on_import():
++    from aimnet.kernels import load_ops
++
++    # set-equality, not ordered list: load_ops() ordering is an implementation
++    # detail, but full membership must hold (do not weaken to a length check).
++    assert set(load_ops()) == EXPECTED_OPS, f"unexpected registered ops: {load_ops()}"
++
++
++def test_ops_namespace_present():
++    import aimnet.kernels  # noqa: F401  triggers registration
++
++    assert hasattr(torch.ops, "aimnet")
++    for name in ("conv_sv_2d_sp_fwd", "conv_sv_2d_sp_bwd", "conv_sv_2d_sp_bwd_bwd"):
++        assert hasattr(torch.ops.aimnet, name), f"missing op {name}"
+diff --git a/tests/test_torch_version_numerics.py b/tests/test_torch_version_numerics.py
+new file mode 100644
+index 0000000..611dae0
+--- /dev/null
++++ b/tests/test_torch_version_numerics.py
+@@ -0,0 +1,53 @@
++"""Cross-torch-version numerical determinism + TF32 behavior.
++
++Guards the CPU-runnable numerical path changed in Phase 2 (calc_distances uses
++torch.linalg.vector_norm). The full-model energy/force golden is GPU-only
++(real model is network/ASE-gated) and lives in the GPU validation task.
++"""
++
++import pytest
++import torch
++
++from aimnet import nbops, ops
++
++# Reference values captured on the locked torch (see Task 2 Step 1).
++REF_DIJ_SUM = 12.056054711341858
++REF_DIJ_01 = 0.9577755928039551
++
++
++def _water_data():
++    coord = torch.tensor([[[0.0, 0.0, 0.1173], [0.0, 0.7572, -0.4692], [0.0, -0.7572, -0.4692]]])
++    numbers = torch.tensor([[8, 1, 1]])
++    data = {"coord": coord, "numbers": numbers, "charge": torch.tensor([0.0])}
++    data = nbops.set_nb_mode(data)
++    return nbops.calc_masks(data)
++
++
++def test_calc_distances_matches_reference():
++    # rel tolerance (not exact ==) so the cross-version guard does not trip on a
++    # sub-ULP difference on a non-x86 runner while still catching real drift.
++    d_ij, _ = ops.calc_distances(_water_data())
++    assert d_ij.double().sum().item() == pytest.approx(REF_DIJ_SUM, rel=1e-12)
++    assert d_ij[0, 0, 1].double().item() == pytest.approx(REF_DIJ_01, rel=1e-12)
++
++
++def test_calc_distances_gradient_is_finite():
++    data = _water_data()
++    data["coord"].requires_grad_(True)
++    d_ij, _ = ops.calc_distances(data)
++    d_ij.sum().backward()
++    assert data["coord"].grad is not None
++    assert torch.isfinite(data["coord"].grad).all()
++
++
++def test_enable_tf32_sets_matmul_precision():
++    # aimnet.train.utils imports ignite/omegaconf (the `train` extra); skip where
++    # those are absent so the determinism tests above stay collectable in the
++    # core/torch-matrix selection, which installs only the dev group.
++    pytest.importorskip("ignite")
++    from aimnet.train.utils import enable_tf32
++
++    enable_tf32(True)
++    assert torch.backends.cuda.matmul.allow_tf32 is True
++    enable_tf32(False)
++    assert torch.backends.cuda.matmul.allow_tf32 is False
+diff --git a/tests/test_train_utils.py b/tests/test_train_utils.py
+index fd6b159..97c1805 100644
+--- a/tests/test_train_utils.py
++++ b/tests/test_train_utils.py
+@@ -26,3 +26,14 @@ def test_build_model_wraps_forces_when_true():
+     cfg = OmegaConf.create({"class": "torch.nn.Identity"})
+     model = build_model(cfg, forces=True)
+     assert isinstance(model, Forces)
++
++
++def test_state_dict_roundtrip_weights_only(tmp_path):
++    torch = pytest.importorskip("torch")
++
++    sd = {"w": torch.randn(3, 3), "b": torch.zeros(3)}
++    p = tmp_path / "sd.pt"
++    torch.save(sd, p)
++    loaded = torch.load(p, map_location="cpu", weights_only=True)
++    assert set(loaded) == {"w", "b"}
++    torch.testing.assert_close(loaded["w"], sd["w"])

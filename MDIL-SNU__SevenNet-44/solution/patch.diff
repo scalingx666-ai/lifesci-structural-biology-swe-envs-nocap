@@ -1,0 +1,214 @@
+diff --git a/pretrained_potentials/SevenNet_0/fine_tune.yaml b/pretrained_potentials/SevenNet_0/fine_tune.yaml
+index 630b99c0..5e1f9e20 100644
+--- a/pretrained_potentials/SevenNet_0/fine_tune.yaml
++++ b/pretrained_potentials/SevenNet_0/fine_tune.yaml
+@@ -67,10 +67,6 @@ train:
+         checkpoint: './checkpoint_sevennet_0.pth'
+         use_statistic_values_of_checkpoint: True # Set True to use shift, scale, and avg_num_neigh from checkpoint or not
+ 
+-    # If the dataset changed (for fine-tuning),
+-    # setting 'use_statistic_value_of_checkpoint' to False roughly changes model's accuracy in the beginning of training.
+-    # We recommand to use it as 'False', and turn train_shift_scale and train_avg_num_neigh to 'True' for fine-tuning dataset adaptation.
+-
+ data:
+     batch_size: 8
+     data_divide_ratio: 0.1
+diff --git a/sevenn/_const.py b/sevenn/_const.py
+index d3ec4880..2c304f78 100644
+--- a/sevenn/_const.py
++++ b/sevenn/_const.py
+@@ -118,13 +118,14 @@ def error_record_condition(x):
+     KEY.AVG_NUM_NEIGH: True,
+     KEY.TRAIN_AVG_NUM_NEIGH: False,
+     KEY.TRAIN_SHIFT_SCALE: False,
+-    KEY.OPTIMIZE_BY_REDUCE: False,
++    KEY.OPTIMIZE_BY_REDUCE: True,
+     KEY.USE_BIAS_IN_LINEAR: False,
+     KEY.READOUT_AS_FCN: False,
+     # Applied af readout as fcn is True
+     KEY.READOUT_FCN_HIDDEN_NEURONS: [30, 30],
+     KEY.READOUT_FCN_ACTIVATION: 'relu',
+     KEY.SELF_CONNECTION_TYPE: 'nequip',
++    KEY._NORMALIZE_SPH: True,
+ }
+ 
+ 
+@@ -210,6 +211,7 @@ def error_record_condition(x):
+     KEY.READOUT_FCN_ACTIVATION: lambda x: x in ACTIVATION.keys(),
+     KEY.ACTIVATION_RADIAL: lambda x: x in ACTIVATION.keys(),
+     KEY.SELF_CONNECTION_TYPE: lambda x: x in IMPLEMENTED_SELF_CONNECTION_TYPE,
++    KEY._NORMALIZE_SPH: None,
+ }
+ 
+ 
+diff --git a/sevenn/_keys.py b/sevenn/_keys.py
+index 7d8d3062..ccb1a9aa 100644
+--- a/sevenn/_keys.py
++++ b/sevenn/_keys.py
+@@ -189,6 +189,7 @@
+ TRAIN_SHIFT_SCALE = 'train_shift_scale'
+ TRAIN_AVG_NUM_NEIGH = 'train_avg_num_neigh'
+ 
++_NORMALIZE_SPH = '_normalize_sph'
+ OPTIMIZE_BY_REDUCE = 'optimize_by_reduce'
+ 
+ # deprecated
+diff --git a/sevenn/main/sevenn_get_model.py b/sevenn/main/sevenn_get_model.py
+index 03260edb..f3c49476 100644
+--- a/sevenn/main/sevenn_get_model.py
++++ b/sevenn/main/sevenn_get_model.py
+@@ -25,19 +25,8 @@ def main(args=None):
+             'deployed_parallel' if not get_serial else 'deployed_serial'
+         )
+ 
+-    config = cp_file['config']
+-    stct_dct = cp_file['model_state_dict']
+-
+-    defaults = {}
+-    defaults.update(_const.DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG)
+-    defaults.update(_const.DEFAULT_DATA_CONFIG)
+-    defaults.update(_const.DEFAULT_TRAINING_CONFIG)
+-    for k_d, v_d in defaults.items():
+-        if k_d not in config.keys():
+-            config[k_d] = v_d
+-            print(f'{k_d} not found in config, {v_d} inserted as defaults')
+-    # for backward compatibility
+-    stct_dct = sevenn.util._map_old_model(stct_dct)
++    model, config = sevenn.util.model_from_checkpoint(checkpoint)
++    stct_dct = model.state_dict()
+ 
+     if get_serial:
+         deploy(stct_dct, config, output_prefix)
+diff --git a/sevenn/model_build.py b/sevenn/model_build.py
+index 39b0c63e..84887f8f 100644
+--- a/sevenn/model_build.py
++++ b/sevenn/model_build.py
+@@ -165,13 +165,14 @@ def build_E3_equivariant_model(model_config: dict, parallel=False):
+     optimize_by_reduce = model_config[KEY.OPTIMIZE_BY_REDUCE]
+     use_bias_in_linear = model_config[KEY.USE_BIAS_IN_LINEAR]
+ 
++    _normalize_sph = model_config[KEY._NORMALIZE_SPH]
+     # model definitions
+     edge_embedding = EdgeEmbedding(
+         # operate on ||r||
+         basis_module=radial_basis_module,
+         cutoff_module=cutoff_function_module,
+         # operate on r/||r||
+-        spherical_module=SphericalEncoding(lmax_edge, -1 if is_parity else 1),
++        spherical_module=SphericalEncoding(lmax_edge, -1 if is_parity else 1, normalize=_normalize_sph),
+     )
+     if not parallel:
+         layers.update({
+@@ -308,7 +309,7 @@ def build_E3_equivariant_model(model_config: dict, parallel=False):
+                     basis_module=radial_basis_module,
+                     cutoff_module=cutoff_function_module,
+                     # operate on r/||r||
+-                    spherical_module=SphericalEncoding(lmax_edge),
++                    spherical_module=SphericalEncoding(lmax_edge, -1 if is_parity else 1, normalize=_normalize_sph),
+                 )
+             })
+             #######################################################
+diff --git a/sevenn/nn/edge_embedding.py b/sevenn/nn/edge_embedding.py
+index 7bff4276..dcc6da1c 100644
+--- a/sevenn/nn/edge_embedding.py
++++ b/sevenn/nn/edge_embedding.py
+@@ -180,7 +180,7 @@ class SphericalEncoding(nn.Module):
+     """
+ 
+     def __init__(
+-        self, lmax: int, parity: int = -1, normalization: str = 'component'
++        self, lmax: int, parity: int = -1, normalization: str = 'component', normalize = True,
+     ):
+         super().__init__()
+         self.lmax = lmax
+@@ -189,7 +189,7 @@ def __init__(
+         self.irreps_out = Irreps.spherical_harmonics(lmax, parity)
+         self.sph = SphericalHarmonics(
+             self.irreps_out,
+-            normalize=False,
++            normalize=normalize,
+             normalization=normalization,
+             irreps_in=self.irreps_in,
+         )
+diff --git a/sevenn/scripts/processing_continue.py b/sevenn/scripts/processing_continue.py
+index 484b1112..29fc96a4 100644
+--- a/sevenn/scripts/processing_continue.py
++++ b/sevenn/scripts/processing_continue.py
+@@ -77,6 +77,12 @@ def processing_continue(config):
+     check_config_compatible(config, config_cp)
+     Logger().write('Checkpoint config is compatible\n')
+ 
++    ################## for backward compat.
++    if KEY._NORMALIZE_SPH not in config_cp:
++        config_cp.update({KEY._NORMALIZE_SPH: False})
++    config.update({KEY._NORMALIZE_SPH: config_cp[KEY._NORMALIZE_SPH]})
++    ################## for backward compat.
++
+     from_epoch = checkpoint['epoch']
+     model_state_dict_cp = checkpoint['model_state_dict']
+     model_state_dict_cp = util._map_old_model(model_state_dict_cp)
+diff --git a/sevenn/sevenn_logger.py b/sevenn/sevenn_logger.py
+index 9e6c3442..21f08edd 100644
+--- a/sevenn/sevenn_logger.py
++++ b/sevenn/sevenn_logger.py
+@@ -303,17 +303,13 @@ def print_config(self, model_config, data_config, train_config):
+         """
+         print some important information from config
+         """
+-        content = (
+-            'succesfully read yaml config!\n\n' + 'from model configuration\n'
+-        )
+-        for k, v in model_config.items():
+-            content += Logger.format_k_v(k, v)
+-        content += '\nfrom train configuration\n'
+-        for k, v in train_config.items():
+-            content += Logger.format_k_v(k, v)
+-        content += '\nfrom data configuration\n'
+-        for k, v in data_config.items():
+-            content += Logger.format_k_v(k, v)
++        content = 'succesfully read yaml config\n'
++        for name, config in zip(["model", "data", "train"], [model_config, data_config, train_config]):
++            content += f'\nfrom {name} configuration\n'
++            for k, v in config.items():
++                if k.startswith("_"):
++                    continue
++                content += Logger.format_k_v(k, v)
+         self.write(content)
+ 
+     # TODO: This is not good make own exception
+diff --git a/sevenn/util.py b/sevenn/util.py
+index 14555461..9969d2bf 100644
+--- a/sevenn/util.py
++++ b/sevenn/util.py
+@@ -239,6 +239,11 @@ def model_from_checkpoint(checkpoint):
+     model_state_dict = checkpoint['model_state_dict']
+     config = checkpoint['config']
+ 
++    ################## for backward compat.
++    if KEY._NORMALIZE_SPH not in config:
++        config[KEY._NORMALIZE_SPH] = False
++    ################## for backward compat.
++
+     for k, v in defaults.items():
+         if k not in config:
+             print(f'Warning: {k} not in config, using default value {v}')
+diff --git a/tests/__pycache__/__init__.cpython-38.pyc b/tests/__pycache__/__init__.cpython-38.pyc
+deleted file mode 100644
+index a3869c42..00000000
+Binary files a/tests/__pycache__/__init__.cpython-38.pyc and /dev/null differ
+diff --git a/tests/__pycache__/testbot.cpython-38.pyc b/tests/__pycache__/testbot.cpython-38.pyc
+deleted file mode 100644
+index 773f89e8..00000000
+Binary files a/tests/__pycache__/testbot.cpython-38.pyc and /dev/null differ
+diff --git a/tests/checkpoint_test/cp_sevennet_0/continue_input.yaml b/tests/checkpoint_test/cp_sevennet_0/continue_input.yaml
+index 4b1595a2..96cc1aba 100644
+--- a/tests/checkpoint_test/cp_sevennet_0/continue_input.yaml
++++ b/tests/checkpoint_test/cp_sevennet_0/continue_input.yaml
+@@ -24,7 +24,6 @@ model:
+     act_gate: {'e': 'silu', 'o': 'tanh'}          # Equivalent to 'nonlinearity_gates' in nequip.
+     act_scalar: {'e': 'silu', 'o': 'tanh'}        # Equivalent to 'nonlinearity_scalars' in nequip.
+ 
+-    avg_num_neigh       : 1368.726                # Normalize the aggregation of messages by the average number of neighbors calculated from the training set
+     train_shift_scale   : False                   # Enable training for shift & scale. Useful if the dataset is augmented
+     train_avg_num_neigh : False                   # Enable training for avg_num_neigh. Useful if the dataset is augmented
+     optimize_by_reduce: True

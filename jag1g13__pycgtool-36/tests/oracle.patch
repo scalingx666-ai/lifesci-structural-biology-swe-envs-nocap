@@ -1,0 +1,454 @@
+diff --git a/pycgtool/__main__.py b/pycgtool/__main__.py
+index dcd2412..bdef110 100755
+--- a/pycgtool/__main__.py
++++ b/pycgtool/__main__.py
+@@ -7,8 +7,6 @@
+ import sys
+ import typing
+ 
+-import tqdm
+-
+ from .frame import Frame
+ from .mapping import Mapping
+ from .bondset import BondSet
+@@ -76,15 +74,7 @@ def mapping_loop(frame: Frame, config) -> typing.Tuple[Frame, Mapping]:
+     mapping = Mapping(config.map, config, itp_filename=config.itp)
+ 
+     cg_frame = mapping.apply(frame)
+-    cg_frame.save(get_output_filepath('gro', config))
+-
+-    logger.info("Beginning analysis of %d frames", config.end - config.begin)
+-
+-    if config.xtc:
+-        # Main loop - perform mapping on every frame in trajectory
+-        for _ in tqdm.trange(config.begin, config.end):
+-            frame.next_frame()
+-            mapping.apply(frame, cg_frame=cg_frame)
++    cg_frame.save(get_output_filepath('gro', config), frame_number=0)
+ 
+     return cg_frame, mapping
+ 
+@@ -99,14 +89,8 @@ def full_run(config):
+     frame = Frame(
+         topology_file=config.gro,
+         trajectory_file=config.xtc,  # May be None
+-        frame_start=config.begin)
+-
+-    try:
+-        config.end = min(config.end, frame.numframes)
+-
+-    except TypeError:
+-        # Value of args.end was None
+-        config.end = frame.numframes
++        frame_start=config.begin,
++        frame_end=config.end)
+ 
+     if config.map:
+         cg_frame, mapping = mapping_loop(frame, config)
+diff --git a/pycgtool/frame.py b/pycgtool/frame.py
+index 511926d..6af7f2e 100644
+--- a/pycgtool/frame.py
++++ b/pycgtool/frame.py
+@@ -36,9 +36,15 @@ class Frame:
+     def __init__(self,
+                  topology_file: typing.Optional[str] = None,
+                  trajectory_file: typing.Optional[str] = None,
+-                 frame_start: int = 0):
+-        self.frame_number = frame_start
+-
++                 frame_start: int = 0,
++                 frame_end: typing.Optional[int] = None):
++        """Load a simulation trajectory.
++
++        :param topology_file: File containing system topology
++        :param trajectory_file: File containing simulation trajectory
++        :param frame_start: First frame of trajectory to use
++        :param frame_end: Last frame of trajectory to use
++        """
+         if topology_file:
+             try:
+                 self._trajectory = mdtraj.load(topology_file)
+@@ -46,13 +52,16 @@ def __init__(self,
+ 
+                 if trajectory_file:
+                     try:
+-                        self._trajectory = mdtraj.load(trajectory_file,
+-                                                       top=self._topology)
++                        self._trajectory = mdtraj.load(
++                            trajectory_file,
++                            top=self._topology)
++
++                        self._slice_trajectory(frame_start, frame_end)
+ 
+                     except ValueError as exc:
+                         raise NonMatchingSystemError from exc
+ 
+-                self._load_trajectory_frame(self.frame_number)
++                self._load_trajectory()
+ 
+             except OSError as exc:
+                 if 'no loader' in str(exc):
+@@ -64,39 +73,44 @@ def __init__(self,
+             # No topology - we're probably building a CG frame
+             self._topology = mdtraj.Topology()
+ 
+-    def _load_trajectory_frame(self, frame_number) -> None:
+-        """Load a trajectory frame into the frame attributes."""
++    def _slice_trajectory(
++            self,
++            frame_start: int = 0,
++            frame_end: typing.Optional[int] = None) -> mdtraj.Trajectory:
++        """Slice input simulation trajectory to a subset of frames.
++
++        :param frame_start: First frame of trajectory to use
++        :param frame_end: Last frame of trajectory to use
++        """
++        traj = self._trajectory
++
++        if frame_start != 0:
++            if frame_end is not None:
++                traj = traj[frame_start:frame_end]
++
++            else:
++                traj = traj[frame_start:]
++
++        return traj
++
++    def _load_trajectory(self) -> None:
++        """Load a trajectory into the frame attributes."""
+         # Improve performance by not double indexing repeatedly
+         traj = self._trajectory
+ 
+-        xyz_frame = traj.xyz[frame_number]
+         for atom in self._topology.atoms:
+-            atom.coords = xyz_frame[atom.index]
++            atom.coords = traj.xyz[:, atom.index]
+ 
+         # TODO handle non-cubic boxes
+         try:
+-            self.unitcell_lengths = traj.unitcell_lengths[frame_number]
+-            self.unitcell_angles = traj.unitcell_angles[frame_number]
++            self.unitcell_lengths = traj.unitcell_lengths
++            self.unitcell_angles = traj.unitcell_angles
+ 
+         except TypeError:
+             self.unitcell_lengths = None
+             self.unitcell_angles = None
+ 
+-        self.time = traj.time[frame_number]
+-
+-    def next_frame(self) -> bool:
+-        """Load the next trajectory frame into the frame attributes.
+-
+-        :return: Loading next frame was successful?
+-        """
+-        try:
+-            self._load_trajectory_frame(self.frame_number + 1)
+-
+-        except IndexError:
+-            return False
+-
+-        self.frame_number += 1
+-        return True
++        self.time = traj.time
+ 
+     @property
+     def residues(self):
+@@ -122,10 +136,9 @@ def natoms(self) -> int:
+         return self._topology.n_atoms
+ 
+     @property
+-    def numframes(self) -> int:
+-        """Number of frames in the frame trajectory."""
+-        # The MDTraj trajectory has the topology file as frame 0
+-        return self._trajectory.n_frames - 1
++    def n_frames(self) -> int:
++        """Number of frames in the trajectory."""
++        return self._trajectory.n_frames
+ 
+     def add_residue(self,
+                     name,
+@@ -168,28 +181,39 @@ def add_atom(
+ 
+         return self._topology.add_atom(name, element, residue)
+ 
+-    def save(self, filename, **kwargs) -> None:
++    def save(self,
++             filename: str,
++             frame_number: typing.Optional[int] = None,
++             **kwargs) -> None:
+         """Write trajctory to file.
+ 
+         :param filename: Name of output file
+         """
+-        self._trajectory.save(str(filename), **kwargs)
++        traj = self._trajectory
++        if frame_number is not None:
++            traj = traj.slice(frame_number)
+ 
+-    def add_frame_to_trajectory(self) -> None:
+-        """Add a new trajectory frame from the values stored as attributes on this frame."""
++        traj.save(str(filename), **kwargs)
++
++    def build_trajectory(self) -> None:
++        """Build an MDTraj trajectory from atom coordinates and the values stored as attributes on this frame."""
+         xyz = np.array([atom.coords for atom in self._topology.atoms])
+ 
++        # We currently have axes: 0 - each atom, 1 - timestep, 2 - xyz coords
++        # Need to convert to axes: 0 - timestep, 1 - each atom, 2 - xyz coords
++        xyz = xyz.swapaxes(0, 1)
++
+         optional_values = {
+-            attr: None if getattr(self, attr) is None else [getattr(self, attr)]
++            attr: getattr(self, attr, None)
+             for attr in {'time', 'unitcell_lengths', 'unitcell_angles'}
+         }  # yapf: disable
+ 
+-        new_frame = mdtraj.Trajectory(xyz,
+-                                      topology=self._topology,
+-                                      **optional_values)
++        new_trajectory = mdtraj.Trajectory(xyz,
++                                           topology=self._topology,
++                                           **optional_values)
+ 
+         if hasattr(self, '_trajectory'):
+-            self._trajectory += new_frame
++            self._trajectory += new_trajectory
+ 
+         else:
+-            self._trajectory = new_frame
++            self._trajectory = new_trajectory
+diff --git a/pycgtool/mapping.py b/pycgtool/mapping.py
+index 1197d50..7046654 100644
+--- a/pycgtool/mapping.py
++++ b/pycgtool/mapping.py
+@@ -378,7 +378,6 @@ def apply(self, frame: Frame, cg_frame: typing.Optional[Frame] = None):
+             # Frame needs initialising
+             cg_frame = self._cg_frame_setup(frame.residues)
+ 
+-        cg_frame.frame_number = frame.frame_number
+         cg_frame.time = frame.time
+         cg_frame.unitcell_lengths = frame.unitcell_lengths
+         cg_frame.unitcell_angles = frame.unitcell_angles
+@@ -417,7 +416,7 @@ def apply(self, frame: Frame, cg_frame: typing.Optional[Frame] = None):
+                                                      bmap.weights,
+                                                      unitcell_lengths)
+ 
+-        cg_frame.add_frame_to_trajectory()
++        cg_frame.build_trajectory()
+ 
+         return cg_frame
+ 
+@@ -437,7 +436,7 @@ def calc_coords_weight(ref_coords, coords, weights, box=None):
+         vectors -= box * np.rint(vectors / box)
+ 
+     # Reshape weights array to match atom positions
+-    weights_t = weights[np.newaxis].T
++    weights_t = weights[np.newaxis, np.newaxis].T
+     result = np.sum(weights_t * vectors, axis=0)
+     result += ref_coords
+     return result
+diff --git a/test/test_bondset.py b/test/test_bondset.py
+index 08d5629..430559f 100644
+--- a/test/test_bondset.py
++++ b/test/test_bondset.py
+@@ -104,8 +104,6 @@ def test_bondset_boltzmann_invert(self):
+         mapping = Mapping('test/data/sugar.map', DummyOptions)
+ 
+         cg_frame = mapping.apply(frame)
+-        while frame.next_frame():
+-            cg_frame = mapping.apply(frame, cg_frame=cg_frame)
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+@@ -121,8 +119,6 @@ class DefaultOptions(DummyOptions):
+         mapping = Mapping('test/data/sugar.map', DefaultOptions)
+ 
+         cg_frame = mapping.apply(frame)
+-        while frame.next_frame():
+-            cg_frame = mapping.apply(frame, cg_frame=cg_frame)
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+@@ -140,8 +136,6 @@ class FuncFormOptions(DummyOptions):
+         mapping = Mapping('test/data/sugar.map', DummyOptions)
+ 
+         cg_frame = mapping.apply(frame)
+-        while frame.next_frame():
+-            cg_frame = mapping.apply(frame, cg_frame=cg_frame)
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+@@ -180,10 +174,8 @@ def test_full_itp_sugar(self):
+         measure = BondSet('test/data/sugar.bnd', DummyOptions)
+         frame = Frame('test/data/sugar.gro', 'test/data/sugar.xtc')
+         mapping = Mapping('test/data/sugar.map', DummyOptions)
+-        cg_frame = mapping.apply(frame)
+ 
+-        while frame.next_frame():
+-            cg_frame = mapping.apply(frame, cg_frame=cg_frame)
++        cg_frame = mapping.apply(frame)
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+@@ -200,6 +192,7 @@ def test_full_itp_vsites(self):
+         measure = BondSet('test/data/martini3/naphthalene.bnd', options)
+         frame = Frame('test/data/martini3/naphthalene.gro')
+         mapping = Mapping('test/data/martini3/naphthalene.map', options)
++
+         cg_frame = mapping.apply(frame)
+ 
+         measure.apply(cg_frame)
+@@ -220,10 +213,8 @@ def test_dump_bonds(self):
+         measure = BondSet('test/data/sugar.bnd', DummyOptions)
+         frame = Frame('test/data/sugar.gro', 'test/data/sugar.xtc')
+         mapping = Mapping('test/data/sugar.map', DummyOptions)
+-        cg_frame = mapping.apply(frame)
+ 
+-        while frame.next_frame():
+-            cg_frame = mapping.apply(frame, cg_frame=cg_frame)
++        cg_frame = mapping.apply(frame)
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+diff --git a/test/test_frame.py b/test/test_frame.py
+index fd340dd..9cc64a9 100644
+--- a/test/test_frame.py
++++ b/test/test_frame.py
+@@ -33,8 +33,8 @@ def check_reference_topology(self, frame, skip_names=True):
+     def check_reference_frame(self, frame):
+         self.check_reference_topology(frame)
+ 
+-        atom0_coords = np.array([0.696, 1.330, 1.211])
+-        box_vectors = np.array([1.89868, 1.89868, 1.89868])
++        atom0_coords = np.array([[0.696, 1.330, 1.211]])
++        box_vectors = np.array([[1.89868, 1.89868, 1.89868]])
+ 
+         np.testing.assert_allclose(atom0_coords, frame.atom(0).coords)
+         np.testing.assert_allclose(box_vectors, frame.unitcell_lengths,
+@@ -43,18 +43,38 @@ def check_reference_frame(self, frame):
+     def check_reference_trajectory(self, frame):
+         self.check_reference_topology(frame)
+ 
+-        atom0_coords_array = np.array([[1.176, 1.152, 1.586],
+-                                       [1.122, 1.130, 1.534]])
++        atom0_coords = np.array([
++            [1.176     , 1.1520001 , 1.5860001 ],
++            [1.1220001 , 1.13      , 1.534     ],
++            [1.0580001 , 1.1620001 , 1.462     ],
++            [0.91600007, 1.276     , 1.5580001 ],
++            [0.73200005, 1.1240001 , 1.286     ],
++            [0.64000005, 1.2160001 , 1.258     ],
++            [0.632     , 1.312     , 1.2520001 ],
++            [0.606     , 1.284     , 1.246     ],
++            [0.582     , 1.312     , 1.1600001 ],
++            [0.68200004, 1.22      , 1.25      ],
++            [0.69600004, 1.33      , 1.21      ],
++        ], dtype=np.float32)  # yapf: disable
++
++        unitcell_lengths = np.array([
++            [1.9052   , 1.9052   , 1.9052   ],
++            [1.9032527, 1.9032527, 1.9032527],
++            [1.9040661, 1.9040661, 1.9040661],
++            [1.896811 , 1.896811 , 1.896811 ],
++            [1.8985983, 1.8985983, 1.8985983],
++            [1.9033976, 1.9033976, 1.9033976],
++            [1.8904614, 1.8904614, 1.8904614],
++            [1.9013108, 1.9013108, 1.9013108],
++            [1.8946321, 1.8946321, 1.8946321],
++            [1.898091 , 1.898091 , 1.898091 ],
++            [1.898684 , 1.898684 , 1.898684 ],
++        ], dtype=np.float32)  # yapf: disable
+ 
+-        box_vectors_array = np.array([[1.9052, 1.9052, 1.9052],
+-                                      [1.90325272, 1.90325272, 1.90325272]])
+-
+-        for _, (atom0_coords, box_vectors) in enumerate(
+-                zip(atom0_coords_array, box_vectors_array)):
+-            np.testing.assert_allclose(atom0_coords, frame.atom(0).coords)
+-            np.testing.assert_allclose(box_vectors, frame.unitcell_lengths,
+-                                       rtol=1e-4)  # PDB files are f9.3
+-            frame.next_frame()
++        np.testing.assert_allclose(atom0_coords, frame.atom(0).coords)
++        np.testing.assert_allclose(unitcell_lengths,
++                                   frame.unitcell_lengths,
++                                   rtol=1e-4)  # PDB files are f9.3
+ 
+     def test_frame_create(self):
+         Frame()
+@@ -92,7 +112,7 @@ def test_frame_output_gro(self):
+ 
+     def test_frame_read_xtc_numframes(self):
+         frame = Frame('test/data/water.gro', 'test/data/water.xtc')
+-        self.assertEqual(10, frame.numframes)
++        self.assertEqual(11, frame.n_frames)
+ 
+     def test_frame_read_xtc(self):
+         frame = Frame('test/data/water.gro', 'test/data/water.xtc')
+diff --git a/test/test_mapping.py b/test/test_mapping.py
+index fa1d6ca..d6f987b 100644
+--- a/test/test_mapping.py
++++ b/test/test_mapping.py
+@@ -110,7 +110,7 @@ def test_mapping_weights_geom(self):
+         mapping = Mapping("test/data/two.map", DummyOptions)
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([1.5, 1.5, 1.5]),
++        np.testing.assert_allclose(np.array([[1.5, 1.5, 1.5]]),
+                                    cg_frame.residue(0).atom(0).coords)
+ 
+     def test_virtual_mapping_weights_geom(self):
+@@ -119,7 +119,7 @@ def test_virtual_mapping_weights_geom(self):
+         mapping = Mapping("test/data/martini3/four.map", DummyOptions)
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([2.5, 2.5, 2.5]), 
++        np.testing.assert_allclose(np.array([[2.5, 2.5, 2.5]]), 
+                                    cg_frame.residue(0).atom(2).coords)
+ 
+     def test_mapping_weights_mass(self):
+@@ -130,7 +130,7 @@ def test_mapping_weights_mass(self):
+         mapping = Mapping("test/data/two.map", options, itp_filename="test/data/two.itp")
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([2., 2., 2.]),
++        np.testing.assert_allclose(np.array([[2., 2., 2.]]),
+                                    cg_frame.residue(0).atom(0).coords)
+ 
+     def test_virtual_mapping_weights_mass(self):
+@@ -141,7 +141,7 @@ def test_virtual_mapping_weights_mass(self):
+         mapping = Mapping("test/data/martini3/four.map", options, itp_filename="test/data/martini3/four.itp")
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([3.0, 3.0, 3.0]),
++        np.testing.assert_allclose(np.array([[3.0, 3.0, 3.0]]),
+                                    cg_frame.residue(0).atom(2).coords)
+ 
+     def test_mapping_weights_guess_mass(self):
+@@ -152,7 +152,7 @@ def test_mapping_weights_guess_mass(self):
+         mapping = Mapping("test/data/two.map", options)
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([1.922575,  1.922575,  1.922575], dtype=np.float32),
++        np.testing.assert_allclose(np.array([[1.922575,  1.922575,  1.922575]], dtype=np.float32),
+                                    cg_frame.residue(0).atom(0).coords, rtol=0.01)
+ 
+     def test_virtual_mapping_weights_guess_mass(self):
+@@ -163,7 +163,7 @@ def test_virtual_mapping_weights_guess_mass(self):
+         mapping = Mapping("test/data/martini3/four.map", options)
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([2.83337, 2.83337, 2.83337], dtype=np.float32),
++        np.testing.assert_allclose(np.array([[2.83337, 2.83337, 2.83337]], dtype=np.float32),
+                                    cg_frame.residue(0).atom(2).coords, rtol=0.01)
+ 
+     def test_mapping_weights_first(self):
+@@ -174,7 +174,7 @@ def test_mapping_weights_first(self):
+         mapping = Mapping("test/data/two.map", options, itp_filename="test/data/two.itp")
+         cg_frame = mapping.apply(frame)
+ 
+-        np.testing.assert_allclose(np.array([1., 1., 1.]),
++        np.testing.assert_allclose(np.array([[1., 1., 1.]]),
+                                    cg_frame.residue(0).atom(0).coords)
+ 
+     def test_mapping_itp_multi(self):

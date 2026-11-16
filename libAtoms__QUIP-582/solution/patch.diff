@@ -1,0 +1,665 @@
+diff --git a/doc/Tutorials/GAP_Committee_Test.png b/doc/Tutorials/GAP_Committee_Test.png
+new file mode 100644
+index 000000000..d8873c616
+Binary files /dev/null and b/doc/Tutorials/GAP_Committee_Test.png differ
+diff --git a/doc/Tutorials/committee_modelling.rst b/doc/Tutorials/committee_modelling.rst
+new file mode 100644
+index 000000000..805f78b8f
+--- /dev/null
++++ b/doc/Tutorials/committee_modelling.rst
+@@ -0,0 +1,80 @@
++.. currentmodule:: quippy
++
++Committee Modelling using GAP potentials 
++***************************************************
++
++Because GAP models are linear with respect to the weights, the full posterior distribution on the coefficients, :math:`c`, is analytic:
++
++.. math::
++    c \sim \mathcal{N}(\mu_c, (K_{MN} \Sigma^{-1} K_{NM} + K_{MM})^{-1})
++
++This means that the full posterior can be evaluated and saved during fitting, and that samples from the posterior can be drawn at any time.
++
++
++Exporting the GAP Posterior Covariance
++--------------------------------------
++
++In order to access the posterior covariance matrix, a new GAP model needs to be trained by ``gap_fit`` with the *export_covariance=T* command line option. 
++When the model is trained using SCALAPACK, this should create a new file of the form <GAP_NAME>.R.<GAP_LABEL>. 
++The matrix :math:`R` defined by the file is a square root of the posterior precision matrix, IE :math:`c \sim \mathcal{N}(\mu_c, (R^T R)^{-1})`.
++
++
++Drawing committees from the Posterior Covariance
++--------------------------------------
++The ``quippy.gap_tools`` module contains a thin wrapper class to the GAP XML file, which we can use in order to draw a committee of models.
++The ``get_xml_committee`` function can be used to generate a list of committee members in the form of these wrapper classes. 
++The committee members can each be saved back down to xml files using the ``<object>.save(fname)`` method, or transformed into ``quippy.potential.Potential`` calculators using the ``<object>.as_potential()`` method.
++
++The ``get_calc_committee`` function works similarly to ``get_xml_committee``, except that it returns the ``Potential`` objects directly. Potential objects created by ``get_calc_committee`` or ``<xml_wrapper_object>.as_potential()`` are given an additional attribute ``potential.xml``, which is a reference to the corresponding xml wrapper.
++
++Each xml wrapper object stored all the information required to generate new committee samples, which means that calling ``<object>.draw_posterior_samples(num_samples)`` will generate a new list of xml wrapper objects corresponding to a new committee.
++
++
++Code Example
++--------------------------------------
++
++The code block generates an xml wrapper committee from a GAP xml file. It then saves down the committee, and generates a list of potentials. Finally, it uses the committee to test the uncertainty in a prediction of total energy.
++
++.. code:: ipython3
++
++    %pylab inline
++    from ase.io import read
++    from quippy.gap_tools import get_xml_committee
++    import numpy as np
++    import matplotlib.pyplot as plt
++
++    gap_xml = "Carbon_GAP.xml"
++    num_committors = 60
++
++    # Generate committee from given GAP model
++    xml_committee = get_xml_committee(gap_xml, num_committors)
++
++    calc_committee = []
++
++    # Save all committee members to XML files
++    # Generate a list of quippy Potentials for committee
++    for i in range(num_committors):
++        xml_committee[i].save(f"GAP_Committee/Committor_{i}.xml")
++        calc_committee.append(xml_committee[i].as_potential())
++
++
++    structure = read("Carbon_Data_Set_Subset.xyz", index="0")
++
++    E_pred = np.zeros((num_committors))
++
++    # Sample total energy on a structure
++    for i in range(num_committors):
++        structure.calc = calc_committee[i]
++        E_pred[i] = structure.get_potential_energy()
++
++
++    plt.hist(E_pred, bins=20)
++    plt.xlabel("Total Energy (eV)")
++    plt.ylabel("Frequency")
++    plt.title("GAP Committee predicted distribution of the total energy of a structure")
++    plt.savefig("GAP_Committee_Test.png")
++
++
++.. image:: GAP_Committee_Test.png
++  :width: 600
++  :align: center
+\ No newline at end of file
+diff --git a/doc/Tutorials/index.rst b/doc/Tutorials/index.rst
+index 16bfc1c4f..1dc8a3619 100644
+--- a/doc/Tutorials/index.rst
++++ b/doc/Tutorials/index.rst
+@@ -10,3 +10,4 @@ The following tutorials are currently available:
+     quippy-ase-interoperability.rst
+     adglass.rst
+     adaptive-qmmm.rst
++    committee_modelling.rst
+\ No newline at end of file
+diff --git a/quippy/init.py b/quippy/init.py
+index e436757c1..d871480b7 100644
+--- a/quippy/init.py
++++ b/quippy/init.py
+@@ -29,7 +29,7 @@
+ import quippy.potential
+ import quippy.descriptors
+ import quippy.nye_tensor
+-
++import quippy.gap_tools
+ import atexit
+ 
+ # Reference values of .true. and .false. from Fortran
+diff --git a/quippy/quippy/gap_tools.py b/quippy/quippy/gap_tools.py
+new file mode 100644
+index 000000000..5e58d903b
+--- /dev/null
++++ b/quippy/quippy/gap_tools.py
+@@ -0,0 +1,279 @@
++import numpy as np
++from xml.etree.ElementTree import parse, fromstring, tostring, ElementTree
++import re
++import os
++from quippy.descriptors import Descriptor
++from quippy.potential import Potential
++from ase.data import chemical_symbols
++
++try: # Try to use triangular solve (faster), if available
++    from scipy.linalg import solve_triangular as solve
++except ImportError: # Revert to general solve
++    solve = np.linalg.solve
++
++
++
++
++class DescXMLWrapper():
++    '''
++    Small wrapper for storing key descriptor info from a GAP xml file
++
++    Key attributes:
++    self.quip_desc : Corresponding quippy.descriptors.Descriptor object
++    self.nsparse : Number of sparse points in the descriptor sparse GP
++    self.weights : Weights for the descriptor sparse GP
++    self.sparse_cuts : Cutoff function evaluations for each of the sparse points
++    self.cov_type : Covariance kernel string
++    self.desc_type : Name of descriptor function
++    self.name : Useful name for the descriptor
++
++
++    '''
++    _Z_regex = "(Z|z)[1-9]*\s?=\s?([1-9]+)"  # RegEx to search command line for "Z=, Z1 = or z2= style args"
++    _Z_regex = re.compile(_Z_regex)
++
++    # RegEx to find the dot_product exponents from command line args
++    _exponent_regex = "exponents\s?=\s?.((\s?(-\d+)\s?)+)."
++    _exponent_regex = re.compile(_exponent_regex)
++
++    def __init__(self, desc_xml):
++        self.weights = np.array([float(child.attrib["alpha"])
++                                for child in desc_xml if "sparseX" in child.tag])
++        self.sparse_cuts = np.array([float(
++            child.attrib["sparseCutoff"]) for child in desc_xml if "sparseX" in child.tag])
++
++        self.nsparse = self.weights.shape[0]
++
++        self.delta = float(desc_xml.attrib["signal_variance"])
++        self._int_cov_type = int(desc_xml.attrib["covariance_type"])
++
++        if self._int_cov_type == 1:  # ard_se
++            self.cov_prop = float([child.text.split()[0]
++                                  for child in desc_xml if "theta" in child.tag][0])
++            self.cov_type = "ard_se"
++        elif self._int_cov_type == 2:  # dot_product
++            self.cov_prop = float(desc_xml.attrib["zeta"])
++            self.cov_type = "dot_product"
++        else:
++            self.cov_prop = []
++            self.cov_type = "UNKNOWN"
++
++        _desc_children = [
++            child for child in desc_xml if "descriptor" in child.tag]
++
++        self._cmd = _desc_children[0].text
++
++        self.desc_type = self._cmd.split(" ")[0]
++
++        Zs = self._Z_regex.findall(self._cmd)
++
++        self.Zs = [Z[1] for Z in Zs]
++
++        self.name = "".join([chemical_symbols[int(Z)]
++                            for Z in self.Zs]) + " " + self.desc_type
++
++        self.quip_desc = Descriptor(self._cmd)
++
++
++class GAPXMLWrapper():
++    '''
++    Small wrapper class to store key GAP information
++
++    Key Attributes:
++    self.gap_label : Label of the GAP potential
++    self.isolated_atom_energies : dict of E0s; E0 for species Z is self.isolated_atom_energies[Z]
++    self.num_desc : Number of descriptors
++    self.descriptors : list of DescXMLWrapper objects for GAP descriptors
++    self.total_nsparse : Number of sparse points for the GAP model
++    self.weights : Full weights for the GAP model
++    self.mean_weights : Mean weights for the original GAP model (IE: self.weights are changed for committors, self.mean_weights is fixed)
++
++    Key Methods:
++    self.save(fname) : Save the xml data back to an xml file
++    self.as_potential() : Return the equivalent quippy.potential.Potential
++    self.draw_posterior_sample(num_samples) : Draw samples from the posterior, if available
++    '''
++
++    def __init__(self, xml, mean_weights=None, xml_dir=None):
++        self._xml_tree = xml
++        root = self._xml_tree.getroot()
++
++
++        if xml_dir is not None:
++            self.xml_dir = xml_dir
++        else:
++            self.xml_dir = os.getcwd()
++
++        self.gap_label = root[0].attrib["label"]
++
++        iso_atom_energies = root[1][0][:]
++
++        self.isolated_atom_energies = {}
++
++        for item in iso_atom_energies:
++            self.isolated_atom_energies[int(item.attrib["Z"])] = float(
++                item.attrib["value"])
++
++        descriptors = root[1][1][:]
++
++        self.num_desc = len(descriptors)
++
++        self.descriptors = [DescXMLWrapper(desc_xml)
++                            for desc_xml in descriptors]
++
++        self.weights = np.block([desc.weights for desc in self.descriptors])
++
++        self.total_nsparse = self.weights.shape[0]
++
++        if mean_weights is not None:
++            self.mean_weights = mean_weights
++        else:
++            self.mean_weights = self.weights.copy()
++
++    def save(self, fname):
++        '''
++        Save internal XML tree to fname
++        '''
++
++        file_dir = os.path.dirname(fname)
++
++        if len(file_dir) == 0: # File should be saved to cwd
++            dest_dir = os.getcwd()
++
++        else:
++            dest_dir = file_dir
++
++        # Save XML file
++        with open(fname, "wb") as f:
++            self._xml_tree.write(f)
++
++        # Find all sparseX files from source of GAP xml
++        xml_src_files = [file for file in os.listdir(self.xml_dir) if ".sparseX."+self.gap_label in file]
++
++        xml_dest_files = os.listdir(dest_dir)
++
++        # Generate symlinks to original sparseX files
++        for sparse_file in xml_src_files:
++            if sparse_file not in xml_dest_files: # File does not exist in dir where xml will be saved
++                os.symlink(self.xml_dir + os.sep + sparse_file, dest_dir + os.sep + sparse_file)
++
++    def as_potential(self):
++        '''
++        Return quippy.potential.Potential equivalent to the model defined by the internal XML tree
++        '''
++
++        cwd = os.getcwd() # Remember which dir we're supposed to be in
++
++        try:
++            os.chdir(self.xml_dir) # Change to same dir as the xml, so QUIP can find sparseX files
++            
++            pot = Potential(param_str=tostring(self._xml_tree.getroot()))
++            pot.xml = self
++
++        except (TypeError, RuntimeError):
++            raise FileNotFoundError(f"Conversion to quippy Potential failed, likely because sparseX files were not found in directory {self.xml_dir}")
++
++        finally:
++            os.chdir(cwd) # Ensure we always end in the same dir we started
++
++        return pot
++
++    def _posterior_sample(self):
++        if self.R is not None:
++            z = np.random.normal(size=self.total_nsparse)
++
++            return self.mean_weights + np.linalg.solve(self.R, z)
++        else:
++            raise FileNotFoundError(f"R matrix not found in directory {self.xml_dir}.")
++
++    def _xml_sample(self):
++        new_weights = self._posterior_sample()
++
++        new_root = fromstring(tostring(self._xml_tree.getroot()))
++
++        new_tree = ElementTree(new_root)
++
++        new_descs = new_root[1][1][:]
++
++        isparse = 0
++
++        for i in range(self.num_desc):
++
++            desc_nsparse = self.descriptors[i].nsparse
++
++            desc_wts = [child for child in new_descs[i]
++                        if "sparseX" in child.tag]
++
++            for j in range(desc_nsparse):
++                desc_wts[j].attrib["alpha"] = str(new_weights[isparse])
++                isparse += 1
++
++        XYZ_data = [child for child in new_root[1] if child.tag == "XYZ_data"]
++
++        if len(XYZ_data):  # Parent xml has XYZ data
++            for dat in XYZ_data:
++                new_root[1].remove(dat)
++
++        return new_tree
++
++    def draw_posterior_samples(self, num_samples=1):
++        '''
++        Draw samples from the posterior of the GAP model
++        Only possible if <GAP_fname>.R.<GAP_label> exists in the same dir as the GAP XML file
++        '''
++        if num_samples == 1:
++            return GAPXMLWrapper(self._xml_sample(), mean_weights=self.mean_weights, xml_dir=self.xml_dir)
++        else:
++            return [self.draw_posterior_samples() for i in range(num_samples)]
++
++
++def read_xml(path_to_xml):
++    '''
++    Generate an instance of GAPXMLWrapper for given XML file
++    '''
++
++    xml_dir = os.path.dirname(path_to_xml)
++
++    if len(xml_dir) == 0: # XML in cwd
++        xml_dir = os.getcwd()
++
++    
++    gap = GAPXMLWrapper(parse(path_to_xml), xml_dir=xml_dir)
++
++    R_fname = path_to_xml + ".R." + gap.gap_label
++
++    if os.path.exists(R_fname):
++        gap.R = np.loadtxt(R_fname).reshape(
++            (gap.total_nsparse, gap.total_nsparse)).T
++    else:
++        gap.R = None
++
++    return gap
++
++
++def get_xml_committee(path_to_xml, committee_size, return_core_wrapper=False):
++    '''
++    Sample a committee of GAPXMLWrappers based on the model defined by path_to_xml XML file
++    '''
++    gap_wrapper = read_xml(path_to_xml)
++
++    committee = gap_wrapper.draw_posterior_samples(committee_size)
++
++    if return_core_wrapper:
++        return committee, gap_wrapper
++    else:
++        return committee
++
++
++def get_calc_committee(path_to_xml, committee_size, return_core_wrapper=False):
++    '''
++    Sample a committee of quippy.potential.Potentials based on the model defined by path_to_xml XML file
++    '''
++    xml_committee, gap_wrapper = get_xml_committee(
++        path_to_xml, committee_size, return_core_wrapper=True)
++    calc_committee = [model.as_potential() for model in xml_committee]
++
++    if return_core_wrapper:
++        return calc_committee, gap_wrapper
++    else:
++        return calc_committee
+diff --git a/src/GAP b/src/GAP
+index e9442fdc9..48ba399e5 160000
+--- a/src/GAP
++++ b/src/GAP
+@@ -1 +1 @@
+-Subproject commit e9442fdc93fac6b1581d18151925b14bf1b26324
++Subproject commit 48ba399e503c0f44be927acceaec3bd212f5dc20
+diff --git a/src/libAtoms/Matrix.f95 b/src/libAtoms/Matrix.f95
+index 9d30ecd59..4475d26d7 100644
+--- a/src/libAtoms/Matrix.f95
++++ b/src/libAtoms/Matrix.f95
+@@ -272,6 +272,45 @@ subroutine MatrixD_to_array1d(this, array)
+   end if
+ end subroutine MatrixD_to_array1d
+ 
++subroutine MatrixD_to_MatrixD(A, B, M, N, ia, ja, ib, jb, UPLO)
++  ! Copy general submatrix A%data(ia:ia+M-1, ja:ja+N-1) to B%data(ib:ib+M-1, jb:jb+N-1)
++  ! For ScaLAPACK use, assumes the BLACS context of B is the same as (or a child of) the context of A
++  ! If UPLO is present, only copy upper (UPLO="U") or lower (UPLO="L") triangle
++  type(MatrixD), intent(in) :: A
++  type(MatrixD), intent(inout) :: B
++  integer, intent(in) :: M, N
++  integer, intent(in), optional:: ia, ja, ib, jb
++  character(1), intent(in), optional :: UPLO
++
++  integer :: my_ia, my_ja, my_ib, my_jb
++
++  character(1) :: my_uplo
++
++  my_uplo = optional_default("F", UPLO)
++
++  if (A%ScaLAPACK_Info_obj%active .and. B%ScaLAPACK_Info_obj%active) then ! ScaLAPACK
++
++    if ((my_uplo /= "U") .and. (my_uplo /= "L")) then ! Assume full matrix copy
++      call ScaLAPACK_pdgemr2d_wrapper(A%ScaLAPACK_Info_obj, A%data, B%ScaLAPACK_Info_obj, B%data, &
++          A%ScaLAPACK_Info_obj%ScaLAPACK_obj%blacs_context, M, N, ia, ja, ib, jb)
++
++    else
++      ! Triangular matrix ScaLAPACK copy
++      call ScaLAPACK_pdtrmr2d_wrapper(my_uplo, "N", A%ScaLAPACK_Info_obj, A%data, B%ScaLAPACK_Info_obj, B%data, &
++          A%ScaLAPACK_Info_obj%ScaLAPACK_obj%blacs_context, M, N, ia, ja, ib, jb)
++    endif
++
++  else ! non-MPI
++    my_ia = optional_default(1, ia)
++    my_ja = optional_default(1, ja)
++    my_ib = optional_default(1, ib)
++    my_jb = optional_default(1, jb)
++
++    ! my_uplo = "F" will be interpreted as default full copy
++    call dlacpy(my_uplo, M, N, A%data(my_ia:my_ia+M-1, my_ja:my_ja+N-1), M, B%data(my_ib:my_ib+M-1, my_jb:my_jb+N-1), M)
++  end if
++end subroutine MatrixD_to_MatrixD
++
+ subroutine MatrixD_QR_Solve(A_SP, B_SP, cheat_nb_A)
+   type(MatrixD), intent(inout) :: A_SP, B_SP
+   logical, intent(in) :: cheat_nb_A
+@@ -285,12 +324,14 @@ subroutine MatrixD_QR_Solve(A_SP, B_SP, cheat_nb_A)
+   endif
+ end subroutine MatrixD_QR_Solve
+ 
+-subroutine SP_Matrix_QR_Solve(A, B, X, ScaLAPACK_obj, mb_A, nb_A)
++subroutine SP_Matrix_QR_Solve(A, B, X, ScaLAPACK_obj, mb_A, nb_A, R, do_export_R)
+   real(dp), intent(inout), dimension(:,:), target :: A
+   real(dp), intent(inout), dimension(:), target :: B
+   real(dp), intent(out), dimension(:) :: X
+   type(ScaLAPACK), intent(in) :: ScaLAPACK_obj
+   integer, intent(in) :: mb_A, nb_A
++  real(dp), intent(out), dimension(:, :), allocatable, optional :: R
++  logical, intent(in), optional :: do_export_R
+ 
+   logical :: cheat_nb_A
+   integer :: mb, nb, ml, nl, mg, ng
+@@ -325,12 +366,59 @@ subroutine SP_Matrix_QR_Solve(A, B, X, ScaLAPACK_obj, mb_A, nb_A)
+ 
+   ! Scalapack needs mb == nb for p?trtrs, cheating if only single process column
+   call MatrixD_QR_Solve(A_SP, B_SP, cheat_nb_A)
+-  call MatrixD_to_array1d(B_SP, X)
++  call MatrixD_QR_Get_Weights(A_SP, B_SP, ng, X, R, do_export_R)
+ 
+   call finalise(A_SP)
+   call finalise(B_SP)
+ end subroutine SP_Matrix_QR_Solve
+ 
++subroutine MatrixD_QR_Get_Weights(A, b, M, weights, R, do_export_R)
++  ! Extract weights from b after MatrixD_QR_Solve
++  ! Optionally extract R
++  type(MatrixD), intent(in) :: A, b
++  integer, intent(in) :: M
++  real(dp), dimension(M), intent(out), target :: weights
++  real(dp), dimension(:, :), intent(out), allocatable, target, optional :: R
++  logical, intent(in), optional :: do_export_R
++
++  type(ScaLAPACK) :: wt_scalapack
++  type(MatrixD) :: wt_matrixD, R_matrixD
++
++  ! Initialise 1x1 scalapack process grid
++  call initialise(wt_scalapack, b%ScaLAPACK_Info_obj%ScaLAPACK_obj%MPI_obj, 1, 1)
++
++  call initialise(wt_matrixD, M, 1, M, 1, wt_scalapack, use_allocate=.false.)
++
++  ! weights
++  weights(:) = 0.0_dp
++  wt_matrixd%data(1:M,1:1) => weights(:)
++
++  call MatrixD_to_MatrixD(b, wt_matrixD, M, 1)
++  call Finalise(wt_matrixD)
++
++  ! R
++  if (present(R) .and. present(do_export_R)) then
++    if (do_export_R) then
++      call print("Extracting Posterior Covariance", PRINT_VERBOSE)
++      if (wt_scalapack%blacs_context > -1) then
++        allocate(R(M, M))
++      else
++        allocate(R(1, 1))
++      end if
++
++      R(:, :) = 0.0_dp
++      ! Reuse wt_scalapack, assuming context of A equal to context of B
++      call initialise(R_matrixD, M, M, M, M, wt_scalapack, use_allocate=.false.)
++      R_matrixd%data(1:ubound(R,1),1:ubound(R,2)) => R(:, :)
++      call MatrixD_to_MatrixD(A, R_matrixD, M, M, UPLO="U")
++      call Finalise(R_matrixD)
++    end if
++  end if
++  call Finalise(wt_scalapack)
++
++end subroutine MatrixD_QR_Get_Weights
++
++
+ subroutine MatrixZ_Initialise(this, N, M, NB, MB, scalapack_obj)
+   type(MatrixZ), intent(out) :: this
+   integer, intent(in), optional :: N, M, NB, MB
+diff --git a/src/libAtoms/ScaLAPACK.f95 b/src/libAtoms/ScaLAPACK.f95
+index ee82f3418..a8d33f4c5 100644
+--- a/src/libAtoms/ScaLAPACK.f95
++++ b/src/libAtoms/ScaLAPACK.f95
+@@ -169,6 +169,7 @@ module ScaLAPACK_module
+ end interface
+ 
+ public :: ScaLAPACK_pdgeqrf_wrapper, ScaLAPACK_pdtrtrs_wrapper, ScaLAPACK_pdormqr_wrapper
++public :: ScaLAPACK_pdgemr2d_wrapper, ScaLAPACK_pdtrmr2d_wrapper
+ public :: ScaLAPACK_matrix_QR_solve, ScaLAPACK_to_array1d, ScaLAPACK_to_array2d
+ 
+ contains
+@@ -256,7 +257,7 @@ subroutine ScaLAPACK_Finalise(this)
+   type(ScaLAPACK), intent(inout) :: this
+ 
+ #ifdef SCALAPACK
+-  if (this%active) then
++  if (this%active .and. this%blacs_context > -1) then
+     call blacs_gridexit(this%blacs_context)
+   endif
+   this%active = .false.
+@@ -362,7 +363,11 @@ subroutine ScaLAPACK_init_matrix_desc(this, N_R, N_C, NB_R, NB_C, desc, l_N_R, l
+     lld = l_N_R
+     if (l_N_r < 1) lld = 1
+ 
+-    call descinit (desc, N_R, use_N_C, NB_R, use_NB_C, 0, 0, this%blacs_context, lld, err)
++    if (this%blacs_context >-1) then
++      call descinit (desc, N_R, use_N_C, NB_R, use_NB_C, 0, 0, this%blacs_context, lld, err)
++    else
++      desc(:) = -1
++    end if
+   endif
+ #endif
+ end subroutine ScaLAPACK_init_matrix_desc
+@@ -1426,6 +1431,56 @@ subroutine ScaLAPACK_pdtrtrs_wrapper(A_info, A_data, B_info, B_data, cheat_nb_A)
+ #endif
+ end subroutine ScaLAPACK_pdtrtrs_wrapper
+ 
++subroutine ScaLAPACK_pdgemr2d_wrapper(A_info, A_data, B_info, B_data, glob_cntxt, m, n, ia, ja, ib, jb)
++  ! Copy general distributed submatrix A_data(ia:ia+m, ja:ja+n) to B_data(ib:ib+m, jb:jb+n)
++  type(Matrix_ScaLAPACK_Info), intent(in) :: A_info, B_info
++  real(dp), intent(in), dimension(:,:) :: A_data ! input distributed matrix
++  real(dp), intent(inout), dimension(:,:)  :: B_data ! target distributed matrix
++  integer :: glob_cntxt ! Context spanning both A and B
++  integer :: m, n ! size of submatrix
++  integer, optional :: ia, ja ! start coords in A; defaults to (1, 1)
++  integer, optional :: ib, jb ! start coords in B; defaults to (1, 1)
++
++  integer :: my_ia, my_ja, my_ib, my_jb
++
++#ifdef SCALAPACK
++  my_ia = optional_default(1, ia)
++  my_ja = optional_default(1, ja)
++  my_ib = optional_default(1, ib)
++  my_jb = optional_default(1, jb)
++
++  call pdgemr2d(m, n, A_data, my_ia, my_ja, A_info%desc, &
++    B_data, my_ib, my_jb, B_info%desc, glob_cntxt)
++
++#endif
++end subroutine ScaLAPACK_pdgemr2d_wrapper
++
++subroutine ScaLAPACK_pdtrmr2d_wrapper(uplo, diag, A_info, A_data, B_info, B_data, glob_cntxt, m, n, ia, ja, ib, jb)
++  ! Copy trapezoidal distributed submatrix A_data(ia:ia+m, ja:ja+n) to B_data(ib:ib+m, jb:jb+n)
++  character(len=1), intent(in) :: uplo, diag ! copy upper/lower triangle; copy diag
++  type(Matrix_ScaLAPACK_Info), intent(in) :: A_info, B_info
++  real(dp), intent(in), dimension(:,:) :: A_data ! input distributed matrix
++  real(dp), intent(inout), dimension(:,:)  :: B_data ! target distributed matrix
++
++  integer :: glob_cntxt ! Context spanning both A and B
++  integer :: m, n ! size of submatrix
++  integer, optional :: ia, ja ! start coords in A; defaults to (1, 1)
++  integer, optional :: ib, jb ! start coords in B; defaults to (1, 1)
++
++  integer :: my_ia, my_ja, my_ib, my_jb
++
++#ifdef SCALAPACK
++  my_ia = optional_default(1, ia)
++  my_ja = optional_default(1, ja)
++  my_ib = optional_default(1, ib)
++  my_jb = optional_default(1, jb)
++
++  call pdtrmr2d(uplo, diag, m, n, A_data, my_ia, my_ja, A_info%desc, &
++    B_data, my_ib, my_jb, B_info%desc, glob_cntxt)
++
++#endif
++end subroutine ScaLAPACK_pdtrmr2d_wrapper
++
+ subroutine ScaLAPACK_matrix_QR_solve(A_info, A_data, B_info, B_data, cheat_nb_A)
+   type(Matrix_ScaLAPACK_Info), intent(inout) :: A_info, B_info
+   real(dp), intent(inout), dimension(:,:) :: A_data, B_data
+diff --git a/tests/test_gapfit.py b/tests/test_gapfit.py
+index 8f3b18cc2..e31be3f82 100644
+--- a/tests/test_gapfit.py
++++ b/tests/test_gapfit.py
+@@ -110,6 +110,22 @@ def tearDown(self):
+         for path in self.here.glob('*.xyz.idx'):
+             os.remove(path)
+ 
++    def check_gap_committee(self, err_tol=0.2):
++        np.random.seed(1)
++        ncomm = 200 # num_committee members to generate
++        xml_committee = quippy.gap_tools.get_xml_committee(self.xml_name, ncomm)
++
++        comm_weights = np.array([comm.weights for comm in xml_committee])
++        true_weights = xml_committee[0].mean_weights
++
++        weight_stds = np.std(comm_weights, axis=0)
++        weight_mean = np.average(comm_weights, axis=0)
++
++        mean_errs = np.abs(weight_mean - true_weights) / weight_stds
++        print("max mean err = ", np.max(mean_errs))
++        assert np.all(mean_errs < err_tol)
++        np.random.seed(None)
++
+     def check_gap_fit(self, ref_file=None):
+         """check GP coefficients match expected values"""
+         assert self.proc.returncode == 0, self.proc
+@@ -273,11 +289,12 @@ def test_si_scalapack_soap_cur_points(self):
+     @unittest.skipIf(os.environ.get('HAVE_SCALAPACK') != '1', 'ScaLAPACK support not enabled')
+     def test_si_scalapack_distance_2b_uniform(self):
+         gap = self.get_gap(self.gap_distance_2b_template, 'sparse_method=uniform')
+-        config = self.get_config('Si.np2.xyz', gap)
++        config = self.get_config('Si.np2.xyz', gap, extra="export_covariance=T")
+         self.run_gap_fit(config, prefix='mpirun -np 2')
+         with open(self.log_name) as f:
+             self.assertTrue("Using ScaLAPACK to solve QR" in f.read())
+         self.check_gap_fit(self.ref_files[('Si', 'distance_2b', 'uniform')])
++        self.check_gap_committee()
+ 
+     @unittest.skipIf(os.environ.get('HAVE_SCALAPACK') != '1', 'ScaLAPACK support not enabled')
+     def test_si_scalapack_two_descriptors(self):

@@ -1,0 +1,169 @@
+diff --git a/src/Estimators.jl b/src/Estimators.jl
+index 0a288be68..77b4fc7e1 100644
+--- a/src/Estimators.jl
++++ b/src/Estimators.jl
+@@ -33,11 +33,12 @@ macro estimate(expr)
+     func = expr.args[1]
+     sim = expr.args[2]
+     configurations = expr.args[3]
+-    result, config = gensym(), gensym()
++    first_config, rest, result, config = gensym(), gensym(), gensym(), gensym()
+ 
+     return esc(quote
+-        local $result = Estimators.$func($sim, $configurations[1])
+-        for $config in $configurations[2:end]
++        local ($first_config, $rest) = Iterators.peel($configurations)
++        local $result = Estimators.$func($sim, $first_config)
++        for $config in $rest
+             $result += Estimators.$func($sim, $config)
+         end
+         $result / length($configurations)
+diff --git a/src/NonadiabaticDistributions/dynamical_distribution.jl b/src/NonadiabaticDistributions/dynamical_distribution.jl
+index 4e5f62b61..7f21cb713 100644
+--- a/src/NonadiabaticDistributions/dynamical_distribution.jl
++++ b/src/NonadiabaticDistributions/dynamical_distribution.jl
+@@ -119,3 +119,7 @@ function write_hdf5(filename, data)
+         end
+     end
+ end
++
++function Base.iterate(s::DynamicalDistribution, state=1)
++    state > lastindex(s) ? nothing : (s[state], state+1)
++end
+diff --git a/src/NonadiabaticDistributions/harmonic_ring_polymer.jl b/src/NonadiabaticDistributions/harmonic_ring_polymer.jl
+new file mode 100644
+index 000000000..6951ad944
+--- /dev/null
++++ b/src/NonadiabaticDistributions/harmonic_ring_polymer.jl
+@@ -0,0 +1,44 @@
++using NonadiabaticMolecularDynamics: RingPolymers
++using Distributions: Distributions
++
++struct HarmonicRingPolymer{T,D}
++    normal_mode_distribution::D
++    normal_mode_transformation::Matrix{T}
++end
++
++"""
++    HarmonicRingPolymer(ω, β, m, n_beads)
++
++Ring polymer position distribution in a 1D harmonic potential
++"""
++function HarmonicRingPolymer(ω, β, m, n_beads)
++    βₙ = β / n_beads
++    ωₙ = 1 / βₙ
++    ωₖ = RingPolymers.get_matsubara_frequencies(n_beads, ωₙ)
++    σ⁻¹ = sqrt.(βₙ*m .* (ω^2 .+ ωₖ.^2))
++    σ = 1 ./ σ⁻¹
++
++    normal_mode_distribution = Distributions.MvNormal(σ)
++    normal_mode_transformation = RingPolymers.get_normal_mode_transformation(n_beads)
++    HarmonicRingPolymer(normal_mode_distribution, normal_mode_transformation)
++end
++
++function Base.rand(rng::AbstractRNG, s::HarmonicRingPolymer)
++    R = rand(rng, s.normal_mode_distribution)
++    return s.normal_mode_transformation * R
++end
++
++function select_item(x::Vector{<:HarmonicRingPolymer{T}}, ::Integer, size::NTuple) where {T}
++    length(size) == 3 || throw(error("`size` $size must have 3 dimensions."))
++    size[2] == length(x) || throw(error("Sample size does not match distribution."))
++    size[3] == length(x[1].normal_mode_distribution) || throw(error("Sample size does not match distribution."))
++
++    out = Array{T,3}(undef, size)
++    @views for i in axes(out, 2)
++        for j in axes(out, 1)
++            out[j,i,:] .= rand(x[i])
++        end
++    end
++
++    return out
++end
+diff --git a/src/NonadiabaticDistributions/nuclear_distributions.jl b/src/NonadiabaticDistributions/nuclear_distributions.jl
+index 1011e22ce..1f0bbb36b 100644
+--- a/src/NonadiabaticDistributions/nuclear_distributions.jl
++++ b/src/NonadiabaticDistributions/nuclear_distributions.jl
+@@ -14,3 +14,6 @@ include("harmonic_wigner.jl")
+ export MomentumHarmonicWigner
+ export PositionHarmonicWigner
+ export VelocityHarmonicWigner
++
++include("harmonic_ring_polymer.jl")
++export HarmonicRingPolymer
+diff --git a/test/Core/calculators.jl b/test/Core/calculators.jl
+index 5867ecc7f..962f05fc7 100644
+--- a/test/Core/calculators.jl
++++ b/test/Core/calculators.jl
+@@ -40,7 +40,7 @@ end
+ 
+     Calculators.evaluate_traceless_potential!(calc)
+     @test calc.traceless_potential[1] ≈ calc.potential[1] .- Diagonal(fill(calc.V̄[1], nstates(model)))
+-    @test tr(calc.traceless_potential[1]) ≈ 0
++    @test tr(calc.traceless_potential[1]) ≈ 0 atol=eps(Float64)
+     @test (@allocated Calculators.evaluate_traceless_potential!(calc)) == 0
+ 
+     Calculators.evaluate_derivative!(calc, rand(1, 1, 10))
+@@ -52,7 +52,7 @@ end
+ 
+     Calculators.evaluate_traceless_derivative!(calc)
+     @test calc.traceless_derivative[1] ≈ calc.derivative[1] .- Diagonal(fill(calc.D̄[1], nstates(model)))
+-    @test tr(calc.traceless_derivative[1]) ≈ 0
++    @test tr(calc.traceless_derivative[1]) ≈ 0 atol=eps(Float64)
+     @test (@allocated Calculators.evaluate_traceless_derivative!(calc)) == 0
+ 
+     Calculators.evaluate_traceless_adiabatic_derivative!(calc)
+diff --git a/test/NonadiabaticDistributions/harmonic_ring_polymer.jl b/test/NonadiabaticDistributions/harmonic_ring_polymer.jl
+new file mode 100644
+index 000000000..8d811c53d
+--- /dev/null
++++ b/test/NonadiabaticDistributions/harmonic_ring_polymer.jl
+@@ -0,0 +1,36 @@
++using Test
++using NonadiabaticMolecularDynamics
++
++ω = 3.4
++β = 11.2
++m = 1
++n_beads = 400
++s = HarmonicRingPolymer(ω, β, m, n_beads)
++configs = (reshape(rand(s), (1,1,n_beads)) for _ in 1:5000)
++
++sim = RingPolymerSimulation(Atoms(1), Harmonic(m=m, ω=ω), n_beads, temperature=1/β)
++
++@testset "Energy expectation" begin
++    quantum = ω/2 * coth(ω*β/2)
++    estimate = Estimators.@estimate total_energy(sim, configs)
++    @test quantum ≈ estimate rtol=1e-2
++end
++
++@testset "Radius of gyration expectation" begin
++    T = 1/β
++    quantum = sqrt(T / ω^2 * (ω / (2T) * coth(ω/2T) - 1))
++    estimate = Estimators.@estimate radius_of_gyration(sim, configs)
++    @test quantum ≈ estimate[1] rtol=1e-2
++end
++
++@testset "select_item" begin
++    atoms = 10
++    beads = 4
++    s = HarmonicRingPolymer.(1:atoms, 1, 1, beads)
++
++    r = NonadiabaticDistributions.select_item(s, 0, (3, atoms, beads))
++    @test r isa Array
++    @test_throws ErrorException("Sample size does not match distribution.") NonadiabaticDistributions.select_item(s, 0, (3, 1, beads))
++    @test_throws ErrorException("Sample size does not match distribution.") NonadiabaticDistributions.select_item(s, 0, (3, 1, 1))
++    @test_throws ErrorException("`size` (3, 1) must have 3 dimensions.") NonadiabaticDistributions.select_item(s, 0, (3, 1))
++end
+diff --git a/test/runtests.jl b/test/runtests.jl
+index 834cbcef7..d31d28a0a 100644
+--- a/test/runtests.jl
++++ b/test/runtests.jl
+@@ -19,6 +19,7 @@ if GROUP == "All" || GROUP == "InitialConditions"
+     @time @safetestset "NonadiabaticDistributions" begin include("NonadiabaticDistributions/nonadiabatic_distributions.jl") end
+     @time @safetestset "Distribution Tests" begin include("NonadiabaticDistributions/nuclear_distributions.jl") end
+     @time @safetestset "Harmonic Wigner distribution tests" begin include("NonadiabaticDistributions/harmonic_wigner.jl") end
++    @time @safetestset "Harmonic Ring Polymer distribution tests" begin include("NonadiabaticDistributions/harmonic_ring_polymer.jl") end
+     @time @safetestset "ElectronicDistributions" begin include("NonadiabaticDistributions/electronic_distributions.jl") end
+ end
+ 

@@ -1,0 +1,598 @@
+diff --git a/unimol/setup.py b/unimol/setup.py
+index 2e5b0a3..07d09ac 100644
+--- a/unimol/setup.py
++++ b/unimol/setup.py
+@@ -17,6 +17,7 @@
+     install_requires=[
+         "numpy",
+         "pandas",
++        "scikit-learn-extra",
+     ],
+     classifiers=[
+         "Development Status :: 5 - Production/Stable",
+diff --git a/unimol/unimol/infer.py b/unimol/unimol/infer.py
+index e1717f0..feabb1f 100644
+--- a/unimol/unimol/infer.py
++++ b/unimol/unimol/infer.py
+@@ -49,10 +49,11 @@ def main(args):
+     model.load_state_dict(state["model"], strict=False)
+ 
+     # Move models to GPU
+-    if use_fp16:
+-        model.half()
+     if use_cuda:
+         model.cuda()
++        # fp16 only supported on CUDA for fused kernels
++        if use_fp16:
++            model.half()
+ 
+     # Print args
+     logger.info(args)
+diff --git a/unimol/unimol/utils/conf_gen_cal_metrics.py b/unimol/unimol/utils/conf_gen_cal_metrics.py
+index c56348e..567452a 100644
+--- a/unimol/unimol/utils/conf_gen_cal_metrics.py
++++ b/unimol/unimol/utils/conf_gen_cal_metrics.py
+@@ -19,7 +19,9 @@
+ from scipy.spatial.transform import Rotation
+ from multiprocessing import Pool
+ from sklearn.cluster import KMeans
++from sklearn_extra.cluster import KMedoids
+ import argparse
++from typing import List
+ 
+ 
+ def get_torsions(m):
+@@ -72,68 +74,85 @@ def GetDihedral(conf, atom_idx):
+     )
+ 
+ 
+-def single_conf_gen_bonds(tgt_mol, num_confs=1000, seed=42):
++def single_conf_gen(tgt_mol: Chem.Mol, num_confs: int = 1000, seed: int = 42, mmff: bool = False, randomize_angles: bool = False, threads: int = 0) -> Chem.Mol:
++    """ Generates conformers for a molecule. Functionality to support: https://arxiv.org/abs/2302.07061 """
+     mol = copy.deepcopy(tgt_mol)
+     mol = Chem.AddHs(mol)
+     allconformers = AllChem.EmbedMultipleConfs(
+-        mol, numConfs=num_confs, randomSeed=seed, clearConfs=True
++        mol, numConfs=num_confs, randomSeed=seed, clearConfs=True, numThreads=threads
+     )
+-    mol = Chem.RemoveHs(mol)
+-    rotable_bonds = get_torsions(mol)
+-    for i in range(len(allconformers)):
+-        np.random.seed(i)
+-        values = 3.1415926 * 2 * np.random.rand(len(rotable_bonds))
+-        for idx in range(len(rotable_bonds)):
+-            SetDihedral(mol.GetConformers()[i], rotable_bonds[idx], values[idx])
+-        Chem.rdMolTransforms.CanonicalizeConformer(mol.GetConformers()[i])
+-    return mol
+-
+ 
+-def single_conf_gen(tgt_mol, num_confs=1000, seed=42):
+-    mol = copy.deepcopy(tgt_mol)
+-    mol = Chem.AddHs(mol)
+-    allconformers = AllChem.EmbedMultipleConfs(
+-        mol, numConfs=num_confs, randomSeed=seed, clearConfs=True
+-    )
+-    sz = len(allconformers)
+-    for i in range(sz):
+-        try:
+-            AllChem.MMFFOptimizeMolecule(mol, confId=i)
+-        except:
+-            continue
++    # WARNING! this might change the molecule stereochemistry
++    if randomize_angles:
++        rotable_bonds = get_torsions(mol)
++        # TODO: if stereochem preservation is wanted, apply same torsion delta to all `i,j,k,l` sharing the same `{j,k}` rotatable bond
++        for i in range(len(allconformers)):
++            np.random.seed(i)
++            values = 3.1415926 * 2 * np.random.rand(len(rotable_bonds))
++            for idx in range(len(rotable_bonds)):
++                SetDihedral(mol.GetConformers()[i], rotable_bonds[idx], values[idx])
++            Chem.rdMolTransforms.CanonicalizeConformer(mol.GetConformers()[i])
++
++    # Forcefield relaxation improves conformer diversity
++    if mmff:
++        sz = len(allconformers)
++        for i in range(sz):
++            try:
++                AllChem.MMFFOptimizeMolecule(mol, confId=i)
++            except:
++                continue
+     mol = Chem.RemoveHs(mol)
+     return mol
+ 
+ 
+-def single_conf_gen_no_MMFF(tgt_mol, num_confs=1000, seed=42):
+-    mol = copy.deepcopy(tgt_mol)
+-    mol = Chem.AddHs(mol)
+-    allconformers = AllChem.EmbedMultipleConfs(
+-        mol, numConfs=num_confs, randomSeed=seed, clearConfs=True
+-    )
+-    mol = Chem.RemoveHs(mol)
+-    return mol
++def clustering(
++    mol: Chem.Mol,
++    M: int = 1000,
++    N: int = 100,
++    mmff: bool = True,
++    randomized_angles: bool = False,
++    kmeans: bool = False,
++    seed: int = 42,
++    threads: int = 0,
++    removeHs: bool = True,
++) -> List[np.ndarray]:
++    """ Creates a diverse set of conformers for a given molecule by
++    procedurally generating candidates with various rdkit methods and clustering.
++    Follows principles outlined in: https://arxiv.org/abs/2302.07061
++    - For paper reproduction, call with: M=1000, N=100, randomized_angles=True, kmeans=True
++    - For best UniMol inference: M=1300, N=10, randomized_angles=False, kmeans=False (adjust M>10 for speed)
++    - WARNING! randomized_angles = True might change the molecule stereochemistry! Ex: PDB: 2ZCR
++
++    Args:
++        mol (Chem.Mol): rdkit molecule
++        M (int): Number of conformers to generate.
++        N (int): Number of conformers to return.
++        mmff (bool): Whether to use MMFF forcefield relaxation.
++        randomized_angles (bool, optional): Whether to use an additional M/4 conformers  with randomized torsion angles.
++            WARNING! might change the molecule stereochemistry
++        kmeans (bool): Whether to use kmeans or kmedoids.
++            Kmeans picks random example of cluster, Kmedoids picks cluster centroid.
++        seed (int): Random seed for conformer generation.
++        threads (int): Number of threads to use for conformer generation. If 0, uses all available threads.
++        removeHs (bool): Whether to remove hydrogens from the final conformers.
++
++    Returns:
++        List[np.ndarray]: List of conformer coordinates
++    """
++    # to support ref paper by default but not be too expensive
++    if not mmff:
++        M = M*4
+ 
+-
+-def clustering(mol, M=1000, N=100):
+-    rdkit_mol = single_conf_gen(mol, num_confs=M)
+-    rdkit_mol = Chem.RemoveHs(rdkit_mol)
+     total_sz = 0
+-    sz = len(rdkit_mol.GetConformers())
+-    tgt_coords = rdkit_mol.GetConformers()[0].GetPositions().astype(np.float32)
+-    tgt_coords = tgt_coords - np.mean(tgt_coords, axis=0)
+     rdkit_coords_list = []
+-    for i in range(sz):
+-        _coords = rdkit_mol.GetConformers()[i].GetPositions().astype(np.float32)
+-        _coords = _coords - _coords.mean(axis=0)  # need to normalize first
+-        _R, _score = Rotation.align_vectors(_coords, tgt_coords)
+-        rdkit_coords_list.append(np.dot(_coords, _R.as_matrix()))
+-    total_sz += sz
+ 
+-    ### add no MMFF optimize conformers
+-    rdkit_mol = single_conf_gen_no_MMFF(mol, num_confs=int(M // 4), seed=43)
+-    rdkit_mol = Chem.RemoveHs(rdkit_mol)
++    # add no-MMFF-optimized conformers (ETKDG v3)
++    rdkit_mol = single_conf_gen(mol, num_confs=int(M // 4), seed=seed, threads=threads)
++    if removeHs:
++        rdkit_mol = Chem.RemoveHs(rdkit_mol)
+     sz = len(rdkit_mol.GetConformers())
++    tgt_coords = rdkit_mol.GetConformers()[0].GetPositions().astype(np.float32)
++    tgt_coords = tgt_coords - np.mean(tgt_coords, axis=0)
+     for i in range(sz):
+         _coords = rdkit_mol.GetConformers()[i].GetPositions().astype(np.float32)
+         _coords = _coords - _coords.mean(axis=0)  # need to normalize first
+@@ -141,29 +160,50 @@ def clustering(mol, M=1000, N=100):
+         rdkit_coords_list.append(np.dot(_coords, _R.as_matrix()))
+     total_sz += sz
+ 
+-    ### add uniform rotation bonds conformers
+-    rdkit_mol = single_conf_gen_bonds(mol, num_confs=int(M // 4), seed=43)
+-    rdkit_mol = Chem.RemoveHs(rdkit_mol)
+-    sz = len(rdkit_mol.GetConformers())
+-    for i in range(sz):
+-        _coords = rdkit_mol.GetConformers()[i].GetPositions().astype(np.float32)
+-        _coords = _coords - _coords.mean(axis=0)  # need to normalize first
+-        _R, _score = Rotation.align_vectors(_coords, tgt_coords)
+-        rdkit_coords_list.append(np.dot(_coords, _R.as_matrix()))
+-    total_sz += sz
++    # add forcefield optimized conformers
++    if mmff:
++        rdkit_mol = single_conf_gen(mol, num_confs=M, mmff=True, seed=seed+1, threads=threads)
++        if removeHs:
++            rdkit_mol = Chem.RemoveHs(rdkit_mol)
++        sz = len(rdkit_mol.GetConformers())
++        for i in range(sz):
++            _coords = rdkit_mol.GetConformers()[i].GetPositions().astype(np.float32)
++            _coords = _coords - _coords.mean(axis=0)  # need to normalize first
++            _R, _score = Rotation.align_vectors(_coords, tgt_coords)
++            rdkit_coords_list.append(np.dot(_coords, _R.as_matrix()))
++        total_sz += sz
++
++    # add uniform rotation bonds conformers - WARNING! - might alter stereochemistry. Ex: PDB-2ZCR
++    if randomized_angles:
++        rdkit_mol = single_conf_gen(mol, num_confs=int(M // 4), seed=seed+2, threads=threads, randomize_angles=True)
++        if removeHs:
++            rdkit_mol = Chem.RemoveHs(rdkit_mol)
++        sz = len(rdkit_mol.GetConformers())
++        for i in range(sz):
++            _coords = rdkit_mol.GetConformers()[i].GetPositions().astype(np.float32)
++            _coords = _coords - _coords.mean(axis=0)  # need to normalize first
++            _R, _score = Rotation.align_vectors(_coords, tgt_coords)
++            rdkit_coords_list.append(np.dot(_coords, _R.as_matrix()))
++        total_sz += sz
+ 
+     rdkit_coords_flatten = np.array(rdkit_coords_list).reshape(total_sz, -1)
+-    cluster_size = N
+-    ids = (
+-        KMeans(n_clusters=cluster_size, random_state=42)
+-        .fit_predict(rdkit_coords_flatten)
+-        .tolist()
+-    )
+-    coords_list = [rdkit_coords_list[ids.index(i)] for i in range(cluster_size)]
++    if kmeans:
++        ids = (
++            KMeans(n_clusters=N, random_state=42)
++            .fit_predict(rdkit_coords_flatten)
++            .tolist()
++        )
++        coords_list = [rdkit_coords_list[ids.index(i)] for i in range(N)]
++    else:
++        clust = KMedoids(n_clusters=N, random_state=seed, )
++        clust.fit(rdkit_coords_flatten)
++        idxs = clust.medoid_indices_.tolist()
++        coords_list = [rdkit_coords_list[idx] for idx in idxs]
++
+     return coords_list
+ 
+ 
+-def single_process_data(content):
++def single_process_data(content) -> List:
+     smi, tgt_mol_list = content[0], content[1]
+     M = min(20 * len(tgt_mol_list), 2000)
+     N = 2 * len(tgt_mol_list)
+diff --git a/unimol/unimol/utils/conformer_model.py b/unimol/unimol/utils/conformer_model.py
+index 66601d3..f9555c1 100644
+--- a/unimol/unimol/utils/conformer_model.py
++++ b/unimol/unimol/utils/conformer_model.py
+@@ -91,15 +91,17 @@ def get_flexible_torsions(mol: Chem.Mol) -> th.Tensor:
+     """ Gets a unique set of ligand torsions which are rotatable. Shape: (T, 4) """
+     # get 3-hop connected atoms, directionally so no repeats
+     dist_mat = th.from_numpy(Chem.GetDistanceMatrix(mol))
+-    i_, j_ = (dist_mat.triu() == 3).bool().nonzero().T.tolist()
+-    # Shortest path, where rotatable bond is not in ring, defines torsion -> find rings
+-    bonds_in_ring = {
+-        (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()) for bond in mol.GetBonds() if bond.IsInRing()
+-    }
++    # get rotatable bonds
++    torsionSmarts = "[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]"
++    torsionQuery = Chem.MolFromSmarts(torsionSmarts)
++    matches = set(mol.GetSubstructMatches(torsionQuery))
++    # get 3-hop connected atoms, directionally so no repeats
++    i_, l_ = (dist_mat.triu() == 3).bool().nonzero().T.tolist()
++    # Shortest path, where rotatable bond in the middle is a torsion
+     flex_unique_torsions = []
+-    for i, l in zip(i_, j_):
++    for i, l in zip(i_, l_):
+         i, j, k, l = Chem.GetShortestPath(mol, i, l)
+-        if (j, k) not in bonds_in_ring and (k, j) not in bonds_in_ring:
++        if {(j, k), (k, j)}.intersection(matches):
+             # torsion in the direction that leaves lesser atoms to later rotate: towards the periphery
+             if (dist_mat[j] < dist_mat[k]).sum() > (dist_mat[j] > dist_mat[k]).sum():
+                 flex_unique_torsions.append([i, j, k, l])
+@@ -175,6 +177,7 @@ def single_SF_loss(
+     Returns:
+         cross_dist_score: cross distance score. scalar. numpy
+         dist_score: distance score. scalar. numpy
++        clash_score. clash score. informative. scalar. numpy.
+         loss: loss value. scalar. has gradients
+     """
+     # ((...), N, 1, 3) - ((...), 1, P, 3) -> ((...), N, P)
+@@ -183,15 +186,18 @@ def single_SF_loss(
+     self_dist = (predict_coords[..., None, :] - predict_coords[..., None, :, :]).norm(dim=-1)
+     # only consider local molecule-pocket interactions
+     dist_mask = cross_distance_predict < dist_threshold
+-    # cross_dist_score = ((cross_dist[dist_mask] - cross_distance_predict[dist_mask]) ** 2).mean(dim=(-1, -2))
+-    # dist_score = ((self_dist - self_distance_predict) ** 2).mean(dim=(-1, -2))
++    # ((...), N, N) -> ((...),)
+     cross_dist_score = ((cross_dist - cross_distance_predict)**2 * dist_mask).sum() / dist_mask.sum(dim=(-1, -2))
+     dist_score = ((self_dist - self_distance_predict) ** 2).mean(dim=(-1, -2))
+     # weight different loss terms
+     loss = cross_dist_score * cross_dist_weight + dist_score * self_dist_weight
++    # penalize clashes - informative
++    clash_pl_score = ((cross_dist - 3.).clamp(max=0) * 5.).square()
++    clash_pl_score = clash_pl_score.sum(dim=(-1, -2)) / dist_mask.sum(dim=(-1, -2))
+     if reduce_batch:
+-        return cross_dist_score.detach().mean().numpy(), dist_score.detach().mean().numpy(), loss.mean()
+-    return cross_dist_score.detach().numpy(), dist_score.detach().numpy(), loss
++        return cross_dist_score.detach().mean().numpy(), dist_score.detach().mean().numpy(), 0., loss.mean()
++    return cross_dist_score.detach().numpy(), dist_score.detach().numpy(), clash_pl_score.detach().numpy(), loss
++
+ 
+ 
+ def dock_with_gradient(
+@@ -202,9 +208,9 @@ def dock_with_gradient(
+     mol: Chem.Mol,
+     conf_coords: np.ndarray,
+     loss_func=single_SF_loss,
+-    holo_coords=None,
+-    iterations=400,
+-    early_stoping=5,
++    holo_coords: np.ndarray = None,
++    iterations: int =400,
++    early_stoping: int = 5,
+ ):
+     """ Docking with gradient descent, optimizing the conformer.
+ 
+@@ -317,7 +323,7 @@ def single_dock_with_gradient(
+     trans.requires_grad = True
+     torsions.requires_grad = True
+ 
+-    optimizer = th.optim.LBFGS(params=[euler, trans, torsions], lr=0.25)
++    optimizer = th.optim.LBFGS(params=[euler, trans, torsions], lr=0.1)
+     bst_loss, times = 10000.0, 0
+     for i in range(iterations):
+         def closure():
+@@ -332,7 +338,7 @@ def closure():
+             for t, vals in zip(torsion_idxs, torsions.unbind(dim=-1)):
+                 aux_coords = update_dihedral(coords=aux_coords, idxs=t.tolist(), value=vals, dist_mat=graph_dist_mat)
+ 
+-            _, _, loss = loss_func(
++            _, _, _, loss = loss_func(
+                 aux_coords, pocket_coords, distance_predict, holo_distance_predict
+             )
+             loss.backward()
+@@ -358,11 +364,13 @@ def closure():
+     for t, vals in zip(torsion_idxs, torsions.unbind(dim=-1)):
+         aux_coords = update_dihedral(coords=aux_coords, idxs=t.tolist(), value=vals, dist_mat=graph_dist_mat)
+ 
+-    cross_score, self_score, loss = loss_func(
++    cross_score, self_score, clash_score, loss = loss_func(
+         aux_coords, pocket_coords, distance_predict, holo_distance_predict, reduce_batch=False
+     )
+     best_idx = loss.argmax(dim=-1).item()
+-    return aux_coords[best_idx].detach().numpy(), loss[best_idx].detach().numpy(), (cross_score[best_idx], self_score[best_idx])
++    return aux_coords[best_idx].detach().numpy(), loss[best_idx].detach().numpy(), (
++        cross_score[best_idx], self_score[best_idx], clash_score[best_idx]
++    )
+ 
+ 
+ def set_coord(mol, coords):
+@@ -429,17 +437,18 @@ def single_docking(input_path: str, output_path: str, output_ligand_path: str):
+             bst_predict_coords = predict_coords
+             bst_meta_info = meta_info
+ 
+-    _rmsd = round(rmsd_func(holo_coords, bst_predict_coords), 4)
++    _rmsd = round(rmsd_func(holo_coords, bst_predict_coords, mol=mol), 4)
+     _cross_score = round(float(bst_meta_info[0]), 4)
+     _self_score = round(float(bst_meta_info[1]), 4)
+-    print(f"{pocket}-{smi}-RMSD:{_rmsd}-CROSSSCORE:{_cross_score}-SELFSCORE:{_self_score}")
++    _clash_score = round(float(bst_meta_info[2]), 4)
++    print(f"{pocket}-{smi}-RMSD:{_rmsd}-CROSSSCORE:{_cross_score}-SELFSCORE:{_self_score}-CLASHSCORE:{_clash_score}")
+     mol = Chem.RemoveHs(mol)
+     mol = set_coord(mol, bst_predict_coords)
+ 
+     if output_path is not None:
+         with open(output_path, "wb") as f:
+             pickle.dump(
+-                [bst_predict_coords, holo_coords, bst_loss, smi, pocket, pocket_coords],
++                [mol, bst_predict_coords, holo_coords, bst_loss, smi, pocket, pocket_coords],
+                 f,
+             )
+     if output_ligand_path is not None:
+diff --git a/unimol/unimol/utils/coordinate_model.py b/unimol/unimol/utils/coordinate_model.py
+index a0c7726..d4a5cc4 100644
+--- a/unimol/unimol/utils/coordinate_model.py
++++ b/unimol/unimol/utils/coordinate_model.py
+@@ -181,7 +181,7 @@ def single_docking(input_path, output_path, output_ligand_path):
+             bst_predict_coords = predict_coords
+             bst_meta_info = meta_info
+ 
+-    _rmsd = round(rmsd_func(holo_coords, bst_predict_coords), 4)
++    _rmsd = round(rmsd_func(holo_coords, bst_predict_coords, mol), 4)
+     _cross_score = round(float(bst_meta_info[0]), 4)
+     _self_score = round(float(bst_meta_info[1]), 4)
+     print(f"{pocket}-{smi}-RMSD:{_rmsd}-{_cross_score}-{_self_score}")
+@@ -191,7 +191,7 @@ def single_docking(input_path, output_path, output_ligand_path):
+     if output_path is not None:
+         with open(output_path, "wb") as f:
+             pickle.dump(
+-                [bst_predict_coords, holo_coords, bst_loss, smi, pocket, pocket_coords],
++                [mol, bst_predict_coords, holo_coords, bst_loss, smi, pocket, pocket_coords],
+                 f,
+             )
+     if output_ligand_path is not None:
+diff --git a/unimol/unimol/utils/docking.py b/unimol/unimol/utils/docking.py
+index f1489a3..8381651 100644
+--- a/unimol/unimol/utils/docking.py
++++ b/unimol/unimol/utils/docking.py
+@@ -27,6 +27,7 @@ def result_log(dir_path):
+     rmsd_results = []
+     for path in glob.glob(os.path.join(output_dir, "*.docking.pkl")):
+         (
++            mol,
+             bst_predict_coords,
+             holo_coords,
+             bst_loss,
+@@ -34,7 +35,7 @@ def result_log(dir_path):
+             pocket,
+             pocket_coords,
+         ) = pd.read_pickle(path)
+-        rmsd = rmsd_func(holo_coords, bst_predict_coords)
++        rmsd = rmsd_func(holo_coords, bst_predict_coords, mol=mol)
+         rmsd_results.append(rmsd)
+     rmsd_results = np.array(rmsd_results)
+     print_results(rmsd_results)
+@@ -116,7 +117,7 @@ def dump(content):
+ 
+     # skip step if repeat
+     with Pool(nthreads) as pool:
+-        for inner_output in tqdm(pool.imap(dump, iterations), total=sz):
++        for inner_output in tqdm(pool.imap_unordered(dump, iterations), total=sz):
+             if not inner_output:
+                 print("fail to dump")
+ 
+@@ -144,7 +145,7 @@ def single_docking(pocket_name):
+ 
+     with Pool(nthreads) as pool:
+         for inner_output in tqdm(
+-            pool.imap(single_docking, new_pocket_list), total=len(new_pocket_list)
++            pool.imap_unordered(single_docking, new_pocket_list), total=len(new_pocket_list)
+         ):
+             if not inner_output:
+                 print("fail to docking")
+diff --git a/unimol/unimol/utils/docking_utils.py b/unimol/unimol/utils/docking_utils.py
+index d2986e6..ef6befb 100644
+--- a/unimol/unimol/utils/docking_utils.py
++++ b/unimol/unimol/utils/docking_utils.py
+@@ -17,9 +17,25 @@
+ import lmdb
+ import pickle
+ import pandas as pd
++from typing import Dict, List, Optional
++from unimol.utils.conf_gen_cal_metrics import clustering, single_conf_gen
+ 
+ 
+-def get_torsions(m, removeHs=True):
++def add_all_conformers_to_mol(mol: Chem.Mol, conformers: List[np.ndarray]) -> Chem.Mol:
++    mol = copy.deepcopy(mol)
++    mol.RemoveAllConformers()
++    for i, conf_pos in enumerate(conformers):
++        conf = Chem.Conformer(mol.GetNumAtoms())
++        mol.AddConformer(conf, assignId=True)
++
++        conf = mol.GetConformer(i)
++        positions = conf_pos.tolist()
++        for j in range(mol.GetNumAtoms()):
++            conf.SetAtomPosition(j, positions[j])
++    return mol
++
++
++def get_torsions(m: Chem.Mol, removeHs=True) -> List:
+     if removeHs:
+         m = Chem.RemoveHs(m)
+     torsionList = []
+@@ -58,30 +74,6 @@ def get_torsions(m, removeHs=True):
+     return torsionList
+ 
+ 
+-def SetDihedral(conf, atom_idx, new_vale):
+-    rdMolTransforms.SetDihedralRad(
+-        conf, atom_idx[0], atom_idx[1], atom_idx[2], atom_idx[3], new_vale
+-    )
+-
+-
+-def single_conf_gen_bonds(tgt_mol, num_confs=1000, seed=42, removeHs=True):
+-    mol = copy.deepcopy(tgt_mol)
+-    mol = Chem.AddHs(mol)
+-    allconformers = AllChem.EmbedMultipleConfs(
+-        mol, numConfs=num_confs, randomSeed=seed, clearConfs=True
+-    )
+-    if removeHs:
+-        mol = Chem.RemoveHs(mol)
+-    rotable_bonds = get_torsions(mol, removeHs=removeHs)
+-    for i in range(len(allconformers)):
+-        np.random.seed(i)
+-        values = 3.1415926 * 2 * np.random.rand(len(rotable_bonds))
+-        for idx in range(len(rotable_bonds)):
+-            SetDihedral(mol.GetConformers()[i], rotable_bonds[idx], values[idx])
+-        Chem.rdMolTransforms.CanonicalizeConformer(mol.GetConformers()[i])
+-    return mol
+-
+-
+ def load_lmdb_data(lmdb_path, key):
+     env = lmdb.open(
+         lmdb_path,
+@@ -102,8 +94,57 @@ def load_lmdb_data(lmdb_path, key):
+     return collects
+ 
+ 
+-def docking_data_pre(raw_data_path, predict_path):
++def reprocess_content(content: Dict, base_mol: Optional[Chem.Mol] = None, M: int = 2000, N: int = 10, mmff: bool = False, seed: int = 42, stereo_from3d: bool = True) -> Dict:
++    """ Reprocess a data point in the LMDB schema for Docking usage. Ensures correct stereochemistry.
++    Basic principle is to perceive stereochem from label molecule's 3D and keep it intact.
++    Use default values for best results
++
++    Args:
++        content: A dictionary of the LMDB schema. (atoms, holo_mol, mol_list, cooredinates, etc.)
++        base_mol: The molecule to replace the holo_mol with, if passed
++        M: The number of conformers to generate
++        N: The number of clusters to group conformers and pick a representative from
++        mmff: Whether to use MMFF minimization after conformer generation
++        seed: The random seed to use for conformer generation
++        stereo_from3d: Whether to perceive stereochemistry from the 3D coordinates of the label molecule
+ 
++    Returns:
++        A copy of the original, with the holo_mol replaced with the base_mol, and coordinates added.
++    """
++    if base_mol is None:
++        base_mol = content["holo_mol"]
++    # Copy so we don't change inputs
++    content = copy.deepcopy(content)
++    base_mol = copy.deepcopy(base_mol)
++    base_mol = Chem.AddHs(base_mol, addCoords=True)
++    # assign stereochem from 3d
++    if stereo_from3d and base_mol.GetNumConformers() > 0:
++        Chem.AssignStereochemistryFrom3D(base_mol)
++    ori_smiles = Chem.MolToSmiles(base_mol)
++    # create new, clean molecule
++    remol = Chem.MolFromSmiles(ori_smiles)
++    # reorder to match and add Hs
++    idxs = remol.GetSubstructMatches(Chem.RemoveHs(base_mol))
++    if isinstance(idxs[0], tuple):
++        idxs = idxs[0]
++    idxs = list(map(int, idxs))
++    remol = Chem.RenumberAtoms(remol, idxs)
++    remol = Chem.AddHs(remol, addCoords=True)
++    # overwrite - write the diverse conformer set for potential later reuse
++    content["coordinates"] = [x for x in clustering(remol, M=M, N=N, seed=seed, removeHs=False, mmff=mmff)]
++    content["mol_list"] = [
++        Chem.AddHs(
++            copy.deepcopy(add_all_conformers_to_mol(
++                Chem.RemoveHs(remol), content["coordinates"]
++            )), addCoords=True
++        ) for i in range(N)
++    ]
++    content["holo_mol"] = copy.deepcopy(base_mol)
++    content["atoms"] = [a.GetSymbol() for a in base_mol.GetAtoms()]
++    return content
++
++
++def docking_data_pre(raw_data_path, predict_path):
+     mol_list = load_lmdb_data(raw_data_path, "mol_list")
+     mol_list = [Chem.RemoveHs(mol) for items in mol_list for mol in items]
+     predict = pd.read_pickle(predict_path)
+@@ -177,7 +218,7 @@ def ensemble_iterations(
+         holo_distance_predict_tta = holo_distance_predict_list[start_idx:end_idx]
+ 
+         mol = copy.deepcopy(mol_list[start_idx])
+-        rdkit_mol = single_conf_gen_bonds(
++        rdkit_mol = single_conf_gen(
+             mol, num_confs=tta_times, seed=42, removeHs=True
+         )
+         sz = len(rdkit_mol.GetConformers())
+@@ -199,10 +240,28 @@ def ensemble_iterations(
+         ]
+ 
+ 
+-def rmsd_func(holo_coords, predict_coords):
++def rmsd_func(holo_coords: np.ndarray, predict_coords: np.ndarray, mol: Optional[Chem.Mol] = None) -> float:
++    """ Symmetric RMSD for molecules. """
+     if predict_coords is not np.nan:
+         sz = holo_coords.shape
+-        rmsd = np.sqrt(np.sum((predict_coords - holo_coords) ** 2) / sz[-2])
++        if mol is not None:
++            # get stereochem-unaware permutations: (P, N)
++            base_perms = np.array(mol.GetSubstructMatches(mol, uniquify=False))
++            # filter for valid stereochem only
++            chem_order = np.array(list(Chem.rdmolfiles.CanonicalRankAtoms(mol, breakTies=False)))
++            perms_mask = (chem_order[base_perms] == chem_order[None]).sum(-1) == mol.GetNumAtoms()
++            base_perms = base_perms[perms_mask]
++            noh_mask = np.array([a.GetAtomicNum() != 1 for a in mol.GetAtoms()])
++            # (N, 3), (N, 3) -> (P, N, 3), ((), N, 3) -> (P,) -> min((P,))
++            best_rmsd = np.inf
++            for perm in base_perms:
++                rmsd = np.sqrt(np.sum((predict_coords[perm[noh_mask]] - holo_coords) ** 2) / sz[-2])
++                if rmsd < best_rmsd:
++                    best_rmsd = rmsd
++
++            rmsd = best_rmsd
++        else:
++            rmsd = np.sqrt(np.sum((predict_coords - holo_coords) ** 2) / sz[-2])
+         return rmsd
+     return 1000.0
+ 

@@ -1,0 +1,235 @@
+diff --git a/src/store/projects.integration.test.ts b/src/store/projects.integration.test.ts
+index d3a3df6e..aed8ce05 100644
+--- a/src/store/projects.integration.test.ts
++++ b/src/store/projects.integration.test.ts
+@@ -1131,6 +1131,93 @@ describe("projects store integration", () => {
+     });
+   });
+ 
++  describe("pre-#400 duplicates on openProject (#403)", () => {
++    it("rewrites a stale example source to duplicate so runs stop reporting the exampleId", async () => {
++      const { store, libraryStorage } =
++        await createTestStore(createFakeEngine());
++      // As duplicateProject wrote it before #400: the original's source.
++      const stale = await libraryStorage.createProject({
++        displayName: "Water vapor (copy)",
++        source: { type: "example", exampleId: "watervapor" },
++        inputScript: "in.lmp",
++      });
++      await libraryStorage.write(stale.dirName, "in.lmp", SCRIPT);
++
++      await store.getActions().projects.openProject({ dirName: stale.dirName });
++
++      const onDisk = await readJson<ProjectMeta>(
++        libraryStorage,
++        stale.dirName,
++        PROJECT_META_PATH,
++      );
++      expect(onDisk.source).toEqual({ type: "duplicate" });
++      expect(store.getState().projects.active?.meta.source).toEqual({
++        type: "duplicate",
++      });
++
++      vi.mocked(track).mockClear();
++      await store.getActions().projects.startRuns([runRequest()]);
++      expect(byName("Run.Start")[0]).toMatchObject({ exampleId: undefined });
++      expect(byName("Run.Finish")[0]).toMatchObject({ exampleId: undefined });
++      expect(byName("Simulation.Start")[0]).toMatchObject({
++        simulationId: stale.dirName,
++      });
++    });
++
++    it("leaves genuine example projects alone, including renamed ones", async () => {
++      const { store, libraryStorage } =
++        await createTestStore(createFakeEngine());
++      const example = await libraryStorage.createProject({
++        displayName: "Water vapor",
++        source: { type: "example", exampleId: "watervapor" },
++      });
++      await libraryStorage.updateProjectMeta(example.dirName, {
++        displayName: "My water run",
++      });
++
++      await store.getActions().projects.openProject({
++        dirName: example.dirName,
++      });
++
++      const onDisk = await readJson<ProjectMeta>(
++        libraryStorage,
++        example.dirName,
++        PROJECT_META_PATH,
++      );
++      expect(onDisk.source).toEqual({
++        type: "example",
++        exampleId: "watervapor",
++      });
++      expect(store.getState().projects.active?.meta.source).toEqual({
++        type: "example",
++        exampleId: "watervapor",
++      });
++    });
++
++    it("does not touch quick projects", async () => {
++      const { store, scratchStorage } =
++        await createTestStore(createFakeEngine());
++      const quick = await scratchStorage.createProject({
++        displayName: "Water vapor (copy)",
++        source: { type: "example", exampleId: "watervapor" },
++      });
++
++      await store
++        .getActions()
++        .projects.openProject({ dirName: quick.dirName, quick: true });
++
++      const onDisk = await readJson<ProjectMeta>(
++        scratchStorage,
++        quick.dirName,
++        PROJECT_META_PATH,
++      );
++      expect(onDisk.source).toEqual({
++        type: "example",
++        exampleId: "watervapor",
++      });
++    });
++  });
++
+   describe("duplicateProject: nested files and pending edits", () => {
+     it("copies nested working-tree files and flushes the debounce buffer", async () => {
+       const { store, libraryStorage } =
+diff --git a/src/store/projects/helpers.test.ts b/src/store/projects/helpers.test.ts
+new file mode 100644
+index 00000000..100b0b24
+--- /dev/null
++++ b/src/store/projects/helpers.test.ts
+@@ -0,0 +1,53 @@
++import { describe, it, expect } from "vitest";
++import { isStaleExampleCopy } from "./helpers";
++import type { ProjectMeta } from "../../storage";
++
++describe("isStaleExampleCopy", () => {
++  it.each([
++    ["display name ends in (copy)", "Water vapor (copy)", "water-vapor-copy"],
++    ["dirName ends in -copy", "My water run", "water-vapor-copy"],
++    ["dirName ends in -copy-N", "My water run", "water-vapor-copy-3"],
++    ["display name only", "Water vapor (copy)", "renamed-dir"],
++  ])("detects an example-sourced copy: %s", (_, displayName, dirName) => {
++    expect(isStaleExampleCopy(projectMeta({ displayName, dirName }))).toBe(
++      true,
++    );
++  });
++
++  it.each([
++    ["a genuine example", "Water vapor", "water-vapor"],
++    ["a second instance of an example", "Water vapor", "water-vapor-2"],
++    ["a renamed example", "My water run", "water-vapor"],
++    ["copy only mid-name", "Copy of water", "copy-of-water"],
++  ])("leaves %s alone", (_, displayName, dirName) => {
++    expect(isStaleExampleCopy(projectMeta({ displayName, dirName }))).toBe(
++      false,
++    );
++  });
++
++  it("ignores copies that are not example-sourced", () => {
++    const names = { displayName: "Mine (copy)", dirName: "mine-copy" };
++    expect(
++      isStaleExampleCopy(projectMeta({ ...names, source: undefined })),
++    ).toBe(false);
++    expect(
++      isStaleExampleCopy(projectMeta({ ...names, source: { type: "blank" } })),
++    ).toBe(false);
++    expect(
++      isStaleExampleCopy(
++        projectMeta({ ...names, source: { type: "duplicate" } }),
++      ),
++    ).toBe(false);
++  });
++});
++
++function projectMeta(
++  overrides: Partial<ProjectMeta> & { displayName: string; dirName: string },
++): ProjectMeta {
++  return {
++    schemaVersion: 1,
++    createdAt: "2026-07-01T00:00:00.000Z",
++    source: { type: "example", exampleId: "watervapor" },
++    ...overrides,
++  };
++}
+diff --git a/src/store/projects/helpers.ts b/src/store/projects/helpers.ts
+index 1f282f68..4fa662d4 100644
+--- a/src/store/projects/helpers.ts
++++ b/src/store/projects/helpers.ts
+@@ -2,7 +2,7 @@
+  * Small helpers shared by the projects model's slices.
+  */
+ 
+-import type { ProjectStorage } from "../../storage";
++import type { ProjectMeta, ProjectStorage } from "../../storage";
+ import type { StoreInjections } from "./types";
+ 
+ const SCRIPT_FILE = /(^|\/)in\.[^/]*$|\.in$/;
+@@ -11,6 +11,22 @@ export function isScriptFile(fileName: string): boolean {
+   return SCRIPT_FILE.test(fileName);
+ }
+ 
++const COPY_DIR_NAME = /-copy(-\d+)?$/;
++
++/**
++ * A duplicate made before #400, which copied the original's example source
++ * and so reports the original's exampleId to metrics on every run (#403).
++ * Recognized by duplicateProject's naming ("<name> (copy)" ->
++ * "<slug>-copy[-N]"); a genuine example's dirName is slug(displayName) and
++ * often differs from its exampleId, so that comparison cannot be used.
++ */
++export function isStaleExampleCopy(meta: ProjectMeta): boolean {
++  return (
++    meta.source?.type === "example" &&
++    (meta.displayName.endsWith("(copy)") || COPY_DIR_NAME.test(meta.dirName))
++  );
++}
++
+ export function storageFor(
+   injections: StoreInjections,
+   quick: boolean,
+diff --git a/src/store/projects/library.ts b/src/store/projects/library.ts
+index a502fdf6..e4db8d67 100644
+--- a/src/store/projects/library.ts
++++ b/src/store/projects/library.ts
+@@ -8,7 +8,12 @@ import { thunk } from "easy-peasy";
+ import { listRuns, reconcileRuns, RUNS_DIR } from "../../storage";
+ import { projectAnalysisNotebook } from "../../utils/AnalyzeNotebook";
+ import { track } from "../../utils/metrics";
+-import { copyTree, isScriptFile, storageFor } from "./helpers";
++import {
++  copyTree,
++  isScriptFile,
++  isStaleExampleCopy,
++  storageFor,
++} from "./helpers";
+ import type { ProjectsModel } from "./types";
+ 
+ export const libraryThunks: Pick<
+@@ -31,11 +36,22 @@ export const libraryThunks: Pick<
+     async (actions, { dirName, quick = false, tab }, helpers) => {
+       const storage = storageFor(helpers.injections, quick);
+       const metas = await storage.listProjects();
+-      const meta = metas.find((m) => m.dirName === dirName);
++      let meta = metas.find((m) => m.dirName === dirName);
+       if (!meta) {
+         actions.setNotice(`Project ${dirName} was not found.`);
+         return;
+       }
++      if (!quick && isStaleExampleCopy(meta)) {
++        // One-time migration: rewritten on disk, so the next open is a no-op.
++        // Only metrics depend on it, so a failed write must not block opening.
++        try {
++          meta = await storage.updateProjectMeta(dirName, {
++            source: { type: "duplicate" },
++          });
++        } catch (error) {
++          console.warn("Could not migrate stale example source", error);
++        }
++      }
+       const owned = new Set(
+         helpers.getState().activeRun
+           ? [helpers.getState().activeRun!.runId]

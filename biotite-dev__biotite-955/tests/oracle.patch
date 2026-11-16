@@ -1,0 +1,194 @@
+diff --git a/src/biotite/structure/compare.py b/src/biotite/structure/compare.py
+index 4a7d6164a..b764ace25 100644
+--- a/src/biotite/structure/compare.py
++++ b/src/biotite/structure/compare.py
+@@ -471,6 +471,17 @@ def lddt(
+         exclude_same_chain,
+         filter_function,
+     )
++    # Each pair appears twice
++    # (if i is in threshold distance to j, j is also in threshold distance to i),
++    # so only the pair where i < j needs to be kept
++    # This improves performance due to less distances that need to be computed
++    # The assumption also only works when no atoms are masked
++    unordered = (
++        isinstance(aggregation, str)
++        and aggregation == "all"
++        and atom_mask is None
++        and partner_mask is None
++    )
+     if symmetric:
+         if not isinstance(subject, AtomArray):
+             raise TypeError(
+@@ -489,18 +500,10 @@ def lddt(
+         contacts = np.concatenate((contacts, subject_contacts), axis=0)
+         # Adding additional contacts may introduce duplicates between the existing and
+         # new ones -> filter them out
+-        contacts = np.unique(contacts, axis=0)
+-    if (
+-        isinstance(aggregation, str)
+-        and aggregation == "all"
+-        and atom_mask is None
+-        and partner_mask is None
+-    ):
+-        # Remove duplicate pairs as each pair appears twice
+-        # (if i is in threshold distance to j, j is also in threshold distance to i)
+-        # keep only the pair where i < j
+-        # This improves performance due to less distances that need to be computed
+-        # The assumption also only works when no atoms are masked
++        contacts = _unique_contacts(
++            contacts, reference_coord.shape[-2], unordered=unordered
++        )
++    elif unordered:
+         contacts = contacts[contacts[:, 0] < contacts[:, 1]]
+ 
+     reference_distances = index_distance(reference_coord, contacts)
+@@ -676,6 +679,45 @@ def _find_contacts(
+     return contacts
+ 
+ 
++def _unique_contacts(
++    contacts: NDArray2[N, C2, np.integer],
++    n_atoms: int,
++    unordered: bool = False,
++) -> NDArray2[M, C2, np.integer]:
++    """
++    Remove duplicate contacts.
++
++    Parameters
++    ----------
++    contacts : ndarray, shape=(n,2), dtype=int
++        The contacts to remove duplicates from.
++    n_atoms : int
++        The number of atoms in the structure the `contacts` point to.
++    unordered : bool, optional
++        If set to true, ``(i,j)`` and ``(j,i)`` are considered the same contact and
++        only the pair with ``i < j`` is kept.
++
++    Returns
++    -------
++    contacts : ndarray, shape=(m,2), dtype=int
++        The unique contacts, sorted in lexicographic order.
++    """
++    if unordered:
++        # Bringing each pair into canonical order already removes half of the
++        # duplicates with a cheap vectorized operation instead of a sort
++        lower = np.min(contacts, axis=-1)
++        upper = np.max(contacts, axis=-1)
++    else:
++        lower = contacts[:, 0]
++        upper = contacts[:, 1]
++    # Encode each pair into a single integer, as finding unique values in a 1D array
++    # is much faster than the lexicographic row sort `np.unique(..., axis=0)` requires
++    keys = np.unique(lower.astype(np.int64) * n_atoms + upper)
++    return np.stack([keys // n_atoms, keys % n_atoms], axis=-1).astype(
++        contacts.dtype, copy=False
++    )
++
++
+ def _average_over_indices(
+     values: np.ndarray,
+     bins: NDArray1[int, np.integer],
+diff --git a/src/biotite/structure/segments.py b/src/biotite/structure/segments.py
+index 18a46f213..6587071df 100644
+--- a/src/biotite/structure/segments.py
++++ b/src/biotite/structure/segments.py
+@@ -242,21 +242,12 @@ def get_segment_starts_for(
+         The indices that point to the segment starts for the input
+         `indices`.
+     """
+-    indices = np.asarray(indices)
+-    length = starts[-1]
+-    # Remove exclusive stop
+-    starts = starts[:-1]
+-
+-    if (indices < 0).any():
+-        raise ValueError("This function does not support negative indices")
+-    if (indices >= length).any():
+-        index = np.min(np.where(indices >= length)[0])
+-        raise ValueError(
+-            f"Index {index} is out of range for an atom array with length {length}"
+-        )
+-
+-    insertion_points = np.searchsorted(starts, indices, side="right") - 1
+-    return starts[insertion_points]
++    # The segment positions are the indices of the corresponding segment starts
++    # `indices` is validated in `get_segment_positions()`
++    positions = get_segment_positions(starts, indices)
++    # The positions never point to the exclusive stop,
++    # hence it does not need to be removed from `starts`
++    return starts[positions]
+ 
+ 
+ def get_segment_positions(
+@@ -290,8 +281,6 @@ def get_segment_positions(
+     """
+     indices = np.asarray(indices)
+     length = starts[-1]
+-    # Remove exclusive stop
+-    starts = starts[:-1]
+ 
+     if (indices < 0).any():
+         raise ValueError("This function does not support negative indices")
+@@ -301,7 +290,14 @@ def get_segment_positions(
+             f"Index {index} is out of range for an atom array with length {length}"
+         )
+ 
+-    return np.searchsorted(starts, indices, side="right") - 1
++    if indices.size >= length:
++        # If there are many indices, creating a lookup table for all atoms amortizes:
++        # It is built in linear time and the subsequent lookup is a cache-friendly
++        # gather, in contrast to a binary search for each index
++        return get_all_segment_positions(starts, length)[indices]
++    else:
++        # Remove exclusive stop
++        return np.searchsorted(starts[:-1], indices, side="right") - 1
+ 
+ 
+ def get_all_segment_positions(
+diff --git a/tests/structure/test_residues.py b/tests/structure/test_residues.py
+index 39aead932..fb4e801df 100644
+--- a/tests/structure/test_residues.py
++++ b/tests/structure/test_residues.py
+@@ -37,10 +37,14 @@ def test_get_residue_masks(array):
+         assert mask.tolist() == ref_mask.tolist()
+ 
+ 
+-def test_get_residue_starts_for(array):
+-    SAMPLE_SIZE = 100
++@pytest.mark.parametrize("sample_size", [100, 1000])
++def test_get_residue_starts_for(array, sample_size):
++    """
++    The two sample sizes are below and above the number of atoms in the structure,
++    to cover both the binary search and the lookup table used internally.
++    """
+     rng = np.random.default_rng(0)
+-    indices = rng.integers(0, array.array_length(), SAMPLE_SIZE)
++    indices = rng.integers(0, array.array_length(), sample_size)
+     ref_starts = np.array(
+         [np.where(mask)[0][0] for mask in struc.get_residue_masks(array, indices)]
+     )
+@@ -76,17 +80,19 @@ def test_get_residues(array):
+     assert len(ids) == struc.get_residue_count(array)
+ 
+ 
++@pytest.mark.parametrize("sample_size", [100, 1000])
+ @pytest.mark.parametrize("seed", range(10))
+-def test_get_residue_positions(array, seed):
++def test_get_residue_positions(array, seed, sample_size):
+     """
+     The positions returned by :func:`get_residue_positions()` with some ``indices``,
+     should be the same as indexing the return value of
+     :func:`get_all_residue_positions()` with the given indices.
+-    """
+-    SIZE = 100
+ 
++    The two sample sizes are below and above the number of atoms in the structure,
++    to cover both the binary search and the lookup table used internally.
++    """
+     rng = np.random.default_rng(seed)
+-    indices = rng.integers(0, array.array_length(), size=SIZE)
++    indices = rng.integers(0, array.array_length(), size=sample_size)
+ 
+     all_positions = struc.get_all_residue_positions(array)
+     ref_positions = all_positions[indices]

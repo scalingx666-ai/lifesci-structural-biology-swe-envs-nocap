@@ -1,0 +1,206 @@
+diff --git a/meeko/export_flexres.py b/meeko/export_flexres.py
+index 2cf91078..54a0cad6 100644
+--- a/meeko/export_flexres.py
++++ b/meeko/export_flexres.py
+@@ -56,8 +56,8 @@ def export_pdb_updated_flexres(polymer, pdbqt_mol):
+                 orig_resmol = Chem.Mol(polymer.monomers[res_id].rdkit_mol)
+                 orig_atomnames = polymer.monomers[res_id].atom_names
+                 
+-                backbone_SMARTS = "[NX3]([H])[CX4][CX3](=O)"
+-                expected_names = ('N', 'H', 'CA', 'C', 'O')
++                backbone_SMARTS = "[NX3]([H])[CX4]([H])[CX3](=O)"
++                expected_names = ('N', 'H', 'CA', 'HA', 'C', 'O')
+ 
+                 backbone_qmol = Chem.MolFromSmarts(backbone_SMARTS)
+                 backbone_matches = orig_resmol.GetSubstructMatches(backbone_qmol)
+@@ -105,7 +105,10 @@ def export_pdb_updated_flexres(polymer, pdbqt_mol):
+                 for neighbor_idx, bond_type in bonds_to_recover: 
+                     new_CA_idx = covres_mol.GetNumAtoms() + expected_names.index('CA')
+                     combined_res.AddBond(new_CA_idx, neighbor_idx, bond_type)
+-                combined_res.RemoveAtom(CA_index)
++
++                CA_h_idx = [nei.GetIdx() for nei in combined_res.GetAtomWithIdx(CA_index).GetNeighbors() if nei.GetAtomicNum()==1]
++                for atom_idx in sorted(CA_h_idx + [CA_index], reverse=True): 
++                    combined_res.RemoveAtom(atom_idx)
+                 combined_res = combined_res.GetMol()
+ 
+                 polymer.monomers[res_id].rdkit_mol = combined_res
+diff --git a/meeko/polymer.py b/meeko/polymer.py
+index e6dba128..3553b9fe 100644
+--- a/meeko/polymer.py
++++ b/meeko/polymer.py
+@@ -25,6 +25,7 @@
+ from .utils.rdkitutils import _aux_altloc_mol_build
+ from .utils.rdkitutils import covalent_radius
+ from .utils.pdbutils import PDBAtomInfo
++from .utils.rdkitutils import getPdbInfoNoNull
+ from .chemtempgen import export_chem_templates_to_json
+ from .chemtempgen import build_noncovalent_CC
+ from .chemtempgen import build_linked_CCs
+@@ -1357,7 +1358,7 @@ def _get_monomers(
+                     passed.append(i)
+ 
+             # 3rd round
+-            if len(passed) == 0: 
++            if len(passed) == 0 or any(all_stats["H_excess"][i] for i in passed): 
+                 for i in range(len(candidate_templates)):
+                     if (
+                         all_stats["heavy_missing"][i]
+@@ -1367,7 +1368,8 @@ def _get_monomers(
+                         or len(all_stats["bonded_atoms_excess"][i])
+                     ):
+                         continue
+-                    passed.append(i)
++                    if i not in passed:
++                        passed.append(i)
+ 
+             if len(passed) == 0:
+                 template_key = None
+@@ -1406,20 +1408,24 @@ def _get_monomers(
+                         best_idxs.append(index)
+ 
+                 if len(best_idxs) > 1:
+-                    tied = " ".join(candidate_template_keys[i] for i in best_idxs)
+-                    m = f"for {residue_key=}, {len(passed)} have passed: "
+-                    tkeys = [candidate_template_keys[i] for i in passed]
+-                    m += f"{tkeys} and tied for fewest missing H: {tied} "
+-                    raise RuntimeError(m)
+-                elif len(best_idxs) == 0:
+-                    raise RuntimeError("unexpected situation")
+-                else:
+-                    index = best_idxs[0]
+-                    template_key = candidate_template_keys[index]
+-                    template = residue_templates[template_key]
+-                    mapping = mappings[index]
+-                    H_miss = all_stats["H_missing"][index]
+-                    log["chosen_by_fewest_missing_H"][residue_key] = template_key
++                    number_excess_H = [len(all_stats["H_excess"][index]) for index in passed]
++                    min_excess_H = min(number_excess_H)
++                    best_idxs = [index for index in passed if len(all_stats["H_excess"][index]) == min_excess_H]
++                    
++                    if len(best_idxs) > 1: 
++                        tied = " ".join(candidate_template_keys[i] for i in best_idxs)
++                        m = f"for {residue_key=}, {len(passed)} have passed: "
++                        tkeys = [candidate_template_keys[i] for i in passed]
++                        m += f"{tkeys} and tied for fewest missing and excess H: {tied} "
++
++                        raise RuntimeError(m)
++                
++                index = best_idxs[0]
++                template_key = candidate_template_keys[index]
++                template = residue_templates[template_key]
++                mapping = mappings[index]
++                H_miss = all_stats["H_missing"][index]
++                log["chosen_by_fewest_missing_H"][residue_key] = template_key
+             if template is None:
+                 rdkit_mol = None
+                 atom_names = None
+@@ -2526,13 +2532,21 @@ def match(self, input_mol):
+         for atom in input_mol.GetAtoms():
+             element = "H" if atom.GetAtomicNum() == 1 else "heavy"
+             if atom.GetIdx() not in mapping_inv:
+-                if element == "H": 
+-                    nei_idx = atom.GetNeighbors()[0].GetIdx()
+-                    if nei_idx in mapping_inv: 
+-                        result[element]["excess"].append(mapping_inv[nei_idx])
+-                    else:
+-                        result[element]["excess"].append(-1)
+-                else:
++                if element == "H":
++                    if atom.GetNeighbors(): 
++                        nei_idx = atom.GetNeighbors()[0].GetIdx()
++                        if nei_idx in mapping_inv: 
++                            result[element]["excess"].append(mapping_inv[nei_idx])
++                        else:
++                            result[element]["excess"].append(-1)
++                    else: # lone hydrogen found in monomer
++                        monomer_info = getPdbInfoNoNull(atom)
++                        if monomer_info:
++                            logger.warning(f"WARNING: Lone hydrogen is ignored: \n" 
++                                            f"  {monomer_info} \n")
++                        else:
++                            logger.warning(f"WARNING: A lone hydrogen is ignored during monomer-template matching. \n")
++                else: 
+                     result[element]["excess"] += 1
+         return result, mapping
+ 
+diff --git a/test/polymer_creation_test.py b/test/polymer_creation_test.py
+index 3799ffd0..6e7ef9a9 100644
+--- a/test/polymer_creation_test.py
++++ b/test/polymer_creation_test.py
+@@ -15,6 +15,7 @@
+ pkgdir = pathlib.Path(meeko.__file__).parents[1]
+ 
+ ahhy_example = pkgdir / "test/polymer_data/AHHY.pdb"
++nphe_ser_example = pkgdir / "test/polymer_data/NPHE_SER.pdb"
+ just_one_ALA_missing = (
+     pkgdir / "test/polymer_data/just-one-ALA-missing-CB.pdb"
+ )
+@@ -123,6 +124,27 @@ def test_AHHY_all_static_residues():
+     assert len(movable_part) == 0
+ 
+ 
++def test_protonated_Nterm_residue():
++    f = open(nphe_ser_example, "r")
++    pdb_string = f.read()
++    polymer = Polymer.from_pdb_string(
++        pdb_string,
++        chem_templates,
++        mk_prep,
++        blunt_ends=[("A:2", 0)],
++    )
++    # Asserts that the residues have been imported in a way that makes sense, and that all the
++    # private functions we expect to have run as expected.
++    assert len(polymer.monomers) == 2
++    assert len(polymer.get_ignored_monomers()) == 0
++    assert len(polymer.get_valid_monomers()) == 2
++    assert polymer.monomers["A:1"].residue_template_key == "NPHE"
++    assert polymer.monomers["A:2"].residue_template_key == "SER"
++
++    check_charge(polymer.monomers["A:1"], 1.0)
++    check_charge(polymer.monomers["A:2"], 0.0)
++
++
+ def test_AHHY_padding():
+     with open(ahhy_example, "r") as f:
+         pdb_string = f.read()
+diff --git a/test/polymer_data/NPHE_SER.pdb b/test/polymer_data/NPHE_SER.pdb
+new file mode 100644
+index 00000000..0f8a336d
+--- /dev/null
++++ b/test/polymer_data/NPHE_SER.pdb
+@@ -0,0 +1,33 @@
++ATOM      1  N   PHE A   1      68.722  74.399 242.118  1.00  9.63      A    N  
++ATOM      2  CA  PHE A   1      67.294  74.658 241.856  1.00  8.10      A    C  
++ATOM      3  C   PHE A   1      66.598  74.783 243.193  1.00  8.76      A    C  
++ATOM      4  O   PHE A   1      66.839  73.949 244.106  1.00  9.91      A    O  
++ATOM      5  CB  PHE A   1      66.715  73.473 241.081  1.00  9.82      A    C  
++ATOM      6  CG  PHE A   1      65.243  73.567 240.859  1.00  9.28      A    C  
++ATOM      7  CD1 PHE A   1      64.361  72.788 241.615  1.00  9.06      A    C  
++ATOM      8  CD2 PHE A   1      64.740  74.432 239.904  1.00  8.56      A    C  
++ATOM      9  CE1 PHE A   1      63.001  72.865 241.408  1.00  9.60      A    C  
++ATOM     10  CE2 PHE A   1      63.373  74.505 239.694  1.00  8.88      A    C  
++ATOM     11  CZ  PHE A   1      62.502  73.696 240.440  1.00  8.74      A    C  
++ATOM     12  HA  PHE A   1      67.173  75.469 241.337  1.00  8.10      A    H  
++ATOM     13  HB2 PHE A   1      67.161  73.409 240.222  1.00  9.82      A    H  
++ATOM     14  HB3 PHE A   1      66.910  72.654 241.563  1.00  9.82      A    H  
++ATOM     15  HD1 PHE A   1      64.696  72.212 242.264  1.00  9.06      A    H  
++ATOM     16  HD2 PHE A   1      65.318  74.963 239.405  1.00  8.56      A    H  
++ATOM     17  HE1 PHE A   1      62.422  72.353 241.925  1.00  9.60      A    H  
++ATOM     18  HE2 PHE A   1      63.032  75.091 239.058  1.00  8.88      A    H  
++ATOM     19  HZ  PHE A   1      61.587  73.724 240.277  1.00  8.74      A    H  
++ATOM     20  H1  PHE A   1      69.160  74.339 241.345  1.00  9.63      A    H  
++ATOM     21  H2  PHE A   1      69.061  75.066 242.601  1.00  9.63      A    H  
++ATOM     22  H3  PHE A   1      68.808  73.636 242.567  1.00  9.63      A    H  
++ATOM     23  N   SER A   2      65.746  75.780 243.354  1.00  9.10      A    N  
++ATOM     24  CA  SER A   2      65.047  75.935 244.606  1.00  8.79      A    C  
++ATOM     25  C   SER A   2      63.631  76.423 244.347  1.00  9.57      A    C  
++ATOM     26  O   SER A   2      63.343  77.010 243.291  1.00  8.63      A    O  
++ATOM     27  CB  SER A   2      65.746  76.932 245.519  1.00 11.39      A    C  
++ATOM     28  OG  SER A   2      67.085  76.531 245.798  1.00 12.67      A    O  
++ATOM     29  H   SER A   2      65.562  76.370 242.756  1.00  9.10      A    H  
++ATOM     30  HA  SER A   2      65.035  75.069 245.043  1.00  8.79      A    H  
++ATOM     31  HB2 SER A   2      65.749  77.808 245.102  1.00 11.39      A    H  
++ATOM     32  HB3 SER A   2      65.252  77.015 246.349  1.00 11.39      A    H  
++ATOM     33  HG  SER A   2      67.220  75.765 245.482  1.00 12.67      A    H  
+\ No newline at end of file

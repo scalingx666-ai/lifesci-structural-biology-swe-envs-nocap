@@ -1,0 +1,578 @@
+diff --git a/.gitignore b/.gitignore
+index 163697c..d0c2aaf 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -191,3 +191,6 @@ PLANS.md
+ # AIMNet Hessian/optimization run artifacts
+ hess_calc_cyc_*.h5
+ final_geometry.xyz
++
++# GPU validation tool output (transient)
++gpu-validation-results/
+diff --git a/Makefile b/Makefile
+index 72e11b5..c46ef1b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -17,6 +17,10 @@ test: ## Test the code with pytest (parallel execution)
+ 	@echo "🚀 Testing code: Running pytest"
+ 	@uv run pytest -n auto -m "not gpu and not network" --cov --cov-config=pyproject.toml --cov-report=xml
+ 
++.PHONY: gpu-validate
++gpu-validate: ## Validate torch/warp-lang/nvalchemiops coupling across torch 2.8-2.12 on a CUDA box
++	@bash scripts/gpu_validate.sh
++
+ .PHONY: typecheck
+ typecheck: ## Run mypy type checking (not in CI)
+ 	@echo "🚀 Type checking: Running mypy"
+diff --git a/aimnet/validation/__init__.py b/aimnet/validation/__init__.py
+new file mode 100644
+index 0000000..8015a04
+--- /dev/null
++++ b/aimnet/validation/__init__.py
+@@ -0,0 +1 @@
++"""Manual GPU validation tooling for the torch / warp-lang / nvalchemiops coupling."""
+diff --git a/aimnet/validation/compare_observables.py b/aimnet/validation/compare_observables.py
+new file mode 100644
+index 0000000..3c691fe
+--- /dev/null
++++ b/aimnet/validation/compare_observables.py
+@@ -0,0 +1,152 @@
++"""Compare per-torch-version GPU observables against a same-run baseline.
++
++Pure stdlib. The orchestrator writes one ``<label>.json`` per torch version
++(plus a ``status.json``); this module diffs every version's energies/forces
++against the baseline version and renders a verdict matrix.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++
++
++@dataclass
++class Row:
++    label: str
++    install: str
++    gpu_suite: str
++    max_de: float | str
++    max_df: float | str
++    verdict: str
++    versions: dict | str
++
++
++def load_results(results_dir) -> dict:
++    """Load ``<label>.json`` result files from a directory (skips status.json)."""
++    out = {}
++    for p in sorted(Path(results_dir).glob("*.json")):
++        if p.name == "status.json":
++            continue
++        out[p.stem] = json.loads(p.read_text())
++    return out
++
++
++def load_status(results_dir) -> dict:
++    p = Path(results_dir) / "status.json"
++    return json.loads(p.read_text()) if p.exists() else {}
++
++
++def _max_abs_force_diff(fa, fb) -> float:
++    """Max elementwise |fa - fb| over arbitrarily nested equal-shaped lists."""
++    m = 0.0
++    stack = [(fa, fb)]
++    while stack:
++        a, b = stack.pop()
++        if isinstance(a, list):
++            for x, y in zip(a, b, strict=True):
++                stack.append((x, y))
++        else:
++            m = max(m, abs(a - b))
++    return m
++
++
++def compare(results: dict, status: dict, *, baseline: str, energy_atol: float, force_atol: float):
++    """Return ``(rows, ok, base_label)``. ``ok`` is False if any leg failed.
++
++    A leg fails if it did not install, has no results, failed the gpu-suite,
++    or drifted beyond tolerance vs the baseline.
++    """
++    base_label = next(
++        (
++            lbl
++            for lbl, d in results.items()
++            if lbl == baseline or str(d["versions"]["torch"]).startswith(baseline + ".")
++        ),
++        None,
++    )
++    if base_label is None:
++        raise SystemExit(f"baseline '{baseline}' not found among results {sorted(results)}")
++    base = results[base_label]
++
++    rows: list[Row] = []
++    ok = True
++    for lbl in sorted(set(status) | set(results)):
++        st = status.get(lbl, {})
++        install = st.get("install", "fail")
++        suite = st.get("gpu_suite", "skipped")
++        if install != "ok":
++            rows.append(Row(lbl, install, suite, "-", "-", "INSTALL-FAIL", st.get("versions", "")))
++            ok = False
++            continue
++        if lbl not in results:
++            rows.append(Row(lbl, install, suite, "-", "-", "NO-RESULTS", ""))
++            ok = False
++            continue
++        d = results[lbl]
++        quad = d["versions"]
++        if lbl == base_label:
++            rows.append(Row(lbl, install, suite, 0.0, 0.0, "BASELINE", quad))
++            if suite == "fail":
++                ok = False
++            continue
++        max_de = 0.0
++        max_df = 0.0
++        for name, obs in d["systems"].items():
++            b = base["systems"][name]
++            max_de = max(max_de, abs(obs["energy"] - b["energy"]))
++            max_df = max(max_df, _max_abs_force_diff(obs["forces"], b["forces"]))
++        verdict = "PASS"
++        if suite == "fail":
++            verdict = "SUITE-FAIL"
++            ok = False
++        if max_de > energy_atol or max_df > force_atol:
++            verdict = "DRIFT"
++            ok = False
++        rows.append(Row(lbl, install, suite, max_de, max_df, verdict, quad))
++    return rows, ok, base_label
++
++
++def _fmt(v) -> str:
++    return f"{v:.2e}" if isinstance(v, float) else str(v)
++
++
++def render(rows, base_label: str) -> str:
++    lines = [f"baseline = {base_label}", ""]
++    header = f"{'torch':>7} {'install':>8} {'gpu-suite':>10} {'maxDE':>10} {'maxDF':>10}  verdict"
++    lines.append(header)
++    lines.append("-" * len(header))
++    for r in rows:
++        lines.append(
++            f"{r.label:>7} {r.install:>8} {r.gpu_suite:>10} {_fmt(r.max_de):>10} {_fmt(r.max_df):>10}  {r.verdict}"
++        )
++    lines.append("")
++    for r in rows:
++        if isinstance(r.versions, dict):
++            quad = " ".join(f"{k}={v}" for k, v in r.versions.items())
++            lines.append(f"  {r.label}: {quad}")
++    return "\n".join(lines)
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("results_dir", help="directory containing <label>.json and status.json")
++    ap.add_argument("--baseline", default="2.9", help="torch version prefix used as the reference")
++    ap.add_argument("--energy-atol", type=float, default=1e-5, help="Hartree")
++    ap.add_argument("--force-atol", type=float, default=1e-4, help="Hartree/Angstrom")
++    args = ap.parse_args(argv)
++
++    results = load_results(args.results_dir)
++    status = load_status(args.results_dir)
++    rows, ok, base_label = compare(
++        results, status, baseline=args.baseline, energy_atol=args.energy_atol, force_atol=args.force_atol
++    )
++    print(render(rows, base_label))
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/aimnet/validation/gpu_observables.py b/aimnet/validation/gpu_observables.py
+new file mode 100644
+index 0000000..e468896
+--- /dev/null
++++ b/aimnet/validation/gpu_observables.py
+@@ -0,0 +1,128 @@
++"""Compute deterministic full-model energies/forces on CUDA and dump to JSON.
++
++Version-agnostic: the orchestrator runs this once inside each per-torch-version
++venv. CUDA is required (the Warp kernels execute only on GPU); without it the
++entrypoint exits with a clear message so the orchestrator can record the leg.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from importlib.metadata import PackageNotFoundError, version
++
++
++def _ver(dist: str):
++    try:
++        return version(dist)
++    except PackageNotFoundError:
++        return None
++
++
++def resolved_versions() -> dict:
++    return {
++        "torch": _ver("torch"),
++        "triton": _ver("triton"),
++        "warp-lang": _ver("warp-lang"),
++        "nvalchemi-toolkit-ops": _ver("nvalchemi-toolkit-ops"),
++    }
++
++
++def _pin_determinism() -> None:
++    import torch
++
++    torch.manual_seed(0)
++    torch.set_float32_matmul_precision("highest")
++    torch.backends.cuda.matmul.allow_tf32 = False
++    if hasattr(torch.backends.cudnn, "allow_tf32"):
++        torch.backends.cudnn.allow_tf32 = False
++
++
++def _repo_data_dir() -> str:
++    # tests/data lives two levels up from this file: <repo>/aimnet/validation/ -> <repo>/tests/data
++    here = os.path.dirname(__file__)
++    return os.path.abspath(os.path.join(here, "..", "..", "tests", "data"))
++
++
++def build_systems() -> dict:
++    """Return ``{name: data}`` for the fixed validation set.
++
++    water/methane are inline; caffeine and the spiro crystal load from
++    tests/data via ASE (matching tests/conftest.py fixtures).
++    """
++    import ase.io
++
++    data = {
++        "water": {
++            "coord": [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
++            "numbers": [8, 1, 1],
++            "charge": 0.0,
++        },
++        "methane": {
++            "coord": [
++                [0.0, 0.0, 0.0],
++                [0.63, 0.63, 0.63],
++                [-0.63, -0.63, 0.63],
++                [-0.63, 0.63, -0.63],
++                [0.63, -0.63, -0.63],
++            ],
++            "numbers": [6, 1, 1, 1, 1],
++            "charge": 0.0,
++        },
++    }
++
++    ddir = _repo_data_dir()
++    caffeine = ase.io.read(os.path.join(ddir, "caffeine.xyz"))
++    data["caffeine"] = {
++        "coord": caffeine.get_positions().tolist(),
++        "numbers": caffeine.get_atomic_numbers().tolist(),
++        "charge": 0.0,
++    }
++    crystal = ase.io.read(os.path.join(ddir, "2000054.cif"))
++    data["spiro_pbc"] = {
++        "coord": crystal.get_positions().tolist(),
++        "numbers": crystal.get_atomic_numbers().tolist(),
++        "charge": 0.0,
++        "cell": crystal.get_cell().array.tolist(),
++        "pbc": [True, True, True],
++    }
++    return data
++
++
++def compute_observables() -> dict:
++    """Build the calculator on CUDA and return {name: {energy, forces}}."""
++    from aimnet.calculators import AIMNet2Calculator
++
++    _pin_determinism()
++    calc = AIMNet2Calculator("aimnet2", nb_threshold=0, device="cuda")
++    out = {}
++    for name, data in build_systems().items():
++        res = calc(data, forces=True)
++        energy = float(res["energy"].detach().double().cpu().reshape(-1)[0].item())
++        # Single-structure output is (N, 3) with no batch dim — do not squeeze.
++        forces = res["forces"].detach().double().cpu().tolist()
++        out[name] = {"energy": energy, "forces": forces}
++    return out
++
++
++def main(argv=None) -> int:
++    import torch
++
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--out", required=True, help="path to write the observables JSON")
++    args = ap.parse_args(argv)
++
++    if not torch.cuda.is_available():
++        raise SystemExit("gpu_observables requires CUDA; none available on this host.")
++
++    doc = {"versions": resolved_versions(), "systems": compute_observables()}
++    with open(args.out, "w") as f:
++        json.dump(doc, f, indent=2)
++    print(f"wrote {args.out} (torch {doc['versions']['torch']})")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/gpu_validation.md b/docs/gpu_validation.md
+new file mode 100644
+index 0000000..ddb0bdc
+--- /dev/null
++++ b/docs/gpu_validation.md
+@@ -0,0 +1,41 @@
++# GPU Validation (torch / warp-lang / nvalchemiops coupling)
++
++The CPU CI matrix verifies torch-core API and CPU numerics across PyTorch 2.8–2.12, but it cannot validate three GPU-only concerns: that `warp-lang` and `nvalchemiops` install coherently with each torch version, that the Warp custom op kernels execute, and that full-model energies/forces stay reproducible across the range. This manual tool covers them on a CUDA machine.
++
++## Running it
++
++```bash
++make gpu-validate
++```
++
++This loops over PyTorch 2.8, 2.9, 2.10, 2.11, 2.12. For each it creates a fresh virtualenv, installs a **resolver-coherent** environment (the matching CUDA torch wheel and its `triton`, plus `aimnet` + `warp-lang` + `nvalchemiops`), runs `pytest -m gpu`, and computes deterministic energies/forces for a fixed set of systems (water, methane, caffeine, a periodic spiro crystal). A same-run torch 2.9 baseline is then used to diff every other version.
++
++Inspect the commands without running anything:
++
++```bash
++DRY_RUN=1 bash scripts/gpu_validate.sh
++```
++
++## Configuration
++
++| Variable | Default | Notes |
++| --- | --- | --- |
++| `CUDA_INDEX` | `https://download.pytorch.org/whl/cu126` | Pick the channel matching your driver. torch 2.12 defaults to CUDA 13; if a `cu126` wheel is unavailable for a version, that leg reports `INSTALL-FAIL` — re-run that version with the appropriate `--index-url`. |
++| `PYTHON` | `python3.12` | aimnet itself supports Python ≥ 3.11, but validation defaults to 3.12 because `nvalchemiops`'s torch extra activates only at Python ≥ 3.12 — i.e. 3.12+ is where the coupling under test actually engages. |
++| `TORCH_VERSIONS` | `2.8 2.9 2.10 2.11 2.12` | Space-separated minor versions. |
++| `BASELINE` | `2.9` | torch version used as the energy/force reference. |
++| `ENERGY_ATOL` | `1e-5` | Hartree. Matches the repo's `ENERGY_ATOL`. |
++| `FORCE_ATOL` | `1e-4` | Hartree/Å. Looser than `FORCE_ATOL=1e-5` to absorb legitimate cross-version GPU reduction-order variation; tighten if your hardware is stable. |
++
++## Reading the matrix
++
++Each row is one torch version with `install`, `gpu-suite`, `maxDE`, `maxDF`, and a verdict:
++
++- `PASS` — installs, suite green, energies/forces within tolerance of baseline.
++- `BASELINE` — the reference version.
++- `INSTALL-FAIL` — the coherent env did not install (often the CUDA channel; sometimes a real warp/nvalchemiops-vs-torch break — the signal this tool exists to find).
++- `SUITE-FAIL` — `pytest -m gpu` failed.
++- `DRIFT` — energies or forces diverged beyond tolerance.
++- `NO-RESULTS` — installed but the observables dump did not produce output.
++
++A nonzero exit code means at least one leg failed. Paste the matrix into the release or PR note as the GPU-side evidence for the supported range. The real `aimnet2` model downloads from GCS on first use, so the box needs network (or a pre-populated `~/.cache/aimnet`).
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 8d2ca8d..463f416 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -49,6 +49,7 @@ nav:
+           - Model Format: model_format.md
+           - Training: train.md
+           - CLI Tools: cli.md
++          - GPU Validation: gpu_validation.md
+     - API Reference:
+           - Overview: api/index.md
+           - Calculators: api/calculators.md
+diff --git a/scripts/gpu_validate.sh b/scripts/gpu_validate.sh
+new file mode 100755
+index 0000000..aa62628
+--- /dev/null
++++ b/scripts/gpu_validate.sh
+@@ -0,0 +1,95 @@
++#!/usr/bin/env bash
++# Validate the torch / warp-lang / nvalchemiops coupling on a CUDA box across
++# the supported PyTorch range. For each version: fresh venv -> resolver-coherent
++# install -> `pytest -m gpu` -> deterministic energy/force dump. A same-run
++# torch-2.9 baseline is then used to diff every other version.
++#
++# Usage:
++#   bash scripts/gpu_validate.sh            # run the full matrix
++#   DRY_RUN=1 bash scripts/gpu_validate.sh  # print the per-version commands only
++#
++# Tunables (env vars):
++#   TORCH_VERSIONS  default "2.8 2.9 2.10 2.11 2.12"
++#   CUDA_INDEX      default "https://download.pytorch.org/whl/cu126"
++#   PYTHON          default "python3.12"
++#   RESULTS         default "./gpu-validation-results"
++#   BASELINE        default "2.9"
++#   ENERGY_ATOL     default "1e-5"   (Hartree)
++#   FORCE_ATOL      default "1e-4"   (Hartree/Angstrom)
++set -u
++
++TORCH_VERSIONS="${TORCH_VERSIONS:-2.8 2.9 2.10 2.11 2.12}"
++CUDA_INDEX="${CUDA_INDEX:-https://download.pytorch.org/whl/cu126}"
++PYTHON="${PYTHON:-python3.12}"
++RESULTS="${RESULTS:-./gpu-validation-results}"
++BASELINE="${BASELINE:-2.9}"
++ENERGY_ATOL="${ENERGY_ATOL:-1e-5}"
++FORCE_ATOL="${FORCE_ATOL:-1e-4}"
++DRY_RUN="${DRY_RUN:-0}"
++
++REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++WORKDIR="$(mktemp -d)"
++mkdir -p "$RESULTS"
++RESULTS="$(cd "$RESULTS" && pwd)"  # absolutize so per-venv dumps and compare agree
++STATUS="$RESULTS/status.json"
++
++# Build status.json incrementally with python (always available via base env).
++_set_status() {  # label key value
++    "$PYTHON" - "$STATUS" "$1" "$2" "$3" <<'PY'
++import json, sys
++path, label, key, value = sys.argv[1:5]
++try:
++    d = json.load(open(path))
++except FileNotFoundError:
++    d = {}
++d.setdefault(label, {})[key] = value
++json.dump(d, open(path, "w"), indent=2)
++PY
++}
++
++echo "repo=$REPO workdir=$WORKDIR results=$RESULTS cuda_index=$CUDA_INDEX python=$PYTHON"
++echo "{}" > "$STATUS"
++
++for V in $TORCH_VERSIONS; do
++    echo "::: torch $V :::"
++    VENV="$WORKDIR/$V"
++    # `uv pip install` honors VIRTUAL_ENV; `uv run` does NOT, so execute the
++    # suite/dump via the venv's own python directly. pytest is installed into
++    # the venv explicitly (the [ase] extra does not pull the dev group).
++    install_cmd="uv venv --python $PYTHON $VENV && \
++        VIRTUAL_ENV=$VENV uv pip install 'torch==$V.*' --index-url $CUDA_INDEX && \
++        VIRTUAL_ENV=$VENV uv pip install -e '$REPO[ase]' pytest"
++    suite_cmd="'$VENV/bin/python' -m pytest '$REPO/tests' -m gpu"
++    dump_cmd="'$VENV/bin/python' -m aimnet.validation.gpu_observables --out '$RESULTS/$V.json'"
++
++    if [ "$DRY_RUN" = "1" ]; then
++        echo "  install: $install_cmd"
++        echo "  suite:   $suite_cmd"
++        echo "  dump:    $dump_cmd"
++        continue
++    fi
++
++    if eval "$install_cmd"; then
++        _set_status "$V" install ok
++    else
++        echo "  install FAILED for torch $V"
++        _set_status "$V" install fail
++        _set_status "$V" gpu_suite skipped
++        continue
++    fi
++
++    if eval "$suite_cmd"; then _set_status "$V" gpu_suite ok; else _set_status "$V" gpu_suite fail; fi
++    eval "$dump_cmd" || echo "  observables dump FAILED for torch $V"
++done
++
++if [ "$DRY_RUN" = "1" ]; then
++    echo "(dry run; no compare)"
++    exit 0
++fi
++
++echo "::: comparing against baseline $BASELINE :::"
++# compare_observables is version-agnostic stdlib living in the aimnet package;
++# run it from the repo's own environment (always has aimnet installed).
++(cd "$REPO" && uv run --no-sync python -m aimnet.validation.compare_observables \
++    "$RESULTS" --baseline "$BASELINE" --energy-atol "$ENERGY_ATOL" --force-atol "$FORCE_ATOL")
++exit $?
+diff --git a/tests/test_compare_observables.py b/tests/test_compare_observables.py
+new file mode 100644
+index 0000000..7e451fd
+--- /dev/null
++++ b/tests/test_compare_observables.py
+@@ -0,0 +1,87 @@
++"""CPU unit tests for the GPU-validation comparator (no GPU needed)."""
++
++import json
++
++import pytest
++
++from aimnet.validation import compare_observables as C
++
++
++def _results(label, torch_ver, energy, forces):
++    return {
++        "versions": {"torch": torch_ver, "triton": "x", "warp-lang": "y", "nvalchemi-toolkit-ops": "z"},
++        "systems": {"water": {"energy": energy, "forces": forces}},
++    }
++
++
++BASE = _results("2.9", "2.9.1+cu126", -10.0, [[0.1, 0.2, 0.3]])
++
++
++def test_passes_when_within_tolerance():
++    results = {"2.9": BASE, "2.12": _results("2.12", "2.12.0+cu126", -10.0 + 1e-7, [[0.1, 0.2, 0.3 + 1e-6]])}
++    status = {"2.9": {"install": "ok", "gpu_suite": "ok"}, "2.12": {"install": "ok", "gpu_suite": "ok"}}
++    rows, ok, base = C.compare(results, status, baseline="2.9", energy_atol=1e-5, force_atol=1e-4)
++    assert base == "2.9"
++    assert ok is True
++    verdicts = {r.label: r.verdict for r in rows}
++    assert verdicts["2.9"] == "BASELINE"
++    assert verdicts["2.12"] == "PASS"
++
++
++def test_flags_energy_drift():
++    results = {"2.9": BASE, "2.8": _results("2.8", "2.8.0+cu126", -10.0 + 1e-3, [[0.1, 0.2, 0.3]])}
++    status = {"2.9": {"install": "ok", "gpu_suite": "ok"}, "2.8": {"install": "ok", "gpu_suite": "ok"}}
++    rows, ok, _ = C.compare(results, status, baseline="2.9", energy_atol=1e-5, force_atol=1e-4)
++    assert ok is False
++    assert {r.label: r.verdict for r in rows}["2.8"] == "DRIFT"
++
++
++def test_flags_force_drift():
++    results = {"2.9": BASE, "2.8": _results("2.8", "2.8.0+cu126", -10.0, [[0.1, 0.2, 0.5]])}
++    status = {"2.9": {"install": "ok", "gpu_suite": "ok"}, "2.8": {"install": "ok", "gpu_suite": "ok"}}
++    _, ok, _ = C.compare(results, status, baseline="2.9", energy_atol=1e-5, force_atol=1e-4)
++    assert ok is False
++
++
++def test_install_failure_is_reported_not_crashed():
++    results = {"2.9": BASE}
++    status = {"2.9": {"install": "ok", "gpu_suite": "ok"}, "2.11": {"install": "fail", "gpu_suite": "skipped"}}
++    rows, ok, _ = C.compare(results, status, baseline="2.9", energy_atol=1e-5, force_atol=1e-4)
++    assert ok is False
++    assert {r.label: r.verdict for r in rows}["2.11"] == "INSTALL-FAIL"
++
++
++def test_missing_results_for_installed_leg():
++    results = {"2.9": BASE}
++    status = {"2.9": {"install": "ok", "gpu_suite": "ok"}, "2.10": {"install": "ok", "gpu_suite": "ok"}}
++    rows, ok, _ = C.compare(results, status, baseline="2.9", energy_atol=1e-5, force_atol=1e-4)
++    assert ok is False
++    assert {r.label: r.verdict for r in rows}["2.10"] == "NO-RESULTS"
++
++
++def test_missing_baseline_raises():
++    results = {"2.12": _results("2.12", "2.12.0+cu126", -10.0, [[0.1, 0.2, 0.3]])}
++    status = {"2.12": {"install": "ok", "gpu_suite": "ok"}}
++    with pytest.raises(SystemExit):
++        C.compare(results, status, baseline="2.9", energy_atol=1e-5, force_atol=1e-4)
++
++
++def test_load_results_from_dir(tmp_path):
++    (tmp_path / "2.9.json").write_text(json.dumps(BASE))
++    (tmp_path / "status.json").write_text(json.dumps({"2.9": {"install": "ok", "gpu_suite": "ok"}}))
++    loaded = C.load_results(tmp_path)
++    assert "2.9" in loaded and "status" not in loaded
++
++
++def test_gpu_observables_importable_and_guards_cuda(monkeypatch, tmp_path):
++    import torch
++
++    from aimnet.validation import gpu_observables as G
++
++    # versions dict always includes torch, regardless of device
++    assert "torch" in G.resolved_versions()
++
++    # main() must refuse to run without CUDA rather than crash cryptically
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
++    with pytest.raises(SystemExit):
++        G.main(["--out", str(tmp_path / "x.json")])

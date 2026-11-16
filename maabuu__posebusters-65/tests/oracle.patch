@@ -1,0 +1,626 @@
+diff --git a/posebusters/__init__.py b/posebusters/__init__.py
+index c6ab0b6..0b23c95 100644
+--- a/posebusters/__init__.py
++++ b/posebusters/__init__.py
+@@ -32,4 +32,4 @@
+     "check_volume_overlap",
+ ]
+ 
+-__version__ = "0.4.1"
++__version__ = "0.4.2"
+diff --git a/posebusters/cli.py b/posebusters/cli.py
+index ee51a24..0de58e3 100644
+--- a/posebusters/cli.py
++++ b/posebusters/cli.py
+@@ -14,7 +14,7 @@
+ from yaml import safe_load
+ 
+ from . import __version__
+-from .posebusters import PoseBusters, _dataframe_from_output
++from .posebusters import PoseBusters
+ from .tools.formatting import create_long_output, create_short_output
+ 
+ logger = logging.getLogger(__name__)
+@@ -40,6 +40,8 @@ def bust(  # noqa: PLR0913
+     no_header: bool = False,
+     full_report: bool = False,
+     top_n: int | None = None,
++    max_workers: bool = False,
++    chunk_size: int | None = None,
+ ):
+     """PoseBusters: Plausibility checks for generated molecule poses."""
+     if table is None and len(mol_pred) == 0:
+@@ -49,14 +51,14 @@ def bust(  # noqa: PLR0913
+         # run on table
+         file_paths = pd.read_csv(table, index_col=None)
+         mode = _select_mode(config, file_paths.columns.tolist())
+-        posebusters = PoseBusters(mode, top_n=top_n)
++        posebusters = PoseBusters(mode, top_n=top_n, max_workers=max_workers, chunk_size=chunk_size)
+         posebusters.file_paths = file_paths
+         posebusters_results = posebusters._run()
+     else:
+         # run on single input
+         d = {k for k, v in dict(mol_pred=mol_pred, mol_true=mol_true, mol_cond=mol_cond).items() if v}
+         mode = _select_mode(config, d)
+-        posebusters = PoseBusters(mode, top_n=top_n)
++        posebusters = PoseBusters(mode, top_n=top_n, max_workers=max_workers, chunk_size=chunk_size)
+         cols = ["mol_pred", "mol_true", "mol_cond"]
+         posebusters.file_paths = pd.DataFrame([[mol_pred, mol_true, mol_cond] for mol_pred in mol_pred], columns=cols)
+         posebusters_results = posebusters._run()
+@@ -64,8 +66,8 @@ def bust(  # noqa: PLR0913
+     if isinstance(output, Path):
+         output = open(Path(output), "w", encoding="utf-8")
+ 
+-    for i, results_dict in enumerate(posebusters_results):
+-        results = _dataframe_from_output(results_dict, posebusters.config, full_report)
++    for i, (k, v) in enumerate(posebusters_results):
++        results = posebusters._make_table({k: v}, posebusters.config, full_report=full_report)
+         output.write(_format_results(results, outfmt, no_header, i))
+ 
+ 
+@@ -99,6 +101,14 @@ def _parse_args(args):
+     cfg_group.add_argument(
+         "--top-n", type=int, default=None, help="run on TOP_N results in MOL_PRED only (default: all)"
+     )
++    cfg_group.add_argument(
++        "--max-workers",
++        type=int,
++        help="number workers for parallel processing. (0: single thread, default: use all available cores)",
++    )
++    cfg_group.add_argument(
++        "--chunk-size", type=int, help="chunk size for parallel processing of SDF files (default: 100)", default=100
++    )
+ 
+     # other
+     inf_group.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+@@ -124,7 +134,7 @@ def _format_results(df: pd.DataFrame, outfmt: str = "short", no_header: bool = F
+ 
+     if outfmt == "csv":
+         header = (not no_header) and (index == 0)
+-        df.index.names = ["file", "molecule"]
++        df.index.names = ["file", "molecule", "position"]
+         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+         return df.to_csv(index=True, header=header)
+ 
+diff --git a/posebusters/posebusters.py b/posebusters/posebusters.py
+index a7fe00f..6499436 100644
+--- a/posebusters/posebusters.py
++++ b/posebusters/posebusters.py
+@@ -4,9 +4,11 @@
+ 
+ import inspect
+ import logging
+-from collections import defaultdict
+ from collections.abc import Generator, Iterable
++from concurrent.futures import ProcessPoolExecutor, as_completed
++from concurrent.futures.process import BrokenProcessPool
+ from functools import partial
++from math import ceil
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+@@ -29,7 +31,7 @@
+ )
+ from .modules.sucos import check_sucos
+ from .modules.volume_overlap import check_volume_overlap
+-from .tools.loading import safe_load_mol, safe_supply_mols
++from .tools.loading import get_num_mols, safe_load_mol, safe_supply_mols
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -51,6 +53,11 @@
+ }
+ molecule_args = {"mol_cond", "mol_true", "mol_pred"}
+ 
++ResultKey = tuple[str, str, int]
++ResultList = list[tuple[str, str, Any]]
++ResultTuple = tuple[ResultKey, ResultList]
++ResultDict = dict[ResultKey, ResultList]
++
+ 
+ class PoseBusters:
+     """Class to run all tests on a set of molecules."""
+@@ -61,8 +68,23 @@ class PoseBusters:
+     module_args: list
+     fname: list
+ 
+-    def __init__(self, config: str | dict[str, Any] = "redock", top_n: int | None = None):
+-        """Initialize PoseBusters object."""
++    def __init__(
++        self,
++        config: str | dict[str, Any] = "redock",
++        top_n: int | None = None,
++        max_workers: int | None = None,
++        chunk_size: int | None = 100,
++    ) -> None:
++        """Initialize PoseBusters object.
++
++        Args:
++            config: Configuration file or dictionary. If a string, it should be one of "dock", "redock", "mol", "gen".
++            top_n: Number of poses to process. If None, all poses are processed.
++            max_workers: Maximum number of workers for parallelization. If None, all available cores are used. If 0 or
++                negative, no parallelization is used.
++            chunk_size: Number of poses to process per process if parallelization is used. If None, parallelization over
++                files only.
++        """
+         self.module_func: list  # dict[str, Callable]
+         self.module_args: list  # dict[str, set[str]]
+ 
+@@ -78,8 +100,8 @@ def __init__(self, config: str | dict[str, Any] = "redock", top_n: int | None =
+         assert len(set(self.config.get("tests", {}).keys()) - set(module_dict.keys())) == 0
+ 
+         self.config["top_n"] = self.config.get("top_n", top_n)
+-
+-        self.results: dict[tuple[str, str], list[tuple[str, str, Any]]] = defaultdict(list)
++        self.config["max_workers"] = self.config.get("max_workers", max_workers)
++        self.config["chunk_size"] = self.config.get("chunk_size", chunk_size)
+ 
+     def bust(
+         self,
+@@ -106,14 +128,9 @@ def bust(
+ 
+         columns = ["mol_pred", "mol_true", "mol_cond"]
+         self.file_paths = pd.DataFrame([[mol_pred, mol_true, mol_cond] for mol_pred in mol_pred_list], columns=columns)
+-
+-        results_gen = self._run()
+-
+-        df = pd.concat([_dataframe_from_output(d, self.config, full_report=full_report) for d in results_gen])
+-        df.index.names = ["file", "molecule"]
+-        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+-
+-        return df
++        generator = self._run()
++        results = self._collect_in_table(generator, full_report=full_report)
++        return results
+ 
+     def bust_table(self, mol_table: pd.DataFrame, full_report: bool = False) -> pd.DataFrame:
+         """Run tests on molecules provided in pandas dataframe as paths or rdkit molecule objects.
+@@ -126,59 +143,129 @@ def bust_table(self, mol_table: pd.DataFrame, full_report: bool = False) -> pd.D
+             Pandas dataframe with results.
+         """
+         self.file_paths = mol_table
++        generator = self._run()
++        results = self._collect_in_table(generator, full_report=full_report)
++        return results
+ 
+-        results_gen = self._run()
+-
+-        df = pd.concat([_dataframe_from_output(d, self.config, full_report=full_report) for d in results_gen])
+-        df.index.names = ["file", "molecule"]
+-        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+-
+-        return df
+-
+-    def _run(self) -> Generator[dict, None, None]:
++    def _run(self) -> Generator[ResultTuple, None, None]:
+         """Run all tests on molecules provided in file paths.
+ 
+         Yields:
+             Generator of result dictionaries.
+         """
+         self._initialize_modules()
++        max_workers = self.config.get("max_workers", None)
++        chunk_size = self.config.get("chunk_size", 100)
++        if max_workers is not None and max_workers <= 0:
++            yield from self._run_single_thread()
++        elif chunk_size is None:
++            yield from self._run_parallel_over_files(max_workers=max_workers)
++        else:
++            yield from self._run_parallel_over_poses(max_workers=max_workers, chunk_size=chunk_size)
+ 
++    def _run_single_thread(self) -> Generator[ResultTuple, None, None]:
+         for _, paths in self.file_paths.iterrows():
+-            mol_args = {}
+-            if "mol_cond" in paths and paths["mol_cond"] is not None:
+-                mol_cond_load_params = self.config.get("loading", {}).get("mol_cond", {})
+-                mol_args["mol_cond"] = safe_load_mol(path=paths["mol_cond"], **mol_cond_load_params)
+-            if "mol_true" in paths and paths["mol_true"] is not None:
+-                mol_true_load_params = self.config.get("loading", {}).get("mol_true", {})
+-                mol_args["mol_true"] = safe_load_mol(path=paths["mol_true"], **mol_true_load_params)
+-
+-            mol_pred_load_params = self.config.get("loading", {}).get("mol_pred", {})
+-            for i, mol_pred in enumerate(safe_supply_mols(paths["mol_pred"], **mol_pred_load_params)):
+-                if self.config["top_n"] is not None and i >= self.config["top_n"]:
+-                    break
+-
+-                mol_args["mol_pred"] = mol_pred
+-
+-                results_key = (str(paths["mol_pred"]), self._get_name(mol_pred, i))
+-
+-                for name, fname, func, args in zip(self.module_name, self.fname, self.module_func, self.module_args):
+-                    # pick needed arguments for module
+-                    args_needed = {k: v for k, v in mol_args.items() if k in args}
+-                    # loading takes all inputs
+-                    if fname == "loading":
+-                        args_needed = {k: args_needed.get(k, None) for k in args_needed}
+-                    # run module when all needed input molecules are valid Mol objects
+-                    if fname != "loading" and not all(args_needed.get(m, None) for m in args_needed):
+-                        module_output: dict[str, Any] = {"results": {}}
+-                    else:
+-                        module_output = func(**args_needed)
+-
+-                    # save to object
+-                    self.results[results_key].extend([(name, k, v) for k, v in module_output["results"].items()])
+-                    # self.results[results_key]["details"].append(module_output["details"])
+-
+-                # return results for this entry
+-                yield {results_key: self.results[results_key]}
++            yield from self._run_multiple_poses(paths)
++
++    def _run_parallel_over_files(
++        self, timeout: int | None = None, max_workers: int | None = None
++    ) -> Generator[ResultTuple, None, None]:
++        with ProcessPoolExecutor(max_workers=max_workers) as executor:
++            futures = [executor.submit(self._run_and_combine, paths) for _, paths in self.file_paths.iterrows()]
++            for future in as_completed(futures, timeout=None):
++                try:
++                    results = future.result(timeout=timeout)
++                except BrokenProcessPool as exception:
++                    # logger.critical("BrokenProcessPool: %s", exception)
++                    raise exception
++                except Exception as exception:
++                    # logger.critical("Error in process: %s", exception)
++                    raise exception
++
++                yield from results
++
++    def _run_parallel_over_poses(
++        self, timeout: int | None = None, max_workers: int | None = None, chunk_size: int = 100
++    ) -> Generator[ResultTuple, None, None]:
++        with ProcessPoolExecutor(max_workers=max_workers) as executor:
++            futures = []
++            for _, paths in self.file_paths.iterrows():
++                num_mols_pred = get_num_mols(paths["mol_pred"])
++                for chunk in range(ceil(num_mols_pred / chunk_size)):
++                    indices = range(chunk * chunk_size, min((chunk + 1) * chunk_size, num_mols_pred))
++                    future = executor.submit(self._run_and_combine, paths=paths, indices=indices)
++                    futures.append(future)
++
++            for future in as_completed(futures, timeout=None):
++                try:
++                    results = future.result(timeout=timeout)
++                except BrokenProcessPool as exception:
++                    # logger.critical("BrokenProcessPool: %s", exception)
++                    raise exception
++                except Exception as exception:
++                    # logger.critical("Error in process: %s", exception)
++                    raise exception
++
++                yield from results
++
++    def _run_and_combine(self, paths: pd.Series, indices: Iterable[int] | None = None) -> list[ResultTuple]:
++        """Run and collect all tests for all poses in the prediction file."""
++        return list(self._run_multiple_poses(paths, indices=indices))
++
++    def _run_multiple_poses(
++        self, paths: pd.Series, indices: Iterable[int] | None = None
++    ) -> Generator[ResultTuple, None, None]:
++        """Run all tests on indexed poses in the prediction file.
++
++        Args:
++            paths: Pandas series with keys "mol_pred", "mol_true", "mol_cond" containing paths to molecules.
++            indices: Indices of poses to process. If None, all poses are processed.
++
++        Yields:
++            Generator of result dictionaries.
++        """
++
++        mol_args = {}
++        if "mol_cond" in paths and paths["mol_cond"] is not None:
++            mol_cond_load_params = self.config.get("loading", {}).get("mol_cond", {})
++            mol_args["mol_cond"] = safe_load_mol(path=paths["mol_cond"], **mol_cond_load_params)
++        if "mol_true" in paths and paths["mol_true"] is not None:
++            mol_true_load_params = self.config.get("loading", {}).get("mol_true", {})
++            mol_args["mol_true"] = safe_load_mol(path=paths["mol_true"], **mol_true_load_params)
++
++        mol_pred_load_params = self.config.get("loading", {}).get("mol_pred", {})
++        for i, mol_pred in enumerate(safe_supply_mols(paths["mol_pred"], indices=indices, **mol_pred_load_params)):
++            if self.config["top_n"] is not None and i >= self.config["top_n"]:
++                break
++            mol_args["mol_pred"] = mol_pred
++
++            key: ResultKey = (str(paths["mol_pred"]), self._get_name(mol_pred), i)
++            results: ResultList = self._run_one_pose(mol_args)
++
++            yield key, results
++
++    def _run_one_pose(self, molecules: dict[str, Any]) -> ResultList:
++        """Run all tests on a single pose."""
++        results = []
++        for name, fname, func, args in zip(self.module_name, self.fname, self.module_func, self.module_args):
++            # pick needed arguments for module
++            args_needed = {k: v for k, v in molecules.items() if k in args}
++
++            # loading takes all inputs
++            if fname == "loading":
++                args_needed = {k: args_needed.get(k, None) for k in args_needed}
++
++            # run module when all needed input molecules are valid Mol objects
++            if fname != "loading" and not all(args_needed.get(m, None) for m in args_needed):
++                module_output: dict[str, Any] = {"results": {}}
++            else:
++                module_output = func(**args_needed)
++
++            # save to object
++            results.extend([(name, k, v) for k, v in module_output["results"].items()])
++            # self.results[results_key]["details"].append(module_output["details"])
++
++        return results
+ 
+     def _initialize_modules(self) -> None:
+         self.module_name = []
+@@ -196,31 +283,39 @@ def _initialize_modules(self) -> None:
+             self.module_args.append(module_args)
+ 
+     @staticmethod
+-    def _get_name(mol: Mol, i: int) -> str:
+-        if mol is None:
+-            return f"invalid_mol_at_pos_{i}"
++    def _get_name(mol: Mol) -> str:
++        """Get the name of a molecule from the RDKit molecule object. Returns empty string if no name found."""
++        if mol is None or not mol.HasProp("_Name"):
++            return ""
++        return mol.GetProp("_Name")
+ 
+-        if not mol.HasProp("_Name") or mol.GetProp("_Name") == "":
+-            return f"mol_at_pos_{i}"
++    def _collect_in_table(self, results_gen, full_report) -> pd.DataFrame:
++        """Collect generator results in a pandas dataframe."""
+ 
+-        return mol.GetProp("_Name")
++        df = pd.concat([self._make_table({k: v}, self.config, full_report=full_report) for k, v in results_gen])
++        df.index.names = ["file", "molecule", "position"]
++        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+ 
++        return df
++
++    @staticmethod
++    def _make_table(results_dict: ResultDict, config, full_report: bool = False) -> pd.DataFrame:
++        """Generate a table from the output of the tests."""
+ 
+-def _dataframe_from_output(results_dict, config, full_report: bool = False) -> pd.DataFrame:
+-    d = {id: {(module, output): value for module, output, value in results} for id, results in results_dict.items()}
+-    df = pd.DataFrame.from_dict(d, orient="index")
++        d = {id: {(module, output): value for module, output, value in results} for id, results in results_dict.items()}
++        df = pd.DataFrame.from_dict(d, orient="index")
+ 
+-    test_columns = [(c["name"], n) for c in config["modules"] for n in c.get("chosen_binary_test_output", [])]
+-    names_lookup = {(c["name"], k): v for c in config["modules"] for k, v in c.get("rename_outputs", {}).items()}
+-    suffix_lookup = {c["name"]: c["rename_suffix"] for c in config["modules"] if "rename_suffix" in c}
++        test_columns = [(c["name"], n) for c in config["modules"] for n in c.get("chosen_binary_test_output", [])]
++        names_lookup = {(c["name"], k): v for c in config["modules"] for k, v in c.get("rename_outputs", {}).items()}
++        suffix_lookup = {c["name"]: c["rename_suffix"] for c in config["modules"] if "rename_suffix" in c}
+ 
+-    available_columns = df.columns.tolist()
+-    missing_columns = [c for c in test_columns if c not in available_columns]
+-    extra_columns = [c for c in available_columns if c not in test_columns]
+-    columns = test_columns + extra_columns if full_report else test_columns
++        available_columns = df.columns.tolist()
++        missing_columns = [c for c in test_columns if c not in available_columns]
++        extra_columns = [c for c in available_columns if c not in test_columns]
++        columns = test_columns + extra_columns if full_report else test_columns
+ 
+-    df[missing_columns] = pd.NA
+-    df = df[columns]
+-    df.columns = [names_lookup.get(c, c[-1] + suffix_lookup.get(c[0], "")) for c in df.columns]
++        df[missing_columns] = pd.NA
++        df = df[columns]
++        df.columns = [names_lookup.get(c, c[-1] + suffix_lookup.get(c[0], "")) for c in df.columns]
+ 
+-    return df
++        return df
+diff --git a/posebusters/tools/formatting.py b/posebusters/tools/formatting.py
+index 0aad11d..99bae12 100644
+--- a/posebusters/tools/formatting.py
++++ b/posebusters/tools/formatting.py
+@@ -24,7 +24,9 @@ def create_long_output(df: pd.DataFrame) -> str:
+     output = ""
+     segments = []
+     for col in cols:
+-        segments.append("Long summary for " + " ".join(col) + "\n" + df[[col]].to_string(index=True, header=False))
++        segments.append(
++            "Long summary for " + " ".join(map(str, col)) + "\n" + df[[col]].to_string(index=True, header=False)
++        )
+     output += "\n\n".join(segments)
+     return output + "\n"
+ 
+diff --git a/posebusters/tools/loading.py b/posebusters/tools/loading.py
+index 69e0561..254ec50 100644
+--- a/posebusters/tools/loading.py
++++ b/posebusters/tools/loading.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ import logging
+-from collections.abc import Generator
++from collections.abc import Generator, Iterable
+ from pathlib import Path
+ 
+ from rdkit.Chem.AllChem import AssignBondOrdersFromTemplate
+@@ -47,7 +47,9 @@ def safe_load_mol(path: Path, load_all: bool = False, **load_params) -> Mol | No
+     return None
+ 
+ 
+-def safe_supply_mols(path: Path, load_all=True, sanitize=True, **load_params) -> Generator[Mol | None, None, None]:
++def safe_supply_mols(
++    path: Path, load_all=True, sanitize=True, indices: Iterable[int] | None = None, **load_params
++) -> Generator[Mol | None, None, None]:
+     """Supply molecules from a file, optionally adding hydrogens and assigning bond orders.
+ 
+     Args:
+@@ -69,15 +71,26 @@ def safe_supply_mols(path: Path, load_all=True, sanitize=True, **load_params) ->
+     else:
+         raise ValueError(f"Molecule file {path} has unknown format. Only .sdf, .mol and .mol2 are supported.")
+ 
+-    supplier = SDMolSupplier(str(path), sanitize=False, strictParsing=True)
+-    i = 0
+-    for mol in supplier:
+-        mol_clean = _process_mol(mol, sanitize=sanitize, **load_params)
+-        i += 1
+-        if mol_clean is not None:
+-            mol_clean.SetProp("_Path", str(path))
+-            mol_clean.SetProp("_Index", str(i))
+-        yield mol_clean
++    with SDMolSupplier(str(path), sanitize=False, strictParsing=True) as supplier:
++        for index in range(len(supplier)) if indices is None else indices:
++            mol_clean = _process_mol(supplier[index], sanitize=sanitize, **load_params)
++            if mol_clean is not None:
++                mol_clean.SetProp("_Path", str(path))
++                mol_clean.SetProp("_Index", str(index))
++            yield mol_clean
++
++
++def get_num_mols(path: Path) -> int:
++    """Get number of molecules in a file. Only supports multiple molecules in SDF files."""
++
++    if isinstance(path, Mol):
++        return 1
++
++    path = Path(path)
++    if path.suffix == ".sdf":
++        with SDMolSupplier(str(path), sanitize=False, strictParsing=False) as supplier:
++            return len(supplier)
++    return 1
+ 
+ 
+ def _load_mol(  # noqa: PLR0913
+@@ -88,25 +101,32 @@ def _load_mol(  # noqa: PLR0913
+     strictParsing=False,
+     proximityBonding=False,
+     cleanupSubstructures=True,
++    index: int | None = None,
+     **params,
+ ) -> Mol | None:
+     """Load molecule(s) from a file, picking the right RDKit function."""
+ 
+-    if load_all and path.suffix == ".sdf":
+-        mol = _load_and_combine_mols(path, sanitize=False, removeHs=removeHs, strictParsing=strictParsing)
+-    elif path.suffix == ".sdf":
+-        mol = MolFromMolFile(str(path), sanitize=False, removeHs=removeHs, strictParsing=strictParsing)
++    if path.suffix == ".sdf":
++        if load_all:
++            mol = _load_and_combine_mols(path, sanitize=False, removeHs=removeHs, strictParsing=strictParsing)
++        elif index is not None:
++            with SDMolSupplier(str(path), sanitize=False, removeHs=removeHs, strictParsing=strictParsing) as supplier:
++                mol = supplier[index]
++        else:
++            mol = MolFromMolFile(str(path), sanitize=False, removeHs=removeHs, strictParsing=strictParsing)
+     elif path.suffix == ".mol2":
+-        # MolFromMol2File only loads first molecule from mol2 file
+-        if load_all and sum(ln.strip().startswith("@<TRIPOS>MOLECULE") for ln in open(path).readlines()) > 1:
+-            logger.error("Cannot load multiple molecules from mol2 file, only loading first.")
++        # MolFromMol2File only loads only first molecule from mol2 file
++        with open(path) as file:
++            if load_all and sum(ln.strip().startswith("@<TRIPOS>MOLECULE") for ln in file.readlines()) > 1:
++                logger.error("Cannot load multiple molecules from mol2 file, only loading first.")
+         mol = MolFromMol2File(str(path), sanitize=False, removeHs=removeHs, cleanupSubstructures=cleanupSubstructures)
+     elif path.suffix == ".pdb":
+         mol = MolFromPDBFile(str(path), sanitize=False, removeHs=removeHs, proximityBonding=proximityBonding)
+     elif path.suffix == ".mol":
+         # .mol files only contain one molecule
+-        block = "".join(open(path).readlines()).strip() + "\nM  END"
+-        mol = MolFromMolBlock(block, sanitize=False, removeHs=removeHs, strictParsing=strictParsing)
++        with open(path) as file:
++            block = "".join(file.readlines()).strip() + "\nM  END"
++            mol = MolFromMolBlock(block, sanitize=False, removeHs=removeHs, strictParsing=strictParsing)
+     else:
+         raise ValueError(f"Unknown file type {path.suffix}")
+ 
+@@ -130,17 +150,15 @@ def _check_path(path: Path | str) -> Path:
+ 
+ def _load_and_combine_mols(path: Path, sanitize=True, removeHs=True, strictParsing=True) -> Mol | None:
+     """Load mols from SDF file and combine into one molecule."""
+-    supplier = SDMolSupplier(str(path), sanitize=sanitize, removeHs=removeHs, strictParsing=strictParsing)
+-
+-    # warning: combines molecules without checking identity or atom order
+-    mol = next(supplier)
+-    while mol is None and supplier.atEnd() is False:
++    with SDMolSupplier(str(path), sanitize=sanitize, removeHs=removeHs, strictParsing=strictParsing) as supplier:
++        # warning: combines molecules without checking identity or atom order
+         mol = next(supplier)
+-    for mol_next in supplier:
+-        if mol_next is not None:
+-            mol.AddConformer(mol_next.GetConformer(), assignId=True)
+-
+-    return mol
++        while mol is None and supplier.atEnd() is False:
++            mol = next(supplier)
++        for mol_next in supplier:
++            if mol_next is not None:
++                mol.AddConformer(mol_next.GetConformer(), assignId=True)
++        return mol
+ 
+ 
+ def _process_mol(  # noqa: PLR0913
+diff --git a/posebusters/tools/parallel.py b/posebusters/tools/parallel.py
+deleted file mode 100644
+index e724b5b..0000000
+--- a/posebusters/tools/parallel.py
++++ /dev/null
+@@ -1,18 +0,0 @@
+-"""Provides some functions for parallel processing."""
+-
+-from __future__ import annotations
+-
+-from collections.abc import Iterable
+-from multiprocessing import Pool
+-from typing import Callable
+-
+-from tqdm import tqdm
+-
+-
+-def parallel_map(function: Callable, iterable: Iterable, max_workers: int | None = None, chunk_size: int = 1, **kwargs):
+-    """Parallel map function."""
+-    with Pool(processes=max_workers, **kwargs) as pool:
+-        results = tqdm(
+-            pool.imap_unordered(function, iterable, chunk_size),
+-        )
+-    return results
+diff --git a/tests/conftest.py b/tests/conftest.py
+index e1b3058..04f0e38 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -96,14 +96,14 @@ def mol_cholesterol():
+ @pytest.fixture
+ def mol_true_1g9v():
+     path = "tests/conftest/1G9V_RQ3/1G9V_RQ3_ligands.sdf"
+-    supplier = SDMolSupplier(str(path), sanitize=True, removeHs=True, strictParsing=True)
+-    mol = next(supplier)
+-    while mol is None and supplier.atEnd() is False:
++    with SDMolSupplier(str(path), sanitize=True, removeHs=True, strictParsing=True) as supplier:
+         mol = next(supplier)
+-    for mol_next in supplier:
+-        if mol_next is not None:
+-            mol.AddConformer(mol_next.GetConformer(), assignId=True)
+-    return mol
++        while mol is None and supplier.atEnd() is False:
++            mol = next(supplier)
++        for mol_next in supplier:
++            if mol_next is not None:
++                mol.AddConformer(mol_next.GetConformer(), assignId=True)
++        return mol
+ 
+ 
+ @pytest.fixture
+@@ -119,14 +119,14 @@ def mol_pred_1g9v():
+ @pytest.fixture
+ def mol_true_1w1p():
+     path = "tests/conftest/1W1P_GIO/1W1P_GIO_ligands.sdf"
+-    supplier = SDMolSupplier(str(path), sanitize=True, removeHs=True, strictParsing=True)
+-    mol = next(supplier)
+-    while mol is None and supplier.atEnd() is False:
++    with SDMolSupplier(str(path), sanitize=True, removeHs=True, strictParsing=True) as supplier:
+         mol = next(supplier)
+-    for mol_next in supplier:
+-        if mol_next is not None:
+-            mol.AddConformer(mol_next.GetConformer(), assignId=True)
+-    return mol
++        while mol is None and supplier.atEnd() is False:
++            mol = next(supplier)
++        for mol_next in supplier:
++            if mol_next is not None:
++                mol.AddConformer(mol_next.GetConformer(), assignId=True)
++        return mol
+ 
+ 
+ @pytest.fixture

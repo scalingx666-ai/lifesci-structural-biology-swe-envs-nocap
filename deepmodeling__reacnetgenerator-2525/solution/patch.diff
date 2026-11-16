@@ -1,0 +1,789 @@
+diff --git a/benchmarks/smiles_batches.py b/benchmarks/smiles_batches.py
+index 5fb72d4c2..145f08f57 100644
+--- a/benchmarks/smiles_batches.py
++++ b/benchmarks/smiles_batches.py
+@@ -236,6 +236,10 @@ def decode(*args):
+     original_run = _smilesworker.run_mp
+ 
+     def run(nproc, **kwargs):
++        if kwargs["func"] is not _smilesworker._convert_smiles_batch:
++            # Per-record workers reuse the converter without batch spill files.
++            yield from original_run(nproc, **kwargs)
++            return
+         folder = Path(kwargs["initargs"][-2])
+         with closing(original_run(nproc, **kwargs)) as batches:
+             for item in batches:
+diff --git a/benchmarks/smiles_record_context.md b/benchmarks/smiles_record_context.md
+new file mode 100644
+index 000000000..824d1e479
+--- /dev/null
++++ b/benchmarks/smiles_record_context.md
+@@ -0,0 +1,148 @@
++# Per-record SMILES conversion state
++
++Small SMILES inputs use ordered per-record tasks. Previously each task serialized
++the bound collector, including its RNG owner and frame-sized timestep dictionary.
++The standard collector now initializes the existing minimal converter once per
++worker and submits a module-level function with the four compressed record blocks.
++Batch admission, worker count, the two-records-per-worker admission bound and
++disk-ordered result consumption retain their existing settings. Custom collectors
++and instance callables keep the bound-method path; single-process conversion stays
++local. No name cache is introduced.
++
++The initializer carries element names, per-atom names, a need-frames flag and a
++frequency/name selector. Timeline filtering, timestep lookup, VF2 fallback and
++global-frequency representative selection remain in the parent. This removes
++trajectory metadata from tasks; it does not bound parent RNG storage, per-atom
++metadata or an individual molecule's decoded frames.
++
++## Matched measurements
++
++Baseline is official `dd47d2fde3d5db6b8e671752dc3a45af2f6917e9`. Measured production
++SHA-256 values:
++
++| Module             | Baseline                                                           | Candidate                                                          |
++| ------------------ | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
++| `_path.py`         | `465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1` | `4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360` |
++| `_smilesworker.py` | `ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286` | `423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18` |
++
++All runs are sequential fresh processes on one Linux AMD EPYC 7K62 host, CPUs
++0–7, with native math threads limited to one. Both versions use the same Python
++3.12.12 environment, NumPy 2.5.4, RDKit 2026.9.1, NetworkX 3.7, LZ4 4.4.5 and
++native extension. Source hashes identify the measured code independently of
++generated package version labels. Each row uses three alternating AB/BA/AB pairs.
++
++Synthetic fixtures construct actual RNG/collector objects, retaining a timestep
++dictionary proportional to frame count. They isolate transport overhead with
++small molecule graphs; they are not additional chemical trajectories. Imports,
++fixture creation, input pre-reading and output fingerprints are outside the timer.
++Naming includes conversion, global grouping, output, worker startup and cleanup.
++The large-output case instead times conversion and incremental result hashing.
++
++| Workload                                         | Base seconds | Candidate seconds | Change |
++| ------------------------------------------------ | -----------: | ----------------: | -----: |
++| fork, 64-frame metadata, 400 records             |       0.1841 |            0.1421 | −22.8% |
++| fork, 100k-frame metadata, 400 records           |       1.9796 |            0.1416 | −92.8% |
++| fork, 1M-frame metadata, 400 records             |      17.5767 |            0.1552 | −99.1% |
++| spawn, 100k-frame metadata, 400 records          |       3.9656 |            0.5608 | −85.9% |
++| forkserver, 100k-frame metadata, 400 records     |       6.7653 |            0.9324 | −86.2% |
++| single process, 100k-frame metadata, 400 records |       0.0542 |            0.0539 |  −0.6% |
++| existing fork batch path, 1,024 records          |       0.1405 |            0.1511 |  +7.6% |
++| fork, two large returned frame arrays            |       1.9102 |            0.1500 | −92.1% |
++| real 5,001-frame window, first 400 records, fork |       0.2951 |            0.1498 | −49.3% |
++| same real window, all 4,509 records, spawn       |       4.7304 |            1.5893 | −66.4% |
++
++The existing batch control is 10.6 ms slower in median despite identical task
++counts and bytes; no batch-path speedup is claimed. The short candidate ranges
++from 0.1328 to 0.2714 seconds, including one slower sample. Forkserver startup also
++varies: base 5.3810–6.9459 seconds, candidate 0.8130–1.5321 seconds. The real cases
++replay fixed no-HMM detection records, not DETECT or an entire production run.
++Windows/macOS and full production trajectories have not been measured.
++
++[All 60 timing samples](smiles_record_context_timings.csv) retain controls, CPU,
++separate parent/child RSS peaks, source hashes and output fingerprints. RSS includes
++imports/preparation and is not a concurrent process-tree total or a memory limit.
++
++## Actual task payloads
++
++[Twelve separate audit runs](smiles_record_context_audits.csv) wrap the production
++serialization function and count the bytes actually returned by its protocol-5
++ForkingPickler. They do not serialize each input a second time. The additional
++initializer diagnostic serializes only the converter initializer and its args;
++it excludes shared runner synchronization and process-startup framing.
++
++| Metadata frames, 400 records | Largest base task bytes | Largest candidate task bytes | Total base / candidate task bytes |
++| ---------------------------- | ----------------------: | ---------------------------: | --------------------------------: |
++| 64                           |                   7,449 |                        1,021 |               2,977,218 / 406,018 |
++| 100,000                      |                 744,849 |                        1,025 |             297,936,196 / 406,596 |
++| 1,000,000                    |               9,747,882 |                        1,025 |           3,899,149,396 / 406,596 |
++
++The candidate converter initializer is 1,245 bytes for each case, installed once
++per worker. The slight short-record size difference comes from frame values in
++the records themselves. Spawn/forkserver reproduce the same 100k-frame task
++bytes. The existing batch control retains 16 tasks and 968,274 input bytes on both
++versions. These are application call payloads, excluding outer pool framing.
++
++## Correctness
++
++The full non-GUI regression suite passes: 749 passed, 6 GUI deselected, 6 xfailed
++and 3 non-strict XPASS. Forty-five new cases exercise actual fork/spawn/forkserver
++pools, all three `miso` modes, parent-side timeline filters, failed SMILES/VF2
++fallback and representative counts, custom extensions, and initializer/task/exit/
++serialization/consumer failures. Failure tests keep exception tracebacks alive
++while checking worker cleanup. Unrelated unpicklable RNG state never reaches
++standard workers.
++
++All 72 timing/audit outputs have equal ordered fingerprints within each
++configuration. Downstream integration covers prepared HMM→MATRIX streams with
++100k frames under fork/miso0, spawn/miso1 and forkserver/miso2, a 64-frame fork
++control, and a real 101-frame DETECT→MATRIX window. All ten HDF5 outputs pass the
++native validator; five base/candidate pairs preserve exact species labels,
++atom/bond identities, ranges, populations, counts and transition evidence after
++normalizing internal IDs. [Integration timings](smiles_record_context_integration.csv)
++are single correctness samples and do not establish whole-pipeline speedups.
++
++Repository pre-commit hooks, configured `ty==0.0.15`, and the existing SMILES audit
++benchmark smoke check pass. Local tests reuse the official worktree's already
++built ignored HTML bundle and native extension; these files are not PR contents.
++
++## Reproduce
++
++Use this checkout's script with separately installed base/candidate environments
++that have matching dependencies. Replace interpreter, input and cache paths.
++Run each configuration sequentially in fresh processes, alternating AB/BA/AB.
++Use an available CPU set; timings here used `taskset -c 0-7` on Linux.
++
++```sh
++export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
++export NUMEXPR_NUM_THREADS=1 PYTHONHASHSEED=0
++export MPLCONFIGDIR=/path/to/writable/matplotlib-cache
++
++"$RNG_BASE_PYTHON" benchmarks/smiles_record_context.py --method fork \
++    --frames 100000 --records 400 --nproc 4 --miso 1 --json base.json
++"$RNG_HEAD_PYTHON" benchmarks/smiles_record_context.py --method fork \
++    --frames 100000 --records 400 --nproc 4 --miso 1 --json candidate.json
++```
++
++Use `--frames 64` / `1000000`, `--method spawn` / `forkserver`, `--nproc 1`,
++`--records 1024`, or `--large-output --miso 0` for controls. Repeat in separate
++output files with `--audit` for payload measurements; exclude audit elapsed times
++from speed summaries. Hashes and resource usage are emitted alongside timings.
++
++Prepare a real detection stream once with `isomer_candidates.py --prepare --input TRAJECTORY --atom-types C Cl H O --nproc 1 --state STATE`, using the actual type map.
++Then pass `--state STATE --frames 5001 --records 400` for the ordered prefix, or
++`--records 100000 --method spawn` to select all records in the measured window.
++`--records` is capped at the prepared state's count. This fixture has 2,600 atoms
++and 4,509 records; its raw trajectory and prepared streams are not included here.
++
++The prepared synthetic integration can be replayed with both interpreters:
++
++```sh
++"$RNG_HEAD_PYTHON" benchmarks/hmm_signal_pipeline.py --frames 100000 \
++    --pairs 20 --nproc 4 --method spawn --miso 1 --output head-output --json head-run.json
++"$RNG_HEAD_PYTHON" benchmarks/equal_z_compare.py base-output head-output
++```
++
++Create `base-output` with the same first command and the base interpreter. Use
++the method/miso/frame combinations in the integration CSV for the other checks.
++The real window uses `equal_z_candidates.py --mode pipeline --input TRAJECTORY --atom-types C Cl H O --nproc 4 --miso 1 --output OUTPUT --json RESULT`, then the
++same independent comparison helper. Neither benchmark starts MD or training.
+diff --git a/benchmarks/smiles_record_context.py b/benchmarks/smiles_record_context.py
+new file mode 100644
+index 000000000..ccec967c1
+--- /dev/null
++++ b/benchmarks/smiles_record_context.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Replay per-record SMILES with a real RNG owner and frame-sized metadata.
++
++Run the same script with base/head PYTHONPATH, alternating fresh processes.
++Synthetic records isolate context size from molecule graph size. Optional real
++states use isomer_candidates.py --prepare; --records limits an ordered prefix.
++Audits measure actual serialized calls and run separately from timing samples.
++"""
++
++import argparse
++import hashlib
++import importlib.metadata
++import json
++import multiprocessing
++import pickle
++import platform
++import tempfile
++import time
++from contextlib import closing
++from pathlib import Path
++
++import numpy as np
++from smiles_batches import _usage
++
++from reacnetgenerator import ReacNetGenerator, _path, utils
++from reacnetgenerator import _smilesworker as workers
++
++
++def main():
++    """Measure conversion or full naming, including worker startup and cleanup."""
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--frames", type=int, default=100000)
++    parser.add_argument("--records", type=int, default=400)
++    parser.add_argument("--nproc", type=int, default=4)
++    parser.add_argument("--miso", type=int, choices=[0, 1, 2], default=1)
++    parser.add_argument("--state", type=Path)
++    parser.add_argument("--large-output", action="store_true")
++    parser.add_argument("--audit", action="store_true")
++    parser.add_argument(
++        "--method", choices=multiprocessing.get_all_start_methods(), default="spawn"
++    )
++    parser.add_argument("--json", type=Path, required=True)
++    args = parser.parse_args()
++    if min(args.frames, args.records, args.nproc) < 1:
++        parser.error("Frame, record and worker counts must be positive")
++    multiprocessing.set_start_method(args.method, force=True)
++    with tempfile.TemporaryDirectory() as temporary:
++        root = Path(temporary)
++        source = root / "input.bond"
++        source.touch()
++        rng = ReacNetGenerator(
++            inputfilename=source,
++            inputfiletype="bond",
++            atomname=["C"],
++            nproc=args.nproc,
++            miso=args.miso,
++            runHMM=False,
++            output_dir=root / "output",
++            printmoleculetime=args.large_output,
++        )
++        rng.N = 256
++        rng.atomtype = np.zeros(rng.N, dtype=int)
++        rng.step = args.frames
++        rng.timestep = dict(enumerate(range(args.frames)))
++        rng.source_frame_counts = [args.frames]
++        records = root / "records.bin"
++        if args.state:
++            metadata = json.loads((args.state / "metadata.json").read_text())
++            rng.atomname = np.asarray(metadata["atomname"])
++            names = np.load(args.state / "atomnames.npy", allow_pickle=False)
++            rng.N = len(names)
++            lookup = {name: index for index, name in enumerate(rng.atomname)}
++            rng.atomtype = np.asarray([lookup[name] for name in names])
++            count = min(args.records, metadata["hmmit"])
++            from reacnetgenerator._moleculepresence import _iter_molecule_records
++
++            with (args.state / "molecules.bin").open("rb") as stream:
++                with records.open("wb") as output:
++                    for index, record in enumerate(_iter_molecule_records(stream)):
++                        if index == count:
++                            break
++                        output.write(b"".join(record))
++        else:
++            count = args.records
++            with records.open("wb") as output:
++                for index in range(count):
++                    atoms = np.asarray([index % 128 * 2, index % 128 * 2 + 1])
++                    frames = (
++                        np.arange(args.frames)
++                        if args.large_output and index in (0, count // 2)
++                        else np.asarray([index % args.frames])
++                    )
++                    for value in (
++                        atoms,
++                        atoms.reshape(1, 2),
++                        np.asarray([1 + index % 3]),
++                        frames,
++                    ):
++                        output.write(utils.listtobytes(value))
++        rng.hmmit = count
++        rng.moleculetemp2filename = str(records)
++        collector = _path._CollectSMILESPaths(rng)
++        collector.atomnames = collector.atomname[collector.atomtype]
++        with records.open("rb") as stream:
++            for _ in iter(lambda: stream.read(1024 * 1024), b""):
++                pass
++        audit = {
++            "tasks": 0,
++            "input_bytes": 0,
++            "max_input_bytes": 0,
++            "converter_initializer_bytes": 0,
++        }
++        if args.audit:
++            original = utils._forking_pickle_dumps
++            original_run = utils.run_mp
++
++            def measured_run(nproc, **kwargs):
++                if kwargs.get("initializer") is not None:
++                    audit["converter_initializer_bytes"] = len(
++                        original((kwargs["initializer"], kwargs["initargs"]))
++                    )
++                return original_run(nproc, **kwargs)
++
++            _path.run_mp = workers.run_mp = measured_run
++
++            def measured(value):
++                payload = original(value)
++                audit["tasks"] += 1
++                audit["input_bytes"] += len(payload)
++                audit["max_input_bytes"] = max(audit["max_input_bytes"], len(payload))
++                return payload
++
++            utils._forking_pickle_dumps = measured
++        digest = hashlib.sha256()
++        before = _usage()
++        started = time.perf_counter()
++        if args.large_output:
++            with records.open("rb") as stream:
++                with closing(
++                    collector._getSMILESresults(
++                        stream, collector._calmoleculeSMILESname
++                    )
++                ) as results:
++                    for result in results:
++                        digest.update(
++                            pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
++                        )
++        else:
++            collector._printmoleculename()
++        elapsed = time.perf_counter() - started
++        after = _usage()
++        for key in ("parent_cpu", "child_cpu"):
++            after[key] -= before[key]
++        outputs = {
++            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
++            for path in (root / "output").glob("*")
++            if path.is_file()
++        }
++        result = {
++            "seconds": elapsed,
++            "frames": args.frames,
++            "records": count,
++            "nproc": args.nproc,
++            "miso": args.miso,
++            "method": args.method,
++            "batched": workers._should_batch_smiles(count, args.nproc),
++            "real_state": args.state is not None,
++            "large_output": args.large_output,
++            "audit": audit if args.audit else None,
++            "outputs": outputs,
++            "results": digest.hexdigest() if args.large_output else None,
++            **after,
++            "python": platform.python_version(),
++            "dependencies": {
++                name: importlib.metadata.version(name)
++                for name in ("numpy", "rdkit", "lz4", "networkx")
++            },
++            "source_sha256": {
++                name: hashlib.sha256(
++                    (Path(_path.__file__).parent / name).read_bytes()
++                ).hexdigest()
++                for name in ("_path.py", "_smilesworker.py", "utils.py")
++            },
++        }
++        args.json.write_text(json.dumps(result, indent=2))
++        print(json.dumps(result), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/smiles_record_context_audits.csv b/benchmarks/smiles_record_context_audits.csv
+new file mode 100644
+index 000000000..3784ce038
+--- /dev/null
++++ b/benchmarks/smiles_record_context_audits.csv
+@@ -0,0 +1,13 @@
++case,variant,repeat,is_audit,frames,records,nproc,miso,method,batched,real_state,large_output,seconds,parent_cpu,child_cpu,parent_peak_mib,child_peak_mib,python,_path.py_sha256,_smilesworker.py_sha256,utils.py_sha256,output_fingerprint,tasks,input_bytes,max_input_bytes,converter_initializer_bytes
++short,base,1,True,64,400,4,1,fork,False,False,False,0.18564223498106003,0.17488099999999984,0.295916,254.375,179.91796875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,2977218,7449,0
++short,candidate,1,True,64,400,4,1,fork,False,False,False,0.13597838603891432,0.11354199999999981,0.152448,254.37890625,179.8125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,406018,1021,1245
++long,base,1,True,100000,400,4,1,fork,False,False,False,1.868476743111387,1.7618040000000001,5.350292,271.9921875,207.6875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,297936196,744849,0
++long,candidate,1,True,100000,400,4,1,fork,False,False,False,0.142423661891371,0.12194500000000019,0.15911899999999998,267.1484375,192.43359375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,406596,1025,1245
++million,base,1,True,1000000,400,4,1,fork,False,False,False,17.21852058498189,16.953807,57.155938,455.47265625,437.92578125,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,3899149396,9747882,0
++million,candidate,1,True,1000000,400,4,1,fork,False,False,False,0.15323791396804154,0.1242110000000003,0.16934799999999997,357.55859375,282.55078125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,406596,1025,1245
++spawn,base,1,True,100000,400,4,1,spawn,False,False,False,3.9557322419714183,1.9001279999999998,13.402536,272.5859375,271.765625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,297936196,744849,0
++spawn,candidate,1,True,100000,400,4,1,spawn,False,False,False,0.5644552900921553,0.12376999999999994,1.847286,267.89453125,267.89453125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,406596,1025,1245
++forkserver,base,1,True,100000,400,4,1,forkserver,False,False,False,7.39334020903334,6.837896000000001,0.0,272.03515625,95.625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,297936196,744849,0
++forkserver,candidate,1,True,100000,400,4,1,forkserver,False,False,False,0.8234369850251824,0.613594,0.0,267.15234375,95.625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c,400,406596,1025,1245
++batch,base,1,True,100000,1024,4,1,fork,True,False,False,0.14507184899412096,0.09630799999999984,0.201611,267.53515625,192.57421875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497,16,968274,60585,1290
++batch,candidate,1,True,100000,1024,4,1,fork,True,False,False,0.1520963590592146,0.1060359999999998,0.258753,267.140625,192.48828125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497,16,968274,60585,1290
+diff --git a/benchmarks/smiles_record_context_integration.csv b/benchmarks/smiles_record_context_integration.csv
+new file mode 100644
+index 000000000..70ea9193f
+--- /dev/null
++++ b/benchmarks/smiles_record_context_integration.csv
+@@ -0,0 +1,11 @@
++case,seconds,frames,pairs,records,retained,nproc,method,miso,native_frames,native_events
++fork_miso0_100000_base,2.514961734879762,100000,20,60,60,4,fork,0,100000,20
++fork_miso0_100000_candidate,2.2627944780979306,100000,20,60,60,4,fork,0,100000,20
++fork_miso1_64_base,0.43298407504335046,64,20,60,60,4,fork,1,64,20
++fork_miso1_64_candidate,0.4625064500141889,64,20,60,60,4,fork,1,64,20
++forkserver_miso2_100000_base,5.062300437828526,100000,20,60,60,4,forkserver,2,100000,20
++forkserver_miso2_100000_candidate,3.378918905975297,100000,20,60,60,4,forkserver,2,100000,20
++real_pilot_base,5.395832241978496,101,,,,4,,1,,
++real_pilot_candidate,5.466132073896006,101,,,,4,,1,,
++spawn_miso1_100000_base,5.250294382916763,100000,20,60,60,4,spawn,1,100000,20
++spawn_miso1_100000_candidate,3.3698402689769864,100000,20,60,60,4,spawn,1,100000,20
+diff --git a/benchmarks/smiles_record_context_timings.csv b/benchmarks/smiles_record_context_timings.csv
+new file mode 100644
+index 000000000..0acd22d8e
+--- /dev/null
++++ b/benchmarks/smiles_record_context_timings.csv
+@@ -0,0 +1,61 @@
++case,variant,repeat,is_audit,frames,records,nproc,miso,method,batched,real_state,large_output,seconds,parent_cpu,child_cpu,parent_peak_mib,child_peak_mib,python,_path.py_sha256,_smilesworker.py_sha256,utils.py_sha256,output_fingerprint
++short,base,1,False,64,400,4,1,fork,False,False,False,0.19512686505913734,0.18166399999999983,0.271122,253.65625,179.87890625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++short,candidate,1,False,64,400,4,1,fork,False,False,False,0.14211786002852023,0.11785299999999976,0.146167,253.41015625,179.9375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++short,candidate,2,False,64,400,4,1,fork,False,False,False,0.13281381013803184,0.11503900000000011,0.151858,253.65234375,179.5,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++short,base,2,False,64,400,4,1,fork,False,False,False,0.1840746309608221,0.15797200000000022,0.209286,253.66015625,179.890625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++short,base,3,False,64,400,4,1,fork,False,False,False,0.17330976901575923,0.15938700000000017,0.26022399999999996,253.65234375,179.4765625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++short,candidate,3,False,64,400,4,1,fork,False,False,False,0.27139409398660064,0.343143,0.255127,254.01171875,179.95703125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++long,base,1,False,100000,400,4,1,fork,False,False,False,1.9795502091292292,1.7458329999999997,5.480937,272.28515625,207.65625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++long,candidate,1,False,100000,400,4,1,fork,False,False,False,0.14159440388903022,0.11814599999999986,0.163135,267.50390625,192.51171875,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++long,candidate,2,False,100000,400,4,1,fork,False,False,False,0.14157507615163922,0.116819,0.169249,267.5,192.37890625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++long,base,2,False,100000,400,4,1,fork,False,False,False,1.8646640300285071,1.758693,5.59058,271.73046875,207.53515625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++long,base,3,False,100000,400,4,1,fork,False,False,False,1.9974511959590018,1.7865930000000003,5.685946,271.73828125,207.6953125,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++long,candidate,3,False,100000,400,4,1,fork,False,False,False,0.14163614204153419,0.12060699999999991,0.165258,267.5234375,192.42578125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++million,base,1,False,1000000,400,4,1,fork,False,False,False,17.231020274106413,16.901248,57.211266,447.76171875,437.79296875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++million,candidate,1,False,1000000,400,4,1,fork,False,False,False,0.15979930595494807,0.1315719999999998,0.183452,357.53515625,282.53125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++million,candidate,2,False,1000000,400,4,1,fork,False,False,False,0.1522410218603909,0.12665300000000013,0.161407,357.53125,282.17578125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++million,base,2,False,1000000,400,4,1,fork,False,False,False,17.57670727605,16.914384,56.916292,455.9609375,438.15625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++million,base,3,False,1000000,400,4,1,fork,False,False,False,17.66804201179184,16.956936000000002,56.579463,446.65625,437.74609375,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++million,candidate,3,False,1000000,400,4,1,fork,False,False,False,0.15521489805541933,0.12753699999999957,0.173702,357.828125,282.109375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++spawn,base,1,False,100000,400,4,1,spawn,False,False,False,4.0102674479130656,1.8516869999999996,13.466965000000002,271.640625,271.3203125,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++spawn,candidate,1,False,100000,400,4,1,spawn,False,False,False,0.5823767289984971,0.1435719999999996,1.8538759999999999,267.5234375,267.5234375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++spawn,candidate,2,False,100000,400,4,1,spawn,False,False,False,0.5608132830820978,0.12105699999999997,1.860186,267.17578125,267.17578125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++spawn,base,2,False,100000,400,4,1,spawn,False,False,False,3.9612625930458307,1.8922750000000002,13.411861,272.046875,270.60546875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++spawn,base,3,False,100000,400,4,1,spawn,False,False,False,3.9655839561019093,1.812335,13.373206999999999,271.734375,270.8203125,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++spawn,candidate,3,False,100000,400,4,1,spawn,False,False,False,0.5601320180576295,0.13871299999999964,1.824977,267.16015625,267.16015625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++forkserver,base,1,False,100000,400,4,1,forkserver,False,False,False,5.381036787061021,3.997627,0.0,272.4296875,95.625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++forkserver,candidate,1,False,100000,400,4,1,forkserver,False,False,False,0.9323945839423686,0.756345,0.0,267.18359375,95.625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++forkserver,candidate,2,False,100000,400,4,1,forkserver,False,False,False,0.8129471291322261,0.60361,0.0,267.16015625,95.625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++forkserver,base,2,False,100000,400,4,1,forkserver,False,False,False,6.76526342285797,5.8303400000000005,0.0,272.14453125,95.625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++forkserver,base,3,False,100000,400,4,1,forkserver,False,False,False,6.9458702630363405,6.090052,0.0,272.1015625,96.0,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++forkserver,candidate,3,False,100000,400,4,1,forkserver,False,False,False,1.532074281014502,1.51494,0.0,267.87890625,95.625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++single,base,1,False,100000,400,1,1,fork,False,False,False,0.05375033710151911,0.053790000000000004,0.0,267.2578125,95.625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++single,candidate,1,False,100000,400,1,1,fork,False,False,False,0.05510989390313625,0.055134999999999934,0.0,267.609375,96.0,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++single,candidate,2,False,100000,400,1,1,fork,False,False,False,0.05390421184711158,0.05394399999999999,0.0,267.24609375,95.625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++single,base,2,False,100000,400,1,1,fork,False,False,False,0.05503138294443488,0.0550759999999999,0.0,267.23828125,95.625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++single,base,3,False,100000,400,1,1,fork,False,False,False,0.05423176987096667,0.0542720000000001,0.0,268.24609375,95.625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++single,candidate,3,False,100000,400,1,1,fork,False,False,False,0.05391269805841148,0.05395100000000008,0.0,267.6171875,96.0,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,04cc30333ff9d5eb2ad6e8a52a8489c63808afd1376c7b51e41b06e03809505c
++batch,base,1,False,100000,1024,4,1,fork,True,False,False,0.13881986192427576,0.09739199999999992,0.208364,267.515625,192.5703125,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497
++batch,candidate,1,False,100000,1024,4,1,fork,True,False,False,0.1697911738883704,0.12005600000000016,0.257519,267.171875,192.609375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497
++batch,candidate,2,False,100000,1024,4,1,fork,True,False,False,0.15112056606449187,0.09945300000000001,0.221078,267.56640625,192.56640625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497
++batch,base,2,False,100000,1024,4,1,fork,True,False,False,0.15680231992155313,0.10442500000000021,0.255329,267.1796875,192.515625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497
++batch,base,3,False,100000,1024,4,1,fork,True,False,False,0.14049361110664904,0.10113599999999989,0.20985900000000002,267.90234375,192.58203125,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497
++batch,candidate,3,False,100000,1024,4,1,fork,True,False,False,0.1424247829709202,0.09597899999999981,0.21659699999999998,267.53515625,192.5859375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,2e76ba2470daee020f0ea03fcf9f1a0910d18bf9400462a66b40137d2035a497
++large,base,1,False,100000,400,4,0,fork,False,False,True,1.8963358360342681,1.713703,4.679568,276.14453125,208.35546875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,672ca20b42a7c98103245ef3084f8f01cbb3f9f2f5bbd55b55059dfecc89e342
++large,candidate,1,False,100000,400,4,0,fork,False,False,True,0.15669454215094447,0.12690599999999996,0.177507,269.265625,194.078125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,672ca20b42a7c98103245ef3084f8f01cbb3f9f2f5bbd55b55059dfecc89e342
++large,candidate,2,False,100000,400,4,0,fork,False,False,True,0.14449570211581886,0.12328699999999992,0.17169500000000001,268.7265625,194.9609375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,672ca20b42a7c98103245ef3084f8f01cbb3f9f2f5bbd55b55059dfecc89e342
++large,base,2,False,100000,400,4,0,fork,False,False,True,1.9101682640612125,1.7359630000000004,4.587670999999999,276.50390625,208.6171875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,672ca20b42a7c98103245ef3084f8f01cbb3f9f2f5bbd55b55059dfecc89e342
++large,base,3,False,100000,400,4,0,fork,False,False,True,1.950138732790947,1.7268869999999998,4.5694110000000006,275.73046875,208.72265625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,672ca20b42a7c98103245ef3084f8f01cbb3f9f2f5bbd55b55059dfecc89e342
++large,candidate,3,False,100000,400,4,0,fork,False,False,True,0.14999440382234752,0.1265400000000001,0.18271900000000002,269.10546875,194.84765625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,672ca20b42a7c98103245ef3084f8f01cbb3f9f2f5bbd55b55059dfecc89e342
++real_prefix,base,1,False,5001,400,4,1,fork,False,True,False,0.33377042692154646,0.33144299999999993,0.6140220000000001,255.90234375,181.90625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,edf3907f11820653897cf7df0b57202f5a53e10a103b70f933f0e0ae581202da
++real_prefix,candidate,1,False,5001,400,4,1,fork,False,True,False,0.14976981282234192,0.13057399999999997,0.256291,255.546875,181.87109375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,edf3907f11820653897cf7df0b57202f5a53e10a103b70f933f0e0ae581202da
++real_prefix,candidate,2,False,5001,400,4,1,fork,False,True,False,0.1841192408464849,0.18592399999999998,0.28296699999999997,255.17578125,182.00390625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,edf3907f11820653897cf7df0b57202f5a53e10a103b70f933f0e0ae581202da
++real_prefix,base,2,False,5001,400,4,1,fork,False,True,False,0.295143665978685,0.23607899999999993,0.34904599999999997,254.7578125,182.41796875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,edf3907f11820653897cf7df0b57202f5a53e10a103b70f933f0e0ae581202da
++real_prefix,base,3,False,5001,400,4,1,fork,False,True,False,0.294812330044806,0.29607300000000003,0.551724,255.5390625,182.35546875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,edf3907f11820653897cf7df0b57202f5a53e10a103b70f933f0e0ae581202da
++real_prefix,candidate,3,False,5001,400,4,1,fork,False,True,False,0.1496163778938353,0.1232129999999998,0.20466299999999998,255.55859375,181.8984375,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,edf3907f11820653897cf7df0b57202f5a53e10a103b70f933f0e0ae581202da
++real_spawn,base,1,False,5001,4509,4,1,spawn,False,True,False,4.701440708944574,3.060442,13.994402000000001,255.52734375,256.6484375,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,e86fafdb3a81bc66dbda5138b1a25df0397069af9e5947a3bf6de2b44c6b679b
++real_spawn,candidate,1,False,5001,4509,4,1,spawn,False,True,False,1.5893450898583978,1.3798329999999996,4.000687,256.640625,255.890625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,e86fafdb3a81bc66dbda5138b1a25df0397069af9e5947a3bf6de2b44c6b679b
++real_spawn,candidate,2,False,5001,4509,4,1,spawn,False,True,False,1.6881272981408983,1.497998,4.120305,256.62890625,255.50390625,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,e86fafdb3a81bc66dbda5138b1a25df0397069af9e5947a3bf6de2b44c6b679b
++real_spawn,base,2,False,5001,4509,4,1,spawn,False,True,False,4.730421110987663,3.1119569999999994,13.985241,256.2421875,257.1640625,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,e86fafdb3a81bc66dbda5138b1a25df0397069af9e5947a3bf6de2b44c6b679b
++real_spawn,base,3,False,5001,4509,4,1,spawn,False,True,False,4.779369593830779,3.102272,14.126508999999999,255.5390625,256.19921875,3.12.12,465e6beed007e927849ff6b98f50b97dabc28f4e462cc40eabedf99fdbaf86e1,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,e86fafdb3a81bc66dbda5138b1a25df0397069af9e5947a3bf6de2b44c6b679b
++real_spawn,candidate,3,False,5001,4509,4,1,spawn,False,True,False,1.563808353152126,1.374638,4.091708,256.26953125,255.14453125,3.12.12,4bcbc923f968e0da54a0a013e3d0e7dfc1e6f36358c44bd900df87e8bc0b7360,423637178c177f839c5c2089a3f3fc8413773e8a032a92db81a637b629bfdb18,bc31be1244c4198e421f1d2e09369f42b64d6f48c46f155b249de40947c476bf,e86fafdb3a81bc66dbda5138b1a25df0397069af9e5947a3bf6de2b44c6b679b
+diff --git a/reacnetgenerator/_path.py b/reacnetgenerator/_path.py
+index 4a3112a43..a94bcf19b 100644
+--- a/reacnetgenerator/_path.py
++++ b/reacnetgenerator/_path.py
+@@ -38,7 +38,11 @@
+ 
+ from ._moleculepresence import _iter_molecule_presence
+ from ._reaction import ReactionsFinder
+-from ._smilesworker import _run_smiles_batches, _should_batch_smiles
++from ._smilesworker import (
++    _run_smiles_batches,
++    _run_smiles_records,
++    _should_batch_smiles,
++)
+ from ._species import species_molecule
+ from ._step3state import (
+     _STEP3_SCAN_ROWS,
+@@ -970,8 +974,7 @@ def _getSMILESresults(self, molecule_file, func):
+                 disable=None,
+             )
+         if (
+-            _should_batch_smiles(self.hmmit, self.nproc)
+-            and type(self) is _CollectSMILESPaths
++            type(self) is _CollectSMILESPaths
+             and getattr(func, "__func__", None)
+             in (
+                 _CollectSMILESPaths._calmoleculeSMILESname,
+@@ -980,7 +983,12 @@ def _getSMILESresults(self, molecule_file, func):
+             and not any(callable(value) for value in vars(self).values())
+         ):
+             # Custom collectors/callables keep their bound-method behavior.
+-            return _run_smiles_batches(
++            runner = (
++                _run_smiles_batches
++                if _should_batch_smiles(self.hmmit, self.nproc)
++                else _run_smiles_records
++            )
++            return runner(
+                 self, molecule_file, func.__name__ == "_calmoleculeSMILESfrequency"
+             )
+         return run_mp(
+diff --git a/reacnetgenerator/_smilesworker.py b/reacnetgenerator/_smilesworker.py
+index fcbfa26a3..e51454002 100644
+--- a/reacnetgenerator/_smilesworker.py
++++ b/reacnetgenerator/_smilesworker.py
+@@ -12,7 +12,7 @@
+ from tqdm.auto import tqdm
+ 
+ from ._moleculepresence import _iter_molecule_records
+-from .utils import run_mp
++from .utils import read_compressed_block, run_mp
+ 
+ _SMILES_BATCH_RECORDS = 64
+ _SMILES_INPUT_BYTES = 256 * 1024
+@@ -88,7 +88,7 @@ def _encoded_smiles_batches(molecule_file):
+ 
+ 
+ def _initialize_smiles_worker(
+-    atomname, atomnames, need_frames, frequency, folder, result_bytes
++    atomname, atomnames, need_frames, frequency, folder=None, result_bytes=None
+ ):
+     """Install only conversion metadata; no RNG object travels with each task."""
+     from ._path import _CollectSMILESPaths
+@@ -108,6 +108,37 @@ def _initialize_smiles_worker(
+     _SMILES_WORKER_STATE = function, folder, result_bytes
+ 
+ 
++def _convert_smiles_record(record):
++    """Use worker-local conversion metadata for one ordered molecule record."""
++    assert _SMILES_WORKER_STATE is not None
++    function, _, _ = _SMILES_WORKER_STATE
++    return function(record)
++
++
++def _run_smiles_records(collector, molecule_file, frequency):
++    """Keep per-record scheduling without serializing the collector per task."""
++    return run_mp(
++        collector.nproc,
++        func=_convert_smiles_record,
++        l=read_compressed_block(molecule_file),
++        initializer=_initialize_smiles_worker,
++        initargs=(
++            collector.atomname,
++            collector.atomnames,
++            collector._needmoleculetimeline(),
++            frequency,
++        ),
++        unordered=False,
++        nlines=4,
++        chunksize=1,
++        max_inflight=max(2, 2 * collector.nproc),
++        disk_ordered=True,
++        total=collector.hmmit,
++        desc="Indentify isomers",
++        unit="molecule",
++    )
++
++
+ class _SMILESResultWriter:
+     """Keep at most a fixed serialized prefix, spilling before a write exceeds it.
+ 
+diff --git a/tests/test_isomer_identification.py b/tests/test_isomer_identification.py
+index 20a36de2a..2ee9cd39e 100644
+--- a/tests/test_isomer_identification.py
++++ b/tests/test_isomer_identification.py
+@@ -246,7 +246,7 @@ def workers(count, **kwargs):
+         calls.append(count)
+         return run_mp(count, **kwargs)
+ 
+-    monkeypatch.setattr("reacnetgenerator._path.run_mp", workers)
++    monkeypatch.setattr("reacnetgenerator._smilesworker.run_mp", workers)
+     collector._printmoleculename()
+     assert calls == ([2] if nproc == 2 else [])
+     assert list(collector.mname) == (
+diff --git a/tests/test_smiles_batching.py b/tests/test_smiles_batching.py
+index a5257113b..42a89051a 100644
+--- a/tests/test_smiles_batching.py
++++ b/tests/test_smiles_batching.py
+@@ -129,23 +129,24 @@ def test_batched_timeline_filters_stay_in_parent(tmp_path, force_batches, filter
+     _assert_closed(tmp_path, children)
+ 
+ 
+-def test_small_spawn_retains_original_ordered_runner(tmp_path, monkeypatch):
+-    """The fallback is exercised at the collector entry, without a batch pre-scan."""
++def test_small_spawn_retains_per_record_scheduling(tmp_path, monkeypatch):
++    """Small inputs initialize conversion metadata without planning batches."""
+     collector = _collector(tmp_path, _records(4))
+     monkeypatch.setattr(workers, "get_start_method", lambda: "spawn")
+     calls = []
+ 
+     def original(nproc, **kwargs):
+-        assert kwargs["func"].__self__ is collector
++        assert kwargs["func"] is workers._convert_smiles_record
+         assert kwargs["nlines"] == 4 and kwargs["total"] == 4
+-        assert "initializer" not in kwargs
++        assert kwargs["initializer"] is workers._initialize_smiles_worker
++        assert len(kwargs["initargs"]) == 4
+         calls.append(nproc)
+         return run_mp(nproc, **kwargs)
+ 
+     def unexpected(*args, **kwargs):
+         raise AssertionError("Small spawn inputs must not plan batches")
+ 
+-    monkeypatch.setattr(_path, "run_mp", original)
++    monkeypatch.setattr(workers, "run_mp", original)
+     monkeypatch.setattr(workers, "_smiles_batches", unexpected)
+     collector._printmoleculename()
+     assert calls == [2]
+diff --git a/tests/test_smiles_record_context.py b/tests/test_smiles_record_context.py
+new file mode 100644
+index 000000000..ae1138ed5
+--- /dev/null
++++ b/tests/test_smiles_record_context.py
+@@ -0,0 +1,167 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Per-record SMILES state, real process contexts and exceptional cleanup."""
++
++import multiprocessing
++from pathlib import Path
++from types import MethodType
++
++import pytest
++
++from reacnetgenerator import _path, utils
++from reacnetgenerator import _smilesworker as workers
++
++from .test_smiles_batching import (
++    _assert_closed,
++    _collector,
++    _exited_task,
++    _failed_initializer,
++    _failed_task,
++    _fallback_initializer,
++    _records,
++    _selected_failure,
++    _serialization_initializer,
++)
++
++
++@pytest.fixture(params=multiprocessing.get_all_start_methods())
++def process_context(request, monkeypatch):
++    """Use actual context-specific pools and synchronization primitives."""
++    context = multiprocessing.get_context(request.param)
++    for name in ("Pool", "SimpleQueue", "Event", "Semaphore"):
++        monkeypatch.setattr(utils, name, getattr(context, name))
++    monkeypatch.setattr(workers, "get_start_method", lambda: request.param)
++    return request.param
++
++
++@pytest.mark.parametrize("miso", [0, 1, 2])
++def test_record_context_matches_local_output(tmp_path, process_context, miso):
++    """Minimal workers preserve names, representatives, frames and timeline order."""
++    local = _collector(tmp_path / "local", _records(20), miso, 1)
++    parallel = _collector(tmp_path / "parallel", _records(20), miso)
++    # A real collector owns an RNG. Make unrelated state impossible to pickle.
++    parallel.rng = {"unrelated": lambda: None}
++    children = {p.pid for p in multiprocessing.active_children()}
++    for collector in (local, parallel):
++        collector._printmoleculename()
++    assert list(parallel.mname) == list(local.mname)
++    for attribute in ("moleculefilename", "moleculetimelinefilename"):
++        assert (
++            Path(getattr(parallel, attribute)).read_bytes()
++            == Path(getattr(local, attribute)).read_bytes()
++        )
++    _assert_closed(tmp_path, children)
++
++
++@pytest.mark.parametrize("filter_kind", ["frames", "timesteps"])
++def test_record_filters_stay_in_parent(tmp_path, process_context, filter_kind):
++    """Workers return frames when a parent-only filter requires a timeline."""
++    local = _collector(tmp_path / "local", _records(8), nproc=1)
++    parallel = _collector(tmp_path / "parallel", _records(8))
++    for collector in (local, parallel):
++        collector.printmoleculetime = False
++        if filter_kind == "frames":
++            collector._moleculeframefilter = {0, 2, 6}
++        else:
++            collector._moleculetimestepfilter = {0, 20, 60}
++        collector._printmoleculename()
++    assert (
++        Path(parallel.moleculetimelinefilename).read_bytes()
++        == Path(local.moleculetimelinefilename).read_bytes()
++    )
++
++
++@pytest.mark.parametrize("miso", [0, 1, 2])
++def test_record_fallback_preserves_frequency(
++    tmp_path, monkeypatch, process_context, miso
++):
++    """ValueError candidates still use parent VF2 and global occurrence counts."""
++    records = [
++        ([0, 1], [(0, 1, order)], list(range(count)))
++        for order, count in ((1, 4), (2, 4), (3, 7))
++    ]
++    local = _collector(tmp_path / "local", records, miso, 1)
++    local.convertSMILES = MethodType(_selected_failure, local)
++    parallel = _collector(tmp_path / "parallel", records, miso)
++
++    def inject(nproc, **kwargs):
++        kwargs["initializer"] = _fallback_initializer
++        return utils.run_mp(nproc, **kwargs)
++
++    monkeypatch.setattr(workers, "run_mp", inject)
++    for collector in (local, parallel):
++        collector._printmoleculename()
++    assert list(parallel.mname) == list(local.mname)
++    assert (
++        Path(parallel.moleculefilename).read_bytes()
++        == Path(local.moleculefilename).read_bytes()
++    )
++
++
++class _CustomCollector(_path._CollectSMILESPaths):
++    def convertSMILES(self, atoms, bonds):
++        return "custom-name"
++
++
++def _custom_name(atoms, bonds):
++    return "custom-name"
++
++
++@pytest.mark.parametrize("custom", ["subclass", "instance"])
++def test_custom_record_converter_keeps_bound_state(
++    tmp_path, monkeypatch, process_context, custom
++):
++    """Existing extension points retain the original bound-method runner."""
++    collector = _collector(tmp_path, _records(4))
++    if custom == "subclass":
++        collector.__class__ = _CustomCollector
++    else:
++        collector.convertSMILES = _custom_name
++    calls = []
++
++    def checked(nproc, **kwargs):
++        assert kwargs["func"].__self__ is collector
++        assert "initializer" not in kwargs
++        calls.append(nproc)
++        return utils.run_mp(nproc, **kwargs)
++
++    monkeypatch.setattr(_path, "run_mp", checked)
++    collector._printmoleculename()
++    assert calls == [2]
++    assert list(collector.mname) == ["custom-name"] * 4
++
++
++@pytest.mark.parametrize(
++    "failure", ["initializer", "task", "exit", "serialize", "consumer"]
++)
++def test_record_failures_close_workers_with_live_traceback(
++    tmp_path, monkeypatch, process_context, failure
++):
++    """Close the iterator even when a retained exception keeps its frames alive."""
++    collector = _collector(tmp_path, _records(8))
++
++    def inject(nproc, **kwargs):
++        if failure == "initializer":
++            kwargs["initializer"] = _failed_initializer
++        elif failure == "serialize":
++            kwargs["initializer"] = _serialization_initializer
++        elif failure in ("task", "exit"):
++            kwargs["func"] = _failed_task if failure == "task" else _exited_task
++        return utils.run_mp(nproc, **kwargs)
++
++    monkeypatch.setattr(workers, "run_mp", inject)
++    if failure == "consumer":
++
++        def fail_consumer(*args, **kwargs):
++            raise RuntimeError("intentional consumer failure")
++
++        monkeypatch.setattr(
++            _path._CollectSMILESPaths, "_formatmoleculename", fail_consumer
++        )
++    children = {p.pid for p in multiprocessing.active_children()}
++    with pytest.raises(
++        (RuntimeError, AttributeError), match=r"intentional|exited|pickl|local object"
++    ) as caught:
++        collector._printmoleculename()
++    assert caught.value.__traceback__ is not None
++    assert Path(collector.moleculetemp2filename).exists()
++    _assert_closed(tmp_path, children)

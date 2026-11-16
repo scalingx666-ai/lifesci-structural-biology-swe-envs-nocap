@@ -1,0 +1,154 @@
+diff --git a/.github/workflows/docker-image.yml b/.github/workflows/docker-image.yml
+new file mode 100644
+index 000000000..b8ce53bba
+--- /dev/null
++++ b/.github/workflows/docker-image.yml
+@@ -0,0 +1,15 @@
++name: Docker Image CI
++
++on:
++  push:
++    branches: [ main ]
++  pull_request:
++    branches: [ main ]
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v2
++    - name: Build the Docker image
++      run: docker build . --file Dockerfile --tag openfold:$(date +%s)
+\ No newline at end of file
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 000000000..e933559ba
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,28 @@
++FROM nvidia/cuda:11.0-cudnn8-runtime-ubuntu18.04
++
++# I'm not sure why i needed both opencl and cuda here, but the relax phase of the script needed opencl
++RUN apt-get update && apt-get install -y wget cuda-minimal-build-11-0 nvidia-opencl-dev
++RUN wget -P /tmp \
++    "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" \
++    && bash /tmp/Miniconda3-latest-Linux-x86_64.sh -b -p /opt/conda \
++    && rm /tmp/Miniconda3-latest-Linux-x86_64.sh
++ENV PATH /opt/conda/bin:$PATH
++
++COPY environment.yml /opt/openfold/environment.yml
++
++# this needs to be run separately so that nvidia-dllogger will install properly
++RUN /opt/conda/bin/python3 -m pip install nvidia-pyindex
++
++# installing into the base environment since the docker container wont do anything other than run openfold
++RUN conda env update -n base --file /opt/openfold/environment.yml && conda clean --all
++
++COPY openfold /opt/openfold/openfold
++COPY scripts /opt/openfold/scripts
++COPY run_pretrained_openfold.py /opt/openfold/run_pretrained_openfold.py
++COPY train_openfold.py /opt/openfold/train_openfold.py
++COPY setup.py /opt/openfold/setup.py
++COPY lib/openmm.patch /opt/openfold/lib/openmm.patch
++RUN wget -q -P /opt/openfold/openfold/resources \
++    https://git.scicore.unibas.ch/schwede/openstructure/-/raw/7102c63615b64735c4941278d92b554ec94415f8/modules/mol/alg/src/stereo_chemical_props.txt
++RUN patch -p0 -d /opt/conda/lib/python3.7/site-packages/ < /opt/openfold/lib/openmm.patch
++RUN python3 /opt/openfold/setup.py install
+diff --git a/README.md b/README.md
+index 30bd75bb1..6721514c0 100644
+--- a/README.md
++++ b/README.md
+@@ -235,6 +235,56 @@ environment. These run components of AlphaFold and OpenFold side by side and
+ ensure that output activations are adequately similar. For most modules, we
+ target a maximum pointwise difference of `1e-4`.
+ 
++## Building and using the docker container
++
++### Building the docker image
++
++Openfold can be built as a docker container using the included dockerfile. To build it, run the following command from the root of this repository:
++
++```bash
++docker build -t openfold .
++```
++
++### Running the docker container 
++
++The built container contains both `run_pretrained_openfold.py` and `train_openfold.py` as well as all necessary software dependencies. It does not contain the model parameters, sequence, or structural databases. These should be downloaded to the host machine following the instructions in the Usage section above. 
++
++The docker container installs all conda components to the base conda environment in `/opt/conda`, and installs openfold itself in `/opt/openfold`,
++
++Before running the docker container, you can verify that your docker installation is able to properly communicate with your GPU by running the following command:
++
++
++```bash
++docker run --rm --gpus all nvidia/cuda:11.0-base nvidia-smi
++```
++
++Note the `--gpus all` option passed to `docker run`. This option is necessary in order for the container to use the GPUs on the host machine.
++
++To run the inference code under docker, you can use a command like the one below.  In this example, parameters and sequences from the alphafold dataset are being used and are located at `/mnt/alphafold_database` on the host machine, and the input files are located in the current working directory. You can adjust the volume mount locations as needed to reflect the locations of your data. 
++
++```bash
++docker run \
++--gpus all \
++-v $PWD/:/data \
++-v /mnt/alphafold_database/:/database \
++-ti openfold:latest \
++python3 /opt/openfold/run_pretrained_openfold.py \
++/data/input.fasta \
++/database/uniref90/uniref90.fasta \
++/database/mgnify/mgy_clusters_2018_12.fa \
++/database/pdb70/pdb70 \
++/database/pdb_mmcif/mmcif_files/ \
++/database/uniclust30/uniclust30_2018_08/uniclust30_2018_08 \
++--output_dir /data \
++--bfd_database_path /database/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt \
++--model_device cuda:0 \
++--jackhmmer_binary_path /opt/conda/bin/jackhmmer \
++--hhblits_binary_path /opt/conda/bin/hhblits \
++--hhsearch_binary_path /opt/conda/bin/hhsearch \
++--kalign_binary_path /opt/conda/bin/kalign \
++--param_path /database/params/params_model_1.npz
++```
++
+ ## Copyright notice
+ 
+ While AlphaFold's and, by extension, OpenFold's source code is licensed under
+diff --git a/openfold/np/residue_constants.py b/openfold/np/residue_constants.py
+index 0a289d27b..0350d47ba 100644
+--- a/openfold/np/residue_constants.py
++++ b/openfold/np/residue_constants.py
+@@ -18,6 +18,7 @@
+ import collections
+ import functools
+ from typing import Mapping, List, Tuple
++from importlib import resources
+ 
+ import numpy as np
+ import tree
+@@ -452,9 +453,8 @@ def load_stereo_chemical_props() -> Tuple[
+       residue_bond_angles: dict that maps resname --> list of BondAngle tuples
+     """
+     # TODO: this file should be downloaded in a setup script
+-    stereo_chemical_props_path = "openfold/resources/stereo_chemical_props.txt"
+-    with open(stereo_chemical_props_path, "rt") as f:
+-        stereo_chemical_props = f.read()
++    stereo_chemical_props = resources.read_text("openfold.resources", "stereo_chemical_props.txt")
++
+     lines_iter = iter(stereo_chemical_props.splitlines())
+     # Load bond lengths.
+     residue_bonds = {}
+diff --git a/setup.py b/setup.py
+index 2d9d1f41b..1f10365b1 100644
+--- a/setup.py
++++ b/setup.py
+@@ -24,6 +24,8 @@
+     license='Apache License, Version 2.0',
+     url='https://github.com/aqlaboratory/openfold',
+     packages=find_packages(exclude=["tests", "scripts"]),
++    include_package_data=True,
++    package_data={"": ["resources/stereo_chemical_props.txt"]},
+     install_requires=[
+         'torch',
+         'deepspeed',

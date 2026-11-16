@@ -1,0 +1,236 @@
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+index 00000000..a7d014cb
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,5 @@
++Dependencies for building locally with `make html`
++```
++micromamba install sphinx
++pip install sphinx-design sphinx-book-theme
++```
+diff --git a/docs/source/lig_prep_advanced.rst b/docs/source/lig_prep_advanced.rst
+index c7fac456..645f8ca7 100644
+--- a/docs/source/lig_prep_advanced.rst
++++ b/docs/source/lig_prep_advanced.rst
+@@ -179,3 +179,59 @@ The indices are the indices of the atoms in the SMARTS strings. Note that
+ we use 0-based indices from the Python API, but 1-based indices from the
+ command line script. In a future version of Meeko we may use 0-based indices
+ everywhere.
++
++
++Customizing atom parameters
++---------------------------
++
++The default atom types are AutoDock4 (AD4) types. Here, we illustrate accessing
++those types for ethanol using Python bindings:
++
++.. code-block:: python
++
++    from rdkit import Chem
++    from rdkit.Chem import AllChem
++    from meeko import MoleculePreparation
++    
++    ethanol = Chem.MolFromSmiles("CCO")
++    ethanol = Chem.AddHs(ethanol)
++    AllChem.EmbedMolecule(ethanol)
++    mk_prep = MoleculePreparation()
++    molsetup = mk_prep(ethanol)[0]
++    atom_types = [atom.atom_type for atom in molsetup.atoms]
++    print(f"{atom_types=}")
++
++Currently, the default value for ``load_atom_params="ad4_types"``, where
++``ad4_types`` is the unsuffixed filename of a JSON file packaged with Meeko. Examples of files
++`currently distributed <https://github.com/forlilab/Meeko/tree/develop/meeko/data/params>`_
++are ``ad4_types.json``, ``ad4_hb.json``, ``ad4_vdw.json``, ``ad4_desolv_volume.json``,
++``ad4_desolv_param.json``, and ``vina_params.json``.
++
++Multiple file names can be passed in a list, and they can be local files,
++which enables making a copy of one of the packaged files and modifying it.
++For local files, the ``.json`` suffix must be included. Additionally, Meeko
++can assign vdW parameters from OpenFF force fields (as long as the ``openff-forcefields`` 
++package is installed):
++
++.. code-block:: python
++
++    param_files = [
++        "vina_params",              # <- packaged with meeko
++        "openff-2.3.0",             # <- from openff-forcefields package
++        "/path/to/local_file.json", # <- user created
++    ]
++    mk_prep = MoleculePreparation(load_atom_params=param_files)
++
++Parameters ``atom_type`` and ``charge`` are stored as attributes of the ``Atom``
++instances in a ``molsetup``. All other parameters are stored in ``molsetup.atom_params``,
++which is a dictionary where the keys are the parameter name, and the values are lists
++of the parameter values for all the atoms in the molsetup, in the same atom order.
++Here's an example:
++
++.. code-block:: python
++
++    mk_prep = MoleculePreparation(load_atom_params=["vina_params", "openff"])
++    molsetup = mk_prep(ethanol)[0]
++    print(f"vina radius for first atom: {molsetup.atom_params['vina_ri'][0]}")
++    print(f"openff radius for first atom: {molsetup.atom_params['rmin_half'][0]}")
++    
+diff --git a/meeko/openff_xml_parser.py b/meeko/openff_xml_parser.py
+index 940a56ab..9a5bdea5 100644
+--- a/meeko/openff_xml_parser.py
++++ b/meeko/openff_xml_parser.py
+@@ -10,11 +10,11 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def load_openff():
++def load_openff(name):
+     import openforcefields
+ 
+     p = pathlib.Path(openforcefields.__file__)  # find openff-forcefields xml files
+-    offxml = p.parents[0] / "offxml" / "openff-2.0.0.offxml"
++    offxml = p.parents[0] / "offxml" / f"{name}.offxml"
+     offxml = offxml.resolve()
+     vdw_list, dihedral_list, vdw_by_type = parse_offxml(offxml)
+     return vdw_list, dihedral_list, vdw_by_type
+@@ -159,11 +159,9 @@ def make_dihedral_entry(attrib_dict_from_xml):
+                 msg += "\nOffending 'Proper' entry: %s" % attrib_dict_from_xml
+                 raise ValueError(msg)
+             elif keyword == "k":
+-                dihedral_entry[key] = float(
+-                    value.replace("* mole**-1 * kilocalorie", "")
+-                )
++                dihedral_entry[key] = float(value.split("*")[0])
+             elif keyword == "phase":
+-                dihedral_entry[key] = math.radians(float(value.replace("* degree", "")))
++                dihedral_entry[key] = math.radians(float(value.split("*")[0]))
+             elif keyword == "periodicity":
+                 dihedral_entry[key] = int(value)
+             elif keyword == "idivf":
+@@ -198,12 +196,12 @@ def make_vdw_entry(attrib_dict_from_xml):
+         if key in ["id", "smirks"]:
+             continue
+         elif key == "epsilon":
+-            vdw_entry["epsilon"] = float(value.replace("* mole**-1 * kilocalorie", ""))
++            vdw_entry["epsilon"] = float(value.split("*")[0])
+         elif key == "rmin_half":
+-            vdw_entry["rmin_half"] = float(value.replace("* angstrom", ""))
++            vdw_entry["rmin_half"] = float(value.split("*")[0])
+         elif key == "sigma":
+             vdw_entry["rmin_half"] = (
+-                float(value.replace("* angstrom", "")) * (4 ** (1.0 / 12)) * 0.5
++                float(value.split("*")[0]) * (4 ** (1.0 / 12)) * 0.5
+             )
+         else:
+             msg = "\nGot unexpected key: %s" % key
+diff --git a/meeko/preparation.py b/meeko/preparation.py
+index 0cfd5ac0..e909e973 100644
+--- a/meeko/preparation.py
++++ b/meeko/preparation.py
+@@ -126,12 +126,23 @@ def __init__(
+         rigidify_bonds_smarts
+         rigidify_bonds_indices
+         input_atom_params
+-        load_atom_params
++        load_atom_params: list[str]
++            the strings are JSON filenames, either somewhere in the filesystem
++            or packaged in Meeko/meeko/data/params/.
++            The default is ["ad4_types"].
++            The strings can also be an OpenFF forcefield such as
++            "openff-2.3.0". The string "openff" without a version suffix
++            specifies "openff-2.0.0" for backwards compatibility. 
+         add_atom_types
+         input_offatom_params
+         load_offatom_params
+         charge_model
+-        dihedral_model
++        dihedral_model: str | None
++            string can be "espaloma" or an OpenFF force field such as
++            "openff-2.3.0". The string "openff" without a version suffix
++            specifies "openff-2.0.0" for backwards compatibility. The OpenFF
++            forcefields are available at:
++            https://github.com/openforcefield/openff-forcefields/tree/main/openforcefields/offxml
+         reactive_smarts
+         reactive_smarts_idx
+         add_index_map
+@@ -198,15 +209,16 @@ def __init__(
+                     f"Invalid value for charge_atom_prop: expected a string (str), but got {type(self.charge_atom_prop).__name__} instead. "
+                 )
+         
+-        allowed_dihedral_models = [None, "openff", "espaloma"]
+         if dihedral_model in (None, "espaloma"):
+             dihedral_list = []
+         elif dihedral_model == "openff":
+-            _, dihedral_list, _ = load_openff()
++            _, dihedral_list, _ = load_openff("openff-2.0.0")  # backward compat
++        elif dihedral_model.startswith("openff"):
++            _, dihedral_list, _ = load_openff(dihedral_model)
+         else:
+             raise ValueError(
+                 "unrecognized dihedral_model: %s, allowed options are: %s"
+-                % (dihedral_model, allowed_dihedral_models)
++                % (dihedral_model, "None, espaloma, openff-*")
+             )
+ 
+         self.dihedral_model = dihedral_model
+@@ -385,15 +397,15 @@ def get_atom_params(
+             load_atom_params = ()
+         for name in load_atom_params:
+             filename = None
+-            if (
+-                name == "openff-2.0.0" or name == "openff"
+-            ):  # TODO allow multiple versions
++            if name.startswith("openff"):
+                 if not _got_toml:
+                     raise ImportError("need package tomli to read metal vdw param to complement openff") from _toml_import_error
+-                vdw_list, _, _ = load_openff()
++                if name == "openff":
++                    name = "openff-2.0.0"
++                vdw_list, _, _ = load_openff(name)
+                 with open(params_dir / "metal_vdw.toml", "rb") as f:
+                     metals_vdw = toml.load(f)
+-                d = {"openff-2.0.0": vdw_list + metals_vdw["vdw_params"]}
++                d = {name: vdw_list + metals_vdw["vdw_params"]}
+             elif name in packaged_params:
+                 filename = packaged_params[name]
+             elif name.endswith(".json"):
+@@ -555,10 +567,10 @@ def prepare(
+         if template_charge == None and self.compute_charges == False:
+             temp_compute_charges = self.compute_charges
+             self.compute_charges=True
+-            if self.charge_model == "read":
+-                print("No template available, or molecule is ligand.\nCharge model will be read from input mol property\n")
+-            else:
+-                print("Residue missing from template, or molecule is ligand.\nCharge will be computed from scratch.\n")
++            #if self.charge_model == "read":
++            #    print("No template available, or molecule is ligand.\nCharge model will be read from input mol property\n")
++            #else:
++            #    print("Residue missing from template, or molecule is ligand.\nCharge will be computed from scratch.\n")
+ 
+         setup = setup_class.from_mol(
+             mol,
+diff --git a/test/parameterization_test.py b/test/parameterization_test.py
+index 4074cdce..2a3a832e 100644
+--- a/test/parameterization_test.py
++++ b/test/parameterization_test.py
+@@ -70,6 +70,22 @@ def test_openff_water():
+     assert epsilon[1] == epsilon[2] 
+     return
+ 
++@pytest.mark.skipif(not _got_openff, reason="requires openff-forcefields")
++def test_openff_acetate():
++    etkdg_v3 = Chem.rdDistGeom.ETKDGv3()
++    acetate = Chem.MolFromSmiles("CC(=O)[O-]")
++    acetate = Chem.AddHs(acetate)
++    Chem.rdDistGeom.EmbedMolecule(acetate, etkdg_v3)
++    mk_prep_200 = MoleculePreparation(load_atom_params=["openff"]) 
++    mk_prep_230 = MoleculePreparation(load_atom_params=["openff-2.3.0"]) 
++    molsetup_200 = mk_prep_200(acetate)[0]
++    molsetup_230 = mk_prep_230(acetate)[0]
++    rmin_half_200 = molsetup_200.atom_params["rmin_half"]
++    rmin_half_230 = molsetup_230.atom_params["rmin_half"]
++    assert rmin_half_200 != rmin_half_230
++    return
++
++
+ def test_merge_rmin_half():
+     methanol = Chem.AddHs(Chem.MolFromSmiles("CO"))
+     etkdg_v3 = rdDistGeom.ETKDGv3()

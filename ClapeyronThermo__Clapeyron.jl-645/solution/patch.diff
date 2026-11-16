@@ -1,0 +1,161 @@
+diff --git a/Project.toml b/Project.toml
+index 752afacc6..71621f7e9 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -72,7 +72,7 @@ JutulDarcy = "0.2, 0.3"
+ LinearAlgebra = "1"
+ LogExpFunctions = "^0.3.24, 1"
+ Metaheuristics = "2, 3"
+-MultiComponentFlash = "1.1.13"
++MultiComponentFlash = "2"
+ NLSolvers = "0.5, 0.6"
+ OrderedCollections = "^1.5, 2"
+ PackedVectorsOfVectors = "^0.1.2"
+diff --git a/ext/ClapeyronMultiComponentFlashExt.jl b/ext/ClapeyronMultiComponentFlashExt.jl
+index a04e97a03..b87be507c 100644
+--- a/ext/ClapeyronMultiComponentFlashExt.jl
++++ b/ext/ClapeyronMultiComponentFlashExt.jl
+@@ -46,9 +46,19 @@ module ClapeyronMultiComponentFlashExt
+     end
+ 
+     function M.initial_guess_K!(K, eos::C.EoSModel, cond)
+-        C.tp_flash_K0!(K, eos, cond.p, cond.T, nothing)
++        C.tp_flash_K0!(K, eos, cond.p, cond.T,cond.z, nothing)
+     end
+ 
++    function M.wilson_estimate!(K, eos::C.EoSModel, p, T)
++        return C.wilson_k_values!(K,eos,p,T)
++    end
++
++    
++    function M.wilson_estimate(eos::C.EoSModel, p, T)
++        return C.wilson_k_values(eos,p,T)
++    end
++
++    M.forces_per_phase(eos::C.EoSModel) = false
+     #this is only defined with cubic EoS.
+     M.force_coefficients(eos::C.EoSModel, cond;static_size = false) = nothing
+     M.force_scalars(eos::C.EoSModel, cond, forces) = nothing
+@@ -92,6 +102,7 @@ module ClapeyronMultiComponentFlashExt
+     if isdefined(M,:component_names)
+         M.component_names(model::C.EoSModel) = C.component_list(model)
+     end
++
+     include("MultiComponentFlash/stability.jl")
+     include("MultiComponentFlash/flash.jl")
+     include("MultiComponentFlash/flow_coupler.jl")
+diff --git a/ext/MultiComponentFlash/stability.jl b/ext/MultiComponentFlash/stability.jl
+index c93bbe714..4495b696e 100644
+--- a/ext/MultiComponentFlash/stability.jl
++++ b/ext/MultiComponentFlash/stability.jl
+@@ -15,7 +15,7 @@
+         # Update fugacities for current conditions used in both tests
+         M.mixture_fugacities!(f_z, eos, c, forces)
+         #props = eos.mixture.properties
+-        
++
+         if check_vapor
+             C.wilson_k_values!(K,eos,p,T,storage.crit)
+             vv = M.michelsen_test!(vapor, f_z, f_xy, vapor.z, z, K, eos, c, forces, Val(true); kwarg...)
+diff --git a/src/methods/property_solvers/multicomponent/flash/PT.jl b/src/methods/property_solvers/multicomponent/flash/PT.jl
+index 854f89936..9582208f2 100644
+--- a/src/methods/property_solvers/multicomponent/flash/PT.jl
++++ b/src/methods/property_solvers/multicomponent/flash/PT.jl
+@@ -92,8 +92,10 @@ function tp_flash2(model::EoSModel, _p, _T, _n, method::FlashMethod)
+     end
+     
+     if length(model_r) == 1 || numphases(method) == 1
+-        return FlashResult(model_r,p,T,n_r)
++        result_1 = tp_flash_pure(model_r,p,T,n_r,method)
++        return index_expansion(result_1,idx_r)
+     end
++
+     ∑n = sum(n_r)
+     z_r = n_r ./ ∑n
+     if has_a_res(model)
+@@ -117,6 +119,8 @@ function tp_flash2(model::EoSModel, _p, _T, _n, method::FlashMethod)
+     return index_expansion(result,idx_r)
+ end
+ 
++tp_flash_pure(model,p,T,z,method) = FlashResult(model,p,T,z)
++
+ function tp_flash2_to_tpflash(model,p,T,z,result)
+     comps, β, volumes, data = result
+     nc = length(z)
+diff --git a/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl b/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl
+index 0a927d0c3..02cdb60a9 100755
+--- a/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl
++++ b/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl
+@@ -85,6 +85,30 @@ function Solvers.primalval(method::MichelsenTPFlash{T}) where {T}
+     end
+ end
+ 
++function tp_flash_pure_michelsen(model,p,T,z)
++    ps,_,_ = extended_saturation_pressure(model,T)
++    _1 = one(Base.promote_eltype(model,p,T,z))
++    _0 = zero(_1)
++    n = sum(z)
++    if ps > p
++        βi = [_0,_1*n]
++        vv = volume(model,p,T,z,phase = :v)
++        vl = vv
++    else
++        βi = [_1*n,_0]
++        vl = volume(model,p,T,z,phase = :l)
++        vv = vl
++    end
++    vapour_idx = 2
++    volumes = [vl,vv]
++    comps = [[1.0],[1.0]]
++    flash0 = FlashResult(comps,βi,volumes,FlashData(p,T,_0,vapour_idx))
++    g = first(modified_gibbs(model,flash0))
++    return FlashResult(comps,βi,volumes,FlashData(p,T,g,vapour_idx))
++end
++
++tp_flash_pure(model,p,T,z,method::MichelsenTPFlash) = tp_flash_pure_michelsen(model,p,T,z)
++
+ numphases(::MichelsenTPFlash) = 2
+ 
+ function MichelsenTPFlash(;equilibrium = :unknown,
+diff --git a/src/methods/property_solvers/multicomponent/tp_flash/RachfordRicetp_flash.jl b/src/methods/property_solvers/multicomponent/tp_flash/RachfordRicetp_flash.jl
+index dcaaffbbf..f516e5b16 100755
+--- a/src/methods/property_solvers/multicomponent/tp_flash/RachfordRicetp_flash.jl
++++ b/src/methods/property_solvers/multicomponent/tp_flash/RachfordRicetp_flash.jl
+@@ -118,6 +118,8 @@ function tp_flash_impl(model::EoSModel, p, T, z, method::RRTPFlash)
+     return FlashResult(comps,βi,volumes,FlashData(p,T,g,vapour_idx))
+ end
+ 
++tp_flash_pure(model,p,T,z,method::RRTPFlash) = tp_flash_pure_michelsen(model,p,T,z)
++
+ michelsen_itss(method::RRTPFlash) = method.max_iters
+ michelsen_use_opt_solver(::RRTPFlash) = false
+ 
+diff --git a/test/extensions/Project.toml b/test/extensions/Project.toml
+index eacd3bd01..33465db1b 100644
+--- a/test/extensions/Project.toml
++++ b/test/extensions/Project.toml
+@@ -23,7 +23,7 @@ EoSSuperancillaries = "1.2.3"
+ Glenn = "0.4"
+ # JutulDarcy = "0.2, 0.3"
+ Metaheuristics = "2, 3"
+-MultiComponentFlash = "1.1.13"
++MultiComponentFlash = "2"
+ PythonCall = "0.9"
+ Symbolics = "7"
+ Unitful = "^1.12"
+diff --git a/test/methods/api_flash.jl b/test/methods/api_flash.jl
+index 85300b5b3..199268184 100644
+--- a/test/methods/api_flash.jl
++++ b/test/methods/api_flash.jl
+@@ -39,6 +39,11 @@
+         @test Clapeyron.numphases(res2) == 2
+         @test res2.fractions[1] ≈ 0.9991083897702745 rtol = 1e-6
+ 
++        #test that index reduction returns a model with the correct number of components
++        respure = Clapeyron.tp_flash2(model_zulip1, p_zulip1, 282.3, [1.0,0.0,0.0,0.0], RRTPFlash(equilibrium=:vle))
++        @test collect(each_active_phase_index(respure)) == [1]
++        @test respure.compositions[1] ≈ [1.0,0.0,0.0,0.0]
++
+         #https://julialang.zulipchat.com/#narrow/channel/265161-Clapeyron.2Ejl/topic/The.20meaning.20of.20subcooled.20liquid.20flash.20results/near/534216551
+         model_zulip2 = PR(["n-butane", "n-pentane", "n-hexane", "n-heptane"])
+         res3 = Clapeyron.tp_flash2(model_zulip2, 1e5 , 450, z_zulip1, RRTPFlash(equilibrium=:vle))

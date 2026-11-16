@@ -1,0 +1,1044 @@
+diff --git a/bin/annot_secondary_structures.py b/bin/annot_secondary_structures.py
+index eb99071..cfc2104 100644
+--- a/bin/annot_secondary_structures.py
++++ b/bin/annot_secondary_structures.py
+@@ -112,9 +112,11 @@ def make_ss_cooccurrence_plot(
+     backend: SSE_BACKEND = "psea",
+     threads: int = 8,
+     title: str = "Secondary structure co-occurrence",
++    **kwargs,
+ ):
+     """
+     Create a secondary structure co-occurrence plot
++    **kwargs are passed to hist2d
+     """
+     if max_seq_len > 0:
+         orig_len = len(pdb_files)
+@@ -134,7 +136,12 @@ def make_ss_cooccurrence_plot(
+ 
+     fig, ax = plt.subplots(dpi=300)
+     h = ax.hist2d(
+-        alpha_counts, beta_counts, bins=np.arange(10), density=True, vmin=0.0, vmax=0.09
++        alpha_counts,
++        beta_counts,
++        bins=np.arange(10),
++        density=True,
++        vmin=0.0,
++        **kwargs,
+     )
+     ax.set_xlabel(r"Number of $\alpha$ helices", fontsize=12)
+     ax.set_ylabel(r"Number of $\beta$ sheets", fontsize=12)
+@@ -175,6 +182,12 @@ def build_parser():
+         help="Number of threads to use",
+     )
+     parser.add_argument("--title", type=str, default="", help="Title for plot")
++    parser.add_argument(
++        "--freqlim",
++        type=float,
++        default=0.09,
++        help="Upper limit for frequency in 2D histogram. Set to 0 to disable.",
++    )
+     return parser
+ 
+ 
+@@ -199,6 +212,7 @@ def main():
+         threads=args.threads,
+         title=args.title,
+         max_seq_len=test_dset.dset.pad if is_test_data else 0,
++        vmax=args.freqlim if args.freqlim > 0 else None,
+     )
+ 
+ 
+diff --git a/bin/sample_autoregressive.py b/bin/sample_autoregressive.py
+new file mode 100644
+index 0000000..3d7c163
+--- /dev/null
++++ b/bin/sample_autoregressive.py
+@@ -0,0 +1,163 @@
++"""
++Code to sample from an autoregressive transformer model
++"""
++
++import os, sys
++import logging
++from pathlib import Path
++import argparse
++
++from tqdm.auto import tqdm
++import numpy as np
++import pandas as pd
++import torch
++
++
++from foldingdiff import modelling, utils
++from foldingdiff import angles_and_coords as ac
++
++
++def sample_initial_angles(
++    n_samples: int, n_angles: int = 4, eps: float = 1e-4, seed=1234
++) -> torch.Tensor:
++    """
++    Sample initial angles based on naturally occurring proteins
++    Returned tensor has shape (n_samples, n_angles, 6) for 6 angles
++    Of this, the first n_angles are set; the rest are random
++    """
++    # Sample initial angles
++    cwd = Path(__file__).parent
++    pdb_files = list((cwd / Path("../data/cath/dompdb")).glob("*"))
++    assert pdb_files
++    logging.info(f"Sampling from {len(pdb_files)} PDB files")
++
++    retval = torch.zeros((n_samples, n_angles, 6))
++    rng = np.random.default_rng(seed)
++    for i, idx in enumerate(rng.integers(0, len(pdb_files), n_samples)):
++        fname = pdb_files[idx]
++        angles = ac.canonical_distances_and_dihedrals(
++            fname, angles=ac.EXHAUSTIVE_ANGLES, distances=ac.MINIMAL_DISTS
++        )
++        assert angles is not None, f"Error when parsing {pdb_files[idx]}"
++        retval[i, :, :] = torch.from_numpy(angles.values[:n_angles, :])
++
++    # If given, add a bit of noise to the angles as well
++    if eps:
++        logging.info(f"Adding noise zero means and variance {eps} to angles")
++        torch.manual_seed(seed)
++        noise = torch.randn((n_samples, n_angles, 6)) * eps
++        retval += noise
++
++    retval = utils.modulo_with_wrapped_range(retval, -np.pi, np.pi)
++    return retval
++
++
++def build_parser():
++    """
++    Build a basic CLI parser
++    """
++    parser = argparse.ArgumentParser(
++        usage=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
++    )
++    parser.add_argument("model", help="Model name or path", type=str)
++    parser.add_argument("-o", "--outdir", help="Output directory", default=".")
++    parser.add_argument(
++        "--num",
++        default=10,
++        type=int,
++        help="Number of samples at each length from 50-128",
++    )
++    parser.add_argument(
++        "--num_angles",
++        help="Number of angles to sample as seed angles",
++        type=int,
++        default=4,
++    )
++    parser.add_argument(
++        "-l",
++        "--lengths",
++        type=int,
++        nargs=2,
++        default=[50, 128],
++        help="Range of lengths to sample from",
++    )
++    parser.add_argument(
++        "-d",
++        "--device",
++        type=str,
++        default="cuda:0",
++        help="Device to run generations on",
++    )
++    return parser
++
++
++def main() -> None:
++    """
++    Run the script
++    """
++    parser = build_parser()
++    args = parser.parse_args()
++
++    outdir = Path(args.outdir).absolute()
++
++    logging.info(f"Creating {outdir}")
++    os.makedirs(outdir, exist_ok=True)
++    assert not os.listdir(outdir), f"Expected {outdir} to be empty"
++
++    # Load the model
++    device = torch.device(args.device)
++    m = modelling.BertForAutoregressive.from_dir(
++        args.model, copy_to=Path(outdir) / "model_snapshot"
++    ).to(device)
++
++    # Load the model offsets
++    angle_offsets = torch.from_numpy(
++        np.load(Path(args.model) / "training_mean_offset.npy")
++    ).to(device)
++
++    # Sample initial angles; 10 initializations, 4 angles
++    initial_angles = sample_initial_angles(args.num, args.num_angles, eps=0.0).to(
++        device
++    )
++    # Shift these angles by the same amount the training was shifted
++    initial_angles = utils.modulo_with_wrapped_range(initial_angles - angle_offsets)
++    initial_angles = torch.nan_to_num(initial_angles, nan=0.0)
++
++    # Perform sampling
++    sampled_angles_dir = outdir / "sampled_angles"
++    sampled_pdb_dir = outdir / "sampled_pdb"
++    os.makedirs(sampled_angles_dir, exist_ok=False)
++    os.makedirs(sampled_pdb_dir, exist_ok=False)
++
++    sampled_angles = []
++    for i in tqdm(range(args.lengths[0], args.lengths[1]), desc="Sampling structures"):
++        seed_values = torch.zeros((args.num, 128, 6)).to(device)
++        seed_values[:, : args.num_angles, :] = initial_angles
++        s = m.sample(
++            seed_angles=seed_values,
++            seq_lengths=torch.tensor([i for _ in range(args.num)]).to(device),
++            num_seed=args.num_angles,
++            pbar=False,
++        )
++        sampled_angles.extend(
++            [
++                pd.DataFrame(
++                    utils.modulo_with_wrapped_range(
++                        vals.cpu().numpy() + angle_offsets.cpu().numpy(), -np.pi, np.pi
++                    ),
++                    columns=ac.EXHAUSTIVE_ANGLES,
++                )
++                for vals in s
++            ]
++        )
++
++    # Write the sampled angles and resulting PDB files out
++    for i, s in tqdm(enumerate(sampled_angles), desc="Writing sampled angles and PDB structures"):
++        s.to_csv(sampled_angles_dir / f"generated_{i}.csv.gz")
++        fname = ac.create_new_chain_nerf(str(sampled_pdb_dir / f"generated_{i}.pdb"), s)
++        assert fname
++
++
++if __name__ == "__main__":
++    logging.basicConfig(level=logging.INFO)
++    main()
+diff --git a/bin/train_autoregressive.py b/bin/train_autoregressive.py
+new file mode 100644
+index 0000000..a7d77a0
+--- /dev/null
++++ b/bin/train_autoregressive.py
+@@ -0,0 +1,284 @@
++"""
++Train a baseline autoregressive model that uses a causal LM approach to generating
++series of angles
++"""
++import os
++from pathlib import Path
++import json
++import argparse
++from datetime import datetime
++import logging
++import multiprocessing
++from typing import *
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++import pytorch_lightning as pl
++from pytorch_lightning.strategies.ddp import DDPStrategy
++
++from transformers import BertConfig
++
++from foldingdiff import datasets, modelling, losses, plotting, utils
++from foldingdiff import custom_metrics as cm
++
++from train import ANGLES_DEFINITIONS, build_callbacks, record_args_and_metadata
++
++
++def get_train_valid_test_sets(
++    angles_definitions: ANGLES_DEFINITIONS = "canonical-full-angles",
++    max_seq_len: int = 512,
++    min_seq_len: int = 0,
++    seq_trim_strategy: datasets.TRIM_STRATEGIES = "leftalign",
++) -> Tuple[
++    datasets.AutoregressiveCausalDataset,
++    datasets.AutoregressiveCausalDataset,
++    datasets.AutoregressiveCausalDataset,
++]:
++    """
++    Get the train/valid/test splits using the autoregressive wrapper on the datsets
++    """
++
++    clean_dset_class = {
++        "canonical": datasets.CathCanonicalAnglesDataset,
++        "canonical-full-angles": datasets.CathCanonicalAnglesOnlyDataset,
++        "canonical-minimal-angles": datasets.CathCanonicalMinimalAnglesDataset,
++        "cart-coords": datasets.CathCanonicalCoordsDataset,
++    }[angles_definitions]
++    logging.info(f"Clean dataset class: {clean_dset_class}")
++
++    splits = ["train", "validation", "test"]
++    logging.info(f"Creating data splits: {splits}")
++    clean_dsets = [
++        clean_dset_class(
++            split=s,
++            pad=max_seq_len,
++            min_length=min_seq_len,
++            trim_strategy=seq_trim_strategy,
++            zero_center=False if angles_definitions == "cart-coords" else True,
++        )
++        for s in splits
++    ]
++
++    # Set the training set mean to the validation set mean
++    if len(clean_dsets) > 1 and clean_dsets[0].means is not None:
++        logging.info(f"Updating valid/test mean offset to {clean_dsets[0].means}")
++        for i in range(1, len(clean_dsets)):
++            clean_dsets[i].means = clean_dsets[0].means
++
++    causal_dsets = [
++        datasets.AutoregressiveCausalDataset(
++            d, dset_key="coords" if angles_definitions == "cart-coords" else "angles"
++        )
++        for d in clean_dsets
++    ]
++    for dsname, ds in zip(splits, causal_dsets):
++        logging.info(f"{dsname}: {ds}")
++    return causal_dsets
++
++
++def train(
++    results_dir: str = "./results",
++    angles_definitions: ANGLES_DEFINITIONS = "canonical-full-angles",
++    max_seq_len: int = 128,
++    min_seq_len: int = 40,
++    trim_strategy: datasets.TRIM_STRATEGIES = "randomcrop",
++    # Related to model architecture
++    seq_len_encoding: modelling.TIME_ENCODING = "gaussian_fourier",  # Embeds the total sequence length
++    num_hidden_layers: int = 12,  # Default 12
++    hidden_size: int = 384,  # Default 768
++    intermediate_size: int = 768,  # Default 3072
++    num_heads: int = 12,  # Default 12
++    position_embedding_type: Literal[
++        "absolute", "relative_key_query", "relative_key"
++    ] = "absolute",  # Default absolute
++    dropout_p: float = 0.1,
++    decoder: modelling.DECODER_HEAD = "mlp",
++    # Related to training strategy
++    gradient_clip: float = 1.0,
++    batch_size: int = 256,
++    lr: float = 5e-5,
++    l2_norm: float = 0.01,
++    loss: modelling.LOSS_KEYS = "smooth_l1",
++    min_epochs: Optional[int] = None,
++    max_epochs: int = 10000,  # 10000, set to 100 for debug
++    early_stop_patience: int = 0,  # Set to 0 to disable early stopping
++    lr_scheduler: modelling.LR_SCHEDULE = "LinearWarmup",  # Try LinearWarmup?
++    use_swa: bool = False,
++):
++    """
++    Train the model
++    """
++    func_args = locals()
++
++    results_folder = Path(results_dir)
++    record_args_and_metadata(func_args, results_folder)
++
++    plots_folder = results_folder / "plots"
++    os.makedirs(plots_folder, exist_ok=True)
++
++    ft_key = "coords" if angles_definitions == "cart-coords" else "angles"
++    dsets = get_train_valid_test_sets(
++        angles_definitions=angles_definitions,
++        max_seq_len=max_seq_len,
++        min_seq_len=min_seq_len,
++        seq_trim_strategy=trim_strategy,
++    )
++    assert len(dsets) == 3
++    np.save(
++        results_folder / "training_mean_offset.npy",
++        dsets[0].dset.get_masked_means(),
++        fix_imports=False,
++    )
++
++    # Calculate effective batch size
++    # https://pytorch-lightning.readthedocs.io/en/1.4.0/advanced/multi_gpu.html#batch-size
++    # Under DDP, effective batch size is batch_size * num_gpus * num_nodes
++    effective_batch_size = batch_size
++    if torch.cuda.is_available():
++        effective_batch_size = int(batch_size / torch.cuda.device_count())
++    pl.utilities.rank_zero_info(
++        f"Given batch size: {batch_size} --> effective batch size with {torch.cuda.device_count()} GPUs: {effective_batch_size}"
++    )
++
++    # Create data loaders
++    train_dataloader, valid_dataloader, test_dataloader = [
++        DataLoader(
++            dataset=ds,
++            batch_size=effective_batch_size,
++            shuffle=i == 0,  # Shuffle only train loader
++            num_workers=multiprocessing.cpu_count(),
++            pin_memory=True,
++        )
++        for i, ds in enumerate(dsets)
++    ]
++
++    logging.info(f"Using loss function: {loss}")
++
++    # Shape of the input is (batch_size, timesteps, features)
++    sample_input = dsets[0][0][ft_key]  # First item of the training dset
++    model_n_inputs = sample_input.shape[-1]
++    logging.info(f"Auto detected {model_n_inputs} inputs")
++
++    cfg = BertConfig(
++        max_position_embeddings=max_seq_len,
++        num_attention_heads=num_heads,
++        hidden_size=hidden_size,
++        intermediate_size=intermediate_size,
++        num_hidden_layers=num_hidden_layers,
++        position_embedding_type=position_embedding_type,
++        hidden_dropout_prob=dropout_p,
++        attention_probs_dropout_prob=dropout_p,
++        use_cache=False,
++    )
++    cfg.save_pretrained(results_folder)
++
++    model = modelling.BertForAutoregressive(
++        config=cfg,
++        time_encoding=seq_len_encoding,  # Repurpose the time embedder to do sequence instead
++        decoder=decoder,
++        ft_is_angular=dsets[0].dset.feature_is_angular[ft_key],
++        ft_names=dsets[0].dset.feature_names[ft_key],
++        lr=lr,
++        loss_key=loss,
++        l2=l2_norm,
++        epochs=max_epochs,
++        steps_per_epoch=len(train_dataloader),
++        lr_scheduler=lr_scheduler,
++    )
++
++    callbacks = build_callbacks(
++        outdir=results_folder, early_stop_patience=early_stop_patience, swa=use_swa
++    )
++
++    # Get accelerator and distributed strategy
++    accelerator, strategy = "cpu", None
++    if torch.cuda.is_available():
++        accelerator = "cuda"
++        if torch.cuda.device_count() > 1:
++            # https://github.com/Lightning-AI/lightning/discussions/6761https://github.com/Lightning-AI/lightning/discussions/6761
++            strategy = DDPStrategy(find_unused_parameters=False)
++
++    logging.info(f"Using {accelerator} with strategy {strategy}")
++    trainer = pl.Trainer(
++        default_root_dir=results_folder,
++        gradient_clip_val=gradient_clip,
++        min_epochs=min_epochs,
++        max_epochs=max_epochs,
++        check_val_every_n_epoch=1,
++        callbacks=callbacks,
++        logger=pl.loggers.CSVLogger(save_dir=results_folder / "logs"),
++        log_every_n_steps=min(200, len(train_dataloader)),  # Log >= once per epoch
++        accelerator=accelerator,
++        strategy=strategy,
++        gpus=torch.cuda.device_count() if torch.cuda.is_available() else None,
++        enable_progress_bar=False,
++        move_metrics_to_cpu=False,  # Saves memory
++    )
++    trainer.fit(
++        model=model,
++        train_dataloaders=train_dataloader,
++        val_dataloaders=valid_dataloader,
++    )
++
++    # Plot the losses
++    metrics_csv = os.path.join(
++        trainer.logger.save_dir, "lightning_logs/version_0/metrics.csv"
++    )
++    assert os.path.isfile(metrics_csv)
++    # Plot the losses
++    plotting.plot_losses(
++        metrics_csv, out_fname=plots_folder / "losses.pdf", simple=True
++    )
++
++
++def build_parser() -> argparse.ArgumentParser:
++    """
++    Build CLI parser
++    """
++    parser = argparse.ArgumentParser(
++        usage=__doc__,
++        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++    )
++    parser.add_argument(
++        "config", nargs="?", default="", type=str, help="json of params"
++    )
++    parser.add_argument(
++        "-o",
++        "--outdir",
++        type=str,
++        default=os.path.join(os.getcwd(), "results"),
++        help="Directory to write model training outputs",
++    )
++    return parser
++
++
++def main():
++    """
++    Run the training script based on params in the given json file
++    """
++    parser = build_parser()
++    args = parser.parse_args()
++
++    # Load in parameters and run training loop
++    config_args = {}
++    if args.config:
++        with open(args.config, "r") as f:
++            config_args = json.load(f)
++
++    config_args = utils.update_dict_nonnull(config_args, {"results_dir": args.outdir})
++
++    train(**config_args)
++
++
++if __name__ == "__main__":
++    curr_time = datetime.now().strftime("%y%m%d_%H%M%S")
++    logging.basicConfig(
++        level=logging.INFO,
++        handlers=[
++            logging.FileHandler(f"training_{curr_time}.log"),
++            logging.StreamHandler(),
++        ],
++    )
++
++    main()
+diff --git a/config_jsons/cath_full_angles_cosine_pdist.json b/config_jsons/cath_full_angles_cosine_pdist.json
+new file mode 100644
+index 0000000..407fc63
+--- /dev/null
++++ b/config_jsons/cath_full_angles_cosine_pdist.json
+@@ -0,0 +1,34 @@
++{
++    "angles_definitions": "canonical-full-angles",
++    "timesteps": 1000,
++    "max_seq_len": 128,
++    "min_seq_len": 40,
++    "trim_strategy": "randomcrop",
++    "variance_schedule": "cosine",
++    "variance_scale": 1.0,
++    "time_encoding": "gaussian_fourier",
++    "position_embedding_type": "relative_key",
++    "num_hidden_layers": 12,
++    "hidden_size": 384,
++    "intermediate_size": 768,
++    "num_heads": 12,
++    "dropout_p": 0.1,
++    "decoder": "mlp",
++    "gradient_clip": 1.0,
++    "lr": 5e-5,
++    "loss": "smooth_l1",
++    "use_pdist_loss": [
++        1e-4,
++        1e-3
++    ],
++    "l2_norm": 0.0,
++    "l1_norm": 0.0,
++    "circle_reg": 0.0,
++    "lr_scheduler": "LinearWarmup",
++    "min_epochs": 10000,
++    "max_epochs": 10000,
++    "early_stop_patience": 0,
++    "use_swa": false,
++    "batch_size": 256,
++    "multithread": true
++}
+\ No newline at end of file
+diff --git a/foldingdiff/datasets.py b/foldingdiff/datasets.py
+index acc478d..943e2f6 100644
+--- a/foldingdiff/datasets.py
++++ b/foldingdiff/datasets.py
+@@ -543,6 +543,65 @@ def __getitem__(self, index):
+         raise NotImplementedError
+ 
+ 
++class AutoregressiveCausalDataset(Dataset):
++    """
++    Class that produces otuoputs in a causal LM format.
++    Wrapped dset should return a dictionary with keys as strings and values as tensors
++    """
++
++    def __init__(
++        self,
++        dset: Dataset,
++        dset_key: str = "angles",
++    ) -> None:
++        super().__init__()
++        self.dset = dset
++        self.dset_key = dset_key
++        assert hasattr(self.dset, "feature_names")
++        assert hasattr(self.dset, "feature_is_angular")
++        assert (
++            dset_key in self.dset.feature_is_angular
++        ), f"{dset_key} not in {self.dset.feature_is_angular}"
++        self.n_features = len(dset.feature_is_angular[dset_key])
++
++    def __len__(self):
++        return len(self.dset)
++
++    def __getitem__(self, index: int):
++        """Get the ith item with a randomly chosen sub-mask"""
++        return_dict = self.dset[index]
++
++        # Get the original length
++        assert "lengths" in return_dict
++        orig_len = return_dict["lengths"].item()
++        assert orig_len <= self.dset.pad
++
++        # sample a length, high is exclusive, generate uniformly
++        causal_len = torch.randint(low=1, high=orig_len, size=(1,)).item()
++        assert causal_len < orig_len
++
++        # Create the causal mask
++        assert "attn_mask" in return_dict
++        causal_attn_mask = torch.zeros_like(return_dict["attn_mask"])
++        causal_attn_mask[:causal_len] = 1.0
++        assert torch.sum(causal_attn_mask) < torch.sum(return_dict["attn_mask"])
++
++        assert (
++            "causal_attn_mask" not in return_dict
++            and "causal_target" not in return_dict
++            and "causal_len" not in return_dict
++        )
++        assert return_dict[self.dset_key].ndim == 2
++        return_dict["causal_attn_mask"] = causal_attn_mask
++        return_dict["causal_target"] = return_dict[self.dset_key][causal_len]
++        return_dict["causal_idx"] = causal_len
++        return return_dict
++    
++    def __str__(self):
++        """Return the string representation"""
++        return f"AutoregressiveCausalDataset wrapping {self.dset} with {self.dset_key}"
++
++
+ class NoisedAnglesDataset(Dataset):
+     """
+     class that produces noised outputs given a wrapped dataset.
+@@ -1059,13 +1118,13 @@ def __getitem__(self, index) -> Dict[str, torch.Tensor]:
+ 
+ 
+ def main():
+-    dset = CathCanonicalCoordsDataset(
++    dset = CathCanonicalAnglesOnlyDataset(
+         pad=128, trim_strategy="discard", use_cache=False, zero_center=False
+     )
+-    noised_dset = NoisedAnglesDataset(dset, dset_key="coords")
++    causal_dset = AutoregressiveCausalDataset(dset, dset_key="angles")
+     # print(len(noised_dset))
+     # print(noised_dset[0])
+-    x = noised_dset[0]
++    x = causal_dset[0]
+ 
+     # x = noised_dset[0]
+     for k, v in x.items():
+diff --git a/foldingdiff/losses.py b/foldingdiff/losses.py
+index 44f5774..ab93764 100644
+--- a/foldingdiff/losses.py
++++ b/foldingdiff/losses.py
+@@ -42,6 +42,9 @@ def radian_smooth_l1_loss(
+     >>> radian_smooth_l1_loss(torch.tensor(-17.0466), torch.tensor(-1.3888), beta=0.1)
+     tensor(3.0414)
+     """
++    assert (
++        target.shape == input.shape
++    ), f"Mismatched shapes: {input.shape} != {target.shape}"
+     assert beta > 0
+     d = target - input
+     d = utils.modulo_with_wrapped_range(d, -torch.pi, torch.pi)
+diff --git a/foldingdiff/modelling.py b/foldingdiff/modelling.py
+index aafb22a..63b19ba 100644
+--- a/foldingdiff/modelling.py
++++ b/foldingdiff/modelling.py
+@@ -28,6 +28,8 @@
+ from transformers.activations import get_activation
+ from transformers.optimization import get_linear_schedule_with_warmup
+ 
++from tqdm.auto import tqdm
++
+ from foldingdiff import losses, nerf
+ from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY
+ 
+@@ -128,6 +130,10 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ class BertEmbeddings(nn.Module):
++    """
++    Adds in positional embeddings if using absolute embeddings, adds layer norm and dropout
++    """
++
+     def __init__(self, config):
+         super().__init__()
+         self.position_embedding_type = getattr(
+@@ -315,10 +321,14 @@ def from_dir(
+             ]
+             logging.info(f"Auto constructed ft_is_angular: {ft_is_angular}")
+ 
++        # Handles the case where we repurpose the time encoding for seq len encoding in the AR model
++        time_encoding_key = (
++            "time_encoding" if "time_encoding" in train_args else "seq_len_encoding"
++        )
+         model_args = dict(
+             config=config,
+             ft_is_angular=ft_is_angular,
+-            time_encoding=train_args["time_encoding"],
++            time_encoding=train_args[time_encoding_key],
+             decoder=train_args["decoder"],
+             # lr=train_args["lr"],
+             # loss=train_args["loss"],
+@@ -618,16 +628,14 @@ def _get_loss_terms(
+             )
+             denoised_angles /= batch["sqrt_alphas_cumprod_t"].view(bs, 1, 1)
+ 
+-            known_angles = batch['angles']
++            known_angles = batch["angles"]
+             inferred_coords = nerf.nerf_build_batch(
+                 phi=known_angles[:, :, self.ft_names.index("phi")],
+                 psi=known_angles[:, :, self.ft_names.index("psi")],
+                 omega=known_angles[:, :, self.ft_names.index("omega")],
+                 bond_angle_n_ca_c=known_angles[:, :, self.ft_names.index("tau")],
+                 bond_angle_ca_c_n=known_angles[:, :, self.ft_names.index("CA:C:1N")],
+-                bond_angle_c_n_ca=known_angles[
+-                    :, :, self.ft_names.index("C:1N:1CA")
+-                ],
++                bond_angle_c_n_ca=known_angles[:, :, self.ft_names.index("C:1N:1CA")],
+             )
+             denoised_coords = nerf.nerf_build_batch(
+                 phi=denoised_angles[:, :, self.ft_names.index("phi")],
+@@ -654,7 +662,7 @@ def _get_loss_terms(
+                 # of each item in the batch
+                 coef = min_coef + (max_coef - min_coef) * (
+                     (max_timesteps - batch["t"]) / max_timesteps
+-                ).to(batch['t'].device)
++                ).to(batch["t"].device)
+                 assert torch.all(coef > 0)
+             else:
+                 coef = self.use_pairwise_dist_loss
+@@ -796,21 +804,220 @@ def configure_optimizers(self) -> Dict[str, Any]:
+         return retval
+ 
+ 
++class BertForAutoregressiveBase(BertForDiffusionBase):
++    """
++    Overrides the previous model's forward function to not handle noise or timesteps
++    """
++
++    def forward(
++        self,
++        inputs: torch.Tensor,
++        attention_mask: torch.Tensor,
++        seq_lengths: torch.Tensor,
++        position_ids: Optional[torch.Tensor] = None,
++        output_attentions: Optional[bool] = None,
++        output_hidden_states: Optional[bool] = None,
++        return_dict: Optional[bool] = None,
++    ):
++        assert len(inputs.shape) == 3  # batch_size, seq_length, features
++        inputs_upscaled = self.inputs_to_hidden_dim(inputs)  # Batch * seq_len * dim
++
++        # Embed the lengths - note that we are reusing the time embedding here
++        # Shape (batch, embed) -> (batch, 1, embed)
++        len_embed = self.time_embed(seq_lengths).unsqueeze(1)
++        inputs_upscaled += len_embed
++
++        if position_ids is None:
++            batch_size, seq_length, *_ = inputs.size()
++            # Shape (batch, seq_len)
++            position_ids = (
++                torch.arange(
++                    seq_length,
++                )
++                .expand(batch_size, -1)
++                .to(inputs.device)
++            )
++
++        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
++        # ourselves in which case we just need to make it broadcastable to all heads. This code is taken
++        # from hugggingface modeling_utils
++        assert (
++            attention_mask.dim() == 2
++        ), f"Attention mask expected in shape (batch_size, seq_length), got {attention_mask.shape}"
++        extended_attention_mask = attention_mask[:, None, None, :]
++        extended_attention_mask = extended_attention_mask.type_as(attention_mask)
++        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
++
++        inputs_upscaled = self.embeddings(inputs_upscaled, position_ids=position_ids)
++        encoder_outputs = self.encoder(
++            inputs_upscaled,
++            attention_mask=extended_attention_mask,
++            output_attentions=output_attentions,
++            output_hidden_states=output_hidden_states,
++            return_dict=return_dict,
++        )
++
++        sequence_output = encoder_outputs[0]
++        per_token_decoded = self.token_decoder(sequence_output)
++        return per_token_decoded
++
++    @torch.no_grad()
++    def sample(
++        self,
++        seed_angles: torch.Tensor,
++        seq_lengths: torch.Tensor,
++        num_seed: int = 2,
++        pbar: bool = True,
++    ) -> List[torch.Tensor]:
++        """
++        Sample a set of angles of seq_lengths given a series of seed angles
++        seed_angles should be given as a tensor of (batch, seq_len, num_angles)
++        The first num_seed angles are taken as fixed and the rest are autoregressively
++        generated
++        """
++        assert torch.all(seed_angles[:, :num_seed, :] <= torch.pi)
++        assert torch.all(seed_angles[:, :num_seed, :] >= -torch.pi)
++        retval = seed_angles.clone().to(seed_angles.device)
++        assert seed_angles.ndim == 3
++
++        attention_mask = torch.zeros(seed_angles.shape[:2]).to(seed_angles.device)
++        for i in tqdm(range(num_seed, torch.max(seq_lengths).item()), disable=not pbar):
++            attention_mask[:, :i] = 1.0
++            assert torch.all(attention_mask.sum(axis=1) == i)
++            next_angle = self.forward(
++                retval,
++                attention_mask=attention_mask,
++                seq_lengths=seq_lengths,
++            )[:, i, :]
++            retval[:, i, :] = next_angle
++        return [retval[i, :l, :] for i, l in enumerate(seq_lengths)]
++
++
++class BertForAutoregressive(BertForAutoregressiveBase, pl.LightningModule):
++    """
++    Wraps model in a pl.LightningModule for easy training as an
++    autoregressive model where we are interested in predicting the next set of
++    angles given the current set of angles
++    """
++
++    def __init__(
++        self,
++        loss_key: LOSS_KEYS = "smooth_l1",
++        lr: float = 5e-5,
++        lr_scheduler: Optional[str] = None,
++        l2: float = 0.0,
++        epochs: int = 1,
++        steps_per_epoch: int = 250,  # Dummy value
++        **kwargs,
++    ):
++        BertForDiffusionBase.__init__(self, **kwargs)
++        self.learning_rate = lr
++        self.lr_scheduler = lr_scheduler
++        self.l2_lambda = l2
++        self.loss = self.angular_loss_fn_dict[loss_key]
++        self.epochs = epochs
++        self.steps_per_epoch = steps_per_epoch
++
++    def _get_loss(self, batch) -> torch.Tensor:
++        """
++        Get the loss terms for a batch
++        """
++        # Get the predictions
++        preds = self.forward(
++            batch["angles"],
++            attention_mask=batch["causal_attn_mask"],
++            seq_lengths=batch["lengths"],
++            position_ids=batch["position_ids"],
++        )
++        assert preds.ndim == 3  # batch_size, seq_length, features
++        # Get the loss terms
++        l = self.loss(
++            preds[torch.arange(batch["lengths"].shape[0]), batch["causal_idx"]],
++            batch["causal_target"],
++        )
++        return l
++
++    def training_step(self, batch, batch_idx):
++        loss = self._get_loss(batch)
++        self.log("train_loss", loss, rank_zero_only=True)
++        return loss
++
++    def training_epoch_end(self, outputs) -> None:
++        """Log average training loss over epoch"""
++        losses = torch.stack([o["loss"] for o in outputs])
++        mean_loss = torch.mean(losses)
++        t_delta = time.time() - self.train_epoch_last_time
++        pl.utilities.rank_zero_info(
++            f"Train loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f} ({t_delta:.2f} seconds)"
++        )
++        # Increment counter and timers
++        self.train_epoch_counter += 1
++        self.train_epoch_last_time = time.time()
++
++    def validation_step(self, batch, batch_idx):
++        with torch.no_grad():
++            loss = self._get_loss(batch)
++        self.log("val_loss", loss, rank_zero_only=True)
++        return {"val_loss": loss}
++
++    def validation_epoch_end(self, outputs) -> None:
++        losses = torch.stack([o["val_loss"] for o in outputs])
++        mean_loss = torch.mean(losses)
++        pl.utilities.rank_zero_info(
++            f"Valid loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f}"
++        )
++
++    def configure_optimizers(self) -> Dict[str, Any]:
++        optim = torch.optim.AdamW(
++            self.parameters(), lr=self.learning_rate, weight_decay=self.l2_lambda
++        )
++        retval = {"optimizer": optim}
++        pl.utilities.rank_zero_info(f"Using optimizer {retval}")
++
++        if self.lr_scheduler:
++            if self.lr_scheduler == "OneCycleLR":
++                retval["lr_scheduler"] = {
++                    "scheduler": torch.optim.lr_scheduler.OneCycleLR(
++                        optim,
++                        max_lr=1e-2,
++                        epochs=self.epochs,
++                        steps_per_epoch=self.steps_per_epoch,
++                    ),
++                    "monitor": "val_loss",
++                    "frequency": 1,
++                    "interval": "step",
++                }
++            elif self.lr_scheduler == "LinearWarmup":
++                # https://huggingface.co/docs/transformers/v4.21.2/en/main_classes/optimizer_schedules#transformers.get_linear_schedule_with_warmup
++                # Transformers typically do well with linear warmup
++                warmup_steps = int(self.epochs * 0.1)
++                pl.utilities.rank_zero_info(
++                    f"Using linear warmup with {warmup_steps}/{self.epochs} warmup steps"
++                )
++                retval["lr_scheduler"] = {
++                    "scheduler": get_linear_schedule_with_warmup(
++                        optim,
++                        num_warmup_steps=warmup_steps,
++                        num_training_steps=self.epochs,
++                    ),
++                    "frequency": 1,
++                    "interval": "epoch",  # Call after 1 epoch
++                }
++            else:
++                raise ValueError(f"Unknown lr scheduler {self.lr_scheduler}")
++
++        return retval
++
++
+ def main():
+     """on the fly testing"""
+-    import datasets
+-    from torch.utils.data import default_collate
+-
+-    # # Create model
+-    # device = torch.device("cuda")
+-    cfg = BertConfig()
+-    model = BertForDiffusionBase.from_dir(
+-        os.path.join(
+-            os.path.dirname(os.path.dirname(__file__)),
+-            "tests/mini_model_for_testing/results",
+-        )
++    m = BertForAutoregressiveBase.from_dir(
++        "/home/wukevin/projects/protdiff_results/models/ar_baseline/results"
+     )
+-    print(model)
++    # rand samples uniformly from [0, 1) so we expand the range and shift it
++    rand_angles = torch.rand(size=(32, 128, 6)) * 2 * torch.pi - torch.pi
++    rand_lens = torch.randint(low=40, high=128, size=(32,))
++    m.sample(seed_angles=rand_angles, seq_lengths=rand_lens)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/slurm/train_ar_baseline.sbatch b/scripts/slurm/train_ar_baseline.sbatch
+new file mode 100644
+index 0000000..556e5b2
+--- /dev/null
++++ b/scripts/slurm/train_ar_baseline.sbatch
+@@ -0,0 +1,17 @@
++#!/bin/bash
++#SBATCH --partition=jamesz
++#SBATCH --job-name=training               # Job name
++#SBATCH --mail-type=FAIL                  # Mail events (NONE, BEGIN, END, FAIL, ALL)
++#SBATCH --mail-user=wukevin@stanford.edu  # Where to send mail	
++#SBATCH --nodes=1                         # Run all processes on a single node
++#SBATCH --ntasks=20                        # Number of processes
++#SBATCH --mem=40gb                        # Job memory request
++#SBATCH -G 2
++#SBATCH -C GPU_SKU:RTX_2080Ti
++#SBATCH --time=6-23:59:59                   # Time limit
++#SBATCH --output=training_%j.log          # Standard output and error log
++. /home/groups/jamesz/miniconda3/etc/profile.d/conda.sh
++. ~/.bashrc
++# Activate the appropriate conda environment
++conda activate /home/groups/jamesz/wukevin/envs/protdiff
++python /home/groups/jamesz/wukevin/projects/protdiff/bin/train_autoregressive.py
+diff --git a/tests/test_model_subparts.py b/tests/test_model_subparts.py
+index 492b54b..4d7f89f 100644
+--- a/tests/test_model_subparts.py
++++ b/tests/test_model_subparts.py
+@@ -81,6 +81,18 @@ def test_permutation(self):
+ 
+         self.assertTrue(torch.all(torch.isclose(x[idx], x_permuted)))
+ 
++    def test_uniqueness(self):
++        """
++        Test that across a range of inputs, each output is unique
++        """
++        x = torch.arange(0, 1000)
++        e = self.embedder(x)
++        for i in range(1000):
++            for j in range(1000):
++                if i == j:
++                    continue
++                self.assertFalse(torch.allclose(e[i], e[j]))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_sampling.py b/tests/test_sampling.py
+index 3040c3e..a08cd90 100644
+--- a/tests/test_sampling.py
++++ b/tests/test_sampling.py
+@@ -10,10 +10,12 @@
+ 
+ from foldingdiff import sampling
+ 
++
+ class TestSamplingReproducible(unittest.TestCase):
+     """
+     Test that sampling is reproducible
+     """
++
+     def setUp(self) -> None:
+         self.mini_model = os.path.join(
+             os.path.dirname(__file__), "mini_model_for_testing", "results"
+@@ -22,9 +24,24 @@ def setUp(self) -> None:
+         self.full_model = "wukevin/foldingdiff"
+ 
+     def test_repro_simple(self):
++        """Test that sampling from the same random seed produces the same result"""
+         torch.manual_seed(1234)
+-        samp_1 = sampling.sample_simple(self.full_model, n=1, sweep_lengths=[50, 51]).pop()
++        samp_1 = sampling.sample_simple(
++            self.full_model, n=1, sweep_lengths=[50, 51]
++        ).pop()
+         torch.manual_seed(1234)
+-        samp_2 = sampling.sample_simple(self.full_model, n=1, sweep_lengths=[50, 51]).pop()
++        samp_2 = sampling.sample_simple(
++            self.full_model, n=1, sweep_lengths=[50, 51]
++        ).pop()
+         self.assertTrue(np.allclose(samp_1.values, samp_2.values))
+-    
++
++    def test_diff_seed_diff_result(self):
++        """Test that having a different random state produces different results"""
++        torch.manual_seed(1234)
++        samp_1 = sampling.sample_simple(
++            self.full_model, n=1, sweep_lengths=[50, 51]
++        ).pop()
++        samp_2 = sampling.sample_simple(
++            self.full_model, n=1, sweep_lengths=[50, 51]
++        ).pop()
++        self.assertFalse(np.allclose(samp_1.values, samp_2.values))

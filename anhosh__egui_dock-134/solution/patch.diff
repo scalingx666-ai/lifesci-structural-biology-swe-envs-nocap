@@ -1,0 +1,200 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3c3edb18..398d0ce7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,10 @@
+ # egui_dock changelog
+ 
++## Unreleased
++
++### Fixed
++- Ensure rect size are calculated before drawing node bodies ([#134](https://github.com/Adanos020/egui_dock/pull/134))
++
+ ## 0.6.0 - 2023-05-24
+ 
+ ### Added
+diff --git a/src/tree/mod.rs b/src/tree/mod.rs
+index f4ff33c6..28be72d5 100644
+--- a/src/tree/mod.rs
++++ b/src/tree/mod.rs
+@@ -61,6 +61,14 @@ pub enum TabDestination {
+ /// For a given node *n*:
+ ///  - left child of *n* will be at index *n * 2 + 1*.
+ ///  - right child of *n* will be at index *n * 2 + 2*.
++///
++/// For "Horizontal" nodes:
++///  - left child contains Left node.
++///  - right child contains Right node.
++///
++/// For "Vertical" nodes:
++///  - left child contains Top node.
++///  - right child contains Bottom node.
+ #[derive(Clone)]
+ #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+ pub struct Tree<Tab> {
+@@ -170,6 +178,12 @@ impl<Tab> Tree<Tab> {
+         self.tree.iter_mut()
+     }
+ 
++    /// Returns an `Iterator` of [`NodeIndex`] ordered in a breadth first manner.
++    #[inline(always)]
++    pub(crate) fn breadth_first_index_iter(&self) -> impl Iterator<Item = NodeIndex> {
++        (0..self.tree.len()).map(NodeIndex)
++    }
++
+     /// Returns an iterator over all tabs in arbitrary order
+     #[inline(always)]
+     pub fn tabs(&self) -> TabIter<'_, Tab> {
+@@ -310,8 +324,8 @@ impl<Tab> Tree<Tab> {
+         }
+ 
+         let index = match split {
+-            Split::Right | Split::Above => [parent.right(), parent.left()],
+-            Split::Left | Split::Below => [parent.left(), parent.right()],
++            Split::Left | Split::Above => [parent.right(), parent.left()],
++            Split::Right | Split::Below => [parent.left(), parent.right()],
+         };
+ 
+         self[index[0]] = old;
+diff --git a/src/widgets/dock_area/mod.rs b/src/widgets/dock_area/mod.rs
+index a137aa04..a365613c 100644
+--- a/src/widgets/dock_area/mod.rs
++++ b/src/widgets/dock_area/mod.rs
+@@ -173,17 +173,24 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
+ 
+         let mut state = State::load(ui.ctx(), self.id);
+ 
++        // First compute all rect sizes in the node graph.
+         self.allocate_area_for_root(ui);
++        for node_index in self.tree.breadth_first_index_iter() {
++            if self.tree[node_index].is_parent() {
++                self.compute_rect_sizes(ui, node_index);
++            }
++        }
+ 
+-        for node_index in (0..self.tree.len()).map(NodeIndex) {
++        // Then draw the bodies of each leafs.
++        for node_index in self.tree.breadth_first_index_iter() {
+             if self.tree[node_index].is_leaf() {
+                 self.show_leaf(ui, &mut state, node_index, tab_viewer);
+             }
+         }
+ 
+-        // Draw separator after node UI so that we can overlay the separator
+-        // interaction zone according to `SeparatorStyle::extra_interact_width`.
+-        for node_index in (0..self.tree.len()).map(NodeIndex) {
++        // Finaly draw separators so that their "interaction zone" is above
++        // bodies (see `SeparatorStyle::extra_interact_width`).
++        for node_index in self.tree.breadth_first_index_iter() {
+             if self.tree[node_index].is_parent() {
+                 self.show_separator(ui, node_index);
+             }
+@@ -242,7 +249,7 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
+         self.tree[NodeIndex::root()].set_rect(rect);
+     }
+ 
+-    fn show_separator(&mut self, ui: &mut Ui, node_index: NodeIndex) {
++    fn compute_rect_sizes(&mut self, ui: &mut Ui, node_index: NodeIndex) {
+         assert!(self.tree[node_index].is_parent());
+ 
+         let style = self.style.as_ref().unwrap();
+@@ -250,14 +257,43 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
+ 
+         duplicate! {
+             [
+-                orientation   dim_point  dim_size  left_rect   right_rect left_point  right_point;
+-                [Horizontal]  [x]        [width]   [right_of]  [left_of]  [max]       [min];
+-                [Vertical]    [y]        [height]  [above]     [below]    [min]       [max];
++                orientation   dim_point  dim_size  left_of    right_of  ;
++                [Horizontal]  [x]        [width]   [left_of]  [right_of];
++                [Vertical]    [y]        [height]  [above]    [below]   ;
+             ]
+             if let Node::orientation { fraction, rect } = &mut self.tree[node_index] {
++                debug_assert!(!rect.any_nan() && rect.is_finite());
+                 let rect = expand_to_pixel(*rect, pixels_per_point);
+ 
+-                let mut separator = rect;
++                let midpoint = rect.min.dim_point + rect.dim_size() * *fraction;
++                let left_separator_border = midpoint - style.separator.width * 0.5;
++                let right_separator_border = midpoint + style.separator.width * 0.5;
++
++                paste! {
++                    let left = rect.intersect(Rect::[<everything_ left_of>](left_separator_border));
++                    let right = rect.intersect(Rect::[<everything_ right_of>](right_separator_border));
++                }
++
++                self.tree[node_index.left()].set_rect(left);
++                self.tree[node_index.right()].set_rect(right);
++            }
++        }
++    }
++
++    fn show_separator(&mut self, ui: &mut Ui, node_index: NodeIndex) {
++        assert!(self.tree[node_index].is_parent());
++
++        let style = self.style.as_ref().unwrap();
++        let pixels_per_point = ui.ctx().pixels_per_point();
++
++        duplicate! {
++            [
++                orientation   dim_point  dim_size;
++                [Horizontal]  [x]        [width] ;
++                [Vertical]    [y]        [height];
++            ]
++            if let Node::orientation { fraction, ref rect } = &mut self.tree[node_index] {
++                let mut separator = *rect;
+ 
+                 let midpoint = rect.min.dim_point + rect.dim_size() * *fraction;
+                 separator.min.dim_point = midpoint - style.separator.width * 0.5;
+@@ -270,21 +306,6 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
+                 let response = ui.allocate_rect(interact_rect, Sense::click_and_drag())
+                     .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]});
+ 
+-                if let Some(pos) = response.interact_pointer_pos() {
+-                    let dim_point = pos.dim_point;
+-                    let delta = response.drag_delta().dim_point;
+-
+-                    if (delta > 0. && dim_point > midpoint && dim_point < rect.max.dim_point)
+-                        || (delta < 0. && dim_point < midpoint && dim_point > rect.min.dim_point)
+-                    {
+-                        let range = rect.max.dim_point - rect.min.dim_point;
+-                        let min = (style.separator.extra / range).min(1.0);
+-                        let max = 1.0 - min;
+-                        let (min, max) = (min.min(max), max.max(min));
+-                        *fraction = (*fraction + delta / range).clamp(min, max);
+-                    }
+-                }
+-
+                 let midpoint = rect.min.dim_point + rect.dim_size() * *fraction;
+                 separator.min.dim_point = map_to_pixel(
+                     midpoint - style.separator.width * 0.5,
+@@ -307,13 +328,23 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
+ 
+                 ui.painter().rect_filled(separator, Rounding::none(), color);
+ 
+-                paste! {
+-                    let left = rect.intersect(Rect::[<everything_ left_rect>](separator.left_point.dim_point));
+-                    let right = rect.intersect(Rect::[<everything_ right_rect>](separator.right_point.dim_point));
+-                }
++                // Update 'fraction' interaction after drawing seperator,
++                // overwise it may overlap on other separator / bodies when
++                // shrunk fast.
++                if let Some(pos) = response.interact_pointer_pos() {
++                    let dim_point = pos.dim_point;
++                    let delta = response.drag_delta().dim_point;
+ 
+-                self.tree[node_index.left()].set_rect(left);
+-                self.tree[node_index.right()].set_rect(right);
++                    if (delta > 0. && dim_point > midpoint && dim_point < rect.max.dim_point)
++                        || (delta < 0. && dim_point < midpoint && dim_point > rect.min.dim_point)
++                    {
++                        let range = rect.max.dim_point - rect.min.dim_point;
++                        let min = (style.separator.extra / range).min(1.0);
++                        let max = 1.0 - min;
++                        let (min, max) = (min.min(max), max.max(min));
++                        *fraction = (*fraction + delta / range).clamp(min, max);
++                    }
++                }
+             }
+         }
+     }

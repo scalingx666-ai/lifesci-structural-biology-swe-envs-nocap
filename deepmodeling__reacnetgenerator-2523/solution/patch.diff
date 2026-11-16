@@ -1,0 +1,515 @@
+diff --git a/benchmarks/fork_smiles_admission.md b/benchmarks/fork_smiles_admission.md
+new file mode 100644
+index 000000000..77f393f57
+--- /dev/null
++++ b/benchmarks/fork_smiles_admission.md
+@@ -0,0 +1,157 @@
++# Fork SMILES batch admission at higher worker counts
++
++With 4,509 molecule records and 32 fork workers, the old `256 * nproc`
++threshold selects per-record transport; the same input with four workers uses
++batches. Per-record tasks repeatedly serialize the collector, including atom
++metadata. This change caps the fork admission threshold at
++`256 * min(nproc, 4)` records for `nproc > 1`, retaining the previously measured
++two/four-worker thresholds while admitting medium inputs with larger pools.
++
++The requested pool size and `2 * nproc` in-flight limit are unchanged. Existing
++batch input/result budgets, singleton exceptions, spill behavior and ordered
++consumption remain in use. Spawn/forkserver retain 8,192 records per worker;
++single-process execution stays local. This is a measured admission heuristic,
++not a claim that 1,024 records is optimal for every molecule or machine.
++
++## Method
++
++Baseline: official master `1d3a23a88d5c7adf34e58a40db9b7722ac3889c6`.
++The candidate changes only `_should_batch_smiles` in production code. Its
++`_smilesworker.py` SHA-256 is `ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286`.
++Both variants use the same native extension and Python 3.12.12 environment:
++NumPy 2.5.4, RDKit 2026.9.1, NetworkX 3.7, Open Babel 3.2.1 and h5py 3.14.0.
++The campaign uses frozen source overlays in one dependency environment; Git/file
++hashes identify the code rather than the installed package's build-version label.
++Measurements run sequentially on one Linux AMD EPYC 7K62 host, CPUs 0–31,
++with native math threads limited to one and no concurrent test/build campaign.
++
++The two real windows each contain 5,001 frames and 2,600 atoms from the same
++2-chlorophenol/O2 trajectory at 2,500 K: early 0–50 ps and middle
++1,250.02–1,300.02 ps. They use 32 workers, `miso=1`, no HMM and stride 1.
++Fixed-record naming replays use 4,509 / 9,918 definitions and include conversion,
++grouping and name-file writing. Full pipeline timers cover `rng.run()` from
++DETECT through MATRIX. Imports, fixture preparation and output validation are
++outside the timers. Every process explicitly pre-reads its input; fresh-process
++pairs alternate AB/BA/AB. The middle pipeline was extended to five pairs
++(AB/BA/AB/BA/AB) after its first three pairs were 1.6% slower for the candidate;
++all original samples are retained. RSS is a process high-water mark including setup;
++largest-child RSS is not the sum of simultaneous worker memory.
++
++## Results
++
++Medians in seconds (three pairs, five for the middle pipeline):
++
++| Measurement     |   Base | Candidate | Change |
++| --------------- | -----: | --------: | -----: |
++| Early naming    |  2.598 |     0.703 | -72.9% |
++| Middle naming   |  7.322 |     7.317 |  -0.1% |
++| Early pipeline  | 42.182 |    38.451 |  -8.8% |
++| Middle pipeline | 49.190 |    49.564 |  +0.8% |
++
++The middle window already uses batches in both versions and is an unchanged
++path control. Ranges and resource measurements (base / candidate):
++
++- Early: pipeline ranges 41.535–42.246 s / 38.386–38.916 s; Step 3 medians 17.332 / 13.586 s; parent peak RSS 300.3 / 299.9 MiB; largest-child peak RSS 230.3 / 230.2 MiB.
++- Middle: pipeline ranges 48.679–49.967 s / 48.795–50.608 s; Step 3 medians 22.222 / 22.179 s; parent peak RSS 328.5 / 329.8 MiB; largest-child peak RSS 243.1 / 249.2 MiB.
++
++Repeated/mixed controls use the existing `smiles_batches.py` synthetic inputs;
++they are stress workloads, not additional chemical observations. Each label
++states its record and worker count. `large1024_32` also returns two large frame
++arrays and includes incremental output hashing in both timers.
++
++| Control       |  Base | Candidate | Change |
++| ------------- | ----: | --------: | -----: |
++| repeat1024_32 | 0.627 |     0.321 | -48.8% |
++| repeat4096_32 | 2.555 |     0.553 | -78.4% |
++| mixed1024_32  | 1.907 |     1.468 | -23.0% |
++| mixed4096_32  | 9.122 |     7.056 | -22.6% |
++| large1024_32  | 0.696 |     0.373 | -46.4% |
++| repeat1024_8  | 0.398 |     0.178 | -55.3% |
++
++Six unchanged-path controls each have one pair: 1,023 records with 32 fork
++workers, 1,024/4 and 512/2 fork configurations, one process, and four-worker
++spawn/forkserver runs. These check output compatibility, not speed. The 512/2
++single pair changes from 0.138 to 0.151 s (+9.4%); its scheduling is unchanged
++and one pair cannot establish a performance difference. All raw results,
++including these controls, are in [naming samples](fork_smiles_admission_names.csv).
++
++Separate [IPC audits](fork_smiles_admission_audit.csv) show early task count
++4,509 -> 170, and application task serialization 201,391,060 -> 10,375,834 bytes.
++Initializer metadata is transferred once per worker and excluded from these
++per-task totals. The middle input retains exactly 270 tasks and 16,073,243 input
++bytes. The large-result candidate spills 4,196,750 bytes across two SMILES result
++streams, preserving exact output hashes. These counters exclude the shared
++ordered spool's own files and runner framing; audit timings are not speed samples.
++
++## Correctness and limits
++
++675 non-GUI tests pass, with 6 GUI deselections, 6 xfailed and 3 non-strict XPASS.
++The 15 added cases check admission boundaries, unchanged spawn/forkserver guards,
++requested pool size, and exact names/timeline rows for all three `miso` modes.
++Existing tests cover oversized inputs/results, ordering, filters, failed SMILES,
++worker exit, serialization errors and cleanup.
++
++All 60 timed naming/result samples and 10 separate audits preserve their exact
++ordered output fingerprints. All 24 full-pipeline outputs pass native validation;
++all 12 base/candidate pairs preserve exact species labels, atom/bond definitions,
++presence ranges, populations, reaction counts and transition evidence after only
++normalizing internal IDs/table order. Integration includes HMM-on `miso=0` and
++no-HMM `miso=2` pilots plus HMM-on early/middle-window `miso=1` pairs. Those single
++pairs are correctness checks. [Pipeline samples](fork_smiles_admission_pipeline.csv)
++retain all timings and actual admission decisions.
++
++These results cover bounded windows, one Linux host and up to 32 workers.
++They do not establish a universal speedup or a total RSS bound. Spawn/forkserver
++correctness controls ran on Linux; macOS/Windows performance was not measured.
++
++## Reproduce
++
++Install the base and candidate separately with identical dependencies; use this
++checkout's benchmark scripts with either installed interpreter. Replace each
++placeholder with the actual path. Choose an available fixed CPU set on Linux;
++`0-31` matches this campaign. Use fresh output names for every repetition and
++run samples sequentially, alternating version order.
++
++```sh
++export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
++export NUMEXPR_NUM_THREADS=1 PYTHONHASHSEED=0
++RNG_BASE_PYTHON=/path/to/base/bin/python
++RNG_HEAD_PYTHON=/path/to/head/bin/python
++RNG_INPUT=/path/to/window.lammpstrj
++RNG_STATE=/path/to/new-fixed-state
++
++# Prepare one common stream, outside all timers.
++taskset -c 0-31 "$RNG_BASE_PYTHON" benchmarks/isomer_candidates.py --prepare \
++    --input "$RNG_INPUT" --atom-types C Cl H O --nproc 32 \
++    --state "$RNG_STATE" --json prepared.json
++
++# Each invocation explicitly warms its record input outside the timer.
++taskset -c 0-31 "$RNG_BASE_PYTHON" benchmarks/fork_smiles_admission.py \
++    --state "$RNG_STATE" --nproc 32 --method fork --json base-names.json
++taskset -c 0-31 "$RNG_HEAD_PYTHON" benchmarks/fork_smiles_admission.py \
++    --state "$RNG_STATE" --nproc 32 --method fork --json head-names.json
++
++# Synthetic controls: repeat with both interpreters and all reported sizes.
++taskset -c 0-31 "$RNG_HEAD_PYTHON" benchmarks/fork_smiles_admission.py \
++    --case mixed --records 1024 --nproc 32 --method fork --json mixed.json
++
++# Full pipeline; warm the trajectory separately before each process.
++cat "$RNG_INPUT" > /dev/null
++taskset -c 0-31 "$RNG_BASE_PYTHON" benchmarks/equal_z_candidates.py --mode pipeline \
++    --input "$RNG_INPUT" --atom-types C Cl H O --nproc 32 --miso 1 \
++    --output base-output --json base-pipeline.json
++cat "$RNG_INPUT" > /dev/null
++taskset -c 0-31 "$RNG_HEAD_PYTHON" benchmarks/equal_z_candidates.py --mode pipeline \
++    --input "$RNG_INPUT" --atom-types C Cl H O --nproc 32 --miso 1 \
++    --output head-output --json head-pipeline.json
++"$RNG_HEAD_PYTHON" benchmarks/equal_z_compare.py base-output head-output
++```
++
++Use `--case repeated` or `--case large-output` for the other synthetic workloads.
++Use `--records 1023` for the below-threshold control, `--nproc 1/2/4/8` for the
++worker controls, and `--method spawn/forkserver` for those startup controls.
++Pass one concrete value per option. Repeat selected cases with `--audit` only
++after timing runs have finished; do not combine their timings with the table.
++For the HMM integration controls, add `--hmm` to the pipeline command and select
++`--miso 0` for the pilot or `--miso 1` for the real windows; the no-HMM pilot uses
++`--miso 2`.
+diff --git a/benchmarks/fork_smiles_admission.py b/benchmarks/fork_smiles_admission.py
+new file mode 100644
+index 000000000..dc705be11
+--- /dev/null
++++ b/benchmarks/fork_smiles_admission.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Replay fork admission controls with explicit input warming in each process.
++
++Real states use isomer_candidates.py --prepare. Synthetic controls reuse
++smiles_batches.py, including oversized returned frames. Audits serialize tasks
++again and must be run separately from timing samples. Use identical arguments
++and this script with both installed source versions.
++"""
++
++import argparse
++import hashlib
++import importlib.metadata
++import json
++import multiprocessing
++import platform
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace
++
++import isomer_candidates
++import smiles_batches
++
++from reacnetgenerator import _smilesworker
++
++
++def warm(path):
++    """Pre-read compressed records outside the measured production entry point."""
++    with open(path, "rb") as stream:
++        for _ in iter(lambda: stream.read(1024 * 1024), b""):
++            pass
++
++
++def main():
++    """Measure one fresh process and retain exact ordered output fingerprints."""
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--case",
++        choices=["real", "repeated", "low-repeat", "mixed", "large-output"],
++        default="real",
++    )
++    parser.add_argument("--state", type=Path)
++    parser.add_argument(
++        "--records",
++        type=int,
++        default=1024,
++        help="Synthetic record count; real states replay all records",
++    )
++    parser.add_argument("--nproc", type=int, default=32)
++    parser.add_argument("--miso", type=int, choices=[0, 1, 2], default=1)
++    parser.add_argument(
++        "--method",
++        choices=multiprocessing.get_all_start_methods(),
++        default=multiprocessing.get_start_method(),
++    )
++    parser.add_argument("--audit", action="store_true")
++    parser.add_argument("--json", type=Path, required=True)
++    args = parser.parse_args()
++    if args.nproc < 1 or args.records < 1:
++        parser.error("--nproc and --records must be positive")
++    if args.case == "real" and args.state is None:
++        parser.error("Real replays require --state")
++    multiprocessing.set_start_method(args.method, force=True)
++    with tempfile.TemporaryDirectory() as directory:
++        folder = Path(directory)
++        if args.case == "real":
++            audit = smiles_batches._audit() if args.audit else None
++            result = isomer_candidates.replay(
++                SimpleNamespace(
++                    case="real",
++                    state=args.state,
++                    nproc=args.nproc,
++                    miso=args.miso,
++                    audit=False,
++                ),
++                folder,
++            )
++            result["audit"] = audit
++        else:
++            original_fixture = smiles_batches._fixture
++
++            def prepared(options, root):
++                """Warm the same prepared stream for either installed version."""
++                rng, source = original_fixture(options, root)
++                warm(rng.moleculetemp2filename)
++                return rng, source
++
++            smiles_batches._fixture = prepared
++            try:
++                result = smiles_batches.sample(
++                    SimpleNamespace(
++                        case=args.case,
++                        records=args.records,
++                        state=None,
++                        nproc=args.nproc,
++                        miso=args.miso,
++                        hmm=False,
++                        stage="results" if args.case == "large-output" else "names",
++                        audit=args.audit,
++                    ),
++                    folder,
++                )
++            finally:
++                smiles_batches._fixture = original_fixture
++            result["seconds"] = result["wall"]
++        result.update(
++            method=args.method,
++            batching=_smilesworker._should_batch_smiles(result["records"], args.nproc),
++            worker_source_sha256=hashlib.sha256(
++                Path(_smilesworker.__file__).read_bytes()
++            ).hexdigest(),
++            python=platform.python_version(),
++            dependencies={
++                name: importlib.metadata.version(name)
++                for name in ["numpy", "rdkit", "networkx", "lz4"]
++            },
++        )
++        args.json.write_text(json.dumps(result, indent=2))
++        print(json.dumps(result), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/fork_smiles_admission_audit.csv b/benchmarks/fork_smiles_admission_audit.csv
+new file mode 100644
+index 000000000..0b910fcd7
+--- /dev/null
++++ b/benchmarks/fork_smiles_admission_audit.csv
+@@ -0,0 +1,11 @@
++label,repeat,variant,records,nproc,method,miso,batched,tasks,input_bytes,max_input_bytes,result_bytes,max_result_bytes,max_pending,pending,spilled_bytes,max_spilled_bytes,worker_source_sha256
++early32,1,base,4509,32,fork,1,False,4509,201391060,52943,1531782,496,64,0,0,0,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early32,1,candidate,4509,32,fork,1,True,170,10375834,81818,1535862,27490,64,0,0,0,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle32,1,base,9918,32,fork,1,True,270,16073243,81029,5629773,49785,64,0,0,0,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle32,1,candidate,9918,32,fork,1,True,270,16073243,81029,5629773,49785,64,0,0,0,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_32,1,base,1024,32,fork,1,False,1024,8134656,7951,444416,434,64,0,0,0,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_32,1,candidate,1024,32,fork,1,True,16,994864,62179,444800,27800,16,0,0,0,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed1024_32,1,base,1024,32,fork,1,False,1024,8677120,9648,3283456,9365,64,0,0,0,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed1024_32,1,candidate,1024,32,fork,1,True,32,1538912,49105,3284512,103363,32,0,0,0,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++large1024_32,1,base,1024,32,fork,1,False,1024,10094774,1057261,5442568,2098375,64,0,0,0,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++large1024_32,1,candidate,1024,32,fork,1,True,20,3230114,1050662,1246432,73173,20,0,4196750,2098375,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
+diff --git a/benchmarks/fork_smiles_admission_names.csv b/benchmarks/fork_smiles_admission_names.csv
+new file mode 100644
+index 000000000..29d373be1
+--- /dev/null
++++ b/benchmarks/fork_smiles_admission_names.csv
+@@ -0,0 +1,61 @@
++label,repeat,variant,records,nproc,method,miso,batched,seconds,parent_peak_mib,largest_child_peak_mib,fingerprint,worker_source_sha256
++early32,1,base,4509,32,fork,1,False,2.9766213048715144,226.25390625,155.890625,"[""3cb0c4bb97aa05678232594944e69f9804a8db74af30d1b3cea05cb2a4e8dc2a"",""6d016e2c02468dc2ed0ab5aa47b8e8fc2062cc52437b9c68d870427f41233c69""]",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early32,1,candidate,4509,32,fork,1,True,0.7116516239475459,228.76953125,156.04296875,"[""3cb0c4bb97aa05678232594944e69f9804a8db74af30d1b3cea05cb2a4e8dc2a"",""6d016e2c02468dc2ed0ab5aa47b8e8fc2062cc52437b9c68d870427f41233c69""]",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++early32,2,candidate,4509,32,fork,1,True,0.7033470261376351,228.8046875,156.2734375,"[""3cb0c4bb97aa05678232594944e69f9804a8db74af30d1b3cea05cb2a4e8dc2a"",""6d016e2c02468dc2ed0ab5aa47b8e8fc2062cc52437b9c68d870427f41233c69""]",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++early32,2,base,4509,32,fork,1,False,2.483874313067645,226.92578125,155.828125,"[""3cb0c4bb97aa05678232594944e69f9804a8db74af30d1b3cea05cb2a4e8dc2a"",""6d016e2c02468dc2ed0ab5aa47b8e8fc2062cc52437b9c68d870427f41233c69""]",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early32,3,base,4509,32,fork,1,False,2.597660604165867,226.87890625,155.87109375,"[""3cb0c4bb97aa05678232594944e69f9804a8db74af30d1b3cea05cb2a4e8dc2a"",""6d016e2c02468dc2ed0ab5aa47b8e8fc2062cc52437b9c68d870427f41233c69""]",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early32,3,candidate,4509,32,fork,1,True,0.6846864209510386,229.6796875,155.76953125,"[""3cb0c4bb97aa05678232594944e69f9804a8db74af30d1b3cea05cb2a4e8dc2a"",""6d016e2c02468dc2ed0ab5aa47b8e8fc2062cc52437b9c68d870427f41233c69""]",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle32,1,base,9918,32,fork,1,True,7.320067576831207,239.41015625,159.73828125,"[""ae2dfd51ddd42ca19a2a77da38ceb27068b778f18bae98d37b9d83424c981cfa"",""853f9dc0940fd1b2d427cb8303cd0c21cf5f9b4578959d32240a4453422bbada""]",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle32,1,candidate,9918,32,fork,1,True,7.3670026489999145,239.66015625,159.76171875,"[""ae2dfd51ddd42ca19a2a77da38ceb27068b778f18bae98d37b9d83424c981cfa"",""853f9dc0940fd1b2d427cb8303cd0c21cf5f9b4578959d32240a4453422bbada""]",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle32,2,candidate,9918,32,fork,1,True,7.3166331958491355,239.84375,159.49609375,"[""ae2dfd51ddd42ca19a2a77da38ceb27068b778f18bae98d37b9d83424c981cfa"",""853f9dc0940fd1b2d427cb8303cd0c21cf5f9b4578959d32240a4453422bbada""]",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle32,2,base,9918,32,fork,1,True,7.367203213041648,239.1796875,160.1640625,"[""ae2dfd51ddd42ca19a2a77da38ceb27068b778f18bae98d37b9d83424c981cfa"",""853f9dc0940fd1b2d427cb8303cd0c21cf5f9b4578959d32240a4453422bbada""]",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle32,3,base,9918,32,fork,1,True,7.322148931911215,240.16796875,159.56640625,"[""ae2dfd51ddd42ca19a2a77da38ceb27068b778f18bae98d37b9d83424c981cfa"",""853f9dc0940fd1b2d427cb8303cd0c21cf5f9b4578959d32240a4453422bbada""]",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle32,3,candidate,9918,32,fork,1,True,7.314649909967557,239.85546875,159.8515625,"[""ae2dfd51ddd42ca19a2a77da38ceb27068b778f18bae98d37b9d83424c981cfa"",""853f9dc0940fd1b2d427cb8303cd0c21cf5f9b4578959d32240a4453422bbada""]",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_32,1,base,1024,32,fork,1,False,0.6271699909120798,254.55078125,180.484375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_32,1,candidate,1024,32,fork,1,True,0.3212683778256178,255.1015625,180.89453125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_32,2,candidate,1024,32,fork,1,True,0.308188539929688,254.5703125,180.8046875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_32,2,base,1024,32,fork,1,False,0.6612445719074458,254.2265625,180.94140625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_32,3,base,1024,32,fork,1,False,0.6195826691109687,254.5703125,180.9140625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_32,3,candidate,1024,32,fork,1,True,0.3232732380274683,254.921875,180.44921875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat4096_32,1,base,4096,32,fork,1,False,2.5552339570131153,255.30859375,181.4609375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""b05486a33548db4696c6c10b3262d97af595762b278259b54f5e9685ece38687""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat4096_32,1,candidate,4096,32,fork,1,True,0.5684246369637549,256.8125,181.58203125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""b05486a33548db4696c6c10b3262d97af595762b278259b54f5e9685ece38687""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat4096_32,2,candidate,4096,32,fork,1,True,0.5531712309457362,256.20703125,182.0078125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""b05486a33548db4696c6c10b3262d97af595762b278259b54f5e9685ece38687""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat4096_32,2,base,4096,32,fork,1,False,2.421332525787875,255.28125,181.4921875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""b05486a33548db4696c6c10b3262d97af595762b278259b54f5e9685ece38687""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat4096_32,3,base,4096,32,fork,1,False,2.6459705750457942,254.6875,181.60546875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""b05486a33548db4696c6c10b3262d97af595762b278259b54f5e9685ece38687""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat4096_32,3,candidate,4096,32,fork,1,True,0.5380616770125926,256.05859375,181.484375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""b05486a33548db4696c6c10b3262d97af595762b278259b54f5e9685ece38687""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed1024_32,1,base,1024,32,fork,1,False,1.9276609548833221,292.4375,180.8046875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""450be493f32627ba3a0636467642613d0cfb32f6efc21eb9c787908f229577ac""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed1024_32,1,candidate,1024,32,fork,1,True,1.468450534855947,294.3046875,181.4453125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""450be493f32627ba3a0636467642613d0cfb32f6efc21eb9c787908f229577ac""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed1024_32,2,candidate,1024,32,fork,1,True,1.4794228018727154,294.69921875,181.125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""450be493f32627ba3a0636467642613d0cfb32f6efc21eb9c787908f229577ac""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed1024_32,2,base,1024,32,fork,1,False,1.8654684079810977,292.421875,180.93359375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""450be493f32627ba3a0636467642613d0cfb32f6efc21eb9c787908f229577ac""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed1024_32,3,base,1024,32,fork,1,False,1.907007697969675,292.05078125,180.57421875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""450be493f32627ba3a0636467642613d0cfb32f6efc21eb9c787908f229577ac""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed1024_32,3,candidate,1024,32,fork,1,True,1.4678726359270513,294.32421875,181.265625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""450be493f32627ba3a0636467642613d0cfb32f6efc21eb9c787908f229577ac""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed4096_32,1,base,4096,32,fork,1,False,9.122392348013818,393.6796875,181.83203125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""6e7efb18dc30bd6b3bab60ad2359032e38ffdd5ad9fa5d516e20f39341428fbd""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed4096_32,1,candidate,4096,32,fork,1,True,7.031128969043493,397.45703125,181.89453125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""6e7efb18dc30bd6b3bab60ad2359032e38ffdd5ad9fa5d516e20f39341428fbd""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed4096_32,2,candidate,4096,32,fork,1,True,7.216693034861237,397.05859375,181.94140625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""6e7efb18dc30bd6b3bab60ad2359032e38ffdd5ad9fa5d516e20f39341428fbd""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++mixed4096_32,2,base,4096,32,fork,1,False,9.211795005016029,393.296875,181.94140625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""6e7efb18dc30bd6b3bab60ad2359032e38ffdd5ad9fa5d516e20f39341428fbd""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed4096_32,3,base,4096,32,fork,1,False,8.898215939057991,394.9453125,181.6015625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""6e7efb18dc30bd6b3bab60ad2359032e38ffdd5ad9fa5d516e20f39341428fbd""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++mixed4096_32,3,candidate,4096,32,fork,1,True,7.056250449968502,398.94140625,181.74609375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""6e7efb18dc30bd6b3bab60ad2359032e38ffdd5ad9fa5d516e20f39341428fbd""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++large1024_32,1,base,1024,32,fork,1,False,0.6957288279663771,261.42578125,190.22265625,"{""manifest"":null,""results"":""2e9c6c7ad75c23d34c78faa5c7d3fb82165ee9e65956bdbd33acb16324b5e053"",""text"":{}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++large1024_32,1,candidate,1024,32,fork,1,True,0.3842236038763076,260.72265625,187.46484375,"{""manifest"":null,""results"":""2e9c6c7ad75c23d34c78faa5c7d3fb82165ee9e65956bdbd33acb16324b5e053"",""text"":{}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++large1024_32,2,candidate,1024,32,fork,1,True,0.3657811409793794,260.44921875,187.9140625,"{""manifest"":null,""results"":""2e9c6c7ad75c23d34c78faa5c7d3fb82165ee9e65956bdbd33acb16324b5e053"",""text"":{}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++large1024_32,2,base,1024,32,fork,1,False,0.6846837168559432,262.5078125,190.26171875,"{""manifest"":null,""results"":""2e9c6c7ad75c23d34c78faa5c7d3fb82165ee9e65956bdbd33acb16324b5e053"",""text"":{}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++large1024_32,3,base,1024,32,fork,1,False,0.7032605251297355,263.33203125,190.3984375,"{""manifest"":null,""results"":""2e9c6c7ad75c23d34c78faa5c7d3fb82165ee9e65956bdbd33acb16324b5e053"",""text"":{}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++large1024_32,3,candidate,1024,32,fork,1,True,0.37282515107654035,260.71875,188.80078125,"{""manifest"":null,""results"":""2e9c6c7ad75c23d34c78faa5c7d3fb82165ee9e65956bdbd33acb16324b5e053"",""text"":{}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_8,1,base,1024,8,fork,1,False,0.38275152491405606,254.56640625,180.52734375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_8,1,candidate,1024,8,fork,1,True,0.17813712102361023,254.5390625,180.61328125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_8,2,candidate,1024,8,fork,1,True,0.16720007895492017,254.5859375,180.41796875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_8,2,base,1024,8,fork,1,False,0.39840688183903694,254.58203125,180.5703125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_8,3,base,1024,8,fork,1,False,0.4454167881049216,254.56640625,180.98828125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_8,3,candidate,1024,8,fork,1,True,0.1815879892092198,254.57421875,180.61328125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++below1023_32,1,base,1023,32,fork,1,False,0.6592499231919646,254.16796875,180.3125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""30686059c3e00ac1585f55fd1e7ab17f546e688765570b47821d596963fe9c7d""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++below1023_32,1,candidate,1023,32,fork,1,False,0.6261084110010415,254.72265625,180.30859375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""30686059c3e00ac1585f55fd1e7ab17f546e688765570b47821d596963fe9c7d""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat1024_4,1,base,1024,4,fork,1,True,0.169604656053707,254.55859375,180.6171875,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat1024_4,1,candidate,1024,4,fork,1,True,0.1657456229440868,254.1953125,180.375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++repeat512_2,1,base,512,2,fork,1,True,0.13836797210387886,254.19921875,179.4140625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""fb1aeaf2b3210789f5a78e0135e35ac4ea995b977033d112784b7e4fc9219ed8""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++repeat512_2,1,candidate,512,2,fork,1,True,0.15139393811114132,253.83203125,179.8828125,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""fb1aeaf2b3210789f5a78e0135e35ac4ea995b977033d112784b7e4fc9219ed8""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++single1024,1,base,1024,1,fork,1,False,0.15250417008064687,255.71484375,95.625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++single1024,1,candidate,1024,1,fork,1,False,0.1538495570421219,255.67578125,95.625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++spawn1024_4,1,base,1024,4,spawn,1,False,2.4567545189056545,254.5859375,257.2890625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++spawn1024_4,1,candidate,1024,4,spawn,1,False,2.5043620180804282,254.59375,258.27734375,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++forkserver1024_4,1,base,1024,4,forkserver,1,False,3.434260302921757,254.57421875,95.625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++forkserver1024_4,1,candidate,1024,4,forkserver,1,False,3.26508940407075,254.20703125,95.625,"{""manifest"":null,""results"":null,""text"":{""moleculefilename"":""d762d1e93be67f7d86faf7b5050ced854e3aae0f1725d6f5ebb1d52b74ff51ff""}}",ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
+diff --git a/benchmarks/fork_smiles_admission_pipeline.csv b/benchmarks/fork_smiles_admission_pipeline.csv
+new file mode 100644
+index 000000000..b9a2574ef
+--- /dev/null
++++ b/benchmarks/fork_smiles_admission_pipeline.csv
+@@ -0,0 +1,25 @@
++case,repeat,variant,pipeline_seconds,step1_seconds,step2_seconds,step3_seconds,step4_seconds,hmm,miso,records,batched,parent_peak_rss_KiB,largest_child_peak_rss_KiB,worker_source_sha256
++pilot_hmm0,1,base,3.514437763951719,1.258,0.37,1.806,0.079,True,0,801,False,268332,192360,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++pilot_hmm0,1,candidate,3.6937619450036436,1.211,0.337,2.026,0.118,True,0,801,False,266864,191276,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++pilot_miso2,1,base,4.5419515748508275,1.395,0.068,2.879,0.199,False,2,1575,False,267932,191672,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++pilot_miso2,1,candidate,4.165638925042003,1.275,0.066,2.624,0.201,False,2,1575,True,269348,191304,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++early,1,base,42.24619853706099,20.818,2.619,17.614,1.193,False,1,4509,False,307868,236236,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early,1,candidate,38.91595862293616,20.797,2.735,14.168,1.213,False,1,4509,True,306776,235684,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++early,2,candidate,38.4507329731714,20.95,2.649,13.586,1.263,False,1,4509,True,309028,238608,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++early,2,base,41.534672308014706,20.843,2.232,17.262,1.195,False,1,4509,False,307516,234924,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early,3,base,42.18179402407259,20.985,2.658,17.332,1.205,False,1,4509,False,306712,235844,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early,3,candidate,38.3859395950567,21.423,2.426,13.328,1.207,False,1,4509,True,307072,235040,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle,1,base,49.19033368397504,19.917,5.575,22.222,1.474,False,1,9918,True,336428,245888,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle,1,candidate,49.56377043505199,20.55,5.121,22.432,1.457,False,1,9918,True,337744,259540,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle,2,candidate,49.74429419217631,20.55,6.318,21.439,1.435,False,1,9918,True,337308,252996,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle,2,base,48.953632144024596,20.018,5.624,21.85,1.459,False,1,9918,True,333752,249988,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle,3,base,48.67863461119123,19.803,5.533,21.888,1.452,False,1,9918,True,331864,241092,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle,3,candidate,50.60810871096328,20.651,6.326,22.179,1.448,False,1,9918,True,331408,261540,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle,4,candidate,48.7952006671112,19.449,5.987,21.92,1.437,False,1,9918,True,338476,242400,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle,4,base,49.966761705931276,20.394,5.66,22.475,1.436,False,1,9918,True,336728,251848,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle,5,base,49.337973634013906,19.714,5.81,22.387,1.424,False,1,9918,True,338140,248956,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle,5,candidate,49.24465865409002,20.176,5.345,22.261,1.461,False,1,9918,True,338264,255164,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++early_hmm1,1,base,25.936924607027322,21.327,0.55,3.241,0.815,True,1,956,False,303964,225480,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++early_hmm1,1,candidate,26.4509095759131,21.417,0.534,3.691,0.806,True,1,956,False,300260,223212,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
++middle_hmm1,1,base,23.88932242617011,19.248,0.594,3.086,0.957,True,1,1072,False,313592,236384,85b797cafcaa964938b83e2b95721a546f3501a68ad181a184ccf9859f6b456a
++middle_hmm1,1,candidate,23.379674110095948,19.529,0.588,2.325,0.933,True,1,1072,True,313692,236940,ee5ec642fc88964281199bf0bce847a794ddef9dbabb41206be3ee0c3149c286
+diff --git a/benchmarks/smiles_batches.md b/benchmarks/smiles_batches.md
+index e1402d3a4..516e2afba 100644
+--- a/benchmarks/smiles_batches.md
++++ b/benchmarks/smiles_batches.md
+@@ -7,11 +7,14 @@ are unchanged.
+ 
+ ## Scheduling and resource limits
+ 
+-Fork batches start at 256 records per requested worker. Spawn and forkserver
+-retain the existing ordered per-record path below 8,192 records per worker.
+-These conservative admission thresholds were checked at several workload
+-sizes, with two workers and additional four-worker controls. They are not a
+-universal optimal crossover or a new default worker count.
++Fork batches start at `256 * min(nproc, 4)` records for `nproc > 1`.
++The [fork admission update](fork_smiles_admission.md) caps the threshold at
++1,024 records so requesting more workers does not restore per-record transport
++for medium inputs. Spawn and forkserver retain the ordered per-record path
++below 8,192 records per worker. These thresholds are not a universal optimal
++crossover or a new default worker count. The historical measurements below used
++the original fork threshold of 256 records per requested worker, with two-worker
++and additional four-worker controls; those configurations are unchanged.
+ 
+ Normal batches contain at most 64 records, 256 KiB of serialized record input,
+ and a 4 MiB decoded-size estimate. The estimate uses LZ4 content lengths with
+diff --git a/reacnetgenerator/_smilesworker.py b/reacnetgenerator/_smilesworker.py
+index 3a1c66243..fcbfa26a3 100644
+--- a/reacnetgenerator/_smilesworker.py
++++ b/reacnetgenerator/_smilesworker.py
+@@ -25,12 +25,14 @@
+ 
+ def _should_batch_smiles(molecule_count, nproc):
+     """Retain ordered per-record scheduling for small startup-sensitive inputs."""
+-    threshold = (
+-        _SMILES_FORK_RECORDS_PER_WORKER
+-        if get_start_method() == "fork"
+-        else _SMILES_SPAWN_RECORDS_PER_WORKER
+-    )
+-    return nproc > 1 and molecule_count >= threshold * nproc
++    if get_start_method() == "fork":
++        # More requested workers should not push medium inputs back to
++        # per-record transport. Keep the measured two/four-worker crossover;
++        # cap admission at 1024 records without changing the pool size.
++        threshold = _SMILES_FORK_RECORDS_PER_WORKER * min(nproc, 4)
++    else:
++        threshold = _SMILES_SPAWN_RECORDS_PER_WORKER * nproc
++    return nproc > 1 and molecule_count >= threshold
+ 
+ 
+ def _smiles_record_cost(record):
+diff --git a/tests/test_smiles_batching.py b/tests/test_smiles_batching.py
+index 271ffa611..a5257113b 100644
+--- a/tests/test_smiles_batching.py
++++ b/tests/test_smiles_batching.py
+@@ -151,6 +151,55 @@ def unexpected(*args, **kwargs):
+     assert calls == [2]
+ 
+ 
++@pytest.mark.parametrize(
++    "nproc, boundary", [(2, 512), (4, 1024), (8, 1024), (32, 1024)]
++)
++def test_fork_admission_keeps_medium_inputs_batched(monkeypatch, nproc, boundary):
++    """Requesting more workers must not restore per-record transport above 1024."""
++    monkeypatch.setattr(workers, "get_start_method", lambda: "fork")
++    assert not workers._should_batch_smiles(boundary - 1, nproc)
++    assert workers._should_batch_smiles(boundary, nproc)
++    assert not workers._should_batch_smiles(boundary, 1)
++
++
++@pytest.mark.parametrize("method", ["spawn", "forkserver"])
++@pytest.mark.parametrize("nproc", [2, 4, 8, 32])
++def test_nonfork_admission_retains_startup_guard(monkeypatch, method, nproc):
++    """The fork cap must not lower the import-sensitive spawn/forkserver threshold."""
++    monkeypatch.setattr(workers, "get_start_method", lambda: method)
++    assert not workers._should_batch_smiles(8192 * nproc - 1, nproc)
++    assert workers._should_batch_smiles(8192 * nproc, nproc)
++
++
++@pytest.mark.parametrize("miso", [0, 1, 2])
++def test_newly_admitted_fork_input_preserves_outputs(tmp_path, monkeypatch, miso):
++    """The new boundary uses the requested pool size and exact ordered outputs."""
++    monkeypatch.setattr(workers, "get_start_method", lambda: "fork")
++    records = _records(1024)
++    local = _collector(tmp_path / "local", records, miso, 1)
++    parallel = _collector(tmp_path / "parallel", records, miso, 8)
++    local._printmoleculename()
++    calls = []
++
++    def checked(nproc, **kwargs):
++        assert nproc == 8
++        assert kwargs["max_inflight"] == 16
++        calls.append(kwargs["total"])
++        return run_mp(nproc, **kwargs)
++
++    monkeypatch.setattr(workers, "run_mp", checked)
++    children = {p.pid for p in multiprocessing.active_children()}
++    parallel._printmoleculename()
++    assert calls and 1 < calls[0] < len(records)
++    assert list(parallel.mname) == list(local.mname)
++    for attribute in ("moleculefilename", "moleculetimelinefilename"):
++        assert (
++            Path(getattr(parallel, attribute)).read_bytes()
++            == Path(getattr(local, attribute)).read_bytes()
++        )
++    assert {p.pid for p in multiprocessing.active_children()} == children
++
++
+ def test_admission_is_bounded_by_decoded_and_wire_sizes(tmp_path, monkeypatch):
+     """A tiny compressed frame range must not share a batch with other records."""
+     collector = _collector(

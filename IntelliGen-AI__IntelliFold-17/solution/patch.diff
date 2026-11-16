@@ -1,0 +1,1347 @@
+diff --git a/NOTICE b/NOTICE
+index 65d2b81..d2dd4e7 100644
+--- a/NOTICE
++++ b/NOTICE
+@@ -23,3 +23,13 @@ The AlphaFold 3 model parameters ("weights") and outputs generated with them are
+ NOT included here and are governed by separate non-commercial terms
+ (https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md).
+ This repository ships only IntelliGen-AI's own IntelliFold-v2 weights.
++
++This product includes diffusion-steering ("physical guidance") code under
++intellifold/steering/ derived from Boltz (https://github.com/jwohlwend/boltz),
++Copyright (c) 2024 Jeremy Wohlwend, Gabriele Corso, and Saro Passaro, licensed
++under the MIT License. constants.py reuses the van-der-Waals radii table and
++element-count constant; rdkit_features.py adapts the RDKit/PoseBusters geometry,
++chirality, stereo, and planar-bond constraint extraction (SMARTS patterns and
++flat-bottom buffers); guidance.py reuses the schedule formula and the default
++physical-guidance weights/intervals/buffers. The full Boltz MIT license text is
++in THIRD_PARTY_LICENSES/Boltz-MIT.txt.
+diff --git a/README.md b/README.md
+index a5d8e4f..67c9ab7 100644
+--- a/README.md
++++ b/README.md
+@@ -89,9 +89,34 @@ self-balancing local queue, resumable — rerun to continue):
+ intellifold predict ./my_inputs/ --model-dir=model_v2 --gpus all --output-dir results -- --norun_data_pipeline
+ ```
+ 
++**Steer toward physically valid poses (optional, off by default)** — add `--steering` to nudge the
++diffusion sampler at every denoising step with the gradient of a set of differentiable
++physical/chemical potentials (bond lengths & angles, internal clashes, chirality, double-bond / ring
++planarity, protein–ligand van-der-Waals overlap, covalent connections, and symmetric-chain
++repulsion); the potential set is adapted from [Boltz](https://github.com/jwohlwend/boltz). This
++improves the **physical plausibility** of predicted small-molecule poses without retraining — on our
++PoseBusters-v2 evaluation it raises the PoseBusters validity rate from **~72% to ~93%** (and the joint
++"valid **and** pocket-aligned ligand RMSD < 2 Å" rate from ~62% to ~75%) while leaving docking
++accuracy essentially unchanged. Without `--steering` the sampler is unchanged.
++
++```bash
++intellifold predict fold_input.json --model-dir=model_v2 --output-dir results \
++    -- --norun_data_pipeline --steering
++```
++
++Steering tuning flags (also after `--`): `--steering_num_gd_steps` (default `20`, gradient-descent
++iterations per denoising step) and `--steering_weight_scale` (default `1.0`, global multiplier on all
++potential weights).
++
++> ⚠️ **Steering is slower.** It runs `num_gd_steps` extra gradient evaluations inside every denoising
++> step, and because the per-target constraint set has a target-specific shape, each input triggers its
++> own XLA compilation (the no-steering path reuses bucketed compilations across inputs). Expect a
++> noticeably longer wall-clock per target — only enable it when you want the improved physical
++> validity; for large batches keep it off unless you specifically need PoseBusters-clean poses.
++
+ **`--` passes everything after it straight through to AlphaFold 3** (its own flags) — e.g.
+-`--norun_data_pipeline`, `--db_dir=/path/to/databases`, `--num_diffusion_samples=5`. Set `HF_ENDPOINT`
+-(e.g. `hf-mirror.com`) for a download mirror.
++`--norun_data_pipeline`, `--db_dir=/path/to/databases`, `--num_diffusion_samples=5`, `--steering`. Set
++`HF_ENDPOINT` (e.g. `hf-mirror.com`) for a download mirror.
+ 
+ ### How the IntelliFold JAX weights were produced
+ 
+@@ -140,6 +165,7 @@ If you use IntelliFold in your research, please cite our paper:
+ - Many components in `intellifold/openfold/` are adapted from [OpenFold](https://github.com/aqlaboratory/openfold), with substantial modifications and improvements by our team (except for the `LayerNorm` part).  
+ - This repository, the implementation of **Inference Data Pipeline**(Data/Feature Processing and MSA generation tasks) referred to [Boltz-1](https://github.com/jwohlwend/boltz), and modify some codes to adapt to the input of our model.
+   - The **template pipeline** implementation in the **Inference Data Pipeline** of this repository refers to [Protenix](https://github.com/bytedance/Protenix), with additional adjustments and modifications to fit our model.
++- The optional **diffusion steering** (physical guidance) feature adapts the inference-time potential set from [Boltz](https://github.com/jwohlwend/boltz), reimplemented for the AlphaFold 3 JAX sampler.
+ 
+ 
+ 
+diff --git a/THIRD_PARTY_LICENSES/Boltz-MIT.txt b/THIRD_PARTY_LICENSES/Boltz-MIT.txt
+new file mode 100644
+index 0000000..9ef8d6a
+--- /dev/null
++++ b/THIRD_PARTY_LICENSES/Boltz-MIT.txt
+@@ -0,0 +1,25 @@
++The diffusion-steering ("physical guidance") code under intellifold/steering/
++adapts material from Boltz (https://github.com/jwohlwend/boltz), which is
++distributed under the following license:
++
++MIT License
++
++Copyright (c) 2024 Jeremy Wohlwend, Gabriele Corso, Saro Passaro
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/intellifold/run_jax_inference.py b/intellifold/run_jax_inference.py
+index 8aec52b..b1b9a32 100644
+--- a/intellifold/run_jax_inference.py
++++ b/intellifold/run_jax_inference.py
+@@ -384,6 +384,23 @@
+     'Number of diffusion samples to generate.',
+     lower_bound=1,
+ )
++_STEERING = flags.DEFINE_boolean(
++    'steering',
++    False,
++    'Enable diffusion steering (physical gradient guidance) on the ligand'
++    ' geometry during sampling. Off by default.',
++)
++_STEERING_NUM_GD_STEPS = flags.DEFINE_integer(
++    'steering_num_gd_steps',
++    20,
++    'Gradient-descent iterations per denoising step when --steering is set.',
++    lower_bound=1,
++)
++_STEERING_WEIGHT_SCALE = flags.DEFINE_float(
++    'steering_weight_scale',
++    1.0,
++    'Global multiplier on every steering potential weight (1.0 = default).',
++)
+ _NUM_SEEDS = flags.DEFINE_integer(
+     'num_seeds',
+     None,
+@@ -433,6 +450,9 @@ def make_model_config(
+     num_recycles: int = 10,
+     return_embeddings: bool = False,
+     return_distogram: bool = False,
++    steering: bool = False,
++    steering_num_gd_steps: int = 20,
++    steering_weight_scale: float = 1.0,
+ ) -> model.Model.Config:
+   """Returns a model config with some defaults overridden."""
+   config = model.Model.Config()
+@@ -445,6 +465,9 @@ def make_model_config(
+       flash_attention_implementation
+   )
+   config.heads.diffusion.eval.num_samples = num_diffusion_samples
++  config.heads.diffusion.eval.steering_enabled = steering
++  config.heads.diffusion.eval.steering_num_gd_steps = steering_num_gd_steps
++  config.heads.diffusion.eval.steering_weight_scale = steering_weight_scale
+   config.num_recycles = num_recycles
+   config.return_embeddings = return_embeddings
+   config.return_distogram = return_distogram
+@@ -606,7 +629,33 @@ def predict_structure(
+   )
+   all_inference_start_time = time.time()
+   all_inference_results = []
++  steering_on = (
++      model_runner._model_config.heads.diffusion.eval.steering_enabled
++  )
+   for seed, example in zip(fold_input.rng_seeds, featurised_examples):
++    if steering_on:
++      from intellifold.steering import (
++          build_steering_features,
++          STEERING_KEY_PREFIX,
++      )
++
++      steering_feats = build_steering_features(example, ccd)
++      if steering_feats:
++        for _k, _v in steering_feats.items():
++          example[STEERING_KEY_PREFIX + _k] = _v
++        _n = steering_feats.get(
++            'posebusters_index', np.empty((2, 0))
++        ).shape[1]
++        print(
++            f'[steering] attached constraints for {fold_input.name}'
++            f' ({_n} bound pairs across'
++            f' {len(steering_feats) // 3} potential groups).'
++        )
++      else:
++        print(
++            f'[steering] {fold_input.name}: no constrainable ligand residues;'
++            ' running unsteered.'
++        )
+     print(f'Running model inference with seed {seed}...')
+     inference_start_time = time.time()
+     rng_key = jax.random.PRNGKey(seed)
+@@ -1049,6 +1098,9 @@ def main(_):
+             num_recycles=_NUM_RECYCLES.value,
+             return_embeddings=_SAVE_EMBEDDINGS.value,
+             return_distogram=_SAVE_DISTOGRAM.value,
++            steering=_STEERING.value,
++            steering_num_gd_steps=_STEERING_NUM_GD_STEPS.value,
++            steering_weight_scale=_STEERING_WEIGHT_SCALE.value,
+         ),
+         device=devices[_GPU_DEVICE.value],
+         model_dir=pathlib.Path(MODEL_DIR.value),
+diff --git a/intellifold/steering/__init__.py b/intellifold/steering/__init__.py
+new file mode 100644
+index 0000000..ae7f1dd
+--- /dev/null
++++ b/intellifold/steering/__init__.py
+@@ -0,0 +1,40 @@
++# Copyright 2026 IntelliGen-AI and/or its affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Diffusion steering / guidance for the IntelliFold JAX engine.
++
++Boltz-style inference-time physical-guidance steering for the AlphaFold 3 JAX
++sampler. Default OFF; enabled per-run via the ``--steering`` flag (see
++``intellifold/run_jax_inference.py``).
++
++Two pieces:
++* ``rdkit_features.build_steering_features`` - host-side (CPU) RDKit constraint
++  extraction from a featurised example, returning grouped numpy arrays.
++* ``guidance.apply_guidance`` - JAX gradient guidance applied inside the
++  diffusion sampler's denoising loop.
++"""
++
++from intellifold.steering.guidance import apply_guidance, default_groups
++from intellifold.steering.rdkit_features import build_steering_features
++
++# Keys this package attaches to the featurised example dict; the model picks
++# them up before converting the dict to a typed Batch.
++STEERING_KEY_PREFIX = "steering__"
++
++__all__ = [
++    "apply_guidance",
++    "default_groups",
++    "build_steering_features",
++    "STEERING_KEY_PREFIX",
++]
+diff --git a/intellifold/steering/constants.py b/intellifold/steering/constants.py
+new file mode 100644
+index 0000000..36510b6
+--- /dev/null
++++ b/intellifold/steering/constants.py
+@@ -0,0 +1,50 @@
++# Copyright 2026 IntelliGen-AI and/or its affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# This file adapts diffusion-steering material from Boltz
++# (https://github.com/jwohlwend/boltz), Copyright (c) 2024 Jeremy Wohlwend,
++# Gabriele Corso, and Saro Passaro, licensed under the MIT License. The full
++# Boltz MIT license text is in THIRD_PARTY_LICENSES/Boltz-MIT.txt.
++
++"""Element / chemistry constants for the diffusion-steering potentials.
++
++Boltz-style values, kept framework-agnostic: plain Python lists consumed by the
++host-side feature builder and by the JAX potentials.
++"""
++
++# Width of IntelliFold's one-hot element axis. Index = atomic number Z, with
++# Z=0 reserved for padding and Z=1..118 the real elements.
++NUM_ELEMENTS = 128
++
++# Van-der-Waals radii in angstroms indexed by atomic number Z (1..118), taken
++# from the Boltz / RDKit periodic table. Anything outside the table defaults to
++# 2.0 A, a safe upper bound for steric terms.
++VDW_RADII_BY_Z = [
++    1.2, 1.4, 2.2, 1.9, 1.8, 1.7, 1.6, 1.55, 1.5, 1.54,
++    2.4, 2.2, 2.1, 2.1, 1.95, 1.8, 1.8, 1.88, 2.8, 2.4,
++    2.3, 2.15, 2.05, 2.05, 2.05, 2.05, 2.0, 2.0, 2.0, 2.1,
++    2.1, 2.1, 2.05, 1.9, 1.9, 2.02, 2.9, 2.55, 2.4, 2.3,
++    2.15, 2.1, 2.05, 2.05, 2.0, 2.05, 2.1, 2.2, 2.2, 2.25,
++    2.2, 2.1, 2.1, 2.16, 3.0, 2.7, 2.5, 2.48, 2.47, 2.45,
++    2.43, 2.42, 2.4, 2.38, 2.37, 2.35, 2.33, 2.32, 2.3, 2.28,
++    2.27, 2.25, 2.2, 2.1, 2.05, 2.0, 2.0, 2.05, 2.1, 2.05,
++    2.2, 2.3, 2.3, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.4,
++    2.0, 2.3, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
++    2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
++    2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
++]
++assert len(VDW_RADII_BY_Z) == 118
++
++# Atoms-per-token axis size in IntelliFold's dense atom layout.
++ATOMS_PER_TOKEN = 24
+diff --git a/intellifold/steering/guidance.py b/intellifold/steering/guidance.py
+new file mode 100644
+index 0000000..ade193e
+--- /dev/null
++++ b/intellifold/steering/guidance.py
+@@ -0,0 +1,185 @@
++# Copyright 2026 IntelliGen-AI and/or its affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# This file adapts diffusion-steering material from Boltz
++# (https://github.com/jwohlwend/boltz), Copyright (c) 2024 Jeremy Wohlwend,
++# Gabriele Corso, and Saro Passaro, licensed under the MIT License. The full
++# Boltz MIT license text is in THIRD_PARTY_LICENSES/Boltz-MIT.txt.
++
++"""Gradient-based diffusion guidance (physical-guidance steering).
++
++At each denoising step we run ``num_gd_steps`` of gradient descent on the sum of
++the active potentials and add the accumulated displacement to the model's x0
++prediction. Potential gradients come from ``jax.grad``; the dihedral uses the
++``atan2`` form so its gradient is finite everywhere, so no displacement clipping
++is needed.
++
++The per-group guidance weights, intervals and schedules cover the Boltz-style
++physical-guidance set: PoseBusters bounds, Connections, VDW overlap,
++symmetric-chain COM, chirality, stereo, and planar bonds.
++"""
++
++from __future__ import annotations
++
++import math
++from typing import Callable, Dict, List, NamedTuple
++
++import jax
++import jax.numpy as jnp
++
++from intellifold.steering import potentials as P
++
++
++# ----------------------------------------------------------------------------
++# Schedules (functions of the normalised diffusion time t in [0, 1], where
++# t = 1 - step / num_steps).
++# ----------------------------------------------------------------------------
++
++
++def constant(value: float) -> Callable[[jnp.ndarray], jnp.ndarray]:
++    return lambda t: jnp.asarray(value, jnp.float32)
++
++
++def piecewise_step(thresholds: List[float], values: List[float]):
++    """values[i] for the smallest i with t <= thresholds[i], else values[-1]."""
++
++    def fn(t):
++        out = jnp.asarray(values[-1], jnp.float32)
++        for thr, val in zip(reversed(thresholds), reversed(values[:-1])):
++            out = jnp.where(t <= thr, jnp.asarray(val, jnp.float32), out)
++        return out
++
++    return fn
++
++
++def exponential_interp(start: float, end: float, alpha: float):
++    """Boltz ExponentialInterpolation: start..end as t goes 0->1."""
++    denom = math.exp(alpha) - 1.0
++
++    def fn(t):
++        if alpha == 0:
++            return jnp.asarray(start + (end - start) * t, jnp.float32)
++        return start + (end - start) * (jnp.exp(alpha * t) - 1.0) / denom
++
++    return fn
++
++
++class Group(NamedTuple):
++    """One flat-bottom potential family: variable kind, weight schedule, GD interval."""
++
++    name: str
++    kind: str  # "distance" | "dihedral" | "abs_dihedral"
++    weight_fn: Callable[[jnp.ndarray], jnp.ndarray]
++    interval: int
++
++
++# Default physical-guidance groups (Boltz-style weights / intervals).
++def default_groups() -> List[Group]:
++    return [
++        Group("posebusters", "distance", constant(0.01), 1),
++        Group("connections", "distance", constant(0.15), 1),
++        Group("chiral", "dihedral", constant(0.1), 1),
++        Group("stereo", "abs_dihedral", constant(0.05), 1),
++        Group("planar", "abs_dihedral", constant(0.05), 1),
++        Group("vdw", "distance", piecewise_step([0.4], [0.125, 0.0]), 5),
++    ]
++
++
++# Symmetric-chain COM potential is handled separately (it needs per-chain COMs
++# and a time-scheduled buffer rather than host-baked bounds).
++_SYMCOM_WEIGHT = constant(0.5)
++_SYMCOM_INTERVAL = 4
++_SYMCOM_BUFFER = exponential_interp(start=1.0, end=5.0, alpha=-2.0)
++
++
++def _group_arrays(steering: Dict[str, jnp.ndarray], name: str):
++    """Return (index, lower, upper) for a group, or None if absent/empty."""
++    idx = steering.get(f"{name}_index")
++    if idx is None or idx.shape[1] == 0:
++        return None
++    return idx, steering[f"{name}_lower"], steering[f"{name}_upper"]
++
++
++def apply_guidance(
++    positions_denoised: jnp.ndarray,
++    atom_mask: jnp.ndarray,
++    steering: Dict[str, jnp.ndarray],
++    t: jnp.ndarray,
++    is_last_step: jnp.ndarray,
++    num_gd_steps: int,
++    weight_scale: float,
++    groups: List[Group],
++) -> jnp.ndarray:
++    """Gradient-guide a single sample's x0 prediction.
++
++    Args:
++      positions_denoised: ``[num_tokens, atoms_per_token, 3]`` x0 prediction.
++      atom_mask: ``[num_tokens, atoms_per_token]`` bool; padding atoms stay put.
++      steering: dict of host-built jnp index / bound arrays per group.
++      t: scalar normalised diffusion time for schedule evaluation.
++      is_last_step: scalar bool; guidance is skipped on the final step.
++      num_gd_steps: gradient-descent iterations per denoising step.
++      weight_scale: global multiplier on every group weight (1.0 = faithful).
++      groups: active flat-bottom potential groups.
++
++    Returns:
++      The guided ``[num_tokens, atoms_per_token, 3]`` positions.
++    """
++    shape = positions_denoised.shape
++    coords = positions_denoised.reshape(-1, 3)
++    mask = atom_mask.reshape(-1).astype(coords.dtype)[:, None]
++
++    # Flat-bottom groups that have constraints for this target.
++    active = []
++    for g in groups:
++        arrs = _group_arrays(steering, g.name)
++        if arrs is not None:
++            active.append((g, arrs))
++
++    sym = None
++    if "symcom_pairs" in steering and steering["symcom_pairs"].shape[1] > 0:
++        sym = (steering["symcom_weight"], steering["symcom_pairs"])
++
++    if not active and sym is None:
++        return positions_denoised
++
++    def energy_at(x, gd_step):
++        e = jnp.zeros((), dtype=x.dtype)
++        for g, (idx, lo, hi) in active:
++            if gd_step % g.interval != 0:
++                continue
++            w = weight_scale * g.weight_fn(t)
++            e = e + w * P.ENERGY_FNS[g.kind](x, idx, lo, hi)
++        if sym is not None and gd_step % _SYMCOM_INTERVAL == 0:
++            weight, pairs = sym
++            w = weight_scale * _SYMCOM_WEIGHT(t)
++            e = e + w * P.com_distance_energy(x, weight, pairs, _SYMCOM_BUFFER(t))
++        return e
++
++    grad_energy = jax.grad(energy_at, argnums=0)
++
++    # Gradient descent on the accumulated displacement:
++    # ``guidance_update -= sum_p gw_p * grad E_p`` over num_gd_steps iterations.
++    # A non-finite gradient component is dropped to zero: ``jax.grad`` of
++    # ``atan2`` is NaN only at an exactly-collinear (measure-zero) config, so
++    # zeroing those keeps the sampler from propagating NaNs. No magnitude clipping.
++    guidance_update = jnp.zeros_like(coords)
++    for gd_step in range(num_gd_steps):
++        g = grad_energy(coords + guidance_update, gd_step)
++        g = jnp.where(jnp.isfinite(g), g, 0.0)
++        guidance_update = guidance_update - g
++
++    guidance_update = guidance_update * mask
++    guidance_update = jnp.where(is_last_step, 0.0, guidance_update)
++    return (coords + guidance_update).reshape(shape)
+diff --git a/intellifold/steering/potentials.py b/intellifold/steering/potentials.py
+new file mode 100644
+index 0000000..0638e8f
+--- /dev/null
++++ b/intellifold/steering/potentials.py
+@@ -0,0 +1,136 @@
++# Copyright 2026 IntelliGen-AI and/or its affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Differentiable steering potentials in JAX.
++
++We define only the scalar potential *energies*; the guidance loop differentiates
++them with ``jax.grad`` (no hand-derived analytic gradients needed). Every
++constant buffer (bond / angle / clash margins, chirality / stereo / planar angle
++thresholds) is baked into the per-constraint ``lower`` / ``upper`` bounds on the
++host, so the JAX side reduces to two flat-bottom kernels: one on inter-atom
++distances, one on dihedral angles.
++
++All potentials operate on a flat atom tensor ``coords`` of shape
++``[N_atoms, 3]`` where ``N_atoms = num_tokens * atoms_per_token`` and the atom
++at (token ``t``, slot ``a``) lives at flat index ``t * atoms_per_token + a``.
++Index arrays select into that flat axis.
++"""
++
++from __future__ import annotations
++
++import jax
++import jax.numpy as jnp
++
++
++_EPS = 1e-8
++
++
++def flat_bottom_energy(value, lower, upper, k=1.0):
++    """Hooke energy with a flat bottom between ``lower`` and ``upper``.
++
++    Zero inside ``[lower, upper]``; grows linearly with slope ``k`` outside.
++    ``lower`` / ``upper`` may contain +/- inf to leave a side unbounded.
++    Returns the summed scalar energy.
++    """
++    below = jnp.where(jnp.isneginf(lower), 0.0, jnp.maximum(lower - value, 0.0))
++    above = jnp.where(jnp.isposinf(upper), 0.0, jnp.maximum(value - upper, 0.0))
++    return k * jnp.sum(below + above)
++
++
++def pair_distance(coords, index):
++    """Distances between atom ``index[0]`` and atom ``index[1]``. -> [P]."""
++    r = coords[index[0]] - coords[index[1]]
++    return jnp.sqrt(jnp.sum(r * r, axis=-1) + _EPS)
++
++
++def dihedral_angle(coords, index):
++    """Signed dihedral phi defined by four indexed atoms. -> [M] in [-pi, pi].
++
++    Uses the ``atan2`` formulation rather than ``arccos``. ``arccos`` has a
++    derivative ``-1/sqrt(1 - u^2)`` that blows up to +/-inf exactly when the
++    dihedral approaches 0 or pi -- which is precisely where planar / stereo
++    constraints push -- so differentiating it through ``jax.grad`` yields NaNs.
++    ``atan2`` is smooth across the whole circle and gives well-behaved grads.
++    """
++    p0 = coords[index[0]]
++    p1 = coords[index[1]]
++    p2 = coords[index[2]]
++    p3 = coords[index[3]]
++
++    b0 = p0 - p1
++    b1 = p2 - p1
++    b2 = p3 - p2
++
++    b1n = b1 / (jnp.linalg.norm(b1, axis=-1, keepdims=True) + _EPS)
++
++    # Components of b0 and b2 perpendicular to the central bond b1.
++    v = b0 - jnp.sum(b0 * b1n, axis=-1, keepdims=True) * b1n
++    w = b2 - jnp.sum(b2 * b1n, axis=-1, keepdims=True) * b1n
++
++    x = jnp.sum(v * w, axis=-1)
++    y = jnp.sum(jnp.cross(b1n, v) * w, axis=-1)
++    return jnp.arctan2(y, x)
++
++
++# ----------------------------------------------------------------------------
++# Per-group energies. Each takes the flat ``coords`` and the group's host-built
++# index / bound arrays, returning a scalar energy. Empty groups (M == 0) give 0.
++# ----------------------------------------------------------------------------
++
++
++def distance_energy(coords, index, lower, upper):
++    """Flat-bottom on pairwise distances (PoseBusters bounds, connections, VDW)."""
++    if index.shape[1] == 0:
++        return jnp.zeros((), dtype=coords.dtype)
++    return flat_bottom_energy(pair_distance(coords, index), lower, upper)
++
++
++def signed_dihedral_energy(coords, index, lower, upper):
++    """Flat-bottom on signed dihedral angles (chirality)."""
++    if index.shape[1] == 0:
++        return jnp.zeros((), dtype=coords.dtype)
++    return flat_bottom_energy(dihedral_angle(coords, index), lower, upper)
++
++
++def abs_dihedral_energy(coords, index, lower, upper):
++    """Flat-bottom on |dihedral| (stereo bonds, planar improper)."""
++    if index.shape[1] == 0:
++        return jnp.zeros((), dtype=coords.dtype)
++    return flat_bottom_energy(jnp.abs(dihedral_angle(coords, index)), lower, upper)
++
++
++def com_distance_energy(coords, weight, pairs, lower):
++    """Flat-bottom repulsion between symmetric chains' centres of mass.
++
++    ``weight`` is a ``[C, N]`` per-chain averaging matrix (rows sum to 1 over a
++    chain's real atoms), so ``weight @ coords`` gives each chain's COM. ``pairs``
++    selects the symmetric chain pairs; ``lower`` is the (time-scheduled) minimum
++    COM separation. Mirrors SymmetricChainCOMPotential.
++    """
++    if pairs.shape[1] == 0:
++        return jnp.zeros((), dtype=coords.dtype)
++    com = weight @ coords  # [C, 3]
++    d = jnp.linalg.norm(com[pairs[0]] - com[pairs[1]], axis=-1)  # [M]
++    lower = jnp.broadcast_to(jnp.asarray(lower, coords.dtype), d.shape)
++    upper = jnp.full_like(d, jnp.inf)
++    return flat_bottom_energy(d, lower, upper)
++
++
++# Maps a group's variable kind to its energy function. The host tags each group
++# with one of these names.
++ENERGY_FNS = {
++    "distance": distance_energy,
++    "dihedral": signed_dihedral_energy,
++    "abs_dihedral": abs_dihedral_energy,
++}
+diff --git a/intellifold/steering/rdkit_features.py b/intellifold/steering/rdkit_features.py
+new file mode 100644
+index 0000000..9a22c0c
+--- /dev/null
++++ b/intellifold/steering/rdkit_features.py
+@@ -0,0 +1,585 @@
++# Copyright 2026 IntelliGen-AI and/or its affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# This file adapts diffusion-steering material from Boltz
++# (https://github.com/jwohlwend/boltz), Copyright (c) 2024 Jeremy Wohlwend,
++# Gabriele Corso, and Saro Passaro, licensed under the MIT License. The full
++# Boltz MIT license text is in THIRD_PARTY_LICENSES/Boltz-MIT.txt.
++
++"""Host-side steering feature builder (runs on CPU, before the jitted model).
++
++Rebuilds an RDKit ``Mol`` for every ligand residue from the featurised
++example's CCD layout, reads off the Boltz/PoseBusters geometry constraints
++(distance bounds, chiral centres, E/Z stereo bonds, planar double bonds), and
++emits them as plain numpy arrays keyed by potential group.
++
++All constant buffers (bond / angle / clash margins, chirality / stereo / planar
++angle thresholds) are baked into per-constraint ``lower`` / ``upper`` bounds
++here, so the JAX side only has to evaluate flat-bottom energies. Atom indices
++use the dense flat convention ``token_idx * atoms_per_token + slot`` that the
++diffusion sampler's ``[num_tokens, atoms_per_token, 3]`` layout flattens to.
++
++Returns ``None`` when nothing constrainable is found (e.g. a protein-only
++target), in which case the caller attaches no steering keys and the run is
++identical to a vanilla prediction.
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++from typing import Dict, Optional
++
++import numpy as np
++
++from intellifold.steering.constants import ATOMS_PER_TOKEN, NUM_ELEMENTS, VDW_RADII_BY_Z
++
++_LOG = logging.getLogger(__name__)
++
++# Boltz-style physical-guidance buffer defaults.
++_BOND_BUFFER = 0.125
++_ANGLE_BUFFER = 0.125
++_CLASH_BUFFER = 0.10
++_CHIRAL_BUFFER = 0.52360
++_STEREO_BUFFER = 0.52360
++_PLANAR_BUFFER = 0.26180
++# VDWOverlapPotential / ConnectionsPotential buffers (constant -> baked here).
++# SymmetricChainCOMPotential's buffer is time-scheduled (1->5 A), so it is
++# evaluated in JAX rather than baked; the host only emits chain membership.
++_VDW_BUFFER = 0.225
++_CONNECTIONS_BUFFER = 2.0
++
++_PLANAR_SMARTS = "[C;X3;^2](*)(*)=[C;X3;^2](*)(*)"
++
++
++def _vdw_radii_table() -> np.ndarray:
++    radii = np.full(NUM_ELEMENTS, 2.0, dtype=np.float32)
++    radii[1 : 1 + len(VDW_RADII_BY_Z)] = np.asarray(VDW_RADII_BY_Z, dtype=np.float32)
++    radii[0] = 0.0
++    return radii
++
++
++# ----------------------------------------------------------------------------
++# RDKit mol construction + constraint extraction (one residue at a time)
++# ----------------------------------------------------------------------------
++
++
++def _ccd_mol(ccd, res_name: str):
++    """Build an RDKit Mol from the CCD entry, with stereo perceived."""
++    from alphafold3.data.tools import rdkit_utils
++    import rdkit.Chem as Chem
++
++    entry = ccd.get(res_name)
++    if entry is None:
++        return None
++    try:
++        mol = rdkit_utils.mol_from_ccd_cif(
++            entry, force_parse=True, sort_alphabetically=False, remove_hydrogens=True
++        )
++    except Exception as e:  # pragma: no cover - depends on CCD entry
++        _LOG.debug("mol_from_ccd_cif failed for %s: %s", res_name, e)
++        return None
++    if mol is None or mol.GetNumAtoms() == 0:
++        return None
++    try:
++        Chem.AssignStereochemistry(
++            mol, cleanIt=True, force=True, flagPossibleStereoCenters=True
++        )
++    except Exception:
++        pass
++    return mol
++
++
++def _idx_map(mol, name_to_flat: Dict[str, int]) -> Dict[int, int]:
++    """Map mol atom index -> flat IntelliFold atom index by atom name."""
++    out = {}
++    for ai, atom in enumerate(mol.GetAtoms()):
++        if not atom.HasProp("atom_name"):
++            continue
++        nm = atom.GetProp("atom_name").strip()
++        if nm in name_to_flat:
++            out[ai] = name_to_flat[nm]
++    return out
++
++
++def _geometry_constraints(mol, idx_map):
++    """RDKit bounds matrix -> (pairs[2,P], lo[P], hi[P], is_bond[P], is_angle[P])."""
++    import rdkit.Chem as Chem
++    from rdkit.Chem.rdDistGeom import GetMoleculeBoundsMatrix
++
++    n = mol.GetNumAtoms()
++    if n <= 1:
++        return None
++    mol.UpdatePropertyCache(strict=False)
++    Chem.GetSymmSSSR(mol)
++    bounds = GetMoleculeBoundsMatrix(
++        mol, set15bounds=True, scaleVDW=True, doTriangleSmoothing=True,
++        useMacrocycle14config=False,
++    )
++    bond_set = {tuple(sorted(b)) for b in mol.GetSubstructMatches(Chem.MolFromSmarts("*~*"))}
++    angle_set = {
++        tuple(sorted([a[0], a[2]]))
++        for a in mol.GetSubstructMatches(Chem.MolFromSmarts("*~*~*"))
++    }
++    pairs, lo, hi, isb, isa = [], [], [], [], []
++    iu, ju = np.triu_indices(n, k=1)
++    for i, j in zip(iu.tolist(), ju.tolist()):
++        if i not in idx_map or j not in idx_map:
++            continue
++        pairs.append([idx_map[i], idx_map[j]])
++        hi.append(float(bounds[i, j]))  # upper triangle = upper bound
++        lo.append(float(bounds[j, i]))  # lower triangle = lower bound
++        key = (i, j)
++        isb.append(key in bond_set)
++        isa.append(key in angle_set)
++    if not pairs:
++        return None
++    return (
++        np.asarray(pairs, np.int64).T,
++        np.asarray(lo, np.float32),
++        np.asarray(hi, np.float32),
++        np.asarray(isb, bool),
++        np.asarray(isa, bool),
++    )
++
++
++def _chiral_constraints(mol, idx_map):
++    """SP3 chiral centres -> (quads[4,C], is_r[C]); 1 reference + 3 alternates."""
++    import rdkit.Chem as Chem
++    from rdkit.Chem.rdchem import HybridizationType
++
++    if not all(a.HasProp("_CIPRank") for a in mol.GetAtoms()):
++        return None
++    quads, is_r = [], []
++    for center_idx, orient in Chem.FindMolChiralCenters(mol, includeUnassigned=False):
++        center = mol.GetAtomWithIdx(int(center_idx))
++        if center.GetHybridization() != HybridizationType.SP3:
++            continue
++        nbrs = sorted(
++            ((n.GetIdx(), int(n.GetProp("_CIPRank"))) for n in center.GetNeighbors()),
++            key=lambda x: x[1], reverse=True,
++        )
++        nbr = tuple(n[0] for n in nbrs)
++        if not 3 <= len(nbr) <= 4:
++            continue
++        r = orient == "R"
++        quad = (*nbr[:3], int(center_idx))
++        if all(i in idx_map for i in quad):
++            quads.append([idx_map[i] for i in quad])
++            is_r.append(r)
++        if len(nbr) == 4:
++            for skip in range(3):
++                rest = nbr[:skip] + nbr[skip + 1:]
++                quad = (rest[::-1] if skip % 2 == 0 else rest) + (int(center_idx),)
++                if all(i in idx_map for i in quad):
++                    quads.append([idx_map[i] for i in quad])
++                    is_r.append(r)
++    if not quads:
++        return None
++    return np.asarray(quads, np.int64).T, np.asarray(is_r, bool)
++
++
++def _stereo_constraints(mol, idx_map):
++    """E/Z bonds -> (quads[4,S], is_e[S]); primary + optional alternate."""
++    import rdkit.Chem as Chem
++    from rdkit.Chem.rdchem import BondStereo
++
++    if not all(a.HasProp("_CIPRank") for a in mol.GetAtoms()):
++        return None
++    quads, is_e = [], []
++    for bond in mol.GetBonds():
++        stereo = bond.GetStereo()
++        if stereo not in (BondStereo.STEREOE, BondStereo.STEREOZ):
++            continue
++        sa, ea = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
++        sn = sorted(
++            ((n.GetIdx(), int(n.GetProp("_CIPRank")))
++             for n in mol.GetAtomWithIdx(sa).GetNeighbors() if n.GetIdx() != ea),
++            key=lambda n: n[1], reverse=True,
++        )
++        en = sorted(
++            ((n.GetIdx(), int(n.GetProp("_CIPRank")))
++             for n in mol.GetAtomWithIdx(ea).GetNeighbors() if n.GetIdx() != sa),
++            key=lambda n: n[1], reverse=True,
++        )
++        if not sn or not en:
++            continue
++        e = stereo == BondStereo.STEREOE
++        quad = (sn[0][0], sa, ea, en[0][0])
++        if all(i in idx_map for i in quad):
++            quads.append([idx_map[i] for i in quad])
++            is_e.append(e)
++        if len(sn) == 2 and len(en) == 2:
++            quad = (sn[1][0], sa, ea, en[1][0])
++            if all(i in idx_map for i in quad):
++                quads.append([idx_map[i] for i in quad])
++                is_e.append(e)
++    if not quads:
++        return None
++    return np.asarray(quads, np.int64).T, np.asarray(is_e, bool)
++
++
++def _planar_constraints(mol, idx_map):
++    """sp2-sp2 C=C planar groups -> improper quads[4, 2P]."""
++    import rdkit.Chem as Chem
++
++    smarts = Chem.MolFromSmarts(_PLANAR_SMARTS)
++    quads = []
++    for m in mol.GetSubstructMatches(smarts):
++        if not all(i in idx_map for i in m):
++            continue
++        f = [idx_map[i] for i in m]  # 6 atoms: a0..a5
++        # Two improper dihedrals keep the double bond planar (PlanarBondPotential).
++        quads.append([f[1], f[2], f[3], f[0]])
++        quads.append([f[4], f[5], f[0], f[3]])
++    if not quads:
++        return None
++    return np.asarray(quads, np.int64).T
++
++
++# ----------------------------------------------------------------------------
++# Buffer baking: convert raw constraints to flat-bottom (lower, upper) bounds
++# ----------------------------------------------------------------------------
++
++
++def _bake_posebusters(pairs, lo, hi, isb, isa, atom_vdw):
++    lower = lo.copy()
++    upper = hi.copy()
++    bb, ab, cb = _BOND_BUFFER, _ANGLE_BUFFER, _CLASH_BUFFER
++
++    m = isb & ~isa
++    lower[m] *= 1.0 - bb; upper[m] *= 1.0 + bb
++    m = ~isb & isa
++    lower[m] *= 1.0 - ab; upper[m] *= 1.0 + ab
++    m = isb & isa
++    lower[m] *= 1.0 - min(bb, ab); upper[m] *= 1.0 + min(bb, ab)
++    m = ~isb & ~isa
++    lower[m] *= 1.0 - cb; upper[m] = np.inf
++
++    # VDW clash floor on non-bonded pairs; cap bonded uppers at the same cutoff.
++    bond_cutoffs = 0.35 + atom_vdw[pairs].mean(axis=0)
++    lower[~isb] = np.maximum(lower[~isb], bond_cutoffs[~isb])
++    upper[isb] = np.minimum(upper[isb], bond_cutoffs[isb])
++    return lower.astype(np.float32), upper.astype(np.float32)
++
++
++def _bake_chiral(is_r):
++    lower = np.where(is_r, _CHIRAL_BUFFER, -np.inf).astype(np.float32)
++    upper = np.where(is_r, np.inf, -_CHIRAL_BUFFER).astype(np.float32)
++    return lower, upper
++
++
++def _bake_stereo(is_e):
++    lower = np.where(is_e, math.pi - _STEREO_BUFFER, -np.inf).astype(np.float32)
++    upper = np.where(is_e, np.inf, _STEREO_BUFFER).astype(np.float32)
++    return lower, upper
++
++
++def _bake_planar(n):
++    lower = np.full(n, -np.inf, np.float32)
++    upper = np.full(n, _PLANAR_BUFFER, np.float32)
++    return lower, upper
++
++
++# ----------------------------------------------------------------------------
++# Inter-chain potentials: VDW overlap, connections, symmetric-chain COM.
++# A full upper-triangular enumeration over real atoms then masking would be
++# huge; here we enumerate only the kept (inter-chain, single-ion, non-connected)
++# pairs directly so the JAX graph stays small.
++# ----------------------------------------------------------------------------
++
++
++def _per_atom_asym(asym_id_token, A):
++    """[T] token asym ids -> [T*A] per-atom asym ids (each slot inherits token)."""
++    return np.repeat(asym_id_token, A)
++
++
++def _build_connections(example, A):
++    """Inter-residue covalent bonds -> (atom_pairs[2,K], chain_pairs[2,K]).
++
++    Every covalent bond that
++    crosses a residue boundary (polymer-ligand, ligand-ligand inter-residue)
++    becomes a soft-bond constraint, and the chains it links are recorded so
++    VDW overlap skips them. AF3 exposes these as gather tables; same-residue
++    (intra-ligand) bonds are already covered by the PoseBusters bounds and are
++    excluded via ``ref_space_uid``.
++    """
++    asym_atom = None
++    pdam = np.asarray(example["pred_dense_atom_mask"]).astype(bool)  # [T, A]
++    ref_uid = np.asarray(example.get("ref_space_uid")) if "ref_space_uid" in example else None
++    asym_tok = np.asarray(example["asym_id"])
++    pairs, chain_pairs, seen = [], [], set()
++
++    for key in ("token_atoms_to_polymer_ligand_bonds", "token_atoms_to_ligand_ligand_bonds"):
++        gi = example.get(f"{key}:gather_idxs")
++        gm = example.get(f"{key}:gather_mask")
++        if gi is None or gm is None:
++            continue
++        gi = np.asarray(gi)
++        gm = np.asarray(gm).astype(bool)
++        # Each row that is fully masked-in encodes one bond's two flat atom
++        # endpoints (token*A + slot). Layout: [N, 2] of flat atom indices.
++        if gi.ndim != 2 or gi.shape[1] != 2:
++            continue
++        valid = gm.all(axis=-1)
++        for flat_a, flat_b in gi[valid]:
++            fa, fb = int(flat_a), int(flat_b)
++            if fa < 0 or fb < 0:
++                continue
++            ta, tb = fa // A, fb // A
++            if ta >= asym_tok.shape[0] or tb >= asym_tok.shape[0]:
++                continue
++            # Skip intra-residue bonds (already in PoseBusters bounds).
++            if ref_uid is not None:
++                ua = ref_uid[ta, fa % A]
++                ub = ref_uid[tb, fb % A]
++                if ua == ub and ua >= 0:
++                    continue
++            pairs.append([fa, fb])
++            ca, cb = int(asym_tok[ta]), int(asym_tok[tb])
++            if ca != cb:
++                k = tuple(sorted((ca, cb)))
++                if k not in seen:
++                    seen.add(k)
++                    chain_pairs.append(list(k))
++    if not pairs:
++        return (np.empty((2, 0), np.int64), np.empty((2, 0), np.int64))
++    return (
++        np.asarray(pairs, np.int64).T,
++        np.asarray(chain_pairs, np.int64).T if chain_pairs else np.empty((2, 0), np.int64),
++    )
++
++
++def _build_vdw(asym_id_token, pdam, atom_vdw, A, connected_chain_pairs):
++    """Inter-chain VDW-overlap pairs -> (index[2,P], lower[P]).
++
++    Only real atoms, only chains with more than one atom (drop lone ions), and
++    only chain pairs that are not
++    covalently connected, lower bound = sum of VDW radii * (1 - buffer).
++    """
++    asym_atom = _per_atom_asym(asym_id_token, A)            # [T*A]
++    atom_mask = pdam.reshape(-1).astype(bool)               # [T*A]
++    real = np.nonzero(atom_mask)[0]
++    if real.size < 2:
++        return np.empty((2, 0), np.int64), np.empty((0,), np.float32)
++    asym_real = asym_atom[real]
++    # chain sizes over real atoms; keep only multi-atom chains (drop lone ions).
++    chains, counts = np.unique(asym_real, return_counts=True)
++    multi = set(int(c) for c, n in zip(chains, counts) if n > 1)
++    connected = set()
++    if connected_chain_pairs is not None and connected_chain_pairs.size:
++        for a, b in connected_chain_pairs.T:
++            connected.add(tuple(sorted((int(a), int(b)))))
++    # group real-atom flat indices by chain
++    by_chain = {int(c): real[asym_real == c] for c in chains if int(c) in multi}
++    keep_chains = sorted(by_chain)
++    pair_a, pair_b = [], []
++    for i in range(len(keep_chains)):
++        for j in range(i + 1, len(keep_chains)):
++            ci, cj = keep_chains[i], keep_chains[j]
++            if tuple(sorted((ci, cj))) in connected:
++                continue
++            ai = by_chain[ci]
++            bj = by_chain[cj]
++            aa, bb = np.meshgrid(ai, bj, indexing="ij")
++            pair_a.append(aa.reshape(-1))
++            pair_b.append(bb.reshape(-1))
++    if not pair_a:
++        return np.empty((2, 0), np.int64), np.empty((0,), np.float32)
++    pa = np.concatenate(pair_a)
++    pb = np.concatenate(pair_b)
++    lower = (atom_vdw[pa] + atom_vdw[pb]) * (1.0 - _VDW_BUFFER)
++    index = np.stack([pa, pb], axis=0).astype(np.int64)
++    return index, lower.astype(np.float32)
++
++
++def _build_symmetric_chains(example, pdam, A):
++    """Symmetric (same-entity, multi-atom) chains -> (pairs[2,M], atom_chain[T*A], C).
++
++    Symmetric-chain COM repulsion: chains sharing an ``entity_id`` repel
++    each other's centre of mass. Returns ``pairs`` as *dense* chain-index pairs
++    (0..C-1), a per-atom dense chain label (-1 for atoms not in any symmetric
++    multi-atom chain), and the chain count C, so the JAX side can build per-chain
++    COMs with a segment reduction. Empty for monomeric / lone-ion ligands.
++    """
++    asym_tok = np.asarray(example["asym_id"])
++    ent_tok = np.asarray(example["entity_id"])
++    asym_atom = _per_atom_asym(asym_tok, A)
++    atom_mask = pdam.reshape(-1).astype(bool)
++    real = np.nonzero(atom_mask)[0]
++    asym_real = asym_atom[real]
++    chains, counts = np.unique(asym_real, return_counts=True)
++    multi = {int(c) for c, n in zip(chains, counts) if n > 1}
++    asym_to_ent = {}
++    for a, e in zip(asym_tok.tolist(), ent_tok.tolist()):
++        asym_to_ent.setdefault(int(a), int(e))
++    ent_to_asyms = {}
++    for a in sorted(set(asym_tok.tolist())):
++        if int(a) in multi:
++            ent_to_asyms.setdefault(asym_to_ent[int(a)], []).append(int(a))
++    pairs = []
++    for grp in ent_to_asyms.values():
++        for i in range(len(grp)):
++            for j in range(i + 1, len(grp)):
++                pairs.append([grp[i], grp[j]])
++    if not pairs:
++        return np.empty((2, 0), np.int64), np.empty((0, asym_atom.shape[0]), np.float32)
++    # Dense-index the symmetric chains and build per-chain COM averaging weights
++    # (row c sums to 1 over chain c's real atoms), so JAX gets COM = weight @ coords.
++    used = sorted({c for p in pairs for c in p})
++    dense = {c: i for i, c in enumerate(used)}
++    N = asym_atom.shape[0]
++    weight = np.zeros((len(used), N), np.float32)
++    for c in used:
++        members = (asym_atom == c) & atom_mask
++        n = int(members.sum())
++        if n > 0:
++            weight[dense[c], members] = 1.0 / n
++    dense_pairs = np.asarray([[dense[a], dense[b]] for a, b in pairs], np.int64).T
++    return dense_pairs, weight
++
++
++# ----------------------------------------------------------------------------
++# Top-level builder
++# ----------------------------------------------------------------------------
++
++
++def build_steering_features(
++    example: dict,
++    ccd,
++    *,
++    ligand_only: bool = True,
++    atoms_per_token: int = ATOMS_PER_TOKEN,
++) -> Optional[Dict[str, np.ndarray]]:
++    """Build grouped steering arrays from a featurised example dict.
++
++    Args:
++      example: a single featurised ``features.BatchDict`` (numpy arrays).
++      ccd: an ``alphafold3.constants.chemical_components.Ccd`` instance.
++      ligand_only: restrict constraints to ligand residues (cheap; the
++        small-molecule validity signal posebuster scores). Set False to also
++        constrain polymer residues (Boltz behaviour).
++
++    Returns:
++      dict of numpy arrays per group (``<group>_index/_lower/_upper``) or None
++      if nothing constrainable was found.
++    """
++    layout = example["token_atoms_layout"]
++    layout = layout.item() if isinstance(layout, np.ndarray) and layout.ndim == 0 else layout
++    is_ligand = np.asarray(example["is_ligand"]).astype(bool)
++    ref_element = np.asarray(example["ref_element"])  # [T, A] atomic numbers
++    A = atoms_per_token
++    n_tok = layout.shape[0]
++
++    atom_vdw = _vdw_radii_table()[np.clip(ref_element, 0, NUM_ELEMENTS - 1)].reshape(-1)
++
++    # Group tokens by residue (chain_id, res_id, res_name).
++    groups: Dict[tuple, list] = {}
++    for t in range(n_tok):
++        res_name = ""
++        for a in range(A):
++            if layout.res_name[t, a]:
++                res_name = layout.res_name[t, a]
++                break
++        if not res_name:
++            continue
++        if ligand_only and not is_ligand[t]:
++            continue
++        key = (layout.chain_id[t, 0], int(layout.res_id[t, 0]), res_name)
++        groups.setdefault(key, []).append(t)
++
++    pb_pairs, pb_lo, pb_hi = [], [], []
++    ch_q, ch_lo, ch_hi = [], [], []
++    st_q, st_lo, st_hi = [], [], []
++    pl_q = []
++
++    for (_chain, _resid, res_name), tokens in groups.items():
++        tokens = sorted(tokens)
++        mol = _ccd_mol(ccd, res_name)
++        if mol is None:
++            continue
++        name_to_flat = {}
++        for t in tokens:
++            for a in range(A):
++                nm = layout.atom_name[t, a]
++                if nm:
++                    name_to_flat[nm.strip()] = t * A + a
++        idx_map = _idx_map(mol, name_to_flat)
++        if not idx_map:
++            continue
++
++        geom = _geometry_constraints(mol, idx_map)
++        if geom is not None:
++            pairs, lo, hi, isb, isa = geom
++            lower, upper = _bake_posebusters(pairs, lo, hi, isb, isa, atom_vdw)
++            pb_pairs.append(pairs); pb_lo.append(lower); pb_hi.append(upper)
++
++        chir = _chiral_constraints(mol, idx_map)
++        if chir is not None:
++            quads, is_r = chir
++            lo_, hi_ = _bake_chiral(is_r)
++            ch_q.append(quads); ch_lo.append(lo_); ch_hi.append(hi_)
++
++        ster = _stereo_constraints(mol, idx_map)
++        if ster is not None:
++            quads, is_e = ster
++            lo_, hi_ = _bake_stereo(is_e)
++            st_q.append(quads); st_lo.append(lo_); st_hi.append(hi_)
++
++        planar = _planar_constraints(mol, idx_map)
++        if planar is not None:
++            pl_q.append(planar)
++
++    out: Dict[str, np.ndarray] = {}
++
++    def _emit(name, idx_list, lo_list, hi_list, idx_rows):
++        if not idx_list:
++            return
++        out[f"{name}_index"] = np.concatenate(idx_list, axis=1).astype(np.int32)
++        out[f"{name}_lower"] = np.concatenate(lo_list).astype(np.float32)
++        out[f"{name}_upper"] = np.concatenate(hi_list).astype(np.float32)
++
++    _emit("posebusters", pb_pairs, pb_lo, pb_hi, 2)
++    _emit("chiral", ch_q, ch_lo, ch_hi, 4)
++    _emit("stereo", st_q, st_lo, st_hi, 4)
++    if pl_q:
++        pl = np.concatenate(pl_q, axis=1).astype(np.int32)
++        lo_, hi_ = _bake_planar(pl.shape[1])
++        out["planar_index"] = pl
++        out["planar_lower"] = lo_
++        out["planar_upper"] = hi_
++
++    # --- Inter-chain potentials (VDW overlap, connections, symmetric-chain COM).
++    pdam = np.asarray(example["pred_dense_atom_mask"]).astype(bool)
++    asym_token = np.asarray(example["asym_id"])
++
++    conn_index, conn_chains = _build_connections(example, A)
++    if conn_index.shape[1]:
++        out["connections_index"] = conn_index.astype(np.int32)
++        out["connections_lower"] = np.full(conn_index.shape[1], -np.inf, np.float32)
++        out["connections_upper"] = np.full(conn_index.shape[1], _CONNECTIONS_BUFFER, np.float32)
++
++    vdw_index, vdw_lower = _build_vdw(asym_token, pdam, atom_vdw, A, conn_chains)
++    if vdw_index.shape[1]:
++        out["vdw_index"] = vdw_index.astype(np.int32)
++        out["vdw_lower"] = vdw_lower
++        out["vdw_upper"] = np.full(vdw_index.shape[1], np.inf, np.float32)
++
++    sym_pairs, sym_weight = _build_symmetric_chains(example, pdam, A)
++    if sym_pairs.shape[1]:
++        # COM potential: buffer is time-scheduled so bounds are applied in JAX.
++        out["symcom_pairs"] = sym_pairs.astype(np.int32)
++        out["symcom_weight"] = sym_weight.astype(np.float32)
++
++    return out or None
+diff --git a/third_party/alphafold3/src/alphafold3/model/model.py b/third_party/alphafold3/src/alphafold3/model/model.py
+index 52412ff..272dca9 100644
+--- a/third_party/alphafold3/src/alphafold3/model/model.py
++++ b/third_party/alphafold3/src/alphafold3/model/model.py
+@@ -253,6 +253,7 @@ def _sample_diffusion(
+       embeddings: dict[str, jnp.ndarray],
+       *,
+       sample_config: diffusion_head.SampleConfig,
++      steering: dict[str, jnp.ndarray] | None = None,
+   ) -> dict[str, jnp.ndarray]:
+     denoising_step = functools.partial(
+         self.diffusion_module,
+@@ -266,6 +267,7 @@ def _sample_diffusion(
+         batch=batch,
+         key=hk.next_rng_key(),
+         config=sample_config,
++        steering=steering,
+     )
+     return sample
+ 
+@@ -275,6 +277,16 @@ def __call__(
+     if key is None:
+       key = hk.next_rng_key()
+ 
++    # Pull optional steering constraint arrays out of the raw feature dict
++    # before it is converted to a typed Batch (which would drop unknown keys).
++    # They are attached on the host only when steering is requested.
++    steering_prefix = 'steering__'
++    steering = {
++        k[len(steering_prefix):]: v
++        for k, v in batch.items()
++        if k.startswith(steering_prefix)
++    } or None
++
+     batch = feat_batch.Batch.from_data_dict(batch)
+ 
+     embedding_module = evoformer_network.Evoformer(
+@@ -322,6 +334,7 @@ def recycle_body(_, args):
+         batch,
+         embeddings,
+         sample_config=self.config.heads.diffusion.eval,
++        steering=steering,
+     )
+ 
+     # Compute dist_error_fn over all samples for distance error logging.
+diff --git a/third_party/alphafold3/src/alphafold3/model/network/diffusion_head.py b/third_party/alphafold3/src/alphafold3/model/network/diffusion_head.py
+index 14fe909..9566870 100644
+--- a/third_party/alphafold3/src/alphafold3/model/network/diffusion_head.py
++++ b/third_party/alphafold3/src/alphafold3/model/network/diffusion_head.py
+@@ -105,6 +105,11 @@ class SampleConfig(base_config.BaseConfig):
+   noise_scale: float = 1.003
+   step_scale: float = 1.5
+   num_samples: int = 1
++  # Diffusion steering (physical guidance). Off by default; when enabled the
++  # caller must also supply the per-target steering arrays to `sample`.
++  steering_enabled: bool = False
++  steering_num_gd_steps: int = 20
++  steering_weight_scale: float = 1.0
+ 
+ 
+ class DiffusionHead(hk.Module):
+@@ -308,6 +313,7 @@ def sample(
+     batch: feat_batch.Batch,
+     key: jnp.ndarray,
+     config: SampleConfig,
++    steering: dict[str, jnp.ndarray] | None = None,
+ ) -> dict[str, jnp.ndarray]:
+   """Sample using denoiser on batch.
+ 
+@@ -317,6 +323,9 @@ def sample(
+     key: random key
+     config: config for the sampling process (e.g. number of denoising steps,
+       etc.)
++    steering: optional dict of host-built steering constraint arrays. When set
++      and ``config.steering_enabled`` is True, gradient guidance from the
++      physical potentials is applied to each step's x0 prediction.
+ 
+   Returns:
+     a dict
+@@ -330,7 +339,14 @@ def sample(
+ 
+   mask = batch.predicted_structure_info.atom_mask
+ 
+-  def apply_denoising_step(carry, noise_level):
++  steering_on = config.steering_enabled and steering is not None
++  if steering_on:
++    from intellifold.steering import guidance as steering_guidance
++
++    steering_groups = steering_guidance.default_groups()
++
++  def apply_denoising_step(carry, scan_in):
++    noise_level, step_idx = scan_in
+     key, positions, noise_level_prev = carry
+     key, key_noise, key_aug = jax.random.split(key, 3)
+ 
+@@ -346,6 +362,23 @@ def apply_denoising_step(carry, noise_level):
+     positions_noisy = positions + noise
+ 
+     positions_denoised = denoising_step(positions_noisy, t_hat)
++
++    if steering_on:
++      # Normalised diffusion time goes 1 -> 0 across the schedule, matching the
++      # PyTorch sampler's `steering_t = 1 - step / num_steps`.
++      t_norm = 1.0 - step_idx / config.steps
++      is_last = step_idx >= config.steps - 1
++      positions_denoised = steering_guidance.apply_guidance(
++          positions_denoised,
++          mask,
++          steering,
++          t_norm,
++          is_last,
++          num_gd_steps=config.steering_num_gd_steps,
++          weight_scale=config.steering_weight_scale,
++          groups=steering_groups,
++      )
++
+     grad = (positions_noisy - positions_denoised) / t_hat
+ 
+     d_t = noise_level - t_hat
+@@ -370,7 +403,10 @@ def apply_denoising_step(carry, noise_level):
+   apply_denoising_step = hk.vmap(
+       apply_denoising_step, in_axes=(0, None), split_rng=(not hk.running_init())
+   )
+-  result, _ = hk.scan(apply_denoising_step, init, noise_levels[1:], unroll=4)
++  step_indices = jnp.arange(config.steps)
++  result, _ = hk.scan(
++      apply_denoising_step, init, (noise_levels[1:], step_indices), unroll=4
++  )
+   _, positions_out, _ = result
+ 
+   final_dense_atom_mask = jnp.tile(mask[None], (num_samples, 1, 1))

@@ -1,0 +1,218 @@
+diff --git a/NOTICE b/NOTICE
+index d2dd4e7..2092775 100644
+--- a/NOTICE
++++ b/NOTICE
+@@ -5,11 +5,16 @@ This product includes software developed by DeepMind Technologies Limited as par
+ of AlphaFold 3 (https://github.com/google-deepmind/alphafold3), licensed under the
+ Apache License, Version 2.0.
+ 
+-  * third_party/alphafold3/ is a verbatim copy of AlphaFold 3 v3.0.3 (Copyright
+-    2024 DeepMind Technologies Limited; Apache-2.0), with the original per-file
+-    license headers and the repository's LICENSE/OUTPUT_TERMS/WEIGHTS_TERMS files
+-    retained unmodified. The bundled src/alphafold3/test_data/ fixtures were
+-    omitted; no other files were changed.
++  * third_party/alphafold3/ is a copy of AlphaFold 3 v3.0.3 (Copyright 2024
++    DeepMind Technologies Limited; Apache-2.0), with the original per-file license
++    headers and the repository's LICENSE/OUTPUT_TERMS/WEIGHTS_TERMS files retained.
++    The bundled src/alphafold3/test_data/ fixtures were omitted. Files modified by
++    IntelliGen-AI, 2026:
++      - src/alphafold3/model/network/atom_cross_attention.py: optional
++        queries-layout gather of the keys' ref_space_uid (off by default; see the
++        modification notice in the file header);
++      - src/alphafold3/model/network/diffusion_head.py: optional inference-time
++        diffusion steering (off by default).
+   * intellifold/run_jax_inference.py is a MODIFIED copy of AlphaFold 3's
+     run_alphafold.py (Copyright 2024 DeepMind Technologies Limited; Apache-2.0).
+     Modifications by IntelliGen-AI, 2026 -- see the modification notice in the
+diff --git a/intellifold/patches.py b/intellifold/patches.py
+index 8143771..0d2c7bc 100644
+--- a/intellifold/patches.py
++++ b/intellifold/patches.py
+@@ -99,8 +99,8 @@ def noise_embeddings(sigma_scaled_noise_level):
+   return True
+ 
+ 
+-# IntelliFold-v2 "full_fat" preset. Everything not listed is identical to the
+-# public AF3 config (c_s=384/16 heads, c_token=768/16, c_atom=128/4; block counts
++# IntelliFold-v2 "full_fat" preset (plus one behavioural flag, see the last two
++# entries). Everything not listed is identical to the public AF3 config (c_s=384/16 heads, c_token=768/16, c_atom=128/4; block counts
+ # 48 pairformer / 24 diffusion-transformer / 4 msa / 2 template / 4 confidence).
+ _FULLFAT_OVERRIDES = {
+     'evoformer.pair_channel': 512,                                   # c_z
+@@ -111,6 +111,13 @@ def noise_embeddings(sigma_scaled_noise_level):
+     'evoformer.pairformer.pair_attention.num_head': 8,
+     'evoformer.template.template_stack.pair_attention.num_head': 8,
+     'heads.confidence.pairformer.pair_attention.num_head': 8,
++    # Not a dimension: IntelliFold-v2 was trained with the per-atom-pair
++    # same-reference-space mask built from the queries layout, the semantics of
++    # intellifold/openfold (the PyTorch model). Both atom cross-attention encoders
++    # (trunk conditioning and diffusion head) must use it; see
++    # atom_cross_attention.AtomCrossAttEncoderConfig.keys_ref_space_uid_from_queries.
++    'evoformer.per_atom_conditioning.keys_ref_space_uid_from_queries': True,
++    'heads.diffusion.keys_ref_space_uid_from_queries': True,
+ }
+ 
+ 
+diff --git a/tests/test_keys_ref_space_uid.py b/tests/test_keys_ref_space_uid.py
+new file mode 100644
+index 0000000..b3ce1e3
+--- /dev/null
++++ b/tests/test_keys_ref_space_uid.py
+@@ -0,0 +1,79 @@
++"""keys_ref_space_uid: queries-layout gather for IntelliFold-v2, AF3 behaviour otherwise.
++
++Toy layout (3 tokens with 2, 3 and 1 atoms, 4 dense slots per token; 2 query
++subsets of 4; every subset's keys are all 8 query slots). The same-reference-space
++mask must mark exactly the query/key pairs whose atoms belong to the same token.
++"""
++import os
++
++import numpy as np
++import pytest
++
++from alphafold3.model.atom_layout import atom_layout
++from alphafold3.model.network import atom_cross_attention as aca
++
++# token-atom layout (num_tokens=3, num_dense=4); uid = token index + 1, 0 = padding
++UID_TOKEN_ATOMS = np.array([[1, 1, 0, 0],
++                            [2, 2, 2, 0],
++                            [3, 0, 0, 0]])
++# queries layout packs the 6 real atoms: [a0 a1 b0 b1 | b2 c0 pad pad]
++TOKEN_ATOMS_TO_QUERIES = atom_layout.GatherInfo(
++    gather_idxs=np.array([[0, 1, 4, 5], [6, 8, 0, 0]]),
++    gather_mask=np.array([[1, 1, 1, 1], [1, 1, 0, 0]], dtype=bool),
++    input_shape=np.array([3, 4]),
++)
++# keys index the flattened QUERIES layout (input_shape == queries shape)
++QUERIES_TO_KEYS = atom_layout.GatherInfo(
++    gather_idxs=np.tile(np.arange(8), (2, 1)),
++    gather_mask=np.tile(np.array([1, 1, 1, 1, 1, 1, 0, 0], dtype=bool), (2, 1)),
++    input_shape=np.array([2, 4]),
++)
++TRUE_KEY_UID = np.array([1, 1, 2, 2, 2, 3])          # uid of each real key atom
++
++
++def _mask(from_queries):
++  q_uid = atom_layout.convert(TOKEN_ATOMS_TO_QUERIES, UID_TOKEN_ATOMS, layout_axes=(-2, -1))
++  k_uid = aca._keys_ref_space_uid(QUERIES_TO_KEYS, q_uid, UID_TOKEN_ATOMS, from_queries)
++  return q_uid, k_uid, q_uid[:, :, None] == k_uid[:, None, :]
++
++
++def test_queries_layout_gather_marks_exactly_same_conformer_pairs():
++  q_uid, k_uid, valid = _mask(from_queries=True)
++  np.testing.assert_array_equal(k_uid[:, :6], np.tile(TRUE_KEY_UID, (2, 1)))
++  truth = q_uid[:, :, None] == TRUE_KEY_UID[None, None, :]
++  real_q = TOKEN_ATOMS_TO_QUERIES.gather_mask
++  np.testing.assert_array_equal(valid[:, :, :6][real_q], truth[real_q])
++
++
++def test_af3_default_reads_other_atoms_uid():
++  # Upstream behaviour (google-deepmind/alphafold3#730): key k reads token-atom
++  # slot k, so from the second token on it is another atom's uid or padding.
++  _, k_uid, _ = _mask(from_queries=False)
++  np.testing.assert_array_equal(k_uid[0, :6], [1, 1, 0, 0, 2, 2])
++  assert not np.array_equal(k_uid[0, :6], TRUE_KEY_UID)
++
++
++def test_flag_defaults_off_and_full_fat_turns_it_on_for_both_encoders(monkeypatch):
++  from alphafold3.model import model
++  from intellifold import patches
++
++  stock = model.Model.Config()
++  assert stock.evoformer.per_atom_conditioning.keys_ref_space_uid_from_queries is False
++  assert stock.heads.diffusion.keys_ref_space_uid_from_queries is False
++
++  monkeypatch.setenv('INTFOLD_FULLFAT', '1')
++  cfg = model.Model.Config()
++  assert patches.widen_config_full_fat(cfg)
++  assert cfg.evoformer.per_atom_conditioning.keys_ref_space_uid_from_queries is True
++  assert cfg.heads.diffusion.keys_ref_space_uid_from_queries is True
++
++
++def test_stock_af3_config_is_untouched_without_full_fat(monkeypatch):
++  from alphafold3.model import model
++  from intellifold import patches
++
++  monkeypatch.delenv('INTFOLD_FULLFAT', raising=False)
++  cfg = model.Model.Config()
++  assert not patches.widen_config_full_fat(cfg)
++  assert cfg.evoformer.per_atom_conditioning.keys_ref_space_uid_from_queries is False
++  assert cfg.heads.diffusion.keys_ref_space_uid_from_queries is False
+diff --git a/third_party/alphafold3/src/alphafold3/model/network/atom_cross_attention.py b/third_party/alphafold3/src/alphafold3/model/network/atom_cross_attention.py
+index 6667a10..959f04c 100644
+--- a/third_party/alphafold3/src/alphafold3/model/network/atom_cross_attention.py
++++ b/third_party/alphafold3/src/alphafold3/model/network/atom_cross_attention.py
+@@ -16,6 +16,16 @@
+ # out at https://github.com/google-deepmind/alphafold3. You may only use these
+ # if received directly from Google. Use is subject to terms of use available at
+ # https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
++#
++# ----------------------------------------------------------------------------
++# NOTICE OF MODIFICATION (Apache-2.0 sec. 4(b))
++# Modified by IntelliGen-AI in 2026. Changes vs. AlphaFold 3 v3.0.3:
++#   * add `AtomCrossAttEncoderConfig.keys_ref_space_uid_from_queries` and the
++#     `_keys_ref_space_uid` helper, so the keys' ref_space_uid can be gathered from
++#     the queries layout (the layout `queries_to_keys` indexes). Default False keeps
++#     the upstream behaviour exactly; IntelliFold-v2 turns it on (see
++#     intellifold/patches.py). Upstream report: google-deepmind/alphafold3#730.
++# ----------------------------------------------------------------------------
+ 
+ """Per-atom cross attention."""
+ import dataclasses
+@@ -38,6 +48,18 @@ class AtomCrossAttEncoderConfig(base_config.BaseConfig):
+       base_config.autocreate(num_intermediate_factor=2, num_blocks=3)
+   )
+   per_atom_pair_channels: int = 16
++  # How the keys' ref_space_uid is gathered for the same-reference-space mask
++  # `offsets_valid`. `queries_to_keys` indexes the flattened QUERIES layout
++  # (num_subsets, num_queries). False (AlphaFold 3 behaviour) applies it to
++  # `batch.ref_structure.ref_space_uid`, which is in the token-atom layout
++  # (num_tokens, num_dense): same flattened size, but a different atom at each
++  # index once any token has fewer than num_dense atoms, so the mask is almost
++  # all False and the reference-conformer offsets barely enter. True gathers
++  # from the queries layout, the same token -> queries -> keys path as
++  # `keys_ref_pos`, so the mask marks query/key atoms in the same reference
++  # conformer. Weights must be run with the setting they were trained with:
++  # stock AF3 -> False, IntelliFold-v2 -> True.
++  keys_ref_space_uid_from_queries: bool = False
+ 
+ 
+ def _per_atom_conditioning(
+@@ -123,6 +145,23 @@ class AtomCrossAttEncoderOutput:
+ )
+ 
+ 
++def _keys_ref_space_uid(
++    queries_to_keys: atom_layout.GatherInfo,
++    queries_ref_space_uid: jnp.ndarray,
++    token_atoms_ref_space_uid: jnp.ndarray,
++    from_queries: bool,
++) -> jnp.ndarray:
++  """ref_space_uid of every key atom, shape (num_subsets, num_keys).
++
++  See AtomCrossAttEncoderConfig.keys_ref_space_uid_from_queries for why the
++  source layout matters. Note that `atom_layout.convert` only checks the source
++  shape against `queries_to_keys.input_shape` for numpy GatherInfo; under jit the
++  token-atom source passes silently.
++  """
++  source = queries_ref_space_uid if from_queries else token_atoms_ref_space_uid
++  return atom_layout.convert(queries_to_keys, source, layout_axes=(-2, -1))
++
++
+ def atom_cross_att_encoder(
+     token_atoms_act: jnp.ndarray | None,  # (num_tokens, max_atoms_per_token, 3)
+     trunk_single_cond: jnp.ndarray | None,  # (num_tokens, ch)
+@@ -276,10 +315,11 @@ def atom_cross_att_encoder(
+       queries_ref_pos,
+       layout_axes=(-3, -2),
+   )
+-  keys_ref_space_uid = atom_layout.convert(
++  keys_ref_space_uid = _keys_ref_space_uid(
+       batch.atom_cross_att.queries_to_keys,
++      queries_ref_space_uid,
+       batch.ref_structure.ref_space_uid,
+-      layout_axes=(-2, -1),
++      from_queries=c.keys_ref_space_uid_from_queries,
+   )
+ 
+   offsets_valid = (

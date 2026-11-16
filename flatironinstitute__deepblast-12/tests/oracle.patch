@@ -1,0 +1,584 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..9cb8a8f
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,50 @@
++# Temporary files
++*~
++\#*#
++.pytest_cache/*
++
++*.py[cod]
++
++# C extensions
++*.so
++
++# Packages
++*.egg
++*.egg-info
++dist
++build
++eggs
++parts
++bin
++var
++sdist
++develop-eggs
++.installed.cfg
++lib
++lib64
++__pycache__
++
++# Installer logs
++pip-log.txt
++
++# Unit test / coverage reports
++.coverage
++.tox
++nosetests.xml
++
++# Translations
++*.mo
++
++# Mr Developer
++.mr.developer.cfg
++.project
++.pydevproject
++
++# vi
++.*.swp
++
++# Sphinx builds
++doc/source/generated
++
++# OSX files
++.DS_Store
+diff --git a/deepblast/alignment.py b/deepblast/alignment.py
+index 71c61e6..7e92b58 100644
+--- a/deepblast/alignment.py
++++ b/deepblast/alignment.py
+@@ -3,24 +3,24 @@
+ import torch.nn.functional as F
+ from deepblast.language_model import BiLM, pretrained_language_models
+ from deepblast.nw import NeedlemanWunschDecoder
+-from deepblast.embedding import StackedRNN
++from deepblast.embedding import StackedRNN, EmbedLinear
+ 
+ 
+ class NeedlemanWunschAligner(nn.Module):
+ 
+-    def __init__(self, nin, nembed, nunits, nout, nlayers=2, lm=None):
++    def __init__(self, n_alpha, n_input, n_units, n_embed, n_layers=2, lm=None):
+         """
+         Parameters
+         ----------
+-        nin : int
+-           Input dimensions (default 22)
+-        nembed : int
+-           Number of embedding dimensions
+-        nunits : int
++        n_alpha : int
++           Size of the alphabet (default 22)
++        n_input : int
++           Input dimensions.
++        n_units : int
+            Number of hidden units in RNN.
+-        nout : int
+-           Output dimensions (default 22)
+-        nlayers : int
++        n_embed : int
++           Embedding dimension
++        n_layers : int
+            Number of RNN layers.
+         lm : BiLM
+            Pretrained language model (optional)
+@@ -36,8 +36,12 @@ def __init__(self, nin, nembed, nunits, nout, nlayers=2, lm=None):
+             self.lm = BiLM()
+             self.lm.load_state_dict(torch.load(path))
+             self.lm.eval()
+-        self.embedding = StackedRNN(nin, nembed, nunits, nout, nlayers, lm)
+-        self.gap_score = nn.Linear(nembed * 2, 1)
++        if n_layers > 1:
++            self.embedding = StackedRNN(n_alpha, n_input, n_units, n_embed, n_layers, lm=lm)
++        else:
++            self.embedding = EmbedLinear(n_alpha, n_input, n_embed, lm=lm)
++
++        self.gap_score = nn.Linear(n_embed * 2, 1)
+         self.nw = NeedlemanWunschDecoder(operator='softmax')
+ 
+     def forward(self, x, y):
+@@ -67,7 +71,7 @@ def forward(self, x, y):
+         B, N, M = theta.shape
+         aln = torch.zeros((B, N, M))
+         for b in range(B):
+-            aln[b] = self.nw(theta[b], A[b])
++            aln[b] = self.nw.decode(theta[b], A[b])
+         return aln
+ 
+     def traceback(self, x, y):
+diff --git a/deepblast/dataset/__init__.py b/deepblast/dataset/__init__.py
+index f0d19e3..19d2560 100644
+--- a/deepblast/dataset/__init__.py
++++ b/deepblast/dataset/__init__.py
+@@ -1 +1 @@
+-from deepblast.dataset.dataset import AlignmentDataset, collate
++from deepblast.dataset.dataset import AlignmentDataset
+diff --git a/deepblast/dataset/dataset.py b/deepblast/dataset/dataset.py
+index fe79c08..305cc52 100644
+--- a/deepblast/dataset/dataset.py
++++ b/deepblast/dataset/dataset.py
+@@ -38,22 +38,6 @@ def states2matrix(states, N, M):
+     return mat
+ 
+ 
+-def collate(xs):
+-    B = len(xs)
+-    N = max(len(x) for x in xs)
+-    lengths = np.array([len(x) for x in xs], dtype=int)
+-
+-    order = np.argsort(lengths)[::-1]
+-    lengths = lengths[order]
+-
+-    X = torch.LongTensor(B, N).zero_() + mask_idx
+-    for i in range(B):
+-        x = xs[order[i]]
+-        n = len(x)
+-        X[i,:n] = torch.from_numpy(x)
+-    return X, lengths
+-
+-
+ class AlignmentDataset(Dataset):
+     """ Dataset for training and testing. """
+     def __init__(self, pairs, tokenizer=UniprotTokenizer()):
+@@ -97,6 +81,8 @@ def __getitem__(self, i):
+         states = torch.Tensor(list(map(state_f, alnstr)))
+         gene = self.tokenizer(str.encode(gene.replace('-', '')))
+         pos = self.tokenizer(str.encode(pos.replace('-', '')))
++        gene = torch.Tensor(gene).long()
++        pos = torch.Tensor(pos).long()
+         N, M = len(gene), len(pos)
+         alignment_matrix = torch.from_numpy(states2matrix(states, N, M))
+         return gene, pos, states, alignment_matrix
+diff --git a/deepblast/embedding.py b/deepblast/embedding.py
+index 1d9a1c3..0aba1e8 100644
+--- a/deepblast/embedding.py
++++ b/deepblast/embedding.py
+@@ -42,27 +42,28 @@ def forward(self, x):
+         return h
+ 
+ 
+-class Linear(nn.Module):
++class EmbedLinear(nn.Module):
+     def __init__(self, nin, nhidden, nout, padding_idx=-1,
+                  sparse=False, lm=None):
+-        super(Linear, self).__init__()
+-        
++        super(EmbedLinear, self).__init__()
++
+         if padding_idx == -1:
+             padding_idx = nin-1
+-        
++
+         if lm is not None:
+             self.embed = LMEmbed(nin, nhidden, lm, padding_idx=padding_idx, sparse=sparse)
+             self.proj = nn.Linear(self.embed.nout, nout)
+             self.lm = True
+         else:
+-            self.proj = nn.Embedding(nin, nout, padding_idx=padding_idx, sparse=sparse)
++            self.embed = nn.Embedding(nin, nout, padding_idx=padding_idx, sparse=sparse)
++            self.proj = nn.Linear(nout, nout)
+             self.lm = False
+ 
+         self.nout = nout
+-        
+-        
++
++
+     def forward(self, x):
+-        
++
+         if self.lm:
+             h = self.embed(x)
+             if type(h) is PackedSequence:
+@@ -79,7 +80,7 @@ def forward(self, x):
+                 z = PackedSequence(z, x.batch_sizes)
+             else:
+                 z = self.embed(x)
+-    
++
+         return z
+ 
+ 
+@@ -87,10 +88,10 @@ class StackedRNN(nn.Module):
+     def __init__(self, nin, nembed, nunits, nout, nlayers=2, padding_idx=-1, dropout=0,
+                  rnn_type='lstm', sparse=False, lm=None):
+         super(StackedRNN, self).__init__()
+-        
++
+         if padding_idx == -1:
+             padding_idx = nin-1
+-        
++
+         if lm is not None:
+             self.embed = LMEmbed(nin, nembed, lm, padding_idx=padding_idx, sparse=sparse)
+             nembed = self.embed.nout
+@@ -100,6 +101,7 @@ def __init__(self, nin, nembed, nunits, nout, nlayers=2, padding_idx=-1, dropout
+             self.lm = False
+ 
+         if rnn_type == 'lstm':
++
+             RNN = nn.LSTM
+         elif rnn_type == 'gru':
+             RNN = nn.GRU
+@@ -113,10 +115,10 @@ def __init__(self, nin, nembed, nunits, nout, nlayers=2, padding_idx=-1, dropout
+         self.proj = nn.Linear(2*nunits, nout)
+         self.nout = nout
+ 
+-        
+-        
++
++
+     def forward(self, x):
+-        
++
+         if self.lm:
+             h = self.embed(x)
+         else:
+@@ -125,9 +127,9 @@ def forward(self, x):
+                 h = PackedSequence(h, x.batch_sizes)
+             else:
+                 h = self.embed(x)
+-            
++
+         h,_ = self.rnn(h)
+-        
++
+         if type(h) is PackedSequence:
+             h = h.data
+             h = self.dropout(h)
+@@ -138,7 +140,7 @@ def forward(self, x):
+             h = self.dropout(h)
+             z = self.proj(h)
+             z = z.view(x.size(0), x.size(1), -1)
+-    
++
+         return z
+ 
+ 
+diff --git a/deepblast/nw.py b/deepblast/nw.py
+index 2e8e5da..faee454 100644
+--- a/deepblast/nw.py
++++ b/deepblast/nw.py
+@@ -148,7 +148,6 @@ def _adjoint_backward_pass(E, Q, Qd):
+                        Q[i + 1, j + 1, m] * Ed[i + 1, j + 1] + \
+                        Qd[i, j + 1, y] * E[i, j + 1] + \
+                        Q[i, j + 1, y] * Ed[i, j + 1]
+-
+     return Ed
+ 
+ 
+@@ -262,7 +261,7 @@ def decode(self, theta, A):
+             # data.requires_grad_()
+             nll = self.forward(theta, A)
+             v = torch.sum(nll)
+-            v_grad, = torch.autograd.grad(
+-                v, (theta.data, A.data,),
++            v_grad, _ = torch.autograd.grad(
++                v, (theta, A),
+                 create_graph=True)
+         return v_grad
+diff --git a/deepblast/tests/test_alignment.py b/deepblast/tests/test_alignment.py
+index 1f862e0..9a2e421 100644
+--- a/deepblast/tests/test_alignment.py
++++ b/deepblast/tests/test_alignment.py
+@@ -13,8 +13,8 @@ def setUp(self):
+         self.embedding.load_state_dict(torch.load(path))
+         self.embedding.eval()
+         self.tokenizer = UniprotTokenizer()
+-        nin, nembed, nunits, nout = 22, 1024, 1024, 1024
+-        self.aligner = NeedlemanWunschAligner(nin, nembed, nunits, nout)
++        nalpha, ninput, nunits, nembed = 22, 1024, 1024, 1024
++        self.aligner = NeedlemanWunschAligner(nalpha, ninput, nunits, nembed)
+ 
+     def test_alignment(self):
+         x = torch.Tensor(
+diff --git a/deepblast/tests/test_trainer.py b/deepblast/tests/test_trainer.py
+new file mode 100644
+index 0000000..f5f25a3
+--- /dev/null
++++ b/deepblast/tests/test_trainer.py
+@@ -0,0 +1,50 @@
++import os
++import shutil
++import unittest
++from deepblast.trainer import LightningAligner
++from deepblast.utils import get_data_path
++from pytorch_lightning import Trainer
++import argparse
++
++
++class TestTrainer(unittest.TestCase):
++
++    def setUp(self):
++        # Fake parse args
++        self.output_dir = 'output-dir'
++        os.mkdir(self.output_dir)
++        args = [
++            '--train-pairs', get_data_path('train.txt'),
++            '--test-pairs', get_data_path('test.txt'),
++            '--valid-pairs', get_data_path('valid.txt'),
++            '--output-directory', self.output_dir,
++            '--epochs', '1',
++            '--batch-size', '1',
++            '--num-workers', '1'
++        ]
++        parser = argparse.ArgumentParser(add_help=False)
++        parser = LightningAligner.add_model_specific_args(parser)
++        parser.add_argument('--num-workers', type=int)
++        args = parser.parse_args(args)
++
++        self.model = LightningAligner(args)
++        # profiler = AdvancedProfiler()
++
++        self.trainer = Trainer(
++            max_nb_epochs=1,
++            # profiler=profiler,
++            # fast_dev_run=True
++            #auto_scale_batch_size='power'
++        )
++
++    def tearDown(self):
++        shutil.rmtree(self.output_dir)
++        pass
++
++    def test_run(self):
++        # Smoke test to make sure that it runs.
++        self.trainer.fit(self.model)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/deepblast/trainer.py b/deepblast/trainer.py
+new file mode 100644
+index 0000000..777bb7e
+--- /dev/null
++++ b/deepblast/trainer.py
+@@ -0,0 +1,135 @@
++import datetime
++import argparse
++import pandas as pd
++import torch
++from torch import optim
++from torch.utils.data import DataLoader
++from torch.utils.tensorboard import SummaryWriter
++from torch.optim.lr_scheduler import StepLR
++import pytorch_lightning as pl
++from pytorch_lightning import Trainer
++from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
++from deepblast.alignment import NeedlemanWunschAligner
++from deepblast.language_model import BiLM, pretrained_language_models
++from deepblast.dataset.alphabet import UniprotTokenizer, Uniprot21
++from deepblast.dataset import AlignmentDataset
++from deepblast.losses import SoftAlignmentLoss
++
++
++class LightningAligner(pl.LightningModule):
++
++    def __init__(self, args):
++        super(LightningAligner, self).__init__()
++        self.tokenizer = UniprotTokenizer()
++        self.hparams = args
++        self.initialize_aligner()
++        self.loss_func = SoftAlignmentLoss()
++
++    def initialize_aligner(self):
++        n_alpha = len(self.tokenizer.alphabet)
++        n_embed = self.hparams.embedding_dim
++        n_input = self.hparams.rnn_input_dim
++        n_units = self.hparams.rnn_dim
++        n_layers = self.hparams.layers
++        if self.hparams.aligner == 'nw':
++            self.aligner = NeedlemanWunschAligner(
++                n_alpha, n_input, n_units, n_embed, n_layers)
++        else:
++            raise NotImplemented(
++                f'Aligner {self.hparams.aligner_type} not implemented.')
++
++    def forward(self, x, y):
++        return self.aligner.forward(x, y)
++
++    def initialize_logging(self, root_dir='./', logging_path=None):
++        if logging_path is None:
++            basename = "logdir"
++            suffix = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
++            logging_path = "_".join([basename, suffix])
++        full_path = root_dir + logging_path
++        writer = SummaryWriter(full_path)
++        return writer
++
++    def train_dataloader(self):
++        pairs = pd.read_table(self.hparams.train_pairs, header=None)
++        train_dataset = AlignmentDataset(pairs)
++        train_dataloader = DataLoader(
++            train_dataset, self.hparams.batch_size,
++            shuffle=True, num_workers=self.hparams.num_workers)
++        return train_dataloader
++
++    def valid_dataloader(self):
++        pairs = pd.read_table(self.hparams.valid_pairs, header=None)
++        valid_dataset = AlignmentDataset(pairs)
++        valid_dataloader = DataLoader(
++            valid_dataset, self.hparams.batch_size,
++            shuffle=False, num_workers=self.hparams.num_workers)
++        return valid_dataloader
++
++    def test_dataloader(self):
++        pairs = pd.read_table(self.hparams.testing_pairs, header=None)
++        test_dataset = AlignmentDataset(pairs)
++        test_dataloader = DataLoader(test_dataset, self.hparams.batch_size,
++                                     shuffle=False, collate_fn=collate,
++                                     num_workers=self.hparams.num_workers)
++        return test_dataloader
++
++    def training_step(self, batch, batch_idx):
++        x, y, s, A = batch
++        self.aligner.train()
++        predA = self.aligner(x, y)
++        loss = self.loss_func(A, predA)
++        assert torch.isnan(loss).item() == False
++        return {'loss': loss}
++
++    def valid_step(self, batch, batch_idx):
++        x, y, s, A = batch
++        self.aligner.train()
++        predA = self.aligner(x, y)
++        loss = SoftAlignmentLoss(A, predA)
++        assert torch.isnan(loss).item() == False
++        # TODO: Measure the alignment accuracy
++        return {'validation_loss': loss}
++
++    def test_step(self):
++        # TODO: Measure the alignment accuracy
++        pass
++
++    def configure_optimizers(self):
++        for p in self.aligner.lm.parameters():
++            p.requires_grad = False
++        grad_params = list(filter(
++            lambda p: p.requires_grad, self.aligner.parameters()))
++        optimizer = torch.optim.Adam(
++            grad_params, lr=self.hparams.learning_rate)
++        scheduler = StepLR(optimizer, step_size=10)
++        return [optimizer], [scheduler]
++
++    @staticmethod
++    def add_model_specific_args(parent_parser):
++        parser = argparse.ArgumentParser(parents=[parent_parser])
++        parser.add_argument('--train-pairs', help='Training pairs file', required=True)
++        parser.add_argument('--test-pairs', help='Testing pairs file', required=True)
++        parser.add_argument('--valid-pairs', help='Validation pairs file', required=True)
++        parser.add_argument('-a','--aligner',
++                            help='Aligner type. Choices include (nw, hmm).',
++                            required=False, type=str, default='nw')
++        parser.add_argument('--embedding-dim', help='Embedding dimension (default 512).',
++                            required=False, type=int, default=512)
++        parser.add_argument('--rnn-input-dim', help='RNN input dimension (default 512).',
++                            required=False, type=int, default=512)
++        parser.add_argument('--rnn-dim', help='Number of hidden RNN units (default 512).',
++                            required=False, type=int, default=512)
++        parser.add_argument('--layers', help='Number of RNN layers (default 2).',
++                            required=False, type=int, default=2)
++        parser.add_argument('--learning-rate', help='Learning rate',
++                            required=False, type=float, default=5e-5)
++        parser.add_argument('--batch-size', help='Training batch size',
++                            required=False, type=int, default=32)
++        parser.add_argument('--finetune', help='Perform finetuning (does not work with mean)',
++                            default=False, required=False, type=bool)
++        parser.add_argument('--epochs', help='Training batch size',
++                            required=False, type=int, default=10)
++        parser.add_argument('-o','--output-directory', help='Output directory of model results',
++                            required=True)
++        return parser
+diff --git a/scripts/deepblast-train.py b/scripts/deepblast-train.py
+new file mode 100644
+index 0000000..2cea291
+--- /dev/null
++++ b/scripts/deepblast-train.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import argparse
++import pandas as pd
++import matplotlib.pyplot as plt
++import datetime
++import glob
++import os
++import re
++from Bio import SeqIO
++
++import torch
++from torch import optim
++from torch.utils.data import DataLoader
++from torch.utils.tensorboard import SummaryWriter
++from torch.optim.lr_scheduler import StepLR
++import pytorch_lightning as pl
++from pytorch_lightning import Trainer
++from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
++
++from deepblast.trainer import LightningAligner
++
++
++def main(args):
++    model = LightningAligner(args)
++    # profiler = AdvancedProfiler()
++
++    trainer = Trainer(
++        max_nb_epochs=args.epochs,
++        gpus=args.gpus,
++        nb_gpu_nodes=args.nodes,
++        accumulate_grad_batches=args.grad_accum,
++        distributed_backend=args.backend,
++        precision=args.precision,
++        check_val_every_n_epoch=0.1,
++        # profiler=profiler,
++        # fast_dev_run=True
++        #auto_scale_batch_size='power'
++    )
++
++    ckpt_path = os.path.join(
++        args.output_directory,
++        trainer.logger.name,
++        f"version_{trainer.logger.version}",
++        "checkpoints",
++    )
++    print(f'{ckpt_path}:', ckpt_path)
++    # initialize Model Checkpoint Saver
++    checkpoint_callback = ModelCheckpoint(
++        filepath=ckpt_path,
++        period=1,
++        monitor='val_loss',
++        mode='min',
++        verbose=True
++    )
++    trainer.checkpoint_callback = checkpoint_callback
++    trainer.fit(model)
++
++    # In case this doesn't checkpoint
++    torch.save(model.state_dict(),
++               args.output_directory + '/model_current.pt')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(add_help=False)
++    parser.add_argument('--gpus', type=int, default=None)
++    parser.add_argument('--grad-accum', type=int, default=1)
++    parser.add_argument('--nodes', type=int, default=1)
++    parser.add_argument('--num-workers', type=int, default=1)
++    parser.add_argument('--precision', type=int, default=32)
++    parser.add_argument('--backend', type=str, default=None)
++    # options include ddp_cpu, dp, dpp
++
++    parser = LightningAligner.add_model_specific_args(parser)
++    hparams = parser.parse_args()
++    main(hparams)

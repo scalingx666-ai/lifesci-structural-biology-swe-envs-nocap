@@ -1,0 +1,1643 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 95769db..2841621 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ [Unreleased]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.2.0...HEAD
+ 
++### Added
++
++- `--alignment-min-identity` and `--alignment-min-coverage` parameters - discard structural templates whose global alignment falls below the thresholds; off by default
++- `benchmark` command - runs structure retrieval, contact map transfer and prediction for several MMseqs2 identity bins and `--generate-contacts` values from one database search, with per-stage wall times in `timing.tsv`
++
++### Changed
++
++- `predict_protein_function` is composed of reusable stages: `align_database_hits`, `select_templates`, `build_contact_maps` and `predict_from_contact_maps`
++
+ ### Fixed
+ 
+ - `align_contact_map` returning an asymmetric map for one-directional template contacts
+diff --git a/README.md b/README.md
+index ca77893..f10037b 100644
+--- a/README.md
++++ b/README.md
+@@ -328,6 +328,37 @@ paths to `LD_LIBRARY_PATH`:
+ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(python -c 'import os, nvidia.cudnn, nvidia.cublas, nvidia.cuda_runtime; libs=[nvidia.cudnn, nvidia.cublas, nvidia.cuda_runtime]; print(":".join([os.path.join(m.__path__[0], "lib") for m in libs]))')
+ ```
+ 
++### 6. Structural template filtering
++
++Templates whose global alignment to the query falls below
++`--alignment-min-identity` or `--alignment-min-coverage` are discarded,
++and the query falls back to the next database or the CNN.
++Both filters are off by default.
++
++### 7. Benchmarking
++
++`mDeepFRI benchmark` measures how the similarity of the structural template
++affects contact maps and predictions. Every database is searched once with
++every query. For each `--identity-bin LOW HIGH` (MMseqs2 identity, `HIGH`
++exclusive) one hit is kept per query and database - the best by bitscore,
++or a random one with `--hit-selection random --seed 42` - and hits of a
++query to itself are dropped unless `--keep-self-hits` is set. Contact maps
++are built for every `--generate-contacts` value and, if weights are given,
++GO terms are predicted. `--search-results` reuses the `database_search`
++folder of a previous run.
++
++```{code-block} bash
++mDeepFRI benchmark -i /path/to/protein/sequences \
++  -d /path/to/foldcomp/database/ -w /path/to/deepfri/weights/folder \
++  -o /output_path -p mf -p bp -p cc \
++  --identity-bin 0 0.5 --identity-bin 0 0.9 --identity-bin 0 1.01
++```
++
++The output contains `database_search/` with all MMseqs2 hits, `timing.tsv`
++with the wall time of each stage and, per identity bin, the selected `hits/`,
++their global `alignments/` with gapped sequences and one
++`generate_contacts_<value>/` folder with the `predict-function` outputs.
++
+ ## 🔖 Citations
+ 
+ Metagenomic-DeepFRI is a scientific software. If you use it
+diff --git a/docs/cli.rst b/docs/cli.rst
+index 95a2b6d..a033e68 100644
+--- a/docs/cli.rst
++++ b/docs/cli.rst
+@@ -1,10 +1,11 @@
+ Commands (CLI)
+ ==============
+ 
+-The ``mDeepFRI`` command-line interface provides two main commands:
++The ``mDeepFRI`` command-line interface provides three main commands:
+ 
+ - ``get-models`` - Download pre-trained DeepFRI models (v1.0 or v1.1)
+ - ``predict-function`` - Run the prediction pipeline on protein sequences
++- ``benchmark`` - Evaluate structure retrieval and prediction across identity bins of database hits
+ 
+ Key Features
+ ------------
+diff --git a/mDeepFRI/benchmark.py b/mDeepFRI/benchmark.py
+new file mode 100644
+index 0000000..b7742d9
+--- /dev/null
++++ b/mDeepFRI/benchmark.py
+@@ -0,0 +1,348 @@
++"""
++Benchmarking of structure retrieval, contact map transfer and prediction.
++
++Every database is searched once with every query. For each identity bin one
++MMseqs2 hit is kept per query and database, aligned globally and used as a
++structural template. Contact maps are built for each ``generate_contacts``
++value and, if weights are given, GO terms are predicted.
++
++Output layout::
++
++    database_search/<db>_results.tsv     all MMseqs2 hits
++    <bin>/hits/<db>.tsv                  selected hit per query
++    <bin>/alignments/<db>.tsv            global alignments of the hits
++    <bin>/structures/<db>/               template structures (optional)
++    <bin>/generate_contacts_<gc>/        templates, contact maps, predictions
++    timing.tsv                           wall time of each stage
++"""
++
++import csv
++import dataclasses
++import logging
++import re
++import time
++from contextlib import contextmanager
++from functools import partial
++from pathlib import Path
++from typing import Iterable, List, Literal, Optional, Tuple
++
++import numpy as np
++import numpy.lib.recfunctions as rfn
++
++from mDeepFRI.alignment import AlignmentResult
++from mDeepFRI.mmseqs import MMSEQS_COLUMNS, MMseqsResult, QueryFile
++from mDeepFRI.pipeline import (_initialize_processing_modes,
++                               align_database_hits, build_contact_maps,
++                               load_databases, predict_from_contact_maps,
++                               save_contact_maps, select_templates,
++                               write_alignment_summary)
++from mDeepFRI.utils import load_deepfri_config
++
++logger = logging.getLogger(__name__)
++
++ALIGNMENTS_HEADER = [
++    "query_id", "target_id", "query_identity", "query_coverage",
++    "target_coverage", "query_alignment", "target_alignment"
++]
++TIMING_HEADER = [
++    "stage", "identity_bin", "database", "generate_contacts", "seconds"
++]
++MODEL_VERSION = re.compile(r"-model_v\d+$")
++
++
++def is_self_hit(query: str, target: str) -> bool:
++    """
++    Check whether a hit is the query itself, ignoring AlphaFold model versions.
++
++    Args:
++        query (str): Query identifier, e.g. `P12345` or `AF-P12345-F1-model_v6`.
++        target (str): Target identifier, e.g. `AF-P12345-F1-model_v4`.
++
++    Returns:
++        bool: True for a self-hit.
++    """
++    return (MODEL_VERSION.sub("", query) == MODEL_VERSION.sub("", target)
++            or target.startswith(f"AF-{query}-"))
++
++
++def select_hits(hits: np.ndarray,
++                identity_bin: Tuple[float, float],
++                selection: Literal["bitscore", "random"] = "bitscore",
++                drop_self_hits: bool = True,
++                seed: int = 0) -> np.ndarray:
++    """
++    Keep one MMseqs2 hit per query within an identity bin.
++
++    Args:
++        hits (np.ndarray): MMseqs2 hits.
++        identity_bin (Tuple[float, float]): Inclusive lower and exclusive
++            upper bound of the MMseqs2 identity.
++        selection (str, optional): Keep the hit with the highest bitscore,
++            ties broken by identity, or a random hit. Defaults to "bitscore".
++        drop_self_hits (bool, optional): Discard hits to the query itself.
++            Defaults to True.
++        seed (int, optional): Random seed for random selection.
++            Defaults to 0.
++
++    Returns:
++        np.ndarray: One hit per query, sorted by query.
++    """
++    low, high = identity_bin
++    candidates = hits[(hits["fident"] >= low) & (hits["fident"] < high)]
++    if drop_self_hits:
++        self_hits = [
++            is_self_hit(query, target)
++            for query, target in zip(candidates["query"], candidates["target"])
++        ]
++        candidates = candidates[~np.array(self_hits, dtype=bool)]
++
++    if selection == "random":
++        order = np.argsort(candidates["query"], kind="stable")
++        _, starts, counts = np.unique(candidates["query"][order],
++                                      return_index=True,
++                                      return_counts=True)
++        rng = np.random.default_rng(seed)
++        picks = [
++            start + rng.integers(0, count)
++            for start, count in zip(starts, counts)
++        ]
++        return candidates[order[picks]]
++
++    order = np.argsort(candidates, order=["query", "bits", "fident"])[::-1]
++    _, first = np.unique(candidates["query"][order], return_index=True)
++    return candidates[order[first]]
++
++
++def write_alignments(path: Path, alignments: List[AlignmentResult]) -> None:
++    """
++    Write global alignments with their gapped sequences.
++
++    Args:
++        path (Path): Output TSV file.
++        alignments (List[AlignmentResult]): Alignments to write.
++    """
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "w", encoding="utf-8", newline="") as f:
++        writer = csv.writer(f, delimiter="\t")
++        writer.writerow(ALIGNMENTS_HEADER)
++        for aln in alignments:
++            writer.writerow([
++                aln.query_name, aln.target_name, aln.query_identity,
++                aln.query_coverage, aln.target_coverage, aln.gapped_sequence,
++                aln.gapped_target
++            ])
++
++
++@contextmanager
++def _timed(timing_file: Path,
++           stage: str,
++           identity_bin: Optional[str] = None,
++           database: Optional[str] = None,
++           generate_contacts: Optional[int] = None):
++    start = time.perf_counter()
++    yield
++    seconds = round(time.perf_counter() - start, 2)
++    logger.info("%s finished in %.2f s.", stage, seconds)
++    with open(timing_file, "a", encoding="utf-8", newline="") as f:
++        csv.writer(f, delimiter="\t").writerow(
++            [stage, identity_bin, database, generate_contacts, seconds])
++
++
++def run_benchmark(query_file: QueryFile,
++                  output_path: Path,
++                  databases: Iterable[str] = (),
++                  identity_bins: Iterable[Tuple[float,
++                                                float]] = ((0.0, 1.01), ),
++                  generate_contacts: Iterable[int] = (2, ),
++                  weights: Optional[str] = None,
++                  deepfri_processing_modes: Iterable[str] = ("bp", "cc", "ec",
++                                                             "mf"),
++                  search_results: Optional[Path] = None,
++                  skip_pdb: bool = False,
++                  overwrite: bool = False,
++                  mmseqs_sensitivity: float = 5.7,
++                  min_bits: float = 0,
++                  max_eval: float = 1e-3,
++                  min_ident: float = 0.0,
++                  min_coverage: float = 0.9,
++                  selection: Literal["bitscore", "random"] = "bitscore",
++                  drop_self_hits: bool = True,
++                  seed: int = 0,
++                  alignment_gap_open: int = 10,
++                  alignment_gap_extend: int = 1,
++                  scoring_matrix: str = "VTML80",
++                  alignment_min_identity: float = 0.0,
++                  alignment_min_coverage: float = 0.0,
++                  angstrom_contact_threshold: float = 6,
++                  save_structures: bool = False,
++                  save_cmaps: bool = False,
++                  skip_matrix: bool = False,
++                  tmpdir: Optional[Path] = None,
++                  threads: int = 1) -> None:
++    """
++    Run the pipeline for every combination of identity bin and
++    `generate_contacts` value, reusing one database search.
++
++    Args:
++        query_file (QueryFile): Query sequences.
++        output_path (Path): Output directory.
++        databases (Iterable[str], optional): FoldComp databases searched
++            after PDB100, in order of preference.
++        identity_bins (Iterable[Tuple[float, float]], optional): Bounds of
++            the MMseqs2 identity, lower inclusive and upper exclusive.
++            Defaults to all hits.
++        generate_contacts (Iterable[int], optional): Numbers of neighbours
++            connected to residues inserted in the query. Defaults to (2,).
++        weights (str, optional): DeepFRI weights folder. Without weights,
++            only contact maps are built.
++        deepfri_processing_modes (Iterable[str], optional): Modes to predict.
++        search_results (Path, optional): Directory with `<db>_results.tsv`
++            files of a previous search, used instead of searching.
++        skip_pdb (bool, optional): Skip PDB100. Defaults to False.
++        overwrite (bool, optional): Rebuild database files. Defaults to False.
++        mmseqs_sensitivity (float, optional): MMseqs2 sensitivity.
++        min_bits (float, optional): Minimum MMseqs2 bitscore.
++        max_eval (float, optional): Maximum MMseqs2 e-value.
++        min_ident (float, optional): Minimum MMseqs2 identity.
++        min_coverage (float, optional): Minimum MMseqs2 query and target
++            coverage.
++        selection (str, optional): Per-query hit selection, see
++            `select_hits`. Defaults to "bitscore".
++        drop_self_hits (bool, optional): Discard hits to the query itself.
++            Defaults to True.
++        seed (int, optional): Random seed for random selection.
++        alignment_gap_open (int, optional): Gap open penalty.
++        alignment_gap_extend (int, optional): Gap extension penalty.
++        scoring_matrix (str, optional): Alignment scoring matrix.
++        alignment_min_identity (float, optional): Minimum identity of the
++            global alignment for a template. Defaults to 0.0.
++        alignment_min_coverage (float, optional): Minimum query coverage of
++            the global alignment for a template. Defaults to 0.0.
++        angstrom_contact_threshold (float, optional): Contact distance
++            threshold. Defaults to 6.
++        save_structures (bool, optional): Save template structures.
++        save_cmaps (bool, optional): Save contact maps.
++        skip_matrix (bool, optional): Skip writing prediction matrices.
++        tmpdir (Path, optional): Temporary directory for MMseqs2.
++        threads (int, optional): Number of threads. Defaults to 1.
++    """
++    output_path = Path(output_path)
++    output_path.mkdir(parents=True, exist_ok=True)
++    timing_file = output_path / "timing.tsv"
++    timing_file.write_text("\t".join(TIMING_HEADER) + "\n")
++    timed = partial(_timed, timing_file)
++
++    if weights:
++        deepfri_models_config = load_deepfri_config(weights)
++        deepfri_processing_modes = _initialize_processing_modes(
++            deepfri_processing_modes, deepfri_models_config)
++
++    dbs = load_databases(databases=databases,
++                         skip_pdb=skip_pdb,
++                         overwrite=overwrite,
++                         threads=threads)
++
++    for db in dbs:
++        if search_results:
++            db.mmseqs_result = Path(search_results) / f"{db.name}_results.tsv"
++            if not db.mmseqs_result.exists():
++                raise FileNotFoundError(
++                    f"No search results for {db.name}: {db.mmseqs_result}")
++            continue
++
++        search_path = output_path / "database_search"
++        search_path.mkdir(exist_ok=True)
++        db.mmseqs_result = search_path / f"{db.name}_results.tsv"
++        with timed("search", database=db.name):
++            hits = query_file.search(db.mmseqs_db,
++                                     mmseqs_sensitivity=mmseqs_sensitivity,
++                                     eval=max_eval,
++                                     tmpdir=tmpdir,
++                                     threads=threads)
++            hits = hits.apply_filters(min_cov=min_coverage,
++                                      min_bits=min_bits,
++                                      min_ident=min_ident)
++            hits.find_best_matches(k=None).save(db.mmseqs_result)
++
++    identity_bins = list(identity_bins)
++    bin_names = [
++        f"identity_bin_{low:.2f}-{high:.2f}" for low, high in identity_bins
++    ]
++    for db in dbs:
++        with timed("hit_selection", database=db.name):
++            hits = MMseqsResult.from_best_matches(db.mmseqs_result).result_arr
++            for bin_name, identity_bin in zip(bin_names, identity_bins):
++                selected = select_hits(hits,
++                                       identity_bin,
++                                       selection=selection,
++                                       drop_self_hits=drop_self_hits,
++                                       seed=seed)
++                hits_path = output_path / bin_name / "hits" / f"{db.name}.tsv"
++                hits_path.parent.mkdir(parents=True, exist_ok=True)
++                MMseqsResult(rfn.repack_fields(selected[MMSEQS_COLUMNS]),
++                             query_file.filepath, db.mmseqs_db).save(hits_path)
++
++    for bin_name in bin_names:
++        bin_path = output_path / bin_name
++        logger.info("Processing %s.", bin_name)
++        bin_dbs = [
++            dataclasses.replace(db,
++                                mmseqs_result=bin_path / "hits" /
++                                f"{db.name}.tsv") for db in dbs
++        ]
++
++        with timed("alignment", identity_bin=bin_name):
++            alignments = align_database_hits(
++                bin_dbs,
++                alignment_gap_open=alignment_gap_open,
++                alignment_gap_extend=alignment_gap_extend,
++                scoring_matrix=scoring_matrix,
++                threads=threads)
++        for db in bin_dbs:
++            write_alignments(bin_path / "alignments" / f"{db.name}.tsv",
++                             alignments[db.name])
++
++        with timed("templates", identity_bin=bin_name):
++            templates = select_templates(
++                query_file,
++                bin_dbs,
++                alignments,
++                min_identity=alignment_min_identity,
++                min_coverage=alignment_min_coverage,
++                structures_path=(bin_path /
++                                 "structures" if save_structures else None),
++                threads=threads)
++
++        for gc in generate_contacts:
++            gc_path = bin_path / f"generate_contacts_{gc}"
++            gc_path.mkdir(parents=True, exist_ok=True)
++            with timed("contact_maps",
++                       identity_bin=bin_name,
++                       generate_contacts=gc):
++                aligned_cmaps = build_contact_maps(
++                    templates,
++                    angstrom_contact_threshold=angstrom_contact_threshold,
++                    generate_contacts=gc,
++                    threads=threads)
++            if save_cmaps:
++                save_contact_maps(aligned_cmaps, gc_path / "contact_maps")
++
++            if not weights:
++                aligned = {aln.query_name for aln, _ in aligned_cmaps}
++                write_alignment_summary(
++                    gc_path / "alignment_summary.tsv", aligned_cmaps,
++                    [q for q in query_file.sequences if q not in aligned])
++                continue
++
++            with timed("prediction",
++                       identity_bin=bin_name,
++                       generate_contacts=gc):
++                predict_from_contact_maps(query_file,
++                                          aligned_cmaps,
++                                          deepfri_models_config,
++                                          deepfri_processing_modes,
++                                          gc_path,
++                                          threads=threads,
++                                          skip_matrix=skip_matrix)
++
++    logger.info("Benchmark finished successfully.")
+diff --git a/mDeepFRI/cli.py b/mDeepFRI/cli.py
+index 99c26d0..5b21656 100644
+--- a/mDeepFRI/cli.py
++++ b/mDeepFRI/cli.py
+@@ -4,6 +4,7 @@
+ This module provides the Click-based CLI for the Metagenomic-DeepFRI pipeline,
+ including commands for:
+ - Protein function prediction (predict-function)
++- Benchmarking of structure retrieval (benchmark)
+ - Model weight downloading (get-models)
+ - Utility operations (calculate-contact-map)
+ 
+@@ -14,6 +15,7 @@
+     cli: Main command group
+     get_models: Download DeepFRI model weights
+     predict_function: Run protein function prediction pipeline
++    benchmark: Run the pipeline over identity bins of database hits
+     calculate_contact_map: Generate contact map from structure file
+ 
+ Functions:
+@@ -34,6 +36,7 @@
+ from click.exceptions import UsageError
+ from click.utils import echo
+ 
++from mDeepFRI.benchmark import run_benchmark
+ from mDeepFRI.bio_utils import (calculate_contact_map,
+                                 get_residues_coordinates, load_structure)
+ from mDeepFRI.pipeline import (hierarchical_database_search, load_query_file,
+@@ -130,13 +133,6 @@ def search_options(function):
+         is_flag=True,
+         help="Overwrite existing files.",
+     )
+-    @click.option(
+-        "--top-k",
+-        default=5,
+-        type=int,
+-        show_default=True,
+-        help="Number of top MMseqs2 hits to save.",
+-    )
+     @click.option(
+         "--mmseqs-min-coverage",
+         default=0.9,
+@@ -221,6 +217,99 @@ def wrapper(*args, **kwargs):
+     return wrapper
+ 
+ 
++top_k_option = click.option(
++    "--top-k",
++    default=5,
++    type=int,
++    show_default=True,
++    help="Number of top MMseqs2 hits to save.",
++)
++
++
++def prediction_options(function):
++    """
++    A decorator to apply click options for contact map
++    construction and function prediction to a command.
++    """
++    @click.option(
++        "-p",
++        "--processing-modes",
++        default=["bp", "cc", "ec", "mf"],
++        type=click.Choice(["bp", "cc", "ec", "mf"]),
++        multiple=True,
++        help="Processing modes. Default is all"
++        "(biological process, cellular component, enzyme comission, molecular function).",
++    )
++    @click.option(
++        "-a",
++        "--angstrom-contact-thresh",
++        default=6,
++        type=float,
++        help="Angstrom contact threshold. Default is 6.",
++    )
++    @click.option(
++        "--alignment-gap-open",
++        default=10,
++        type=int,
++        help="Gap open penalty for contact map alignment.",
++    )
++    @click.option(
++        "--alignment-gap-extend",
++        default=1,
++        type=int,
++        help="Gap extend penalty for contact map alignment.",
++    )
++    @click.option(
++        "--alignment-min-identity",
++        default=0.0,
++        type=click.FloatRange(0, 1),
++        show_default=True,
++        help="Minimum identity of the global alignment for a structural "
++        "template. 0 disables the filter.",
++    )
++    @click.option(
++        "--alignment-min-coverage",
++        default=0.0,
++        type=click.FloatRange(0, 1),
++        show_default=True,
++        help="Minimum query coverage of the global alignment for a "
++        "structural template. 0 disables the filter.",
++    )
++    @click.option(
++        "--save-structures",
++        default=False,
++        type=bool,
++        is_flag=True,
++        help="Save structures of the top hits.",
++    )
++    @click.option(
++        "--save-cmaps",
++        default=False,
++        type=bool,
++        is_flag=True,
++        help="Save contact maps of the top hits.",
++    )
++    @click.option(
++        "--skip-matrix",
++        default=False,
++        type=bool,
++        is_flag=True,
++        help="Skip writing prediction matrix files (saves disk space).",
++    )
++    @click.option(
++        "--scoring-matrix",
++        default="VTML80",
++        type=str,
++        show_default=True,
++        help="Scoring matrix for sequence alignment (e.g., VTML80, BLOSUM62).",
++    )
++    @wraps(function)
++    def wrapper(*args, **kwargs):
++        return function(*args, **kwargs)
++
++    return wrapper
++
++
+ @click.group()
+ @click.option("--debug/--no-debug", default=False)
+ @click.version_option(version=importlib.metadata.version("mDeepFRI"))
+@@ -302,6 +391,7 @@ def generate_config(weights_path, version):
+ 
+ @main.command
+ @search_options
++@top_k_option
+ @click.pass_context
+ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+                      min_length, max_length, mmseqs_min_bitscore,
+@@ -336,6 +426,8 @@ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+ 
+ @main.command()
+ @search_options
++@top_k_option
++@prediction_options
+ @click.option(
+     "-w",
+     "--weights",
+@@ -346,40 +438,12 @@ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+                     path_type=Path),
+     help="Path to a folder containing model weights.",
+ )
+-@click.option(
+-    "-p",
+-    "--processing-modes",
+-    default=["bp", "cc", "ec", "mf"],
+-    type=click.Choice(["bp", "cc", "ec", "mf"]),
+-    multiple=True,
+-    help="Processing modes. Default is all"
+-    "(biological process, cellular component, enzyme comission, molecular function).",
+-)
+-@click.option(
+-    "-a",
+-    "--angstrom-contact-thresh",
+-    default=6,
+-    type=float,
+-    help="Angstrom contact threshold. Default is 6.",
+-)
+ @click.option(
+     "--generate-contacts",
+     default=2,
+     type=int,
+     help="Gap fill threshold during contact map alignment.",
+ )
+-@click.option(
+-    "--alignment-gap-open",
+-    default=10,
+-    type=int,
+-    help="Gap open penalty for contact map alignment.",
+-)
+-@click.option(
+-    "--alignment-gap-extend",
+-    default=1,
+-    type=int,
+-    help="Gap extend penalty for contact map alignment.",
+-)
+ @click.option(
+     "--remove-intermediate",
+     default=False,
+@@ -387,34 +451,6 @@ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+     is_flag=True,
+     help="Remove intermediate files.",
+ )
+-@click.option(
+-    "--save-structures",
+-    default=False,
+-    type=bool,
+-    is_flag=True,
+-    help="Save structures of the top hits.",
+-)
+-@click.option(
+-    "--save-cmaps",
+-    default=False,
+-    type=bool,
+-    is_flag=True,
+-    help="Save contact maps of the top hits.",
+-)
+-@click.option(
+-    "--skip-matrix",
+-    default=False,
+-    type=bool,
+-    is_flag=True,
+-    help="Skip writing prediction matrix files (saves disk space).",
+-)
+-@click.option(
+-    "--scoring-matrix",
+-    default="VTML80",
+-    type=str,
+-    show_default=True,
+-    help="Scoring matrix for sequence alignment (e.g., VTML80, BLOSUM62).",
+-)
+ @click.option(
+     "--custom-mapping",
+     default=None,
+@@ -446,16 +482,15 @@ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+     "the file will be downloaded automatically to the output directory.",
+ )
+ @click.pass_context
+-def predict_function(ctx, input, db_path, weights, output, processing_modes,
+-                     angstrom_contact_thresh, generate_contacts,
+-                     mmseqs_sensitivity, mmseqs_min_bitscore,
+-                     mmseqs_max_evalue, mmseqs_min_identity,
+-                     mmseqs_min_coverage, top_k, alignment_gap_open,
+-                     alignment_gap_extend, remove_intermediate, overwrite,
+-                     threads, skip_pdb, min_length, max_length, tmpdir,
+-                     save_structures, save_cmaps, skip_matrix, scoring_matrix,
+-                     custom_mapping, write_metadata, propagate_go_terms,
+-                     obo_path):
++def predict_function(
++        ctx, input, db_path, weights, output, processing_modes,
++        angstrom_contact_thresh, generate_contacts, mmseqs_sensitivity,
++        mmseqs_min_bitscore, mmseqs_max_evalue, mmseqs_min_identity,
++        mmseqs_min_coverage, top_k, alignment_gap_open, alignment_gap_extend,
++        remove_intermediate, overwrite, threads, skip_pdb, min_length,
++        max_length, tmpdir, save_structures, save_cmaps, skip_matrix,
++        scoring_matrix, alignment_min_identity, alignment_min_coverage,
++        custom_mapping, write_metadata, propagate_go_terms, obo_path):
+     """Predict protein function from sequence."""
+ 
+     logger.info("Starting Metagenomic-DeepFRI.")
+@@ -531,7 +566,127 @@ def predict_function(ctx, input, db_path, weights, output, processing_modes,
+         write_metadata=write_metadata,
+         custom_mapping_file=str(custom_mapping) if custom_mapping else None,
+         propagate_go_terms=propagate_go_terms,
+-        obo_path=obo_path)
++        obo_path=obo_path,
++        alignment_min_identity=alignment_min_identity,
++        alignment_min_coverage=alignment_min_coverage)
++
++
++@main.command(context_settings={"default_map": {"mmseqs_min_identity": 0.0}})
++@search_options
++@prediction_options
++@click.option(
++    "-w",
++    "--weights",
++    default=None,
++    type=click.Path(exists=True,
++                    dir_okay=True,
++                    file_okay=False,
++                    path_type=Path),
++    help="Path to a folder containing model weights. "
++    "Without weights, only contact maps are built.",
++)
++@click.option(
++    "--generate-contacts",
++    default=[2],
++    type=int,
++    multiple=True,
++    show_default=True,
++    help="Gap fill threshold during contact map alignment. "
++    "Can be given multiple times.",
++)
++@click.option(
++    "--identity-bin",
++    default=[(0.0, 1.01)],
++    type=(float, float),
++    multiple=True,
++    show_default=True,
++    help="MMseqs2 identity range LOW HIGH of the hits, LOW inclusive and "
++    "HIGH exclusive. Can be given multiple times.",
++)
++@click.option(
++    "--hit-selection",
++    default="bitscore",
++    type=click.Choice(["bitscore", "random"]),
++    show_default=True,
++    help="Keep the hit with the highest bitscore or a random hit "
++    "per query, database and identity bin.",
++)
++@click.option(
++    "--seed",
++    default=0,
++    type=int,
++    show_default=True,
++    help="Random seed for --hit-selection random.",
++)
++@click.option(
++    "--drop-self-hits/--keep-self-hits",
++    default=True,
++    show_default=True,
++    help="Discard hits to the query itself, e.g. its own AlphaFold model.",
++)
++@click.option(
++    "--search-results",
++    default=None,
++    type=click.Path(exists=True,
++                    file_okay=False,
++                    dir_okay=True,
++                    path_type=Path),
++    help="Directory with <db>_results.tsv files of a previous benchmark, "
++    "used instead of searching the databases.",
++)
++@click.pass_context
++def benchmark(ctx, input, output, db_path, weights, processing_modes,
++              angstrom_contact_thresh, generate_contacts, mmseqs_sensitivity,
++              mmseqs_min_bitscore, mmseqs_max_evalue, mmseqs_min_identity,
++              mmseqs_min_coverage, alignment_gap_open, alignment_gap_extend,
++              alignment_min_identity, alignment_min_coverage, overwrite,
++              threads, skip_pdb, min_length, max_length, tmpdir,
++              save_structures, save_cmaps, skip_matrix, scoring_matrix,
++              identity_bin, hit_selection, seed, drop_self_hits,
++              search_results):
++    """
++    Benchmark structure retrieval over identity bins of MMseqs2 hits.
++
++    Every database is searched with every query once. Each identity bin keeps
++    one hit per query and database, and contact maps are built and used for
++    prediction for every --generate-contacts value.
++    """
++
++    log_command_params(ctx)
++
++    query_file = load_query_file(query_file=input,
++                                 min_length=min_length,
++                                 max_length=max_length)
++
++    run_benchmark(query_file,
++                  output,
++                  databases=db_path,
++                  identity_bins=identity_bin,
++                  generate_contacts=generate_contacts,
++                  weights=weights,
++                  deepfri_processing_modes=processing_modes,
++                  search_results=search_results,
++                  skip_pdb=skip_pdb,
++                  overwrite=overwrite,
++                  mmseqs_sensitivity=mmseqs_sensitivity,
++                  min_bits=mmseqs_min_bitscore,
++                  max_eval=mmseqs_max_evalue,
++                  min_ident=mmseqs_min_identity,
++                  min_coverage=mmseqs_min_coverage,
++                  selection=hit_selection,
++                  drop_self_hits=drop_self_hits,
++                  seed=seed,
++                  alignment_gap_open=alignment_gap_open,
++                  alignment_gap_extend=alignment_gap_extend,
++                  scoring_matrix=scoring_matrix,
++                  alignment_min_identity=alignment_min_identity,
++                  alignment_min_coverage=alignment_min_coverage,
++                  angstrom_contact_threshold=angstrom_contact_thresh,
++                  save_structures=save_structures,
++                  save_cmaps=save_cmaps,
++                  skip_matrix=skip_matrix,
++                  tmpdir=tmpdir,
++                  threads=threads)
+ 
+ 
+ @main.command()
+diff --git a/mDeepFRI/mmseqs.py b/mDeepFRI/mmseqs.py
+index 8f6b4c0..536d5d4 100644
+--- a/mDeepFRI/mmseqs.py
++++ b/mDeepFRI/mmseqs.py
+@@ -44,6 +44,10 @@
+ 
+ MMSEQS_PATH = Path(mDeepFRI.__path__[0]).parent / "mmseqs" / "bin" / "mmseqs"
+ FOLDCOMP_PATH = Path(mDeepFRI.__path__[0]).parent / "foldcomp_bin"
++MMSEQS_COLUMNS = [
++    "query", "target", "fident", "alnlen", "mismatch", "gapopen", "qstart",
++    "qend", "tstart", "tend", "qcov", "tcov", "evalue", "bits"
++]
+ STRING_COLUMNS = ("query", "target", "query_file", "database_file")
+ 
+ 
+@@ -195,11 +199,7 @@ def _convertalis(query_db: str,
+                  threads: int,
+                  columns: list[str] | None = None):
+     if columns is None:
+-        columns = [
+-            "query", "target", "fident", "alnlen", "mismatch", "gapopen",
+-            "qstart", "qend", "tstart", "tend", "qcov", "tcov", "evalue",
+-            "bits"
+-        ]
++        columns = MMSEQS_COLUMNS
+     args = ",".join(columns)
+     run_command(
+         f"{MMSEQS_PATH} convertalis {query_db} {target_db} {result_db} {output_file} --format-mode 4 "
+@@ -370,13 +370,14 @@ def apply_filters(self,
+         return self.apply_mask(mask)
+ 
+     def find_best_matches(self,
+-                          k: int = 5,
++                          k: Optional[int] = 5,
+                           threads: int = 1) -> "MMseqsResult":
+         """
+         Selects k best matches for each query sequence based on bit score and identity.
+ 
+         Args:
+-            k (int): Number of best matches to select.
++            k (int, optional): Number of best matches to select. If None, all
++                matches are kept.
+             threads (int): Number of threads to use.
+ 
+         Returns:
+@@ -389,6 +390,10 @@ def select_top_k(query, db, k=30):
+         self.result_arr.sort(order=["query", "bits", "fident"],
+                              kind="quicksort")
+ 
++        if k is None:
++            return MMseqsResult(self.result_arr[::-1], self.query_fasta,
++                                self.database)
++
+         select_top = partial(select_top_k, db=self.result_arr[::-1], k=k)
+         # select k best hits
+         top_k = []
+diff --git a/mDeepFRI/pipeline.py b/mDeepFRI/pipeline.py
+index 1dd702c..34d35d6 100644
+--- a/mDeepFRI/pipeline.py
++++ b/mDeepFRI/pipeline.py
+@@ -142,6 +142,44 @@ def load_query_file(query_file: str,
+     return query_file
+ 
+ 
++def load_databases(databases: Iterable[str] = (),
++                   skip_pdb: bool = False,
++                   overwrite: bool = False,
++                   threads: int = 1) -> List[Database]:
++    """
++    Prepare PDB100 and FoldComp databases for MMseqs2 searches.
++
++    Args:
++        databases (Iterable[str], optional): Paths to FoldComp databases.
++        skip_pdb (bool, optional): Skip the PDB100 database. Defaults to False.
++        overwrite (bool, optional): Rebuild existing database files.
++            Defaults to False.
++        threads (int, optional): Number of threads. Defaults to 1.
++
++    Returns:
++        List[Database]: Databases in search order, PDB100 first.
++    """
++    dbs = []
++    # PDB100 database
++    if not skip_pdb:
++        logger.info("Creating PDB100 database.")
++        pdb100 = create_pdb_mmseqs(threads=threads)
++        dbs.append(pdb100)
++        logger.info("PDB100 database created.")
++
++    for database in databases:
++        database = pathlib.Path(database)
++        db = build_database(
++            input_path=database,
++            output_path=database.parent,
++            overwrite=overwrite,
++            threads=threads,
++        )
++        dbs.append(db)
++
++    return dbs
++
++
+ def hierarchical_database_search(query_file: QueryFile,
+                                  output_path: str,
+                                  databases: Iterable[str] = [],
+@@ -224,23 +262,10 @@ def hierarchical_database_search(query_file: QueryFile,
+     for idx, seq in query_file.filtered_out.items():
+         logger.info(f"Skipping {idx}; sequence length {len(seq)} aa.")
+ 
+-    dbs = []
+-    # PDB100 database
+-    if not skip_pdb:
+-        logger.info("Creating PDB100 database.")
+-        pdb100 = create_pdb_mmseqs(threads=threads)
+-        dbs.append(pdb100)
+-        logger.info("PDB100 database created.")
+-
+-    for database in databases:
+-        database = pathlib.Path(database)
+-        db = build_database(
+-            input_path=database,
+-            output_path=database.parent,
+-            overwrite=overwrite,
+-            threads=threads,
+-        )
+-        dbs.append(db)
++    dbs = load_databases(databases=databases,
++                         skip_pdb=skip_pdb,
++                         overwrite=overwrite,
++                         threads=threads)
+ 
+     aligned_total = 0
+     pdb_hits = set()
+@@ -530,6 +555,209 @@ def _run_prediction_loop(predictor, data_iterable: iter, data_len: int,
+         tsv_writer.writerow(out_row)
+ 
+ 
++def align_database_hits(databases: Tuple[Database],
++                        alignment_gap_open: float = 10,
++                        alignment_gap_extend: float = 1,
++                        scoring_matrix: str = "VTML80",
++                        threads: int = 1) -> Dict[str, List[AlignmentResult]]:
++    """
++    Globally align queries to their MMseqs2 hits in each database.
++
++    Args:
++        databases (Tuple[Database]): Databases with MMseqs2 results.
++        alignment_gap_open (float, optional): Gap open penalty. Defaults to 10.
++        alignment_gap_extend (float, optional): Gap extension penalty.
++            Defaults to 1.
++        scoring_matrix (str, optional): Scoring matrix. Defaults to "VTML80".
++        threads (int, optional): Number of threads. Defaults to 1.
++
++    Returns:
++        Dict[str, List[AlignmentResult]]: Best-scoring alignment per query,
++            keyed by database name.
++    """
++    alignments = {}
++    for db in databases:
++        alignments[db.name] = align_mmseqs_results(
++            best_matches_filepath=db.mmseqs_result,
++            sequence_db=db.sequence_db,
++            alignment_gap_open=alignment_gap_open,
++            alignment_gap_extend=alignment_gap_extend,
++            threads=threads,
++            scoring_matrix=scoring_matrix)
++        for aln in alignments[db.name]:
++            aln.db_name = db.name
++
++    return alignments
++
++
++def select_templates(query_file: QueryFile,
++                     databases: Tuple[Database],
++                     alignments: Dict[str, List[AlignmentResult]],
++                     min_identity: float = 0.0,
++                     min_coverage: float = 0.0,
++                     structures_path: Optional[pathlib.Path] = None,
++                     threads: int = 1) -> List[AlignmentResult]:
++    """
++    Select one structural template per query, preferring earlier databases.
++
++    Alignments below the identity or query coverage thresholds are discarded.
++    Queries whose template coordinates cannot be retrieved fall through to
++    the next database.
++
++    Args:
++        query_file (QueryFile): Query sequences.
++        databases (Tuple[Database]): Databases in order of preference.
++        alignments (Dict[str, List[AlignmentResult]]): Alignments per database
++            from `align_database_hits`.
++        min_identity (float, optional): Minimum alignment identity.
++            Defaults to 0.0.
++        min_coverage (float, optional): Minimum query coverage of the
++            alignment. Defaults to 0.0.
++        structures_path (Path, optional): Directory to save template
++            structures in, one subdirectory per database. Defaults to None.
++        threads (int, optional): Number of threads. Defaults to 1.
++
++    Returns:
++        List[AlignmentResult]: Templates with C-alpha coordinates.
++    """
++    templates = []
++    for db in databases:
++        templated = {aln.query_name for aln in templates}
++        passing = [
++            aln for aln in alignments[db.name]
++            if aln.query_identity >= min_identity
++            and aln.query_coverage >= min_coverage
++        ]
++        new_alignments = {
++            aln.query_name: aln
++            for aln in passing if aln.query_name not in templated
++            and aln.query_name in query_file.sequences
++        }
++
++        # remove broken structures
++        if db.name == "highquality_clust30":
++            data_path = pathlib.Path(__file__).parent / "assets"
++            # convert to abspath
++            data_path = data_path.resolve()
++            with open(data_path / "highquality_clust30_error_ids.pkl",
++                      "rb") as f:
++                error_ids = pickle.load(f)
++            # filter out broken structures
++            new_alignments = {
++                query_name: aln
++                for query_name, aln in new_alignments.items()
++                if aln.target_name not in error_ids
++            }
++
++        if not new_alignments:
++            logger.info("No alignments found for %s.", db.name)
++            continue
++
++        query_ids = [aln.query_name for aln in new_alignments.values()]
++        target_ids = [
++            aln.target_name.rsplit(".", 1)[0]
++            for aln in new_alignments.values()
++        ]
++
++        if structures_path:
++            save_dir = structures_path / db.name
++            save_dir.mkdir(parents=True, exist_ok=True)
++        else:
++            save_dir = None
++
++        # extract structural information
++        # in form of C-alpha coordinates
++        coords = extract_calpha_coords(db,
++                                       target_ids,
++                                       query_ids,
++                                       save_directory=save_dir,
++                                       threads=threads)
++
++        for aln, coord in zip(new_alignments.values(), coords):
++            aln.coords = coord
++
++        db_templates = [
++            aln for aln in new_alignments.values() if aln.coords is not None
++        ]
++        templates.extend(db_templates)
++        logger.info("Found templates for %d/%d proteins in %s (%d in total).",
++                    len(db_templates), len(query_file.sequences), db.name,
++                    len(templates))
++
++    return templates
++
++
++def build_contact_maps(
++        templates: List[AlignmentResult],
++        angstrom_contact_threshold: float = 6,
++        generate_contacts: int = 2,
++        threads: int = 1) -> List[Tuple[AlignmentResult, np.ndarray]]:
++    """
++    Transfer template contact maps onto the aligned queries.
++
++    Args:
++        templates (List[AlignmentResult]): Templates from `select_templates`.
++        angstrom_contact_threshold (float, optional): Distance threshold for
++            contacts. Defaults to 6.
++        generate_contacts (int, optional): Number of neighbours connected to
++            residues inserted in the query. Defaults to 2.
++        threads (int, optional): Number of threads. Defaults to 1.
++
++    Returns:
++        List[Tuple[AlignmentResult, np.ndarray]]: Alignments with query
++            contact maps; failed maps are omitted.
++    """
++    partial_map_align = partial(build_align_contact_map,
++                                threshold=angstrom_contact_threshold,
++                                generated_contacts=generate_contacts)
++
++    with Pool(threads) as p:
++        cmaps = list(p.map(partial_map_align, templates))
++
++    return [cmap for cmap in cmaps if cmap[1] is not None]
++
++
++def save_contact_maps(aligned_cmaps: List[Tuple[AlignmentResult, np.ndarray]],
++                      cmap_dir: pathlib.Path) -> None:
++    """
++    Save contact maps as `<query>.npy` files.
++
++    Args:
++        aligned_cmaps (List[Tuple[AlignmentResult, np.ndarray]]): Alignments
++            with query contact maps.
++        cmap_dir (Path): Output directory.
++    """
++    cmap_dir.mkdir(parents=True, exist_ok=True)
++    for aln, cmap in aligned_cmaps:
++        np.save(cmap_dir / f"{aln.query_name}.npy", cmap)
++
++
++def write_alignment_summary(path: pathlib.Path,
++                            aligned_cmaps: List[Tuple[AlignmentResult,
++                                                      np.ndarray]],
++                            unaligned_queries: Iterable[str]) -> None:
++    """
++    Write the template used for each query.
++
++    Args:
++        path (Path): Output TSV file.
++        aligned_cmaps (List[Tuple[AlignmentResult, np.ndarray]]): Alignments
++            with query contact maps.
++        unaligned_queries (Iterable[str]): Queries without a template.
++    """
++    with open(path, "w", encoding="utf-8") as aln_output:
++        tsv_writer = csv.writer(aln_output, delimiter="\t")
++        tsv_writer.writerow(ALIGNMENT_HEADER)
++        for aln, _ in aligned_cmaps:
++            tsv_writer.writerow([
++                aln.query_name, True, aln.target_name, aln.db_name,
++                aln.query_identity, aln.query_coverage, aln.target_coverage
++            ])
++        for query_id in unaligned_queries:
++            tsv_writer.writerow(
++                [query_id, False, np.nan, np.nan, np.nan, np.nan, np.nan])
++
++
+ def predict_protein_function(
+         query_file: QueryFile,
+         databases: Tuple[Database],
+@@ -551,7 +779,9 @@ def predict_protein_function(
+         write_metadata: bool = False,
+         custom_mapping_file: Optional[str] = None,
+         propagate_go_terms: bool = False,
+-        obo_path: Optional[str] = None):
++        obo_path: Optional[str] = None,
++        alignment_min_identity: float = 0.0,
++        alignment_min_coverage: float = 0.0):
+     """
+     Predict protein function using DeepFRI.
+ 
+@@ -613,6 +843,10 @@ def predict_protein_function(
+         obo_path (str, optional): Path to GO OBO file (go-basic.obo).
+             If None and propagate_go_terms is True, the file is downloaded
+             to the output directory automatically.
++        alignment_min_identity (float, optional): Minimum identity of the
++            global alignment for a structural template. Defaults to 0.0.
++        alignment_min_coverage (float, optional): Minimum query coverage of
++            the global alignment for a structural template. Defaults to 0.0.
+ 
+     Returns:
+         None: Results are written to files in output_path.
+@@ -627,12 +861,9 @@ def predict_protein_function(
+     deepfri_processing_modes = _initialize_processing_modes(
+         deepfri_processing_modes, deepfri_models_config)
+ 
+-    weights = pathlib.Path(weights)
+     output_path = pathlib.Path(output_path)
+     output_path.mkdir(parents=True, exist_ok=True)
+ 
+-    aligned_cmaps = []
+-
+     # Use custom mapping if provided, otherwise use hierarchical database search
+     if custom_mapping_file:
+         logger.info(
+@@ -648,141 +879,98 @@ def predict_protein_function(
+             generate_contacts=generate_contacts,
+             threads=threads)
+     else:
+-        # Standard hierarchical database search
+-        for db in databases:
+-            # SEQUENCE ALIGNMENT
+-            # calculate already aligned sequences
+-            alignments = align_mmseqs_results(
+-                best_matches_filepath=db.mmseqs_result,
+-                sequence_db=db.sequence_db,
+-                alignment_gap_open=alignment_gap_open,
+-                alignment_gap_extend=alignment_gap_continuation,
+-                threads=threads,
+-                scoring_matrix=scoring_matrix)
+-
+-            try:
+-                # set a db name for alignments
+-                for aln in alignments:
+-                    aln.db_name = db.name
+-
+-                aligned_queries = [aln[0].query_name for aln in aligned_cmaps]
+-                new_alignments = {
+-                    aln.query_name: aln
+-                    for aln in alignments
+-                    if aln.query_name not in aligned_queries
+-                    and aln.query_name in query_file.sequences
+-                }
+-
+-                # CONTACT MAP ALIGNMENT
+-                # initially designed as a separate step
+-                # some protein structures in PDB are not formatted correctly
+-                # so contact map alignment fails for them
+-                # for this cases we replace closest experimental structure with
+-                # closest predicted structure if available
+-                # if no alignments were found - report
+-
+-                # remove broken structures
+-                if db.name == "highquality_clust30":
+-                    data_path = pathlib.Path(__file__).parent / "assets"
+-                    # convert to abspath
+-                    data_path = data_path.resolve()
+-                    with open(data_path / "highquality_clust30_error_ids.pkl",
+-                              "rb") as f:
+-                        error_ids = pickle.load(f)
+-                    # filter out broken structures
+-                    new_alignments = {
+-                        query_name: aln
+-                        for query_name, aln in new_alignments.items()
+-                        if aln.target_name not in error_ids
+-                    }
++        alignments = align_database_hits(
++            databases,
++            alignment_gap_open=alignment_gap_open,
++            alignment_gap_extend=alignment_gap_continuation,
++            scoring_matrix=scoring_matrix,
++            threads=threads)
++        templates = select_templates(
++            query_file,
++            databases,
++            alignments,
++            min_identity=alignment_min_identity,
++            min_coverage=alignment_min_coverage,
++            structures_path=(output_path /
++                             "structures" if save_structures else None),
++            threads=threads)
++        aligned_cmaps = build_contact_maps(
++            templates,
++            angstrom_contact_threshold=angstrom_contact_threshold,
++            generate_contacts=generate_contacts,
++            threads=threads)
+ 
+-                query_ids = [aln.query_name for aln in new_alignments.values()]
+-                target_ids = [
+-                    aln.target_name.rsplit(".", 1)[0]
+-                    for aln in new_alignments.values()
+-                ]
+-
+-                # extract structural information
+-                # in form of C-alpha coordinates
+-                if save_structures:
+-                    save_dir = output_path / "structures" / db.name
+-                    save_dir.mkdir(parents=True, exist_ok=True)
+-                else:
+-                    save_dir = None
++    if save_cmaps:
++        save_contact_maps(aligned_cmaps, output_path / "contact_maps")
++
++    predict_from_contact_maps(query_file,
++                              aligned_cmaps,
++                              deepfri_models_config,
++                              deepfri_processing_modes,
++                              output_path,
++                              threads=threads,
++                              skip_matrix=skip_matrix,
++                              command_str=command_str,
++                              version=version,
++                              write_metadata=write_metadata,
++                              propagate_go_terms=propagate_go_terms,
++                              obo_path=obo_path)
+ 
+-                coords = extract_calpha_coords(db,
+-                                               target_ids,
+-                                               query_ids,
+-                                               save_directory=save_dir,
+-                                               threads=threads)
++    if remove_intermediate:
++        for db in databases:
++            remove_intermediate_files([db.sequence_db, db.mmseqs_db])
+ 
+-                for aln, coord in zip(new_alignments.values(), coords):
+-                    aln.coords = coord
++    logger.info("meta-DeepFRI finished successfully.")
+ 
+-            # troubleshoot cases where alignments are empty
+-            except IndexError:
+-                logger.info("No alignments found for %s.", db.name)
+-                new_alignments = {}
+-                continue
+ 
+-            # if new alignments are empty - result is empty as well
+-            partial_map_align = partial(build_align_contact_map,
+-                                        threshold=angstrom_contact_threshold,
+-                                        generated_contacts=generate_contacts)
+-
+-            with Pool(threads) as p:
+-                cmaps = list(p.map(partial_map_align, new_alignments.values()))
+-
+-            # filter errored contact maps
+-            # returned as Tuple[AlignmentResult, None] from `retrieve_align_contact_map`
+-            partial_cmaps = [cmap for cmap in cmaps if cmap[1] is not None]
+-            aligned_cmaps.extend(partial_cmaps)
+-            aligned_database = round(
+-                len(partial_cmaps) / len(query_file.sequences) * 100, 2)
+-            aligned_total = round(
+-                len(aligned_cmaps) / len(query_file.sequences) * 100, 2)
+-            logger.info(
+-                f"Aligned {len(partial_cmaps)}/{len(query_file.sequences)} ({aligned_database}%) "
+-                f"proteins against {db.name} [without length ivalid].")
+-            logger.info(
+-                f"Aligned {len(aligned_cmaps)}/{len(query_file.sequences)} ({aligned_total}%) "
+-                "proteins in total [without length invalid].")
++def predict_from_contact_maps(query_file: QueryFile,
++                              aligned_cmaps: List[Tuple[AlignmentResult,
++                                                        np.ndarray]],
++                              deepfri_models_config: Dict[str, Any],
++                              deepfri_processing_modes: List[str],
++                              output_path: pathlib.Path,
++                              threads: int = 1,
++                              skip_matrix: bool = False,
++                              command_str: Optional[str] = None,
++                              version: Optional[str] = None,
++                              write_metadata: bool = False,
++                              propagate_go_terms: bool = False,
++                              obo_path: Optional[str] = None) -> None:
++    """
++    Predict GO terms and write alignment_summary.tsv, prediction matrices and
++    results.tsv.
+ 
+-    if save_cmaps:
+-        cmap_dir = output_path / "contact_maps"
+-        cmap_dir.mkdir(parents=True, exist_ok=True)
+-        for i, (aln, cmap) in enumerate(aligned_cmaps):
+-            cmap_file = cmap_dir / f"{aln.query_name}.npy"
+-            np.save(cmap_file, cmap)
++    Queries with a contact map are predicted with the GCN, all other queries
++    with the CNN.
+ 
+-    aligned_queries = [aln[0].query_name for aln in aligned_cmaps]
++    Args:
++        query_file (QueryFile): Query sequences.
++        aligned_cmaps (List[Tuple[AlignmentResult, np.ndarray]]): Alignments
++            with query contact maps.
++        deepfri_models_config (Dict[str, Any]): Loaded model configuration.
++        deepfri_processing_modes (List[str]): Modes to predict.
++        output_path (Path): Output directory.
++        threads (int, optional): Number of threads. Defaults to 1.
++        skip_matrix (bool, optional): Skip writing prediction matrices.
++            Defaults to False.
++        command_str (str, optional): Command line written with metadata.
++        version (str, optional): Version written with metadata.
++        write_metadata (bool, optional): Prepend '##' metadata lines to
++            results.tsv. Defaults to False.
++        propagate_go_terms (bool, optional): Write propagated GO terms to
++            results_propagated.tsv. Defaults to False.
++        obo_path (str, optional): Path to go-basic.obo; downloaded if None.
++    """
++    aligned_queries = {aln.query_name for aln, _ in aligned_cmaps}
+     unaligned_queries = {
+         query_id: seq
+         for query_id, seq in query_file.sequences.items()
+         if query_id not in aligned_queries
+     }
+ 
+-    if custom_mapping_file and unaligned_queries:
+-        logger.info(
+-            "Predicting %d protein(s) with CNN (sequence-only): %s",
+-            len(unaligned_queries),
+-            ", ".join(unaligned_queries.keys()),
+-        )
+-
+-    # WRITE ALIGNMENT RESULTS
+     alignment_results_file = output_path / "alignment_summary.tsv"
+-
+-    with open(alignment_results_file, "w", encoding="utf-8") as aln_output:
+-        tsv_writer = csv.writer(aln_output, delimiter="\t")
+-        tsv_writer.writerow(ALIGNMENT_HEADER)
+-        for aln, _ in aligned_cmaps:
+-            tsv_writer.writerow([
+-                aln.query_name, True, aln.target_name, aln.db_name,
+-                aln.query_identity, aln.query_coverage, aln.target_coverage
+-            ])
+-        for query_id in unaligned_queries:
+-            tsv_writer.writerow(
+-                [query_id, False, np.nan, np.nan, np.nan, np.nan, np.nan])
++    write_alignment_summary(alignment_results_file, aligned_cmaps,
++                            unaligned_queries)
+ 
+     ### FUNCTION PREDICTION ###
+     # sort cmaps by length of query sequence
+@@ -1049,9 +1237,3 @@ def _open_matrix_sink(filename_suffix: str):
+             output_path=propagated_output,
+             obo_path=obo_file,
+         )
+-
+-    if remove_intermediate:
+-        for db in databases:
+-            remove_intermediate_files([db.sequence_db, db.mmseqs_db])
+-
+-    logger.info("meta-DeepFRI finished successfully.")
+diff --git a/mDeepFRI/tests/__init__.py b/mDeepFRI/tests/__init__.py
+index f48aff5..cb7bf2e 100644
+--- a/mDeepFRI/tests/__init__.py
++++ b/mDeepFRI/tests/__init__.py
+@@ -1,11 +1,12 @@
+-from . import (test_alignment, test_bio_utils, test_cli, test_conctact_map,
+-               test_contact_map_utils, test_go2cog_mapping, test_install,
+-               test_mmseqs, test_pdb, test_pipeline_regression, test_predict,
+-               test_utils, test_vocabulary_mismatch)
++from . import (test_alignment, test_benchmark, test_bio_utils, test_cli,
++               test_conctact_map, test_contact_map_utils, test_go2cog_mapping,
++               test_install, test_mmseqs, test_pdb, test_pipeline_regression,
++               test_predict, test_utils, test_vocabulary_mismatch)
+ 
+ 
+ def load_tests(loader, suite, pattern):
+     suite.addTests(loader.loadTestsFromModule(test_alignment))
++    suite.addTests(loader.loadTestsFromModule(test_benchmark))
+     suite.addTests(loader.loadTestsFromModule(test_bio_utils))
+     suite.addTests(loader.loadTestsFromModule(test_cli))
+     suite.addTests(loader.loadTestsFromModule(test_conctact_map))
+diff --git a/mDeepFRI/tests/test_benchmark.py b/mDeepFRI/tests/test_benchmark.py
+new file mode 100644
+index 0000000..b8a4c10
+--- /dev/null
++++ b/mDeepFRI/tests/test_benchmark.py
+@@ -0,0 +1,68 @@
++import unittest
++
++import numpy as np
++
++from mDeepFRI.benchmark import is_self_hit, select_hits
++
++
++def make_hits(*rows):
++    return np.rec.fromrecords(rows,
++                              names=["query", "target", "fident", "bits"])
++
++
++class TestIsSelfHit(unittest.TestCase):
++    def test_self_hits(self):
++        self.assertTrue(is_self_hit("1abc_A", "1abc_A"))
++        self.assertTrue(is_self_hit("P12345", "AF-P12345-F1-model_v4"))
++        self.assertTrue(
++            is_self_hit("AF-P12345-F1-model_v6", "AF-P12345-F1-model_v4"))
++
++    def test_other_hits(self):
++        self.assertFalse(is_self_hit("P1234", "AF-P12345-F1-model_v4"))
++        self.assertFalse(is_self_hit("1abc_A", "1abc_B"))
++
++
++class TestSelectHits(unittest.TestCase):
++    def test_identity_bin_bounds(self):
++        hits = make_hits(("q1", "t1", 0.5, 100), ("q2", "t2", 0.6, 100),
++                         ("q3", "t3", 0.49, 100))
++        selected = select_hits(hits, (0.5, 0.6))
++        self.assertEqual(selected["query"].tolist(), ["q1"])
++
++    def test_bitscore_ties_broken_by_identity(self):
++        hits = make_hits(("q1", "t1", 0.5, 100), ("q1", "t2", 0.4, 120),
++                         ("q1", "t3", 0.45, 120))
++        selected = select_hits(hits, (0.0, 1.01))
++        self.assertEqual(selected["target"].tolist(), ["t3"])
++
++    def test_self_hits(self):
++        hits = make_hits(("AF-P1-F1-model_v6", "AF-P1-F1-model_v4", 1.0, 500),
++                         ("AF-P1-F1-model_v6", "AF-P2-F1-model_v4", 0.6, 200))
++        dropped = select_hits(hits, (0.0, 1.01))
++        kept = select_hits(hits, (0.0, 1.01), drop_self_hits=False)
++        self.assertEqual(dropped["target"].tolist(), ["AF-P2-F1-model_v4"])
++        self.assertEqual(kept["target"].tolist(), ["AF-P1-F1-model_v4"])
++
++    def test_random_selection_draws_per_query(self):
++        hits = make_hits(("q2", "a", 0.5, 1), ("q1", "b", 0.5, 1),
++                         ("q2", "c", 0.5, 1), ("q1", "d", 0.5, 1),
++                         ("q2", "e", 0.5, 1), ("q3", "f", 0.9, 1))
++        rng = np.random.default_rng(7)
++        expected = []
++        for query in ["q1", "q2", "q3"]:
++            targets = [hit.target for hit in hits if hit.query == query]
++            expected.append(targets[rng.integers(0, len(targets))])
++
++        selected = select_hits(hits, (0.0, 1.01), selection="random", seed=7)
++        self.assertEqual(selected["query"].tolist(), ["q1", "q2", "q3"])
++        self.assertEqual(selected["target"].tolist(), expected)
++
++    def test_empty_bin(self):
++        hits = make_hits(("q1", "t1", 0.5, 100))
++        for selection in ["bitscore", "random"]:
++            selected = select_hits(hits, (0.9, 1.01), selection=selection)
++            self.assertEqual(len(selected), 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mDeepFRI/tests/test_cli.py b/mDeepFRI/tests/test_cli.py
+index 8ef2d49..b99ff3f 100644
+--- a/mDeepFRI/tests/test_cli.py
++++ b/mDeepFRI/tests/test_cli.py
+@@ -43,3 +43,46 @@ def test_search_databases(self):
+             self.assertEqual(result.exit_code, 0, result.exception)
+             self.assertTrue(
+                 (Path(output) / "pdb100_230517_results.tsv").exists())
++
++    def test_benchmark_without_weights(self):
++        """Test that benchmark builds contact maps for every bin and setting."""
++        query = Path(__file__).parent / "data" / "small_query.faa"
++        args = ["benchmark", "-i", str(query), "--save-cmaps"]
++        with TemporaryDirectory() as tmp:
++            output = Path(tmp) / "benchmark"
++            result = self.runner.invoke(
++                main, args + [
++                    "-o",
++                    str(output), "--identity-bin", "0", "0.5",
++                    "--identity-bin", "0.5", "1.01", "--generate-contacts",
++                    "0", "--generate-contacts", "2"
++                ])
++            self.assertEqual(result.exit_code, 0, result.exception)
++
++            bin_path = output / "identity_bin_0.50-1.01"
++            for path in [
++                    output / "timing.tsv",
++                    output / "database_search" / "pdb100_230517_results.tsv",
++                    bin_path / "hits" / "pdb100_230517.tsv",
++                    bin_path / "alignments" / "pdb100_230517.tsv",
++                    output / "identity_bin_0.00-0.50" / "generate_contacts_0" /
++                    "alignment_summary.tsv"
++            ]:
++                self.assertTrue(path.exists(), path)
++            self.assertTrue(
++                list((bin_path / "generate_contacts_2" /
++                      "contact_maps").glob("*.npy")))
++
++            rerun = Path(tmp) / "rerun"
++            result = self.runner.invoke(
++                main, args + [
++                    "-o",
++                    str(rerun), "--identity-bin", "0.5", "1.01",
++                    "--search-results",
++                    str(output / "database_search")
++                ])
++            self.assertEqual(result.exit_code, 0, result.exception)
++            hits = Path(
++                "identity_bin_0.50-1.01") / "hits" / "pdb100_230517.tsv"
++            self.assertEqual((output / hits).read_text(),
++                             (rerun / hits).read_text())
+diff --git a/mDeepFRI/tests/test_pipeline_regression.py b/mDeepFRI/tests/test_pipeline_regression.py
+index 02c7d43..7ba0c74 100644
+--- a/mDeepFRI/tests/test_pipeline_regression.py
++++ b/mDeepFRI/tests/test_pipeline_regression.py
+@@ -5,9 +5,10 @@
+ 
+ import numpy as np
+ 
++from mDeepFRI.alignment import AlignmentResult
+ from mDeepFRI.database import Database
+ from mDeepFRI.pipeline import (FINAL_OUTPUT_HEADER, QueryFile,
+-                               predict_protein_function)
++                               predict_protein_function, select_templates)
+ 
+ 
+ class TestPipelineRegression(unittest.TestCase):
+@@ -510,5 +511,49 @@ def test_metadata_preamble_is_opt_in(
+                                  FINAL_OUTPUT_HEADER)
+ 
+ 
++class TestSelectTemplates(unittest.TestCase):
++    def setUp(self):
++        self.query_file = QueryFile(filepath="query.faa")
++        self.query_file.sequences = {"q1": "AAA", "q2": "AAA"}
++        self.databases = [MagicMock(spec=Database), MagicMock(spec=Database)]
++        self.databases[0].name = "db1"
++        self.databases[1].name = "db2"
++
++        def alignment(query, target, identity):
++            return AlignmentResult(query, "AAA", target, "AAA", "MMM",
++                                   identity, 1.0, 1.0)
++
++        self.alignments = {
++            "db1":
++            [alignment("q1", "low", 0.4),
++             alignment("q2", "broken", 0.9)],
++            "db2": [alignment("q1", "t1", 0.8),
++                    alignment("q2", "t2", 0.9)],
++        }
++
++    @staticmethod
++    def coords(db, targets, queries, **kwargs):
++        return [
++            None if target == "broken" else np.zeros((3, 3))
++            for target in targets
++        ]
++
++    @patch("mDeepFRI.pipeline.extract_calpha_coords", side_effect=coords)
++    def test_fallthrough_to_next_database(self, mock_extract_calpha_coords):
++        templates = select_templates(self.query_file, self.databases,
++                                     self.alignments)
++        self.assertEqual({(t.query_name, t.target_name)
++                          for t in templates}, {("q1", "low"), ("q2", "t2")})
++
++    @patch("mDeepFRI.pipeline.extract_calpha_coords", side_effect=coords)
++    def test_identity_filter(self, mock_extract_calpha_coords):
++        templates = select_templates(self.query_file,
++                                     self.databases,
++                                     self.alignments,
++                                     min_identity=0.5)
++        self.assertEqual({(t.query_name, t.target_name)
++                          for t in templates}, {("q1", "t1"), ("q2", "t2")})
++
++
+ if __name__ == '__main__':
+     unittest.main()

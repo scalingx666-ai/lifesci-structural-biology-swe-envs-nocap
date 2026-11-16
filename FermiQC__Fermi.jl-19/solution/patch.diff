@@ -1,0 +1,142 @@
+diff --git a/src/Core/Geometry.jl b/src/Core/Geometry.jl
+index c4cb527a..3185a10e 100644
+--- a/src/Core/Geometry.jl
++++ b/src/Core/Geometry.jl
+@@ -17,6 +17,12 @@ using Fermi
+ using Fermi.Output
+ using Fermi.PhysicalConstants: atomic_number, bohr_to_angstrom, angstrom_to_bohr
+ using LinearAlgebra
++using Formatting
++
++struct InvalidMolecule <: Exception
++    msg::String
++end
++Base.showerror(io::IO, e::InvalidMolecule) = print(io, "InvalidMolecule: ", e.msg)
+ 
+ """
+     Fermi.Atom
+@@ -117,13 +123,13 @@ function Molecule(atoms::Array{Atom,1}, charge::Int, multiplicity::Int)
+     nelec -= charge
+ 
+     if nelec ≤ 0
+-        throw(Fermi.InvalidFermiOption("Invalid charge ($charge) for given molecule"))
++        throw(Fermi.InvalidMolecule("Invalid charge ($charge) for given molecule"))
+     end
+ 
+     αexcess = multiplicity-1
+ 
+     if isodd(nelec) != isodd(αexcess)
+-        throw(Fermi.InvalidFermiOption("Incompatible charge $(charge) and multiplicity $(multiplicity)"))
++        throw(Fermi.InvalidMolecule("Incompatible charge $(charge) and multiplicity $(multiplicity)"))
+     end
+ 
+     Nβ = (nelec - αexcess)/2
+@@ -165,16 +171,26 @@ function get_atoms(molstring::String; unit::String="angstrom")
+     end
+ 
+     atoms = Atom[]
+-    exp = r"(\w{1,2})\s+([-+]??\d+\.\d+\s+[-+]??\d+\.\d+\s+[-+]??\d+\.\d+)"
++    #exp = r"(\w{1,2})\s+([-+]??\d+\.\d+\s+[-+]??\d+\.\d+\s+[-+]??\d+\.\d+)"
+     for line in split(molstring, "\n")
+-        m = match(exp, line)
++        #m = match(exp, line)
++        m = split(line)
++        if length(m) != 4
++            throw(InvalidMolecule("4 columns expected on XYZ string. Got $(length(m))"))
++        end
++
+         if m != nothing
+             # Convert SubString to String
+-            AtomicSymbol = String(m.captures[1])
++            AtomicSymbol = String(m[1])
+             Z = atomic_number(AtomicSymbol)
+ 
+             # Convert Substring to String and then String to Float64 Array
+-            xyz = parse.(Float64, split(String(m.captures[2]))).*conv
++            xyz = [0.0, 0.0, 0.0]
++            try
++                xyz .= parse.(Float64, m[2:4]).*conv
++            catch ArgumentError
++                throw(InvalidMolecule("Failed to process XYZ string"))
++            end
+ 
+             push!(atoms, Atom(AtomicSymbol, Z, xyz))
+         end
+@@ -194,29 +210,9 @@ function get_xyz(M::Molecule)
+     for i in eachindex(M.atoms)
+ 
+         A = M.atoms[i]
+-        xyz = ["$(A.xyz[1])", "$(A.xyz[2])", "$(A.xyz[3])"]
+-
+-        # Format the string because of OCD
+-
+-        ## Add space in front
+-        for i in eachindex(xyz)
+-            if !(xyz[i][1] in "+-")
+-                xyz[i] = " "*xyz[i]
+-            end
+-        end
+-
+-        ## Equal the length
+-        L = max(map(length, xyz)...)
+-
+-        for i in eachindex(xyz)
+-            while length(xyz[i]) < L
+-                xyz[i] = xyz[i]*"0"
+-            end
+-        end
+-        molstring *= A.AtomicSymbol*"   "*join(xyz, "   ")*"\n"
++        molstring *= format("{}   {: 15.12f}   {: 15.12f}   {: 15.12f}\n", A.AtomicSymbol, A.xyz...)
+     end
+-
+-    return String(strip(molstring))
++    return molstring
+ end
+ 
+ end #Module
+diff --git a/src/Methods/CoupledCluster/ecpT/ijk.jl b/src/Methods/CoupledCluster/ecpT/ijk.jl
+index 9ad9ff35..78814b23 100644
+--- a/src/Methods/CoupledCluster/ecpT/ijk.jl
++++ b/src/Methods/CoupledCluster/ecpT/ijk.jl
+@@ -40,7 +40,6 @@ function ecRCCSDpT{T}() where T <: AbstractFloat
+     @output "Active Virtual Orbitals:  {}\n" actvir
+ 
+     T1, T2, ecT1, ecT2 = cas_decomposition(Casdata, refwfn.ndocc, drop_occ, actocc, actvir, moint.ov, moint.oovv, moint.ovvv, moint.ooov)
+-    t3dets = Casdata[5]
+     Casdata = nothing
+ 
+     d = [i - a for i = diag(moint.oo), a = diag(moint.vv)]
+@@ -52,13 +51,17 @@ function ecRCCSDpT{T}() where T <: AbstractFloat
+     d = nothing
+     D = nothing
+ 
+-    ecRCCSDpT{T}(ecccsd, moint, drop_occ, refwfn.ndocc, t3dets)
++    ecRCCSDpT{T}(ecccsd, moint, actocc.-drop_occ, actvir.-refwfn.ndocc)
+ end
+ 
+-function ecRCCSDpT{T}(ecccsd::ecRCCSD, moint::PhysRestrictedMOIntegrals, frozen::Int, ndocc::Int, casdets::Array{Determinant,1}) where T <: AbstractFloat
++function ecRCCSDpT{T}(ecccsd::ecRCCSD, moint::PhysRestrictedMOIntegrals, cas_holes::Array{Int64,1}, cas_particles::Array{Int64,1}) where T <: AbstractFloat
+ 
+     @output "\n   • Perturbative Triples Started\n\n"
+ 
++    @output "T3 within EC active space are going to be skipped\n"
++    @output "CAS hole space:     {}\n" cas_holes
++    @output "CAS particle space: {}\n\n" cas_particle
++
+     T1 = ecccsd.T1.data
+     T2 = ecccsd.T2.data
+ 
+@@ -153,10 +156,9 @@ function ecRCCSDpT{T}(ecccsd::ecRCCSD, moint::PhysRestrictedMOIntegrals, frozen:
+                     for b in 1:a
+                         δab = Int(a == b)
+                         for c in 1:b
+-
+-                            
+-
+-
++                            if issubset([i,j,k], cas_holes) && issubset([a,b,c], cas_particles)
++                                continue
++                            end
+                             Dd = fo[i] + fo[j] + fo[k] - fv[a] - fv[b] - fv[c]
+                             δbc = Int(b == c)
+                             @inbounds X = (W[a,b,c]*V[a,b,c] + W[a,c,b]*V[a,c,b] + W[b,a,c]*V[b,a,c] + W[b,c,a]*V[b,c,a] + W[c,a,b]*V[c,a,b] + W[c,b,a]*V[c,b,a])

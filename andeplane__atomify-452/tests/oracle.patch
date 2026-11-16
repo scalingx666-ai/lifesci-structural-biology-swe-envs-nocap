@@ -1,0 +1,1075 @@
+diff --git a/src/engine/EngineRegistry.test.ts b/src/engine/EngineRegistry.test.ts
+index 4f7ae93c..e5f40798 100644
+--- a/src/engine/EngineRegistry.test.ts
++++ b/src/engine/EngineRegistry.test.ts
+@@ -13,6 +13,7 @@ describe("EngineRegistry", () => {
+       "Particles",
+       "Bonds",
+       "Colors",
++      "Slice",
+       "Computes",
+       "Fixes",
+       "Variables",
+diff --git a/src/engine/EngineRegistry.ts b/src/engine/EngineRegistry.ts
+index 77790723..2cd6337d 100644
+--- a/src/engine/EngineRegistry.ts
++++ b/src/engine/EngineRegistry.ts
+@@ -17,6 +17,7 @@ import type { Bonds, Particles, Visualizer } from "omovi";
+ import type { LammpsWeb } from "../types";
+ import type Modifier from "../modifiers/modifier";
+ import ColorModifier from "../modifiers/colormodifier";
++import SliceModifier from "../modifiers/slicemodifier";
+ import SyncBondsModifier from "../modifiers/syncbondsmodifier";
+ import SyncComputesModifier from "../modifiers/synccomputesmodifier";
+ import SyncFixesModifier from "../modifiers/syncfixesmodifier";
+@@ -41,6 +42,8 @@ export function createDefaultModifiers(): Modifier[] {
+     new SyncParticlesModifier({ name: "Particles", active: true }),
+     new SyncBondsModifier({ name: "Bonds", active: true }),
+     new ColorModifier({ name: "Colors", active: true }),
++    // After Particles/Bonds/Colors: it hides atoms those just restyled.
++    new SliceModifier({ name: "Slice", active: false }),
+     new SyncComputesModifier({ name: "Computes", active: true }),
+     new SyncFixesModifier({ name: "Fixes", active: true }),
+     new SyncVariablesModifier({ name: "Variables", active: true }),
+diff --git a/src/modifiers/slicemodifier.test.ts b/src/modifiers/slicemodifier.test.ts
+new file mode 100644
+index 00000000..7982cf59
+--- /dev/null
++++ b/src/modifiers/slicemodifier.test.ts
+@@ -0,0 +1,167 @@
++import { describe, expect, it, vi } from "vitest";
++import type { Bonds, Particles } from "omovi";
++import SliceModifier, {
++  computeSlabMask,
++  isInSlab,
++  sliceNormal,
++  type Slab,
++} from "./slicemodifier";
++import type { ModifierInput, ModifierOutput } from "./types";
++
++// The modifier hands its mask to the instance-style adapter, which needs a
++// real omovi visualizer; record the calls instead.
++vi.mock(import("../rendering/particleAttributes"), () => ({
++  setHiddenParticles: vi.fn(),
++}));
++import { setHiddenParticles } from "../rendering/particleAttributes";
++
++describe("sliceNormal", () => {
++  it("returns unit axes and normalizes custom vectors", () => {
++    expect(sliceNormal("y", [5, 5, 5])).toEqual([0, 1, 0]);
++    const [x, y, z] = sliceNormal("custom", [3, 0, 4])!;
++    expect([x, y, z]).toEqual([0.6, 0, 0.8]);
++  });
++
++  it("rejects a zero custom vector", () => {
++    expect(sliceNormal("custom", [0, 0, 0])).toBeUndefined();
++  });
++});
++
++describe("isInSlab", () => {
++  const slab: Slab = {
++    normal: [0, 0, 1],
++    position: 10,
++    width: 4,
++    invert: false,
++  };
++
++  it("keeps points within half the width of the slab center", () => {
++    expect(isInSlab(100, -3, 10, slab)).toBe(true);
++    expect(isInSlab(0, 0, 8, slab)).toBe(true);
++    expect(isInSlab(0, 0, 12, slab)).toBe(true);
++    expect(isInSlab(0, 0, 12.01, slab)).toBe(false);
++    expect(isInSlab(0, 0, 7.99, slab)).toBe(false);
++  });
++
++  it("swaps inside and outside when inverted", () => {
++    const inverted = { ...slab, invert: true };
++    expect(isInSlab(0, 0, 10, inverted)).toBe(false);
++    expect(isInSlab(0, 0, 20, inverted)).toBe(true);
++  });
++
++  it("measures along a tilted normal", () => {
++    const diagonal: Slab = {
++      normal: sliceNormal("custom", [1, 1, 0])!,
++      position: Math.SQRT2,
++      width: 0.1,
++      invert: false,
++    };
++    expect(isInSlab(1, 1, 50, diagonal)).toBe(true);
++    expect(isInSlab(2, 0, 0, diagonal)).toBe(true);
++    expect(isInSlab(1, 0, 0, diagonal)).toBe(false);
++  });
++});
++
++describe("computeSlabMask", () => {
++  it("flags the points outside the slab and counts them", () => {
++    // Arrange
++    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]);
++    const hidden = new Uint8Array(5).fill(7);
++    const slab: Slab = {
++      normal: [1, 0, 0],
++      position: 1.5,
++      width: 1,
++      invert: false,
++    };
++
++    // Act
++    const numHidden = computeSlabMask(positions, 4, slab, hidden);
++
++    // Assert
++    expect(numHidden).toBe(2);
++    expect(Array.from(hidden)).toEqual([1, 0, 0, 1, 7]);
++  });
++});
++
++describe("SliceModifier", () => {
++  it("hides atoms outside the slab and bonds with a hidden end", () => {
++    // Arrange
++    const { modifier, input, output } = setup();
++    Object.assign(modifier, { active: true, axis: "x", position: 1, width: 1 });
++
++    // Act
++    modifier.run(input, output);
++
++    // Assert
++    const mask = vi.mocked(setHiddenParticles).mock.calls.at(-1)![2]!;
++    expect(Array.from(mask.subarray(0, 3))).toEqual([1, 0, 1]);
++    expect(Array.from(output.bonds!.radii)).toEqual([0, 0.5, 0]);
++  });
++
++  it("does nothing while off, and restores everything once when switched off", () => {
++    // Arrange
++    const { modifier, input, output } = setup();
++    modifier.run(input, output);
++    expect(setHiddenParticles).not.toHaveBeenCalled();
++    Object.assign(modifier, { active: true, axis: "x", position: 1, width: 1 });
++    modifier.run(input, output);
++    vi.mocked(setHiddenParticles).mockClear();
++
++    // Act
++    modifier.active = false;
++    modifier.run(input, output);
++    modifier.run(input, output);
++
++    // Assert
++    expect(setHiddenParticles).toHaveBeenCalledTimes(1);
++    expect(setHiddenParticles).toHaveBeenCalledWith(
++      undefined,
++      output.particles,
++      undefined,
++    );
++    expect(Array.from(output.bonds!.radii)).toEqual([0.5, 0.5, 0.5]);
++  });
++
++  it("shows everything for a zero custom normal", () => {
++    const { modifier, input, output } = setup();
++    Object.assign(modifier, {
++      active: true,
++      axis: "custom",
++      customNormal: [0, 0, 0],
++    });
++    modifier.run(input, output);
++    expect(setHiddenParticles).not.toHaveBeenCalled();
++  });
++});
++
++function setup() {
++  vi.mocked(setHiddenParticles).mockClear();
++  const modifier = new SliceModifier({ name: "Slice", active: false });
++  // Three atoms along x at 0, 1, 2.
++  const particles: Partial<Particles> = {
++    capacity: 4,
++    count: 3,
++    positions: new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0, 9, 9, 9]),
++    indices: new Float32Array([10, 11, 12, 0]),
++  };
++  // Bonds 0-1, 1-1 (degenerate, inside), 1-2.
++  const bonds: Partial<Bonds> = {
++    count: 3,
++    positions1: new Float32Array([0, 0, 0, 1, 0, 0, 1, 0, 0]),
++    positions2: new Float32Array([1, 0, 0, 1, 0, 0, 2, 0, 0]),
++    radii: new Float32Array([0.5, 0.5, 0.5]),
++    markNeedsUpdate: vi.fn(),
++  };
++  const input = {
++    renderState: { bondRadius: 2, visualizer: undefined },
++  } as unknown as ModifierInput;
++  const output = {
++    particles: particles as Particles,
++    bonds: bonds as Bonds,
++    colorsDirty: false,
++    computes: {},
++    fixes: {},
++    variables: {},
++  } as ModifierOutput;
++  return { modifier, input, output };
++}
+diff --git a/src/modifiers/slicemodifier.ts b/src/modifiers/slicemodifier.ts
+new file mode 100644
+index 00000000..f382eec4
+--- /dev/null
++++ b/src/modifiers/slicemodifier.ts
+@@ -0,0 +1,144 @@
++import { setHiddenParticles } from "../rendering/particleAttributes";
++import Modifier, { ModifierProps } from "./modifier";
++import { ModifierInput, ModifierOutput } from "./types";
++
++export type SliceAxis = "x" | "y" | "z" | "custom";
++export type Vector3Tuple = [number, number, number];
++
++export type Slab = {
++  /** Unit plane normal. */
++  normal: Vector3Tuple;
++  /** Slab center, as a distance along the normal from the origin. */
++  position: number;
++  width: number;
++  /** Show atoms outside the slab instead of inside. */
++  invert: boolean;
++};
++
++const AXIS_NORMALS: Record<Exclude<SliceAxis, "custom">, Vector3Tuple> = {
++  x: [1, 0, 0],
++  y: [0, 1, 0],
++  z: [0, 0, 1],
++};
++
++/** Unit normal for an axis, or undefined for a zero custom vector. */
++export function sliceNormal(
++  axis: SliceAxis,
++  custom: Vector3Tuple,
++): Vector3Tuple | undefined {
++  if (axis !== "custom") return AXIS_NORMALS[axis];
++  const length = Math.hypot(custom[0], custom[1], custom[2]);
++  if (!(length > 0) || !Number.isFinite(length)) return undefined;
++  return [custom[0] / length, custom[1] / length, custom[2] / length];
++}
++
++export function isInSlab(x: number, y: number, z: number, slab: Slab) {
++  const [nx, ny, nz] = slab.normal;
++  const inside =
++    Math.abs(x * nx + y * ny + z * nz - slab.position) <= 0.5 * slab.width;
++  return inside !== slab.invert;
++}
++
++/**
++ * Flag every point outside the slab: `hidden[i] = 1` for point i of the
++ * packed xyz `positions`. Returns how many points are hidden.
++ */
++export function computeSlabMask(
++  positions: Float32Array,
++  count: number,
++  slab: Slab,
++  hidden: Uint8Array,
++): number {
++  let numHidden = 0;
++  for (let i = 0; i < count; i++) {
++    const hide = isInSlab(
++      positions[3 * i],
++      positions[3 * i + 1],
++      positions[3 * i + 2],
++      slab,
++    )
++      ? 0
++      : 1;
++    hidden[i] = hide;
++    numHidden += hide;
++  }
++  return numHidden;
++}
++
++/**
++ * Shows only the atoms inside a slab, to see into bulk systems. Visual only:
++ * hidden atoms are drawn with zero radius (so they can't be picked either),
++ * and bonds with a hidden end get zero radius too. Atom count, IDs and
++ * per-atom data stay untouched. Must run after the Particles, Bonds and
++ * Colors modifiers, which reset styles and bond data every frame.
++ */
++class SliceModifier extends Modifier {
++  public axis: SliceAxis = "z";
++  public customNormal: Vector3Tuple = [1, 1, 1];
++  public position = 0;
++  public width = 0;
++  public invert = false;
++
++  private hidden = new Uint8Array(0);
++  private particlesHidden = false;
++  private bondsHidden = false;
++
++  constructor({ name, active }: ModifierProps) {
++    super({ name, active });
++  }
++
++  getSlab = (): Slab | undefined => {
++    const normal = sliceNormal(this.axis, this.customNormal);
++    if (!normal) return undefined;
++    return {
++      normal,
++      position: this.position,
++      width: this.width,
++      invert: this.invert,
++    };
++  };
++
++  run = (input: ModifierInput, output: ModifierOutput) => {
++    const visualizer = input.renderState.visualizer;
++    const defaultBondRadius = 0.25 * input.renderState.bondRadius;
++    const slab = this.active ? this.getSlab() : undefined;
++    if (!slab) {
++      // Restore once after the slice is switched off, then do nothing.
++      if (this.particlesHidden && output.particles) {
++        setHiddenParticles(visualizer, output.particles, undefined);
++      }
++      if (this.bondsHidden && output.bonds) {
++        output.bonds.radii.fill(defaultBondRadius);
++        output.bonds.markNeedsUpdate();
++      }
++      this.particlesHidden = false;
++      this.bondsHidden = false;
++      return;
++    }
++
++    const particles = output.particles;
++    if (particles) {
++      if (this.hidden.length < particles.capacity) {
++        this.hidden = new Uint8Array(particles.capacity);
++      }
++      computeSlabMask(particles.positions, particles.count, slab, this.hidden);
++      setHiddenParticles(visualizer, particles, this.hidden);
++      this.particlesHidden = true;
++    }
++
++    const bonds = output.bonds;
++    if (bonds && bonds.count > 0) {
++      const { positions1: p1, positions2: p2 } = bonds;
++      for (let i = 0; i < bonds.count; i++) {
++        const visible =
++          isInSlab(p1[3 * i], p1[3 * i + 1], p1[3 * i + 2], slab) &&
++          isInSlab(p2[3 * i], p2[3 * i + 1], p2[3 * i + 2], slab);
++        bonds.radii[i] = visible ? defaultBondRadius : 0;
++      }
++      bonds.markNeedsUpdate();
++      this.bondsHidden = true;
++    }
++  };
++}
++
++export default SliceModifier;
+diff --git a/src/rendering/particleAttributes.test.ts b/src/rendering/particleAttributes.test.ts
+index 9a155ea4..2a3aea7e 100644
+--- a/src/rendering/particleAttributes.test.ts
++++ b/src/rendering/particleAttributes.test.ts
+@@ -8,6 +8,7 @@ import {
+ import type { Particles, Visualizer } from "omovi";
+ import {
+   installParticleAttributes,
++  setHiddenParticles,
+   syncParticleAttributes,
+   applyRadiusAttribute,
+ } from "./particleAttributes";
+@@ -92,4 +93,42 @@ describe("instance styles", () => {
+       "Unsupported omovi",
+     );
+   });
++  it("hides instances with zero radius and restores their styled radius", () => {
++    const { visualizer: v, particles: p, geometry: g } = fixture();
++    syncParticleAttributes(v, p);
++    v.setRadius(42, 1.5);
++    v.setRadius(900001, 2.5);
++    const radius = () =>
++      Array.from(g.getAttribute("atomRadius").array).slice(0, 2);
++
++    setHiddenParticles(v, p, new Uint8Array([1, 0]));
++    expect(radius()).toEqual([0, 2.5]);
++    // Restyling a hidden atom keeps it hidden but remembers the new radius.
++    v.setRadius(42, 1.25);
++    expect(radius()).toEqual([0, 2.5]);
++    setHiddenParticles(v, p, new Uint8Array([0, 1]));
++    expect(radius()).toEqual([1.25, 0]);
++    setHiddenParticles(v, p, undefined);
++    expect(radius()).toEqual([1.25, 2.5]);
++  });
++  it("keeps hidden periodic images hidden when their atom is restyled", () => {
++    const { visualizer: v, particles: p, geometry: g } = fixture();
++    p.indices.set([42, 42, 42]);
++    p.count = 3;
++    syncParticleAttributes(v, p);
++    setHiddenParticles(v, p, new Uint8Array([0, 1, 0]));
++    v.setRadius(42, 2);
++    expect(Array.from(g.getAttribute("atomRadius").array)).toEqual([2, 0, 2]);
++  });
++  it("drops hide flags when instances are remapped", () => {
++    const { visualizer: v, particles: p, geometry: g } = fixture();
++    syncParticleAttributes(v, p);
++    v.setRadius(42, 1.5);
++    setHiddenParticles(v, p, new Uint8Array([1, 0]));
++    p.indices.set([900001, 42]);
++    syncParticleAttributes(v, p);
++    expect(g.getAttribute("atomRadius").getX(1)).toBe(1.5);
++    v.setRadius(42, 1.75);
++    expect(g.getAttribute("atomRadius").getX(1)).toBe(1.75);
++  });
+ });
+diff --git a/src/rendering/particleAttributes.ts b/src/rendering/particleAttributes.ts
+index 2a81defd..5d5fd13e 100644
+--- a/src/rendering/particleAttributes.ts
++++ b/src/rendering/particleAttributes.ts
+@@ -18,6 +18,8 @@ type AttributeState = {
+   count?: number;
+   color?: InstancedBufferAttribute;
+   radius?: InstancedBufferAttribute;
++  /** Per-slot hide flags (1 = drawn with zero radius); unset = none hidden. */
++  hidden?: Uint8Array;
+ };
+ const states = new WeakMap<Visualizer, AttributeState>();
+ const patchedMaterials = new WeakSet<object>();
+@@ -118,7 +120,7 @@ export function installParticleAttributes(visualizer: Visualizer): void {
+     let slot = state.slots.get(id) ?? -1;
+     if (slot >= 0 && state.radius) {
+       for (; slot >= 0; slot = state.nextSlot![slot])
+-        state.radius.setX(slot, radius);
++        state.radius.setX(slot, state.hidden?.[slot] ? 0 : radius);
+       state.radius.needsUpdate = true;
+     }
+     visualizer.forceRender = true;
+@@ -158,6 +160,8 @@ export function syncParticleAttributes(
+     return;
+   state.ids!.set(particles.indices.subarray(0, particles.count));
+   state.count = particles.count;
++  // Every radius is rewritten below, so earlier hide flags no longer apply.
++  state.hidden = undefined;
+   state.slots.clear();
+   // Walk backwards so each ID's chain starts at its lowest slot.
+   for (let i = particles.count - 1; i >= 0; i--) {
+@@ -175,3 +179,40 @@ export function syncParticleAttributes(
+   state.color!.needsUpdate = true;
+   state.radius!.needsUpdate = true;
+ }
++
++/**
++ * Hide instances by drawing them with zero radius, so whole atoms disappear
++ * from both drawing and GPU picking while IDs and slots stay untouched.
++ * `hidden[i]` follows the particles' array order; pass undefined to show all.
++ * Call after syncParticleAttributes for the same frame.
++ */
++export function setHiddenParticles(
++  visualizer: Visualizer | undefined,
++  particles: Particles,
++  hidden: Uint8Array | undefined,
++): void {
++  const state = visualizer ? states.get(visualizer) : undefined;
++  if (!visualizer || !state || state.particles !== particles || !state.radius)
++    return;
++  const previous = state.hidden;
++  if (!hidden && !previous) return;
++  let changed = false;
++  for (let i = 0; i < particles.count; i++) {
++    const hide = hidden ? hidden[i] : 0;
++    if (hide === (previous ? previous[i] : 0)) continue;
++    const radius = state.styles.get(particles.indices[i])?.radius ?? 0.33;
++    state.radius.setX(i, hide ? 0 : radius);
++    changed = true;
++  }
++  if (hidden) {
++    const flags = previous ?? new Uint8Array(particles.capacity);
++    flags.set(hidden.subarray(0, particles.count));
++    state.hidden = flags;
++  } else {
++    state.hidden = undefined;
++  }
++  if (changed) {
++    state.radius.needsUpdate = true;
++    visualizer.forceRender = true;
++  }
++}
+diff --git a/src/shell/NormalInput.test.tsx b/src/shell/NormalInput.test.tsx
+new file mode 100644
+index 00000000..224e8fcd
+--- /dev/null
++++ b/src/shell/NormalInput.test.tsx
+@@ -0,0 +1,38 @@
++import { describe, it, expect, vi } from "vitest";
++import { render, screen } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { NormalInput } from "./SliceControls";
++
++describe("NormalInput", () => {
++  it("does not commit 0 while a negative number is being typed", async () => {
++    // Arrange
++    const user = userEvent.setup();
++    const onCommit = vi.fn();
++    render(<NormalInput label="x" value={1} onCommit={onCommit} />);
++    const input = screen.getByLabelText("Normal x");
++
++    // Act
++    await user.clear(input);
++    await user.type(input, "-2");
++
++    // Assert
++    expect(onCommit).not.toHaveBeenCalledWith(0);
++    expect(onCommit).toHaveBeenLastCalledWith(-2);
++  });
++
++  it("reverts an emptied field to the current value on blur", async () => {
++    // Arrange
++    const user = userEvent.setup();
++    const onCommit = vi.fn();
++    render(<NormalInput label="y" value={0.5} onCommit={onCommit} />);
++    const input = screen.getByLabelText("Normal y");
++
++    // Act
++    await user.clear(input);
++    await user.tab();
++
++    // Assert
++    expect(onCommit).not.toHaveBeenCalled();
++    expect(input).toHaveValue(0.5);
++  });
++});
+diff --git a/src/shell/RunDetailHeader.tsx b/src/shell/RunDetailHeader.tsx
+index 9c42370d..d9d455d2 100644
+--- a/src/shell/RunDetailHeader.tsx
++++ b/src/shell/RunDetailHeader.tsx
+@@ -1,12 +1,13 @@
+ /**
+  * The run detail sub-header: back to Runs, the run's number, status and
+- * parameters, and its actions (color atoms, periodic images, continue,
+- * replay, stop, analyze in notebook).
++ * parameters, and its actions (color atoms, periodic images, slice,
++ * continue, replay, stop, analyze in notebook).
+  */
+ 
+ import { useStoreActions, useStoreState } from "../hooks";
+ import type { RunMeta } from "../storage";
+ import PeriodicImagesControl from "./PeriodicImagesControl";
++import SliceControls from "./SliceControls";
+ import { useShellUI } from "./ShellContext";
+ import { runNumber } from "./format";
+ import { BackIcon, ChartIcon, StopIcon } from "./icons";
+@@ -120,6 +121,7 @@ const RunDetailHeader = ({
+         </GhostButton>
+       )}
+       {(live || viewStructure) && <PeriodicImagesControl live={live} />}
++      {(live || viewStructure) && <SliceControls />}
+       {meta?.continuationOf && (
+         <Chip>Continued from #{runNumber(meta.continuationOf)}</Chip>
+       )}
+diff --git a/src/shell/SliceControls.test.ts b/src/shell/SliceControls.test.ts
+new file mode 100644
+index 00000000..6794f35f
+--- /dev/null
++++ b/src/shell/SliceControls.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import * as THREE from "three";
++import { boxRangeAlong, choosePopoverAlign } from "./SliceControls";
++
++describe("boxRangeAlong", () => {
++  it("projects the box corners onto the normal", () => {
++    // Rows are the a, b, c box vectors (LAMMPS convention).
++    const box = new THREE.Matrix3().set(10, 0, 0, 0, 20, 0, 0, 0, 30);
++    const origo = new THREE.Vector3(-5, 0, 1);
++    expect(boxRangeAlong([1, 0, 0], box, origo)).toEqual([-5, 5]);
++    expect(boxRangeAlong([0, 0, 1], box, origo)).toEqual([1, 31]);
++  });
++
++  it("covers the tilted corners of a triclinic box", () => {
++    const box = new THREE.Matrix3().set(10, 0, 0, 4, 10, 0, 0, 0, 10);
++    expect(boxRangeAlong([1, 0, 0], box, new THREE.Vector3())).toEqual([0, 14]);
++  });
++
++  it("falls back to a fixed range before the box is known", () => {
++    expect(boxRangeAlong([1, 0, 0], undefined, undefined)).toEqual([-50, 50]);
++  });
++});
++
++describe("choosePopoverAlign", () => {
++  const bounds = { left: 250, right: 980 };
++
++  it("extends right from the left edge when it fits", () => {
++    expect(choosePopoverAlign({ left: 300, right: 360 }, bounds, 278)).toBe(
++      "left",
++    );
++  });
++
++  it("extends left from the right edge near the container's end", () => {
++    expect(choosePopoverAlign({ left: 811, right: 871 }, bounds, 278)).toBe(
++      "right",
++    );
++  });
++
++  it("picks the roomier side when neither fits", () => {
++    const narrow = { left: 0, right: 300 };
++    expect(choosePopoverAlign({ left: 40, right: 100 }, narrow, 278)).toBe(
++      "left",
++    );
++    expect(choosePopoverAlign({ left: 220, right: 280 }, narrow, 278)).toBe(
++      "right",
++    );
++  });
++});
+diff --git a/src/shell/SliceControls.tsx b/src/shell/SliceControls.tsx
+new file mode 100644
+index 00000000..9da67b6c
+--- /dev/null
++++ b/src/shell/SliceControls.tsx
+@@ -0,0 +1,348 @@
++/**
++ * Compact slice control for the run viewport: a "Slice" button whose popover
++ * edits the SliceModifier (normal, slab position and width, invert).
++ */
++
++import { useCallback, useLayoutEffect, useRef, useState } from "react";
++import type * as THREE from "three";
++import { useEngine } from "../engine/EngineContext";
++import { useStoreActions, useStoreState } from "../hooks";
++import SliceModifier, {
++  sliceNormal,
++  type SliceAxis,
++  type Vector3Tuple,
++} from "../modifiers/slicemodifier";
++import { extractBasisVectors } from "../utils/boxGeometry";
++import { GhostButton, MONO, Popover, ToggleSwitch } from "./ui";
++
++const AXES: SliceAxis[] = ["x", "y", "z", "custom"];
++
++/** Extent of the simulation box projected onto a unit normal. */
++export function boxRangeAlong(
++  normal: Vector3Tuple,
++  box: THREE.Matrix3 | undefined,
++  origo: THREE.Vector3 | undefined,
++): [number, number] {
++  if (!box || !origo) return [-50, 50];
++  const { a, b, c } = extractBasisVectors(box);
++  let min = Infinity;
++  let max = -Infinity;
++  for (let corner = 0; corner < 8; corner++) {
++    const p = origo.clone();
++    if (corner & 1) p.add(a);
++    if (corner & 2) p.add(b);
++    if (corner & 4) p.add(c);
++    const d = p.x * normal[0] + p.y * normal[1] + p.z * normal[2];
++    min = Math.min(min, d);
++    max = Math.max(max, d);
++  }
++  return max > min ? [min, max] : [min - 1, max + 1];
++}
++
++type Span = { left: number; right: number };
++
++/**
++ * Which anchor edge a popover of `width` should line up with so it stays
++ * inside `bounds`: left (extends right) when it fits, else right (extends
++ * left), else whichever side has more room.
++ */
++export function choosePopoverAlign(
++  anchor: Span,
++  bounds: Span,
++  width: number,
++): "left" | "right" {
++  if (anchor.left + width <= bounds.right) return "left";
++  if (anchor.right - width >= bounds.left) return "right";
++  return bounds.right - anchor.left >= anchor.right - bounds.left
++    ? "left"
++    : "right";
++}
++
++/** Horizontal extent of the nearest ancestor that clips overflow. */
++function clipBounds(element: HTMLElement): Span {
++  const viewport = { left: 0, right: document.documentElement.clientWidth };
++  for (let el = element.parentElement; el; el = el.parentElement) {
++    if (getComputedStyle(el).overflowX !== "visible") {
++      const rect = el.getBoundingClientRect();
++      return {
++        left: Math.max(rect.left, viewport.left),
++        right: Math.min(rect.right, viewport.right),
++      };
++    }
++  }
++  return viewport;
++}
++
++/**
++ * One custom-normal component. Keeps the typed text as a draft so clearing
++ * the field or typing "-" mid-edit doesn't snap it to 0; only a finite
++ * number is committed, and on blur an unfinished draft reverts.
++ */
++export const NormalInput = ({
++  label,
++  value,
++  onCommit,
++}: {
++  label: string;
++  value: number;
++  onCommit: (value: number) => void;
++}) => {
++  const [draft, setDraft] = useState(String(value));
++  const [shown, setShown] = useState(value);
++  if (shown !== value) {
++    setShown(value);
++    setDraft(String(value));
++  }
++  const parse = (text: string) => {
++    const next = text.trim() === "" ? NaN : Number(text);
++    return Number.isFinite(next) ? next : undefined;
++  };
++
++  return (
++    <input
++      type="number"
++      step={0.1}
++      aria-label={`Normal ${label}`}
++      value={draft}
++      onChange={(event) => {
++        setDraft(event.target.value);
++        const next = parse(event.target.value);
++        if (next !== undefined && next !== value) onCommit(next);
++      }}
++      onBlur={() => {
++        if (parse(draft) === undefined) setDraft(String(value));
++      }}
++      style={{ width: "100%", minWidth: 0, fontFamily: MONO }}
++    />
++  );
++};
++
++const rowStyle = {
++  display: "flex",
++  alignItems: "center",
++  justifyContent: "space-between",
++  gap: 10,
++  fontSize: 12.5,
++  color: "var(--text-2)",
++} as const;
++
++const SliceControls = () => {
++  const [open, setOpen] = useState(false);
++  // Stable, so the popover's outside-click listener isn't re-armed on every
++  // render while the run streams updates.
++  const close = useCallback(() => setOpen(false), []);
++  const sliceModifier = useEngine().modifiers.find(
++    (modifier): modifier is SliceModifier => modifier instanceof SliceModifier,
++  );
++  const sliceActive = sliceModifier?.active;
++  // Line the popover up with whichever button edge keeps it inside the
++  // clipping column: the button can sit at the right end of the header or,
++  // when the header wraps, at the left edge. Measured before paint on open
++  // and on toggling, since the "Slice on" label can re-wrap the header.
++  const anchorRef = useRef<HTMLSpanElement | null>(null);
++  const [align, setAlign] = useState<"left" | "right">("left");
++  useLayoutEffect(() => {
++    const anchor = anchorRef.current;
++    const popover = anchor?.querySelector<HTMLElement>(
++      '[data-testid="slice-popover"]',
++    );
++    if (!open || !anchor || !popover) return;
++    setAlign(
++      choosePopoverAlign(
++        anchor.getBoundingClientRect(),
++        clipBounds(anchor),
++        popover.offsetWidth,
++      ),
++    );
++  }, [open, sliceActive]);
++  const box = useStoreState((state) => state.simulationStatus.box);
++  const origo = useStoreState((state) => state.simulationStatus.origo);
++  const refreshRendering = useStoreActions(
++    (actions) => actions.processing.runPostTimestepRendering,
++  );
++  // The modifier is a plain mutable object; bump to re-render after edits.
++  const [, setVersion] = useState(0);
++
++  if (!sliceModifier) return null;
++  const slice = sliceModifier;
++  const normal = sliceNormal(slice.axis, slice.customNormal);
++  const [min, max] = boxRangeAlong(normal ?? [0, 0, 1], box, origo);
++  const extent = max - min;
++  const step = extent / 500;
++
++  const update = (patch: Partial<SliceModifier>) => {
++    Object.assign(slice, patch);
++    setVersion((version) => version + 1);
++    void refreshRendering();
++  };
++  // Center a slab of a fifth of the box along the (new) normal.
++  const recentered = (axis: SliceAxis, custom: Vector3Tuple) => {
++    const [lo, hi] = boxRangeAlong(
++      sliceNormal(axis, custom) ?? [0, 0, 1],
++      box,
++      origo,
++    );
++    return { position: (lo + hi) / 2, width: (hi - lo) / 5 };
++  };
++  const toggle = () => {
++    const outside =
++      slice.width <= 0 ||
++      slice.position + slice.width / 2 < min ||
++      slice.position - slice.width / 2 > max;
++    update({
++      active: !slice.active,
++      ...(!slice.active && outside
++        ? recentered(slice.axis, slice.customNormal)
++        : {}),
++    });
++  };
++  const setCustomComponent = (index: number, value: number) => {
++    const customNormal = [...slice.customNormal] as Vector3Tuple;
++    customNormal[index] = value;
++    update({ customNormal, ...recentered("custom", customNormal) });
++  };
++
++  return (
++    <span
++      ref={anchorRef}
++      style={{ position: "relative", display: "inline-flex" }}
++    >
++      <GhostButton
++        data-testid="slice-atoms"
++        aria-expanded={open}
++        onClick={() => setOpen((previous) => !previous)}
++        style={
++          slice.active
++            ? { border: "1px solid var(--accent)", color: "var(--accent)" }
++            : undefined
++        }
++      >
++        Slice{slice.active ? " on" : ""}
++      </GhostButton>
++      <Popover
++        open={open}
++        onClose={close}
++        minWidth={264}
++        align={align}
++        testId="slice-popover"
++      >
++        <div
++          style={{
++            padding: "8px 10px",
++            display: "flex",
++            flexDirection: "column",
++            gap: 12,
++          }}
++        >
++          <div style={rowStyle}>
++            <span style={{ fontWeight: 700, color: "var(--text)" }}>
++              Show only a slab
++            </span>
++            <ToggleSwitch
++              on={slice.active}
++              onToggle={toggle}
++              data-testid="slice-toggle"
++              aria-label="Slice"
++            />
++          </div>
++          <div style={rowStyle}>
++            <span>Normal</span>
++            <div style={{ display: "flex", gap: 4 }}>
++              {AXES.map((axis) => (
++                <button
++                  key={axis}
++                  data-testid={`slice-axis-${axis}`}
++                  aria-pressed={slice.axis === axis}
++                  onClick={() =>
++                    update({
++                      axis,
++                      ...recentered(axis, slice.customNormal),
++                    })
++                  }
++                  style={{
++                    padding: "3px 8px",
++                    borderRadius: 7,
++                    border: "1px solid var(--border-strong)",
++                    background:
++                      slice.axis === axis ? "var(--accent)" : "transparent",
++                    color: slice.axis === axis ? "#fff" : "var(--text-2)",
++                    fontFamily: axis === "custom" ? "inherit" : MONO,
++                    fontSize: 12,
++                    fontWeight: 600,
++                    cursor: "pointer",
++                  }}
++                >
++                  {axis}
++                </button>
++              ))}
++            </div>
++          </div>
++          {slice.axis === "custom" && (
++            <div style={{ display: "flex", gap: 6 }}>
++              {slice.customNormal.map((value, index) => (
++                <NormalInput
++                  key={index}
++                  label={"xyz"[index]}
++                  value={value}
++                  onCommit={(next) => setCustomComponent(index, next)}
++                />
++              ))}
++            </div>
++          )}
++          {[
++            {
++              key: "position" as const,
++              label: "Position",
++              lo: min,
++              hi: max,
++            },
++            { key: "width" as const, label: "Width", lo: 0, hi: extent },
++          ].map(({ key, label, lo, hi }) => (
++            <div key={key}>
++              <div style={{ ...rowStyle, marginBottom: 7 }}>
++                <span>{label}</span>
++                <span
++                  style={{
++                    color: "var(--text)",
++                    fontWeight: 600,
++                    fontFamily: MONO,
++                  }}
++                >
++                  {slice[key].toFixed(2)}
++                </span>
++              </div>
++              <input
++                type="range"
++                data-testid={`slice-${key}`}
++                aria-label={label}
++                min={lo}
++                max={hi}
++                step={step}
++                value={Math.min(hi, Math.max(lo, slice[key]))}
++                disabled={!normal}
++                onChange={(event) => {
++                  const value = Number(event.target.value);
++                  update(
++                    key === "position" ? { position: value } : { width: value },
++                  );
++                }}
++                style={{ width: "100%" }}
++              />
++            </div>
++          ))}
++          <div style={rowStyle}>
++            <span>Invert (hide the slab)</span>
++            <ToggleSwitch
++              on={slice.invert}
++              onToggle={() => update({ invert: !slice.invert })}
++              data-testid="slice-invert"
++              aria-label="Invert slice"
++            />
++          </div>
++        </div>
++      </Popover>
++    </span>
++  );
++};
++
++export default SliceControls;
+diff --git a/src/shell/ui/controls.tsx b/src/shell/ui/controls.tsx
+index 2885a177..82865945 100644
+--- a/src/shell/ui/controls.tsx
++++ b/src/shell/ui/controls.tsx
+@@ -322,12 +322,15 @@ export const Popover = ({
+   children,
+   minWidth = 216,
+   testId,
++  align = "right",
+ }: {
+   open: boolean;
+   onClose: () => void;
+   children: ReactNode;
+   minWidth?: number;
+   testId?: string;
++  /** Which edge of the anchor the popover lines up with. */
++  align?: "left" | "right";
+ }) => {
+   const ref = useRef<HTMLDivElement | null>(null);
+   useEffect(() => {
+@@ -356,7 +359,7 @@ export const Popover = ({
+       style={{
+         position: "absolute",
+         top: "calc(100% + 6px)",
+-        right: 0,
++        [align]: 0,
+         zIndex: 100,
+         minWidth,
+         background: "var(--surface)",
+diff --git a/src/store/processing.ts b/src/store/processing.ts
+index 1cbab132..979c821d 100644
+--- a/src/store/processing.ts
++++ b/src/store/processing.ts
+@@ -3,6 +3,7 @@ import Modifier from "../modifiers/modifier";
+ import SyncParticlesModifier from "../modifiers/syncparticlesmodifier";
+ import SyncBondsModifier from "../modifiers/syncbondsmodifier";
+ import ColorModifier from "../modifiers/colormodifier";
++import SliceModifier from "../modifiers/slicemodifier";
+ import { ModifierInput, ModifierOutput } from "../modifiers/types";
+ import { Wall } from "../types";
+ import * as THREE from "three";
+@@ -229,12 +230,13 @@ export const processingModel: ProcessingModel = {
+       const { modifierInput, modifierOutput, allActions, particles, bonds } =
+         getModifierContext(getStoreState, getStoreActions, engine);
+ 
+-      // Only run rendering-related modifiers (Particles, Bonds, Colors)
++      // Only run rendering-related modifiers (Particles, Bonds, Colors, Slice)
+       const renderingModifiers = engine.modifiers.filter(
+         (modifier: Modifier) =>
+           modifier instanceof SyncParticlesModifier ||
+           modifier instanceof SyncBondsModifier ||
+-          modifier instanceof ColorModifier,
++          modifier instanceof ColorModifier ||
++          modifier instanceof SliceModifier,
+       );
+ 
+       renderingModifiers.forEach((modifier: Modifier) =>
+diff --git a/src/store/runHost.test.ts b/src/store/runHost.test.ts
+index 36e9412f..a07450a8 100644
+--- a/src/store/runHost.test.ts
++++ b/src/store/runHost.test.ts
+@@ -7,6 +7,7 @@ vi.mock("../utils/metrics", () => ({ track: vi.fn(), time_event: vi.fn() }));
+ import { storeModel } from "./model";
+ import { createStoreRunHost } from "./runHost";
+ import { EngineRegistry } from "../engine/EngineRegistry";
++import SliceModifier from "../modifiers/slicemodifier";
+ import { createMemoryProjectStorage } from "../storage";
+ import type { AtomType } from "../utils/atomtypes";
+ 
+@@ -48,4 +49,16 @@ describe("store run host", () => {
+     // The buffers stay registered for the new run's frames to refill.
+     expect(engine.particles).toBe(particles);
+   });
++
++  it("switches the slice off for a fresh run", () => {
++    const { engine, host } = fixture();
++    const slice = engine.modifiers.find(
++      (modifier) => modifier instanceof SliceModifier,
++    )!;
++    slice.active = true;
++
++    host.beginFreshRun("proj/runs/run-002");
++
++    expect(slice.active).toBe(false);
++  });
+ });
+diff --git a/src/store/runHost.ts b/src/store/runHost.ts
+index c7bb261e..3f954531 100644
+--- a/src/store/runHost.ts
++++ b/src/store/runHost.ts
+@@ -7,6 +7,7 @@
+ import type { Actions, State } from "easy-peasy";
+ import type { EngineRegistry } from "../engine/EngineRegistry";
+ import type { RunHost } from "../engine/RunController";
++import SliceModifier from "../modifiers/slicemodifier";
+ import type { StoreModel } from "./model";
+ import { getFullLammpsOutput } from "./simulation";
+ 
+@@ -33,6 +34,13 @@ export function createStoreRunHost(
+       if (colorModifier) {
+         colorModifier.computeName = undefined;
+       }
++      // The slab is in absolute coordinates; a new box may not contain it.
++      const sliceModifier = engine.modifiers.find(
++        (modifier) => modifier instanceof SliceModifier,
++      );
++      if (sliceModifier) {
++        sliceModifier.active = false;
++      }
+       engine.clearGeometry();
+       actions.render.resetParticleStyles();
+     },

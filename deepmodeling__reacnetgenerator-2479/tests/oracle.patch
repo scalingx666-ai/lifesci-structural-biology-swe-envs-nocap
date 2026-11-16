@@ -1,0 +1,803 @@
+diff --git a/docs/guide/run.md b/docs/guide/run.md
+index ae5c0ce70..36e5e7621 100644
+--- a/docs/guide/run.md
++++ b/docs/guide/run.md
+@@ -25,3 +25,24 @@ reacnetgenerator -h
+ ```
+ 
+ See [here](cli.md) for the usage of the command line.
++
++## Oversized connected components
++
++ReacNetGenerator stops before molecule naming when a connected component is
++larger than both 256 atoms and 10% of the analyzed system. Large components can
++be physically meaningful, but they can also indicate that a coordinate-based
++bond detector has interpreted non-covalent contacts as bonds. Continuing with
++an unintended system-spanning graph can produce extremely large molecule names
++and reaction-path output.
++
++For coordinate trajectories, ASE provides explicit control over element-pair
++cutoffs:
++
++```bash
++reacnetgenerator --type dump -i trajectory.dump -a Na Cl --use-ase \
++    --ase-pair-cutoffs Na-Cl:0
++```
++
++Use `--max-component-atoms` and `--max-component-fraction` to adjust the limits.
++Set `--max-component-atoms 0` to disable the guard when a large covalent
++component is intentional.
+diff --git a/reacnetgenerator/_detect.py b/reacnetgenerator/_detect.py
+index 574d683dc..c4a0c4537 100644
+--- a/reacnetgenerator/_detect.py
++++ b/reacnetgenerator/_detect.py
+@@ -27,7 +27,7 @@
+ import operator
+ import tempfile
+ from abc import ABCMeta, abstractmethod
+-from collections import defaultdict
++from collections import Counter, defaultdict
+ from enum import Enum, auto
+ from typing import ClassVar
+ 
+@@ -70,12 +70,25 @@ class _Detect(SharedRNGData, metaclass=ABCMeta):
+     nproc: int
+     pbc: bool
+     cell: np.ndarray
++    max_component_atoms: int
++    max_component_fraction: float
++    N: int
++    atomtype: np.ndarray
+ 
+     def __init__(self, rng):
+         SharedRNGData.__init__(
+             self,
+             rng,
+-            ["inputfilename", "atomname", "stepinterval", "nproc", "pbc", "cell"],
++            [
++                "inputfilename",
++                "atomname",
++                "stepinterval",
++                "nproc",
++                "pbc",
++                "cell",
++                "max_component_atoms",
++                "max_component_fraction",
++            ],
+             ["N", "atomtype", "step", "timestep", "temp1it", "moleculetempfilename"],
+         )
+ 
+@@ -145,6 +158,7 @@ def _readinputfile(self):
+                 self.nproc,
+                 func=self._readstepfunc,
+                 l=f,
++                max_inflight=max(1, self.nproc * 2),
+                 nlines=_steplinenum,
+                 return_num=True,
+                 interval=self.stepinterval,
+@@ -182,8 +196,67 @@ def _readNfunc(self, f) -> int:
+     def _readstepfunc(self, item) -> tuple[list[bytes], tuple[int, int]]:
+         pass
+ 
+-    def _connectmolecule(self, bond, level):
++    def _validate_component_sizes(
++        self, mols: list[list[int]], frame=None, timestep=None
++    ):
++        if self.max_component_atoms == 0:
++            return
++        limit = max(
++            self.max_component_atoms,
++            int(np.ceil(self.N * self.max_component_fraction)),
++        )
++        if not mols:
++            return
++        largest = max(mols, key=list.__len__)
++        if len(largest) <= limit:
++            return
++
++        composition = Counter(
++            str(self.atomname[self.atomtype[atom]]) for atom in largest
++        )
++        composition_text = ", ".join(
++            f"{element}:{count}" for element, count in sorted(composition.items())
++        )
++        location = f"frame {frame}"
++        if timestep is not None:
++            location += f" (timestep {timestep})"
++
++        if isinstance(self, _DetectCrd):
++            if self.use_ase:
++                backend = "ASE"
++                cutoffs = self.custom_cutoffs or "none"
++                advice = (
++                    "ASE natural cutoffs can include non-covalent contacts. "
++                    "Inspect the connectivity and use "
++                    "--ase-pair-cutoffs El1-El2:0 to exclude an unintended "
++                    f"element pair. Current ASE pair cutoffs: {cutoffs}."
++                )
++            else:
++                backend = "Open Babel"
++                advice = (
++                    "For coordinate trajectories, consider --use-ase together "
++                    "with --ase-pair-cutoffs El1-El2:0 to control connectivity."
++                )
++        else:
++            backend = "explicit bond input"
++            advice = (
++                "For explicit bond trajectories, revise the upstream bond-order "
++                "cutoff or bonding rule."
++            )
++
++        raise RuntimeError(
++            f"Oversized connected component detected at {location}: "
++            f"{len(largest)} of {self.N} atoms exceed the configured limit of "
++            f"{limit} (max_component_atoms={self.max_component_atoms}, "
++            f"max_component_fraction={self.max_component_fraction}). "
++            f"Composition: {composition_text}. Bond detection backend: {backend}. "
++            f"{advice} If this component is intentional, increase the component "
++            "limits or set --max-component-atoms 0 to disable this guard."
++        )
++
++    def _connectmolecule(self, bond, level, frame=None, timestep=None):
+         mols, bondlists = dps(bond, level)
++        self._validate_component_sizes(mols, frame=frame, timestep=timestep)
+         return [
+             b"".join(
+                 (
+@@ -250,8 +323,8 @@ def _readstepfunc(self, item) -> tuple[list[bytes], tuple[int, int]]:
+                     s2 = int(s[2])
+                     bond[s0] = tuple(map(self._get_idx, s[3 : 3 + s2]))
+                     level[s0] = tuple(map(self._get_bo, s[4 + s2 : 4 + 2 * s2]))
+-        molecules = self._connectmolecule(bond, level)
+         assert timestep is not None
++        molecules = self._connectmolecule(bond, level, frame=step, timestep=timestep)
+         return molecules, (step, timestep)
+ 
+     @staticmethod
+@@ -282,6 +355,8 @@ def __init__(self, rng):
+                 "use_ase",
+                 "ase_cutoff_mult",
+                 "custom_cutoffs",
++                "max_component_atoms",
++                "max_component_fraction",
+             ],
+             ["N", "atomtype", "step", "timestep", "temp1it", "moleculetempfilename"],
+         )
+@@ -586,7 +661,9 @@ def _readstepfunc(self, item) -> tuple[list[bytes], tuple[int, int]]:
+         _, step_atoms = zip(*sorted(step_atoms, key=operator.itemgetter(0)))
+         step_atoms = Atoms(step_atoms)
+         bond, level = self._getbondfromcrd(step_atoms, boxsize)
+-        molecules = self._connectmolecule(bond, level)
++        molecules = self._connectmolecule(
++            bond, level, frame=timestep[0], timestep=timestep[1]
++        )
+         return molecules, timestep
+ 
+ 
+@@ -632,7 +709,9 @@ def _readstepfunc(self, item) -> tuple[list[bytes], tuple[int, int]]:
+         _, step_atoms = zip(*sorted(step_atoms, key=operator.itemgetter(0)))
+         step_atoms = Atoms(step_atoms)
+         bond, level = self._getbondfromcrd(step_atoms, boxsize)
+-        molecules = self._connectmolecule(bond, level)
++        molecules = self._connectmolecule(
++            bond, level, frame=timestep[0], timestep=timestep[1]
++        )
+         return molecules, timestep
+ 
+ 
+@@ -694,5 +773,7 @@ def _readstepfunc(self, item) -> tuple[list[bytes], tuple[int, int]]:
+         _, step_atoms = zip(*sorted(step_atoms, key=operator.itemgetter(0)))
+         step_atoms = Atoms(step_atoms)
+         bond, level = self._getbondfromcrd(step_atoms, boxsize)
+-        molecules = self._connectmolecule(bond, level)
++        molecules = self._connectmolecule(
++            bond, level, frame=timestep[0], timestep=timestep[1]
++        )
+         return molecules, timestep
+diff --git a/reacnetgenerator/_matrix.py b/reacnetgenerator/_matrix.py
+index 93fb66122..50bca22cc 100644
+--- a/reacnetgenerator/_matrix.py
++++ b/reacnetgenerator/_matrix.py
+@@ -71,8 +71,7 @@ def _getallroute(self, allmoleculeroute):
+         names = self.mname[allmoleculeroute - 1]
+         names = names[names[:, 0] != names[:, 1]]
+         if names.size > 0:
+-            equations = np.unique(names, return_counts=True, axis=0)
+-            return zip(equations[0].tolist(), equations[1].tolist())
++            return Counter(map(tuple, names)).items()
+         return []
+ 
+     def _printtable(self, allroute, timeaxis=None):
+diff --git a/reacnetgenerator/_path.py b/reacnetgenerator/_path.py
+index 7315dc22d..26e158e18 100644
+--- a/reacnetgenerator/_path.py
++++ b/reacnetgenerator/_path.py
+@@ -214,8 +214,8 @@ def _printmoleculename(self):
+ 
+     def _getatomeach(self):
+         """Values in atomeach starts from 1."""
+-        atomeach = np.zeros((self.N, self.step), dtype=int)
+-        conflict = np.zeros((self.N, self.step), dtype=int)
++        atomeach = np.zeros((self.N, self.step), dtype=np.int32)
++        conflict = np.zeros((self.N, self.step), dtype=np.bool_)
+         with (
+             open(self.hmmfilename if self.runHMM else self.originfilename, "rb") as fh,
+             open(self.moleculetemp2filename, "rb") as ft,
+@@ -533,7 +533,7 @@ def _printmoleculename(self):
+         finally:
+             if timeline is not None:
+                 timeline.close()
+-        self.mname = np.array(mname)
++        self.mname = np.asarray(mname, dtype=object)
+ 
+ 
+ class _CollectSMILESPaths(_CollectPaths):
+@@ -612,7 +612,7 @@ def _raise_anyway(*args, **kwargs):
+         finally:
+             if timeline is not None:
+                 timeline.close()
+-        self.mname = np.array(mname)
++        self.mname = np.asarray(mname, dtype=object)
+ 
+     def _calmoleculeSMILESname(self, item):
+         line = item
+diff --git a/reacnetgenerator/_reaction.py b/reacnetgenerator/_reaction.py
+index 236c99b2a..4201803d6 100644
+--- a/reacnetgenerator/_reaction.py
++++ b/reacnetgenerator/_reaction.py
+@@ -46,7 +46,7 @@ def __init__(self, rng):
+         )
+ 
+     def findreactions(self, atomeach, conflict):
+-        allreactions = []
++        reaction_counts = Counter()
+         # atomeach j, atomeach j+1, conflict j, conflict j+1
+         if self.printreactionevent:
+             givenarray = (
+@@ -86,7 +86,7 @@ def findreactions(self, atomeach, conflict):
+                 for events in results:
+                     for event in events:
+                         reaction = "->".join((event["Reactant"], event["Product"]))
+-                        allreactions.append(reaction)
++                        reaction_counts[reaction] += 1
+                         event_writer.writerow(
+                             [
+                                 event["Timestep_Index"],
+@@ -96,9 +96,11 @@ def findreactions(self, atomeach, conflict):
+                         )
+         else:
+             for reactions in results:
+-                allreactions.extend(reactions)
++                reaction_counts.update(
++                    reaction for reaction in reactions if reaction is not None
++                )
+         # reaction with SMILES
+-        allreactionswithname = Counter(allreactions).most_common()
++        allreactionswithname = reaction_counts.most_common()
+         with WriteBuffer(open(self.reactionabcdfilename, "w"), sep="\n") as f:
+             for reaction, number in allreactionswithname:
+                 if reaction is not None:
+diff --git a/reacnetgenerator/commandline.py b/reacnetgenerator/commandline.py
+index bd138c76c..6172c1819 100644
+--- a/reacnetgenerator/commandline.py
++++ b/reacnetgenerator/commandline.py
+@@ -20,6 +20,20 @@ def _to_command_values(value):
+         return [value]
+ 
+ 
++def _nonnegative_int(value):
++    value = int(value)
++    if value < 0:
++        raise argparse.ArgumentTypeError("must be a non-negative integer")
++    return value
++
++
++def _fraction(value):
++    value = float(value)
++    if not 0 <= value <= 1:
++        raise argparse.ArgumentTypeError("must be between 0 and 1")
++    return value
++
++
+ def main_parser() -> argparse.ArgumentParser:
+     """Return main parser.
+ 
+@@ -103,6 +117,18 @@ def main_parser() -> argparse.ArgumentParser:
+         type=str,
+         default=None,
+     )
++    parser.add_argument(
++        "--max-component-atoms",
++        help="Minimum atom-count limit for oversized connected components; 0 disables the guard",
++        type=_nonnegative_int,
++        default=256,
++    )
++    parser.add_argument(
++        "--max-component-fraction",
++        help="Fractional limit for oversized connected components; 0 uses only the atom limit",
++        type=_fraction,
++        default=0.1,
++    )
+     parser.add_argument("--nopbc", help="Disable PBC.", action="store_true")
+     parser.add_argument(
+         "--cell",
+@@ -248,6 +274,8 @@ def _commandline():
+         use_ase=args.use_ase,
+         ase_cutoff_mult=args.ase_cutoff_mult,
+         custom_cutoffs=args.ase_pair_cutoffs,
++        max_component_atoms=args.max_component_atoms,
++        max_component_fraction=args.max_component_fraction,
+         printmoleculetime=args.show_molecule_time,
+         moleculeframes=args.moleculeframes,
+         moleculetimesteps=args.moleculetimesteps,
+@@ -327,6 +355,14 @@ def parm2cmd(pp: dict) -> list[str]:
+         commands.extend(("--ase-cutoff-mult", str(pp["ase_cutoff_mult"])))
+     if pp.get("custom_cutoffs", None):
+         commands.extend(("--ase-pair-cutoffs", str(pp["custom_cutoffs"])))
++    component_options = (
++        ("max_component_atoms", "--max-component-atoms", 256),
++        ("max_component_fraction", "--max-component-fraction", 0.1),
++    )
++    for key, option, default in component_options:
++        value = pp.get(key)
++        if value is not None and value != default:
++            commands.extend((option, str(value)))
+     if pp.get("items", None):
+         items = pp["items"]
+         if isinstance(items, (list, tuple)):
+diff --git a/reacnetgenerator/reacnetgen.py b/reacnetgenerator/reacnetgen.py
+index 2332ca496..e66fe189a 100644
+--- a/reacnetgenerator/reacnetgen.py
++++ b/reacnetgenerator/reacnetgen.py
+@@ -100,6 +100,13 @@ class ReacNetGenerator:
+     nproc: int, optional, default: None
+         The number of processors used for analysis. If None (default), the program will try to use
+         all processors.
++    max_component_atoms: int, optional, default: 256
++        Minimum atom-count limit for a connected component. The effective limit is the larger of
++        this value and ``ceil(total_atoms * max_component_fraction)``. Set to 0 to disable the
++        connected-component guard.
++    max_component_fraction: float, optional, default: 0.1
++        Fractional connected-component limit in the interval [0, 1]. Set to 0 to use only
++        ``max_component_atoms``.
+     selectatoms: str, optional, default: None
+         Select an element from the atomic names, such as `C`, and only show species with this
+         element in the reaction network. If None (default), the network will show all elements.
+@@ -184,6 +191,8 @@ def __init__(self, **kwargs: Any) -> None:
+             "use_ase": False,
+             "ase_cutoff_mult": 1.2,
+             "custom_cutoffs": None,
++            "max_component_atoms": 256,
++            "max_component_fraction": 0.1,
+         }
+         none_key = [
+             "selectatoms",
+@@ -249,6 +258,22 @@ def __init__(self, **kwargs: Any) -> None:
+             kwargs.setdefault(kk, f"{kwargs['inputfilename'][0]}.{file_key[kk]}")
+         for kk in nparray_key:
+             kwargs[kk] = np.array(kwargs[kk])
++        max_component_atoms = kwargs["max_component_atoms"]
++        if isinstance(max_component_atoms, (bool, np.bool_)) or not isinstance(
++            max_component_atoms, (int, np.integer)
++        ):
++            raise ValueError("max_component_atoms must be a non-negative integer")
++        if max_component_atoms < 0:
++            raise ValueError("max_component_atoms must be a non-negative integer")
++        kwargs["max_component_atoms"] = int(max_component_atoms)
++        max_component_fraction = kwargs["max_component_fraction"]
++        if isinstance(max_component_fraction, (bool, np.bool_)) or not isinstance(
++            max_component_fraction, (int, float, np.integer, np.floating)
++        ):
++            raise ValueError("max_component_fraction must be between 0 and 1")
++        if not 0 <= max_component_fraction <= 1:
++            raise ValueError("max_component_fraction must be between 0 and 1")
++        kwargs["max_component_fraction"] = float(max_component_fraction)
+         for kk in ("moleculeframes", "moleculetimesteps"):
+             kwargs[kk] = self._normalize_optional_int_filter(kwargs[kk])
+         if (
+diff --git a/tests/test_component_guard.py b/tests/test_component_guard.py
+new file mode 100644
+index 000000000..e4846a52c
+--- /dev/null
++++ b/tests/test_component_guard.py
+@@ -0,0 +1,326 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Test oversized connected-component protection."""
++
++import concurrent.futures
++
++import numpy as np
++import pytest
++from ase import Atoms
++
++from reacnetgenerator import ReacNetGenerator
++from reacnetgenerator._detect import _DetectLAMMPSbond, _DetectLAMMPSdump
++from reacnetgenerator.commandline import main_parser, parm2cmd
++
++
++def make_detector(
++    detector_class=_DetectLAMMPSdump,
++    atom_count=300,
++    **kwargs,
++):
++    """Build a detector with initialized synthetic atom metadata."""
++    rng = ReacNetGenerator(
++        inputfiletype=(
++            "lammpsbondfile"
++            if detector_class is _DetectLAMMPSbond
++            else "lammpsdumpfile"
++        ),
++        inputfilename="synthetic",
++        atomname=["H"],
++        pbc=False,
++        **kwargs,
++    )
++    detector = detector_class(rng)
++    detector.N = atom_count
++    detector.atomtype = np.zeros(atom_count, dtype=int)
++    return detector
++
++
++def chain_graph(atom_count, component_size):
++    """Build one linear component and leave all remaining atoms isolated."""
++    bond = [[] for _ in range(atom_count)]
++    level = [[] for _ in range(atom_count)]
++    for atom in range(component_size - 1):
++        bond[atom].append(atom + 1)
++        bond[atom + 1].append(atom)
++        level[atom].append(1)
++        level[atom + 1].append(1)
++    return bond, level
++
++
++def write_bond_trajectory(path, frame_count=151, atom_count=300, component_size=257):
++    """Write a multi-batch explicit-bond trajectory with one oversized chain."""
++    with path.open("w", encoding="utf-8") as handle:
++        for frame in range(frame_count):
++            handle.write(
++                f"# Timestep {frame}\n"
++                "#\n"
++                f"# Number of particles {atom_count}\n"
++                "#\n"
++                "# Max number of bonds per atom 2 with coarse bond order cutoff 0.300\n"
++                "# Particle connection table and bond orders\n"
++                "# id type nb id_1...id_nb mol bo_1...bo_nb abo nlp q\n"
++            )
++            for atom in range(atom_count):
++                neighbors = []
++                if atom < component_size:
++                    if atom > 0:
++                        neighbors.append(atom)
++                    if atom < component_size - 1:
++                        neighbors.append(atom + 2)
++                fields = [
++                    str(atom + 1),
++                    "1",
++                    str(len(neighbors)),
++                    *(str(neighbor) for neighbor in neighbors),
++                    "0",
++                    *("1.0" for _ in neighbors),
++                    "1.0",
++                    "0.0",
++                    "0.0",
++                ]
++                handle.write(" ".join(fields) + "\n")
++
++
++def detect_bond_trajectory(path):
++    """Run detection in a subprocess so the regression has a hard timeout."""
++    rng = ReacNetGenerator(
++        inputfiletype="lammpsbondfile",
++        inputfilename=path,
++        atomname=["H"],
++        nproc=1,
++    )
++    _DetectLAMMPSbond(rng).detect()
++
++
++def test_default_component_limits():
++    """Use the documented atom and fractional limits by default."""
++    rng = ReacNetGenerator(
++        inputfiletype="lammpsdumpfile",
++        inputfilename="synthetic",
++        atomname=["H"],
++    )
++
++    assert rng.max_component_atoms == 256
++    assert rng.max_component_fraction == 0.1
++    args = main_parser().parse_args(["-i", "synthetic", "-a", "H"])
++    assert args.max_component_atoms == 256
++    assert args.max_component_fraction == 0.1
++
++
++def test_component_at_exact_limit_is_allowed():
++    """Allow a component whose size equals the effective limit."""
++    detector = make_detector(max_component_fraction=0)
++    bond, level = chain_graph(300, 256)
++
++    detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++
++def test_component_above_atom_limit_fails_with_context():
++    """Report actionable context when an ASE component exceeds the limit."""
++    detector = make_detector(use_ase=True, max_component_fraction=0)
++    bond, level = chain_graph(300, 257)
++
++    with pytest.raises(RuntimeError) as exc_info:
++        detector._connectmolecule(bond, level, frame=2, timestep=50)
++
++    message = str(exc_info.value)
++    assert "frame 2 (timestep 50)" in message
++    assert "257 of 300 atoms" in message
++    assert "limit of 256" in message
++    assert "H:257" in message
++    assert "Bond detection backend: ASE" in message
++    assert "--ase-pair-cutoffs El1-El2:0" in message
++
++
++def test_fractional_limit_scales_with_system_size():
++    """Scale the effective limit with the total system size."""
++    detector = make_detector(atom_count=3000)
++    bond, level = chain_graph(3000, 301)
++
++    with pytest.raises(RuntimeError, match="limit of 300"):
++        detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++
++def test_fractional_limit_rounds_up():
++    """Round a fractional component limit up to the next atom."""
++    detector = make_detector(atom_count=2561)
++    boundary_bond, boundary_level = chain_graph(2561, 257)
++    oversized_bond, oversized_level = chain_graph(2561, 258)
++
++    detector._connectmolecule(boundary_bond, boundary_level, frame=0, timestep=0)
++    with pytest.raises(RuntimeError, match="limit of 257"):
++        detector._connectmolecule(oversized_bond, oversized_level, frame=0, timestep=0)
++
++
++def test_component_limits_can_be_overridden():
++    """Accept public API overrides for both component limits."""
++    detector = make_detector(
++        max_component_atoms=400,
++        max_component_fraction=0,
++    )
++    bond, level = chain_graph(300, 300)
++
++    detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++
++def test_zero_atom_limit_disables_guard():
++    """Disable the guard when the atom limit is explicitly zero."""
++    detector = make_detector(
++        max_component_atoms=0,
++        max_component_fraction=1,
++    )
++    bond, level = chain_graph(300, 300)
++
++    detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++
++def test_empty_component_list_is_allowed():
++    """Allow an empty component collection without raising an error."""
++    detector = make_detector(max_component_fraction=0)
++
++    detector._validate_component_sizes([], frame=0, timestep=0)
++
++
++@pytest.mark.parametrize(
++    ("key", "value", "message"),
++    [
++        ("max_component_atoms", -1, "non-negative integer"),
++        ("max_component_atoms", 1.5, "non-negative integer"),
++        ("max_component_atoms", True, "non-negative integer"),
++        ("max_component_fraction", -0.1, "between 0 and 1"),
++        ("max_component_fraction", 1.1, "between 0 and 1"),
++        ("max_component_fraction", True, "between 0 and 1"),
++    ],
++)
++def test_python_api_rejects_invalid_component_limits(key, value, message):
++    """Reject invalid component limits passed through the Python API."""
++    with pytest.raises(ValueError, match=message):
++        ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename="synthetic",
++            atomname=["H"],
++            **{key: value},
++        )
++
++
++@pytest.mark.parametrize(
++    ("option", "value"),
++    [
++        ("--max-component-atoms", "-1"),
++        ("--max-component-atoms", "1.5"),
++        ("--max-component-fraction", "-0.1"),
++        ("--max-component-fraction", "1.1"),
++    ],
++)
++def test_cli_rejects_invalid_component_limits(option, value):
++    """Reject invalid component limits passed through the CLI."""
++    parser = main_parser()
++    with pytest.raises(SystemExit):
++        parser.parse_args(["-i", "synthetic", "-a", "H", option, value])
++
++
++def test_parm2cmd_preserves_zero_component_limits():
++    """Preserve explicit zero values when rebuilding a CLI command."""
++    command = parm2cmd(
++        {
++            "inputfilename": "synthetic",
++            "inputfiletype": "lammpsdumpfile",
++            "atomname": ["H"],
++            "max_component_atoms": 0,
++            "max_component_fraction": 0,
++        }
++    )
++
++    assert command[command.index("--max-component-atoms") + 1] == "0"
++    assert command[command.index("--max-component-fraction") + 1] == "0"
++    args = main_parser().parse_args(command[1:])
++    assert args.max_component_atoms == 0
++    assert args.max_component_fraction == 0
++
++
++def test_openbabel_error_recommends_ase_controls():
++    """Recommend ASE controls for oversized coordinate-based components."""
++    detector = make_detector(use_ase=False, max_component_fraction=0)
++    bond, level = chain_graph(300, 257)
++
++    with pytest.raises(RuntimeError, match="consider --use-ase"):
++        detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++
++def test_explicit_bond_error_recommends_upstream_cutoff():
++    """Recommend upstream bond controls for explicit bond trajectories."""
++    detector = make_detector(
++        detector_class=_DetectLAMMPSbond,
++        max_component_fraction=0,
++    )
++    bond, level = chain_graph(300, 257)
++
++    with pytest.raises(RuntimeError, match="upstream bond-order cutoff"):
++        detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++
++def test_detect_stops_before_writing_molecule_data(tmp_path):
++    """Propagate the guard through trajectory detection before serialization."""
++    atom_count = 300
++    trajectory = tmp_path / "synthetic.dump"
++    atom_lines = "\n".join(
++        f"{atom + 1} 1 {0.6 * atom} 0.0 0.0" for atom in range(atom_count)
++    )
++    trajectory.write_text(
++        f"""ITEM: TIMESTEP
++50
++ITEM: NUMBER OF ATOMS
++{atom_count}
++ITEM: BOX BOUNDS pp pp pp
++0.0 200.0
++0.0 10.0
++0.0 10.0
++ITEM: ATOMS id type x y z
++{atom_lines}
++"""
++    )
++    rng = ReacNetGenerator(
++        inputfiletype="lammpsdumpfile",
++        inputfilename=trajectory,
++        atomname=["H"],
++        pbc=False,
++        use_ase=True,
++        nproc=1,
++    )
++    detector = _DetectLAMMPSdump(rng)
++
++    with pytest.raises(RuntimeError, match=r"frame 0 \(timestep 50\)"):
++        detector.detect()
++    assert detector.moleculetempfilename is None
++
++
++def test_multibatch_guard_error_reaches_caller_without_hanging(tmp_path):
++    """Propagate a worker guard failure after more than one legacy input batch."""
++    trajectory = tmp_path / "oversized.bond"
++    write_bond_trajectory(trajectory)
++
++    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
++        future = executor.submit(detect_bond_trajectory, trajectory)
++        with pytest.raises(RuntimeError, match=r"frame 0 \(timestep 0\)"):
++            future.result(timeout=10)
++
++
++def test_ase_pair_cutoff_can_remove_oversized_component():
++    """Allow an explicit ASE pair cutoff to remove an unintended component."""
++    atom_count = 300
++    atoms = Atoms(
++        ["H"] * atom_count,
++        positions=[(0.6 * atom, 0.0, 0.0) for atom in range(atom_count)],
++        cell=[200.0, 10.0, 10.0],
++        pbc=False,
++    )
++
++    detector = make_detector(use_ase=True)
++    bond, level = detector._getbondfromase(atoms, atoms.cell.array)
++    with pytest.raises(RuntimeError, match="ASE natural cutoffs"):
++        detector._connectmolecule(bond, level, frame=0, timestep=0)
++
++    detector = make_detector(use_ase=True, custom_cutoffs="H-H:0")
++    bond, level = detector._getbondfromase(atoms, atoms.cell.array)
++    molecules = detector._connectmolecule(bond, level, frame=0, timestep=0)
++    assert len(molecules) == atom_count
+diff --git a/tests/test_detect.py b/tests/test_detect.py
+index 5bebc78a8..bef442663 100644
+--- a/tests/test_detect.py
++++ b/tests/test_detect.py
+@@ -265,6 +265,7 @@ def detect_instance(self):
+             inputfilename="dummy",
+             atomname=["H", "O"],
+             use_ase=True,
++            max_component_atoms=0,
+         )
+         return _DetectLAMMPSdump(rng)
+ 
+diff --git a/tests/test_items.py b/tests/test_items.py
+index 5d3c00a57..0735c4067 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -50,6 +50,20 @@ def test_species_reactions(self, rng):
+         rng.run_items(["species", "reactions"])
+         assert os.path.exists(rng.speciesfilename)
+         assert os.path.exists(rng.reactionfilename)
++        assert rng.mname.dtype == object
++
++    def test_smiles_molecule_names_use_object_dtype(self):
++        """SMILES names should not expand to the longest fixed-width string."""
++        rng = ReacNetGenerator(
++            inputfilename=INPUT_NAME,
++            atomname=["H", "O"],
++            inputfiletype="lammpsbondfile",
++            runHMM=False,
++            SMILES=True,
++            nproc=1,
++        )
++        rng.run_items(["species", "reactions"])
++        assert rng.mname.dtype == object
+ 
+     def test_explicit_species_overrides_legacy_flag_for_one_run(self, rng):
+         """Honor a requested species file and then restore caller configuration."""
+diff --git a/tests/test_reacnetgen.py b/tests/test_reacnetgen.py
+index 93649ceab..f667c65e9 100644
+--- a/tests/test_reacnetgen.py
++++ b/tests/test_reacnetgen.py
+@@ -18,6 +18,7 @@
+ from reacnetgenerator import ReacNetGenerator
+ from reacnetgenerator._detect import _Detect
+ from reacnetgenerator._hmmfilter import _HMMFilter
++from reacnetgenerator._matrix import _GenerateMatrix
+ from reacnetgenerator._path import _CollectSMILESPaths, _MoleculeTimelineSpool
+ from reacnetgenerator._reaction import ReactionsFinder
+ from reacnetgenerator.commandline import parm2cmd
+@@ -215,6 +216,16 @@ def test_getatomeach_maps_conflicts_to_original_indices(self, tmp_path):
+         expected_conflict[2, 3] = 1
+         np.testing.assert_array_equal(atomeach, expected_atomeach)
+         np.testing.assert_array_equal(conflict, expected_conflict)
++        assert atomeach.dtype == np.int32
++        assert conflict.dtype == np.bool_
++
++    def test_object_molecule_names_support_reaction_matrix(self):
++        """Variable-length names should retain reaction-route counts."""
++        matrix = object.__new__(_GenerateMatrix)
++        matrix.mname = np.asarray(["A", "B", "C"], dtype=object)
++        routes = np.array([[1, 2], [1, 2], [2, 3], [3, 3]])
++
++        assert dict(matrix._getallroute(routes)) == {("A", "B"): 2, ("B", "C"): 1}
+ 
+     def test_reaction_event_details(self, tmp_path):
+         """Single reaction events should expose time-resolved CSV fields."""
+@@ -269,6 +280,7 @@ def test_reaction_event_file_is_csv(self, tmp_path):
+             "Timestep_Index,Reactant,Product",
+             "0,A+B,C",
+         ]
++        assert (tmp_path / "out.reactionabcd").read_text().splitlines() == ["1 A+B->C"]
+ 
+     def test_reaction_event_default_is_off(self, tmp_path):
+         """Reaction event details should not be calculated unless requested."""

@@ -1,0 +1,501 @@
+diff --git a/benchmark/perf_unifold.py b/benchmark/perf_unifold.py
+index 5580a3b..1b852aa 100644
+--- a/benchmark/perf_unifold.py
++++ b/benchmark/perf_unifold.py
+@@ -60,6 +60,7 @@ def forward(
+         msa_col_attn_mask: torch.Tensor,
+         tri_start_attn_mask: torch.Tensor,
+         tri_end_attn_mask: torch.Tensor,
++        chunk_size: int,
+     ):
+         node, pair = self.EvoformerIteration(
+             node,
+@@ -70,6 +71,7 @@ def forward(
+             msa_col_attn_mask,
+             tri_start_attn_mask,
+             tri_end_attn_mask,
++            chunk_size=chunk_size,
+         )
+         return node, pair
+ 
+@@ -93,6 +95,9 @@ def main():
+     parser.add_argument(
+         "--layers", default=4, type=int, help="Evoformer Layers to Execute"
+     )
++    parser.add_argument(
++        "--chunk-size", default=None, type=int, help="Evoformer Layers to Execute"
++    )
+     parser.add_argument("--cm", default=256, type=int, help="MSA hidden dimension")
+     parser.add_argument("--cz", default=128, type=int, help="Pair hidden dimension")
+     parser.add_argument("--fwd", action="store_true", help="Only execute Fwd Pass.")
+@@ -119,6 +124,8 @@ def main():
+         attn_layers.append(WrapEvoformerLayer(d_node=args.cm, d_pair=args.cz))
+         attn_layers[idx].cuda()
+         attn_layers[idx].to(dtype=precision)
++        if args.fwd:
++            attn_layers[idx].eval()
+ 
+     start_evt_fwd = []
+     start_evt_bwd = []
+@@ -176,7 +183,8 @@ def main():
+                     msa_raw_mask,
+                     msa_col_mask,
+                     tri_start_mask,
+-                    tri_end_mask
++                    tri_end_mask,
++                    chunk_size=args.chunk_size,
+                 )
+ 
+         torch.cuda.synchronize()
+diff --git a/unifold/modules/attentions.py b/unifold/modules/attentions.py
+index 17c401b..e44ac38 100644
+--- a/unifold/modules/attentions.py
++++ b/unifold/modules/attentions.py
+@@ -179,34 +179,40 @@ def _chunk(
+         bias: Optional[torch.Tensor] = None,
+         chunk_size: int = None,
+     ) -> torch.Tensor:
++
+         return chunk_layer(
+-            self.mha,
+-            {"q": m, "k": m, "v": m, "mask": mask, "bias": bias},
++            self._attn_forward,
++            {"m": m, "mask": mask, "bias": bias},
+             chunk_size=chunk_size,
+             num_batch_dims=len(m.shape[:-2]),
+         )
+ 
+-
+     @torch.jit.ignore
+-    def _chunk_attn(
++    def _attn_chunk_forward(
+         self,
+         m: torch.Tensor,
+         mask: Optional[torch.Tensor] = None,
+         bias: Optional[torch.Tensor] = None,
+         chunk_size: Optional[int] = 2560,
+     ) -> torch.Tensor:
++        m = self.layer_norm_m(m)
+         num_chunk = (m.shape[-3] + chunk_size - 1) // chunk_size
+         outputs = []
+         for i in range(num_chunk):
+             chunk_start = i * chunk_size
+-            chunk_end  = min(m.shape[-3], chunk_start + chunk_size)
+-            cur_m = m[..., chunk_start: chunk_end , :, :]
+-            cur_mask = mask[..., chunk_start: chunk_end, :, :, :] if mask is not None else None
++            chunk_end = min(m.shape[-3], chunk_start + chunk_size)
++            cur_m = m[..., chunk_start:chunk_end, :, :]
++            cur_mask = (
++                mask[..., chunk_start:chunk_end, :, :, :] if mask is not None else None
++            )
+             outputs.append(
+                 self.mha(q=cur_m, k=cur_m, v=cur_m, mask=cur_mask, bias=bias)
+             )
+         return torch.concat(outputs, dim=-3)
+ 
++    def _attn_forward(self, m, mask, bias: Optional[torch.Tensor] = None):
++        m = self.layer_norm_m(m)
++        return self.mha(q=m, k=m, v=m, mask=mask, bias=bias)
+ 
+     def forward(
+         self,
+@@ -215,7 +221,6 @@ def forward(
+         attn_mask: Optional[torch.Tensor] = None,
+         chunk_size: Optional[int] = None,
+     ) -> torch.Tensor:
+-        m = self.layer_norm_m(m)
+ 
+         bias = None
+         if self.pair_bias:
+@@ -231,9 +236,12 @@ def forward(
+         else:
+             attn_chunk_size = 2560
+             if m.shape[-3] <= attn_chunk_size:
+-                m = self.mha(q=m, k=m, v=m, mask=attn_mask, bias=bias)
++                m = self._attn_forward(m, attn_mask, bias)
+             else:
+-                return self._chunk_attn(m, attn_mask, bias, chunk_size=attn_chunk_size)
++                # reduce the peak memory cost in extra_msa_stack
++                return self._attn_chunk_forward(
++                    m, attn_mask, bias, chunk_size=attn_chunk_size
++                )
+ 
+         return m
+ 
+@@ -303,12 +311,16 @@ def _chunk(
+         chunk_size: int,
+     ) -> torch.Tensor:
+         return chunk_layer(
+-            self.global_attention,
+-            {"x": m, "mask": mask},
++            self._attn_forward,
++            {"m": m, "mask": mask},
+             chunk_size=chunk_size,
+             num_batch_dims=len(m.shape[:-2]),
+         )
+ 
++    def _attn_forward(self, m, mask):
++        m = self.layer_norm_m(m)
++        return self.global_attention(m, mask=mask)
++
+     def forward(
+         self,
+         m: torch.Tensor,
+@@ -319,12 +331,10 @@ def forward(
+         m = m.transpose(-2, -3)
+         mask = mask.transpose(-1, -2)
+ 
+-        m = self.layer_norm_m(m)
+-
+         if chunk_size is not None:
+             m = self._chunk(m, mask, chunk_size)
+         else:
+-            m = self.global_attention(m, mask=mask)
++            m = self._attn_forward(m, mask=mask)
+ 
+         m = m.transpose(-2, -3)
+         return m
+diff --git a/unifold/modules/common.py b/unifold/modules/common.py
+index 4b52edc..a78e526 100644
+--- a/unifold/modules/common.py
++++ b/unifold/modules/common.py
+@@ -77,6 +77,7 @@ def __init__(self, d_in, n):
+         self.linear_2 = Linear(self.n * self.d_in, d_in, init="final")
+ 
+     def _transition(self, x):
++        x = self.layer_norm(x)
+         x = self.linear_1(x)
+         x = self.act(x)
+         x = self.linear_2(x)
+@@ -101,8 +102,6 @@ def forward(
+         chunk_size: Optional[int] = None,
+     ) -> torch.Tensor:
+ 
+-        x = self.layer_norm(x)
+-
+         if chunk_size is not None:
+             x = self._chunk(x, chunk_size)
+         else:
+@@ -194,8 +193,12 @@ def forward(
+         return z
+ 
+ 
+-def residual(residual, x):
+-    return x + residual
++def residual(residual, x, training):
++    if training:
++        return x + residual
++    else:
++        residual += x
++        return residual
+ 
+ 
+ @torch.jit.script
+@@ -215,7 +218,8 @@ def fused_bias_dropout_add_inference(
+     bias: torch.Tensor,
+     residual: torch.Tensor,
+ ) -> torch.Tensor:
+-    return x + bias + residual
++    residual += bias + x
++    return residual
+ 
+ 
+ def bias_dropout_residual(module, residual, x, dropout_shared_dim, prob, training):
+@@ -247,23 +251,18 @@ def fused_bias_gated_dropout_add(
+     ) + residual
+ 
+ 
+-@torch.jit.script
+-def fused_bias_gated_dropout_add_inference(
+-    x: torch.Tensor,
+-    bias: torch.Tensor,
+-    g: torch.Tensor,
+-    g_bias: torch.Tensor,
+-    residual: torch.Tensor,
+-) -> torch.Tensor:
+-    return (torch.sigmoid(g + g_bias) * (x + bias)) + residual
+-
+-
+-def bias_gated_dropout_residual(
+-    module, residual, outputs, dropout_shared_dim, prob, training
++def tri_mul_residual(
++    module,
++    residual,
++    outputs,
++    dropout_shared_dim,
++    prob,
++    training,
++    chunk_size=None,
+ ):
+-    x, g = outputs
+-    bias, g_bias = module.get_output_bias()
+-    if training:
++    if training or chunk_size is None:
++        x, g = outputs
++        bias, g_bias = module.get_output_bias()
+         shape = list(x.shape)
+         shape[dropout_shared_dim] = 1
+         with torch.no_grad():
+@@ -278,7 +277,9 @@ def bias_gated_dropout_residual(
+             prob,
+         )
+     else:
+-        return fused_bias_gated_dropout_add_inference(x, bias, g, g_bias, residual)
++        # gated is not used here
++        residual += outputs
++        return residual
+ 
+ 
+ class SimpleModuleList(nn.ModuleList):
+diff --git a/unifold/modules/evoformer.py b/unifold/modules/evoformer.py
+index 671054d..5c2d2da 100644
+--- a/unifold/modules/evoformer.py
++++ b/unifold/modules/evoformer.py
+@@ -10,7 +10,7 @@
+     SimpleModuleList,
+     residual,
+     bias_dropout_residual,
+-    bias_gated_dropout_residual,
++    tri_mul_residual,
+ )
+ from .attentions import (
+     MSARowAttentionWithPairBias,
+@@ -128,7 +128,8 @@ def forward(
+ 
+         if self.outer_product_mean_first:
+             z = residual(
+-                z, self.outer_product_mean(m, mask=msa_mask, chunk_size=chunk_size)
++                z, self.outer_product_mean(m, mask=msa_mask, chunk_size=chunk_size),
++                self.training
+             )
+ 
+         m = bias_dropout_residual(
+@@ -142,7 +143,10 @@ def forward(
+             self.training,
+         )
+         if self._is_extra_msa_stack:
+-            m = residual(m, self.msa_att_col(m, mask=msa_mask, chunk_size=chunk_size))
++            m = residual(
++                m, self.msa_att_col(m, mask=msa_mask, chunk_size=chunk_size),
++                self.training
++            )
+         else:
+             m = bias_dropout_residual(
+                 self.msa_att_col,
+@@ -152,28 +156,34 @@ def forward(
+                 self.msa_dropout,
+                 self.training,
+             )
+-        m = residual(m, self.msa_transition(m, chunk_size=chunk_size))
++        m = residual(
++            m, self.msa_transition(m, chunk_size=chunk_size),
++            self.training
++        )
+         if not self.outer_product_mean_first:
+             z = residual(
+-                z, self.outer_product_mean(m, mask=msa_mask, chunk_size=chunk_size)
++                z, self.outer_product_mean(m, mask=msa_mask, chunk_size=chunk_size),
++                self.training
+             )
+ 
+-        z = bias_gated_dropout_residual(
++        z = tri_mul_residual(
+             self.tri_mul_out,
+             z,
+-            self.tri_mul_out(z, mask=pair_mask),
++            self.tri_mul_out(z, mask=pair_mask, chunk_size=chunk_size),
+             self.row_dropout_share_dim,
+             self.pair_dropout,
+             self.training,
++            chunk_size=chunk_size,
+         )
+ 
+-        z = bias_gated_dropout_residual(
++        z = tri_mul_residual(
+             self.tri_mul_in,
+             z,
+-            self.tri_mul_in(z, mask=pair_mask),
++            self.tri_mul_in(z, mask=pair_mask, chunk_size=chunk_size),
+             self.row_dropout_share_dim,
+             self.pair_dropout,
+             self.training,
++            chunk_size=chunk_size,
+         )
+ 
+         z = bias_dropout_residual(
+@@ -193,7 +203,10 @@ def forward(
+             self.pair_dropout,
+             self.training,
+         )
+-        z = residual(z, self.pair_transition(z, chunk_size=chunk_size))
++        z = residual(
++            z, self.pair_transition(z, chunk_size=chunk_size),
++            self.training
++        )
+         return m, z
+ 
+ 
+diff --git a/unifold/modules/template.py b/unifold/modules/template.py
+index 140313c..952d839 100644
+--- a/unifold/modules/template.py
++++ b/unifold/modules/template.py
+@@ -9,7 +9,7 @@
+     SimpleModuleList,
+     residual,
+     bias_dropout_residual,
+-    bias_gated_dropout_residual,
++    tri_mul_residual,
+ )
+ from .common import Linear, Transition, chunk_layer
+ from .attentions import (
+@@ -179,7 +179,7 @@ def forward(
+                 self.dropout,
+                 self.training,
+             )
+-            s = bias_gated_dropout_residual(
++            s = tri_mul_residual(
+                 self.tri_mul_out,
+                 s,
+                 self.tri_mul_out(s, mask=mask),
+@@ -188,7 +188,7 @@ def forward(
+                 self.training,
+             )
+ 
+-            s = bias_gated_dropout_residual(
++            s = tri_mul_residual(
+                 self.tri_mul_in,
+                 s,
+                 self.tri_mul_in(s, mask=mask),
+@@ -197,7 +197,7 @@ def forward(
+                 self.training,
+             )
+         else:
+-            s = bias_gated_dropout_residual(
++            s = tri_mul_residual(
+                 self.tri_mul_out,
+                 s,
+                 self.tri_mul_out(s, mask=mask),
+@@ -206,7 +206,7 @@ def forward(
+                 self.training,
+             )
+ 
+-            s = bias_gated_dropout_residual(
++            s = tri_mul_residual(
+                 self.tri_mul_in,
+                 s,
+                 self.tri_mul_in(s, mask=mask),
+@@ -240,6 +240,7 @@ def forward(
+                 s,
+                 chunk_size=chunk_size,
+             ),
++            self.training
+         )
+         return s
+ 
+diff --git a/unifold/modules/triangle_multiplication.py b/unifold/modules/triangle_multiplication.py
+index d346c91..2dbfeae 100644
+--- a/unifold/modules/triangle_multiplication.py
++++ b/unifold/modules/triangle_multiplication.py
+@@ -27,15 +27,101 @@ def __init__(self, d_pair, d_hid, outgoing=True):
+ 
+         self._alphafold_original_mode = False
+ 
++    def _chunk_2d(
++        self,
++        z: torch.Tensor,
++        mask: Optional[torch.Tensor] = None,
++        chunk_size: int = None,
++    ) -> torch.Tensor:
++
++        # avoid too small chunk size
++        chunk_size = max(chunk_size, 256)
++        new_z = z.new_zeros(z.shape)
++        dim1 = z.shape[-3]
++
++        def _slice_linear(z, linear: Linear, a=True):
++            d_hid = linear.bias.shape[0] // 2
++            index = 0 if a else d_hid
++            p = (
++                nn.functional.linear(z, linear.weight[index : index + d_hid])
++                + linear.bias[index : index + d_hid]
++            )
++            return p
++
++        def _chunk_projection(z, mask, a=True):
++            p = _slice_linear(z, self.linear_ab_p, a) * mask
++            p *= torch.sigmoid(_slice_linear(z, self.linear_ab_g, a))
++            return p
++
++        num_chunk = (dim1 + chunk_size - 1) // chunk_size
++        for i in range(num_chunk):
++            chunk_start = i * chunk_size
++            chunk_end = min(chunk_start + chunk_size, dim1)
++            if self.outgoing:
++                a_chunk = _chunk_projection(
++                    z[..., chunk_start:chunk_end, :, :],
++                    mask[..., chunk_start:chunk_end, :, :],
++                    a=True,
++                )
++                a_chunk = permute_final_dims(a_chunk, (2, 0, 1))
++            else:
++                a_chunk = _chunk_projection(
++                    z[..., :, chunk_start:chunk_end, :],
++                    mask[..., :, chunk_start:chunk_end, :],
++                    a=True,
++                )
++                a_chunk = a_chunk.transpose(-1, -3)
++
++            for j in range(num_chunk):
++                j_chunk_start = j * chunk_size
++                j_chunk_end = min(j_chunk_start + chunk_size, dim1)
++                if self.outgoing:
++                    b_chunk = _chunk_projection(
++                        z[..., j_chunk_start:j_chunk_end, :, :],
++                        mask[..., j_chunk_start:j_chunk_end, :, :],
++                        a=False,
++                    )
++                    b_chunk = b_chunk.transpose(-1, -3)
++                else:
++                    b_chunk = _chunk_projection(
++                        z[..., :, j_chunk_start:j_chunk_end, :],
++                        mask[..., :, j_chunk_start:j_chunk_end, :],
++                        a=False,
++                    )
++                    b_chunk = permute_final_dims(b_chunk, (2, 0, 1))
++                x_chunk = torch.matmul(a_chunk, b_chunk)
++                del b_chunk
++                x_chunk = permute_final_dims(x_chunk, (1, 2, 0))
++                x_chunk = self.layer_norm_out(x_chunk)
++                x_chunk = self.linear_z(x_chunk)
++                x_chunk *= torch.sigmoid(
++                    self.linear_g(
++                        z[..., chunk_start:chunk_end, j_chunk_start:j_chunk_end, :]
++                    )
++                )
++                new_z[
++                    ..., chunk_start:chunk_end, j_chunk_start:j_chunk_end, :
++                ] = x_chunk
++                del x_chunk
++            del a_chunk
++        return new_z
++
+     def forward(
+-        self, z: torch.Tensor, mask: Optional[torch.Tensor] = None
++        self,
++        z: torch.Tensor,
++        mask: Optional[torch.Tensor] = None,
++        chunk_size=None,
+     ) -> torch.Tensor:
++
+         mask = mask.unsqueeze(-1)
+         if not self._alphafold_original_mode:
+             # divided by 1/sqrt(dim) for numerical stability
+             mask = mask * (mask.shape[-2] ** -0.5)
+ 
+         z = self.layer_norm_in(z)
++        if not self.training and chunk_size is not None:
++            return self._chunk_2d(z, mask, chunk_size=chunk_size)
++
+         g = nn.functional.linear(z, self.linear_g.weight)
+         ab = self.linear_ab_p(z) * mask
+         ab *= torch.sigmoid(self.linear_ab_g(z))

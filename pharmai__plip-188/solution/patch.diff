@@ -1,0 +1,486 @@
+diff --git a/.gitignore b/.gitignore
+index a193256..1e4d186 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -48,4 +48,6 @@ target/
+ # Other
+ *~
+ .nfs*
+-tests/
+\ No newline at end of file
++tests/
++# JetBrains IDE settings
++.idea/
+diff --git a/plip/basic/config.py b/plip/basic/config.py
+index d4b67d8..102388e 100644
+--- a/plip/basic/config.py
++++ b/plip/basic/config.py
+@@ -33,6 +33,7 @@
+ NOHYDRO = False  # Do not add hydrogen bonds (in case already present in the structure)
+ MODEL = 1  # The model to be selected for multi-model structures (default = 1).
+ CHAINS = None # Define chains for protein-protein interaction detection
++REGIONS = None
+ 
+ 
+ # Configuration file for Protein-Ligand Interaction Profiler (PLIP)
+diff --git a/plip/basic/remote.py b/plip/basic/remote.py
+index 9c6af3f..89af974 100644
+--- a/plip/basic/remote.py
++++ b/plip/basic/remote.py
+@@ -26,6 +26,7 @@ def __init__(self, mol, site):
+         self.pdbid = mol.pymol_name
+         self.hetid = ligand.hetid
+         self.ligandtype = ligand.type
++        self.regions = ligand.regions
+         self.chain = ligand.chain if not ligand.chain == "0" else ""  # #@todo Fix this
+         self.position = str(ligand.position)
+         self.uid = ":".join([self.hetid, self.chain, self.position])
+diff --git a/plip/basic/supplemental.py b/plip/basic/supplemental.py
+index 6939ae5..c3ae158 100644
+--- a/plip/basic/supplemental.py
++++ b/plip/basic/supplemental.py
+@@ -55,15 +55,29 @@ def whichchain(atom):
+     return atom.GetResidue().GetChain() if atom.GetResidue() is not None else None
+ 
+ 
+-def residue_belongs_to_receptor(res, config):
++def residue_belongs_to_receptor(res, regions=None):
+     """tests whether the residue is defined as receptor and is not part of a peptide or residue ligand."""
+-    if config.CHAINS:
++    if regions:
++        ligand_region, bs_region = regions
++        chain = res.GetChain()
++        num = res.GetNum()
++        if ligand_region and bs_region:  # both ligand and receptor region were defined
++            if num in ligand_region.get(chain, []):
++                return False  # residue belongs to ligand
++            if num in bs_region.get(chain, []):
++                return True  # residue belongs to receptor and not to ligand
++            return False
++        else:
++            return num not in ligand_region.get(chain, [])
++
++    elif config.CHAINS:
+         if config.CHAINS[0] and config.CHAINS[1]:  # if receptor and ligand chains were given
+             return res.GetChain() in config.CHAINS[0] and res.GetChain() not in config.CHAINS[1]
+             # True if residue is part of receptor chains and not of ligand chains
+         if config.CHAINS[1]:  # if only ligand chains were given
+             return res.GetChain() not in config.CHAINS[1]  # True if residue is not part of ligand chains
+         return False  # if only receptor chains were given or both is empty
++
+     return res.GetChain() not in config.PEPTIDES  # True if residue is not part of peptide ligand.
+ 
+ 
+@@ -231,6 +245,18 @@ def start_pymol(quiet=False, options='-p', run=False):
+         pymol.cmd.feedback('disable', 'all', 'everything')
+ 
+ 
++def select_region(region):
++    """region is a dictionary with chains as keys and a list of residue numbers as values."""
++    selection = f"(chain "
++    for i, (chain, res_numbers) in enumerate(region.items()):
++        selection += f"{chain} and not resn HOH and resi {'+'.join(map(str, res_numbers))}"
++        if not i == len(region) - 1:
++            selection += ") or (chain "
++        else:
++            selection += ")"
++    return selection
++
++
+ def nucleotide_linkage(residues):
+     """Support for DNA/RNA ligands by finding missing covalent linkages to stitch DNA/RNA together."""
+ 
+diff --git a/plip/plipcmd.py b/plip/plipcmd.py
+index b79b7df..a718862 100644
+--- a/plip/plipcmd.py
++++ b/plip/plipcmd.py
+@@ -126,7 +126,7 @@ def remove_duplicates(slist):
+     return unique
+ 
+ 
+-def run_analysis(inputstructs, inputpdbids, chains=None):
++def run_analysis(inputstructs, inputpdbids):
+     """Main function. Calls functions for processing, report generation and visualization."""
+     pdbid, pdbpath = None, None
+     # @todo For multiprocessing, implement better stacktracing for errors
+@@ -228,9 +228,6 @@ def main():
+                             help="Allows to define one or multiple chains as peptide ligands or to detect inter-chain contacts",
+                             nargs="+")
+     ligandtype.add_argument("--intra", dest="intra", help="Allows to define one chain to analyze intra-chain contacts.")
+-    parser.add_argument("--residues", dest="residues", default=[], nargs="+",
+-                        help="""Allows to specify which residues of the chain(s) should be considered as peptide ligands.
+-                        Give single residues (separated with comma) or ranges (with dash) or both, for several chains separate selections with one space""")
+     parser.add_argument("--keepmod", dest="keepmod", default=False,
+                         help="Keep modified residues as ligands",
+                         action="store_true")
+@@ -256,17 +253,19 @@ def main():
+                             help=argparse.SUPPRESS)
+ 
+     # Add argument to define receptor and ligand chains
+-    parser.add_argument("--chains", dest="chains", type=str,
++    ligandtype.add_argument("--chains", dest="chains", type=str,
+                         help="Specify chains as receptor/ligand groups, e.g., '[['A'], ['B']]'. "
+                              "Use format [['A'], ['B', 'C']] to define A as receptor, and B, C as ligands.")
+ 
++    # Add argument to define receptor and ligand regions of the protein
++    ligandtype.add_argument("--regions", dest="regions", type=str,
++                        help="Specify protein regions as receptor/ligand groups by chain and residue numbers. "
++                             "e.g., ({A: 1-20, 25, 26, 28}, {A: 54-63, B: 17-46}) to define residues"
++                             "1-20, 25, 26, and 28 of chain A as ligand and residues 54-63 of chain A and residues"
++                             "17-46 of chain B as receptor. Defining a receptor is optional. Multiple ligand-receptor"
++                             "pairs can be parsed as a list of tuples [({A: 1-20}, {B: 17-46}), ({C: 5-43}, {D: 7})].")
+ 
+     arguments = parser.parse_args()
+-    # make sure, residues is only used together with --inter (could be expanded to --intra in the future)
+-    if arguments.residues and not (arguments.peptides or arguments.intra):
+-        parser.error("The --residues option requires specification of a chain with --inter or --peptide")
+-    if arguments.residues and len(arguments.residues)!=len(arguments.peptides):
+-        parser.error("Please provide residue numbers or ranges for each chain specified. Separate selections with a single space.")
+     # configure log levels
+     config.VERBOSE = True if arguments.verbose else False
+     config.QUIET = True if arguments.quiet else False
+@@ -293,7 +292,6 @@ def main():
+     config.BREAKCOMPOSITE = arguments.breakcomposite
+     config.ALTLOC = arguments.altlocation
+     config.PEPTIDES = arguments.peptides
+-    config.RESIDUES = dict(zip(arguments.peptides, map(residue_list, arguments.residues)))
+     config.INTRA = arguments.intra
+     config.NOFIX = arguments.nofix
+     config.NOFIXFILE = arguments.nofixfile
+@@ -304,6 +302,56 @@ def main():
+     config.NOHYDRO = arguments.nohydro
+     config.MODEL = arguments.model
+ 
++    def expand_ranges(residue_ranges):
++        """
++        Takes '1-3, 5, 7' -> [1, 2, 3, 5, 7]
++        """
++        parts = [p.strip() for p in residue_ranges.split(',')]
++        res_list = []
++        for p in parts:
++            if '-' in p:
++                start, end = p.split('-')
++                res_list.extend(range(int(start), int(end) + 1))
++            else:
++                res_list.append(int(p))
++        return res_list
++
++    try:
++        # add inner quotes for Python backend and expand residue ranges to lists of residue numbers.
++        if not arguments.regions:
++            config.REGIONS = None
++        else:
++            import re
++            # add quotes around keys (chain IDs)
++            quoted = re.sub(pattern=r'([{,]\s*)([a-zA-Z0-9_]+)\s*:', repl=r'\1"\2":', string=arguments.regions)
++            # add quotes around values (residue numbers)
++            quoted = re.sub(pattern=r':\s*([0-9,\s\-]+?)\s*(?=,\s*"[a-zA-Z0-9_]+":|})', repl=r': "\1"', string=quoted)
++            # add comma to tuples with only one dictionary (without comma would not be treated as tuple)
++            ensure_tuples = re.sub(r'\((\s*{[^{}]*}\s*)\)', r'(\1,)', quoted)
++            config.REGIONS = ast.literal_eval(ensure_tuples)  # convert string to tuple(s) of one or two dictionaries
++            if not isinstance(config.REGIONS, list):
++                # embed single tuple in a list to give the regions config a consistent data structure
++                config.REGIONS = [config.REGIONS]
++            if not all(isinstance(lig_rec, tuple) for lig_rec in config.REGIONS) or any(
++                    len(lig_rec) > 2 for lig_rec in config.REGIONS) or not all(
++                    isinstance(reg, dict) for lig_rec in config.REGIONS for reg in lig_rec):
++                raise ValueError(
++                    "Regions must be specified by tuples of one or two dictionaries (ligand, receptor)")
++            config.REGIONS = [
++                tuple(
++                    {chain: expand_ranges(residues) for chain, residues in dct.items()}
++                    for dct in lig_rec
++                )
++                for lig_rec in config.REGIONS
++            ]
++            config.REGIONS = [
++                (lig_rec[0], None) if len(lig_rec) == 1 else (lig_rec[0], lig_rec[1])
++                for lig_rec in config.REGIONS
++            ]
++    except (ValueError, SyntaxError):
++        parser.error("The --regions option must be in the format '({A: 1-20, 25, 27}, {A: 54-63, B: 17-46})' Multiple region tuples can be given in a list.")
++
++
+     try:
+         # add inner quotes for python backend
+         if not arguments.chains:
+@@ -312,7 +360,6 @@ def main():
+             import re
+             quoted_input = re.sub(r'(?<!["\'])\b([a-zA-Z0-9_]+)\b(?!["\'])', r'"\1"', arguments.chains)
+             config.CHAINS = ast.literal_eval(quoted_input)
+-        print(config.CHAINS)
+         if config.CHAINS and not all(isinstance(c, list) for c in config.CHAINS):
+             raise ValueError("Chains should be specified as a list of lists, e.g., '[[A], [B, C]]'.")
+     except (ValueError, SyntaxError):
+diff --git a/plip/structure/preparation.py b/plip/structure/preparation.py
+index 2c148ae..eb570df 100644
+--- a/plip/structure/preparation.py
++++ b/plip/structure/preparation.py
+@@ -260,12 +260,41 @@ def getpeptides(self, chain):
+             ligand = self.extract_ligand(non_water)
+             return ligand
+ 
++    def getregion(self, ligand_region, bs_region=None):
++        all_from_region = []
++        for chain, residue_numbers in ligand_region.items():
++            if config.KEEPMOD:
++                residues = [
++                    res for res in pybel.ob.OBResidueIter(
++                        self.proteincomplex.OBMol) if (
++                            res.GetChain() == chain and
++                            res.GetNum() in residue_numbers and
++                            (not self.is_het_residue(res) or res.GetName() in self.modresidues)
++                    )
++                ]
++            else:
++                residues = [
++                    res for res in pybel.ob.OBResidueIter(
++                        self.proteincomplex.OBMol) if (
++                            res.GetChain() == chain and
++                            res.GetNum() in residue_numbers and not
++                            self.is_het_residue(res)
++                    )
++                ]
++            all_from_region.extend(residues)
++        if len(all_from_region) == 0:
++            return None
++        else:
++            non_water = [res for res in all_from_region if not res.GetResidueProperty(9)]  # 9 is water
++            ligand = self.extract_ligand(non_water, regions=(ligand_region, bs_region))
++            return ligand
++
+     def getligs(self):
+         """Get all ligands from a PDB file and prepare them for analysis.
+         Returns all non-empty ligands.
+         """
+ 
+-        if config.PEPTIDES == [] and config.INTRA is None and config.CHAINS is None:
++        if config.PEPTIDES == [] and config.INTRA is None and config.CHAINS is None and config.REGIONS is None:
+             # Extract small molecule ligands (default)
+             ligands = []
+ 
+@@ -293,11 +322,17 @@ def getligs(self):
+         else:
+             # Extract peptides from given chains
+             self.water = [o for o in pybel.ob.OBResidueIter(self.proteincomplex.OBMol) if o.GetResidueProperty(9)]
+-            if config.PEPTIDES and not config.CHAINS:
++            if config.PEPTIDES:
+                 peptide_ligands = [self.getpeptides(chain) for chain in config.PEPTIDES]
+ 
+             #Todo: Validate change here... Do we want to combine multiple chains to a single ligand?
+             # if yes can be easily added to the getpeptides function by flatten the resulting list - Philipp
++            elif config.REGIONS:
++                # regions are defined by tuples of dictionaries in which first dictionary defines the ligand
++                # and second dictionary defines the receptor
++                peptide_ligands = []
++                for lig_rec in config.REGIONS:
++                    peptide_ligands.append(self.getregion(lig_rec[0], lig_rec[1]))
+             elif config.CHAINS:
+                 # chains is defined as list of list e.g. [['A'], ['B', 'C']] in which second list contains the
+                 # ligand chains and the first one should be the receptor
+@@ -311,9 +346,9 @@ def getligs(self):
+ 
+         return [lig for lig in ligands if len(lig.mol.atoms) != 0]
+ 
+-    def extract_ligand(self, kmer):
++    def extract_ligand(self, kmer, regions=None):
+         """Extract the ligand by copying atoms and bonds and assign all information necessary for later steps."""
+-        data = namedtuple('ligand', 'mol hetid chain position water members longname type atomorder can_to_pdb')
++        data = namedtuple('ligand', 'mol hetid chain position water members longname type atomorder can_to_pdb regions')
+         members = [(res.GetName(), res.GetChain(), int32_to_negative(res.GetNum())) for res in kmer]
+         members = sort_members_by_importance(members)
+         rname, rchain, rnum = members[0]
+@@ -321,7 +356,7 @@ def extract_ligand(self, kmer):
+         names = [x[0] for x in members]
+         longname = '-'.join([x[0] for x in members])
+ 
+-        if config.PEPTIDES or config.CHAINS:
++        if config.PEPTIDES or config.CHAINS or config.REGIONS:
+             ligtype = 'PEPTIDE'
+         elif config.INTRA is not None:
+             ligtype = 'INTRA'
+@@ -371,6 +406,10 @@ def extract_ligand(self, kmer):
+         lig.title = ':'.join((rname, rchain, str(rnum)))
+         self.mapper.ligandmaps[lig.title] = mapold
+ 
++        if config.REGIONS:
++            lig_idx = config.REGIONS.index(regions)
++            lig.title = ':'.join((rname, rchain, str(rnum), str(lig_idx)))
++
+         logger.debug('renumerated molecule generated')
+ 
+         if not config.NOPDBCANMAP:
+@@ -384,7 +423,7 @@ def extract_ligand(self, kmer):
+ 
+         ligand = data(mol=lig, hetid=rname, chain=rchain, position=rnum, water=self.water,
+                       members=members, longname=longname, type=ligtype, atomorder=atomorder,
+-                      can_to_pdb=can_to_pdb)
++                      can_to_pdb=can_to_pdb, regions=regions)
+         return ligand
+ 
+     @staticmethod
+@@ -891,7 +930,7 @@ def refine_hydrophobic(all_h, pistacks):
+         hydroph = [h for h in sel2.values()]
+         hydroph_final = []
+         #  3. If a protein atom interacts with several neighboring ligand atoms, just keep the one with the closest dist
+-        if config.PEPTIDES or config.INTRA or config.CHAINS:
++        if config.PEPTIDES or config.INTRA or config.CHAINS or config.REGIONS:
+             # the ligand also consists of amino acid residues, repeat step 2 just the other way around
+             sel3 = {}
+             for h in hydroph:
+@@ -1064,13 +1103,14 @@ def refine_water_bridges(wbridges, hbonds_ldon, hbonds_pdon):
+ 
+ 
+ class BindingSite(Mol):
+-    def __init__(self, atoms, protcomplex, cclass, altconf, min_dist, mapper):
++    def __init__(self, atoms, protcomplex, cclass, altconf, min_dist, mapper, regions):
+         """Find all relevant parts which could take part in interactions"""
+         Mol.__init__(self, altconf, mapper, mtype='protein', bsid=None)
+         self.complex = cclass
+         self.full_mol = protcomplex
+         self.all_atoms = atoms
+         self.min_dist = min_dist  # Minimum distance of bs res to ligand
++        self.regions = regions
+         self.bs_res = list(set([''.join([str(whichresnumber(a)), whichchain(a)]) for a in self.all_atoms]))  # e.g. 47A
+         self.rings = self.find_rings(self.full_mol, self.all_atoms)
+         self.hydroph_atoms = self.hydrophobic_atoms(self.all_atoms)
+@@ -1099,7 +1139,7 @@ def find_charged(self, mol):
+         data = namedtuple('pcharge', 'atoms atoms_orig_idx type center restype resnr reschain')
+         a_set = []
+         # Iterate through all residue, exclude those in chains defined as peptides
+-        for res in [r for r in pybel.ob.OBResidueIter(mol.OBMol) if residue_belongs_to_receptor(r, config)]:
++        for res in [r for r in pybel.ob.OBResidueIter(mol.OBMol) if residue_belongs_to_receptor(r, self.regions)]:
+             if config.INTRA is not None:
+                 if res.GetChain() != config.INTRA:
+                     continue
+@@ -1204,12 +1244,12 @@ def __init__(self, cclass, ligand):
+         self.complex = cclass
+         self.molecule = ligand.mol  # Pybel Molecule
+         # get canonical SMILES String, but not for peptide ligand (tend to be too long -> openBabel crashes)
+-        self.smiles = "" if (config.INTRA or config.PEPTIDES or config.CHAINS) else self.molecule.write(format='can')
++        self.smiles = "" if (config.INTRA or config.PEPTIDES or config.CHAINS or config.REGIONS) else self.molecule.write(format='can')
+         self.inchikey = self.molecule.write(format='inchikey')
+         self.can_to_pdb = ligand.can_to_pdb
+         if not len(self.smiles) == 0:
+             self.smiles = self.smiles.split()[0]
+-        else:
++        elif not (config.INTRA or config.PEPTIDES or config.CHAINS or config.REGIONS):
+             logger.warning(f'could not write SMILES for ligand {ligand}')
+             self.smiles = ''
+         self.heavy_atoms = self.molecule.OBMol.NumHvyAtoms()  # Heavy atoms count
+@@ -1225,6 +1265,7 @@ def __init__(self, cclass, ligand):
+         self.molweight, self.logp = float(descvalues['MW']), float(descvalues['logP'])
+         self.num_rot_bonds = int(self.molecule.OBMol.NumRotors())
+         self.atomorder = ligand.atomorder
++        self.regions = ligand.regions
+ 
+         ##########################################################
+         # Special Case for hydrogen bond acceptor identification #
+@@ -1302,7 +1343,7 @@ def find_charged(self, all_atoms):
+         """
+         data = namedtuple('lcharge', 'atoms orig_atoms atoms_orig_idx type center fgroup')
+         a_set = []
+-        if not (config.INTRA or config.PEPTIDES or config.CHAINS):
++        if not (config.INTRA or config.PEPTIDES or config.CHAINS or config.REGIONS):
+             for a in all_atoms:
+                 a_set = self.append_if_charged_func_group(a=a, a_set=a_set, data=data)
+         else:
+@@ -1592,12 +1633,12 @@ def characterize_complex(self, ligand):
+         if config.KEEPMOD:
+             resis = self.exclude_ligand_modresidues(lig_obj.members, resis)
+ 
+-        bs_res = self.extract_bs(cutoff, lig_obj.centroid, resis)
++        bs_res = self.extract_bs(cutoff, lig_obj.centroid, resis, lig_obj.regions)
+         # Get a list of all atoms belonging to the binding site, search by idx
+         bs_atoms = [self.atoms[idx] for idx in [i for i in self.atoms.keys()
+                                                 if self.atoms[i].OBAtom.GetResidue().GetIdx() in bs_res]
+                     if idx in self.Mapper.proteinmap and self.Mapper.mapid(idx, mtype='protein') not in self.altconf]
+-        if ligand.type == 'PEPTIDE':
++        if ligand.type == 'PEPTIDE' and not config.REGIONS:
+             # If peptide, don't consider the peptide chain as part of the protein binding site
+             bs_atoms = [a for a in bs_atoms if a.OBAtom.GetResidue().GetChain() != lig_obj.chain]
+         if ligand.type == 'INTRA':
+@@ -1621,7 +1662,7 @@ def characterize_complex(self, ligand):
+         num_bs_atoms = len(bs_atoms_refined)
+         logger.info(f'binding site atoms in vicinity ({config.BS_DIST} A max. dist: {num_bs_atoms})')
+ 
+-        bs_obj = BindingSite(bs_atoms_refined, self.protcomplex, self, self.altconf, min_dist, self.Mapper)
++        bs_obj = BindingSite(bs_atoms_refined, self.protcomplex, self, self.altconf, min_dist, self.Mapper, lig_obj.regions)
+         pli_obj = PLInteraction(lig_obj, bs_obj, self)
+         self.interaction_sets[ligand.mol.title] = pli_obj
+ 
+@@ -1634,12 +1675,12 @@ def exclude_ligand_modresidues(self, ligmembers, resis):
+         else:
+             return resis
+ 
+-    def extract_bs(self, cutoff, ligcentroid, resis):
++    def extract_bs(self, cutoff, ligcentroid, resis, regions=None):
+         """Return list of ids from residues belonging to the binding site"""
+-        return [obres.GetIdx() for obres in resis if self.res_belongs_to_bs(obres, cutoff, ligcentroid)]
++        return [obres.GetIdx() for obres in resis if self.res_belongs_to_bs(obres, cutoff, ligcentroid, regions)]
+ 
+     @staticmethod
+-    def res_belongs_to_bs(res, cutoff, ligcentroid):
++    def res_belongs_to_bs(res, cutoff, ligcentroid, regions=None):
+         """Check for each residue if its centroid is within a certain distance to the ligand centroid.
+         Additionally checks if a residue belongs to a chain restricted by the user (e.g. by defining a peptide chain)"""
+         rescentroid = centroid([(atm.x(), atm.y(), atm.z()) for atm in pybel.ob.OBResidueAtomIter(res)])
+@@ -1647,7 +1688,7 @@ def res_belongs_to_bs(res, cutoff, ligcentroid):
+         near_enough = True if euclidean3d(rescentroid, ligcentroid) < cutoff else False
+         #Todo: Test if properly working
+         # Add restriction via chains flag
+-        return near_enough and residue_belongs_to_receptor(res, config)
++        return near_enough and residue_belongs_to_receptor(res, regions)
+ 
+     def get_atom(self, idx):
+         return self.atoms[idx]
+diff --git a/plip/visualization/visualize.py b/plip/visualization/visualize.py
+index 6a0f1ac..19fd71b 100644
+--- a/plip/visualization/visualize.py
++++ b/plip/visualization/visualize.py
+@@ -1,7 +1,7 @@
+ from pymol import cmd
+ 
+ from plip.basic import config, logger
+-from plip.basic.supplemental import start_pymol
++from plip.basic.supplemental import start_pymol, select_region
+ from plip.visualization.pymol import PyMOLVisualizer
+ 
+ logger = logger.get_logger()
+@@ -21,6 +21,9 @@ def visualize_in_pymol(plcomplex):
+     chain = plcomplex.chain
+     if config.PEPTIDES or config.CHAINS:
+         vis.ligname = 'PeptideChain%s' % plcomplex.chain
++    if config.REGIONS:
++        lig_idx = config.REGIONS.index(plcomplex.regions)
++        vis.ligname = f'Ligand{lig_idx+1}'
+     if config.INTRA is not None:
+         vis.ligname = 'Intra%s' % plcomplex.chain
+ 
+@@ -46,10 +49,11 @@ def visualize_in_pymol(plcomplex):
+     cmd.set_name(current_name, pdbid)
+     cmd.hide('everything', 'all')
+     if config.PEPTIDES:
+-        if plcomplex.chain in config.RESIDUES.keys():
+-            cmd.select(ligname, 'chain %s and not resn HOH and resi %s' % (plcomplex.chain, "+".join(map(str, config.RESIDUES[plcomplex.chain]))))
+-        else:
+-            cmd.select(ligname, 'chain %s and not resn HOH' % plcomplex.chain)
++        cmd.select(ligname, 'chain %s and not resn HOH' % plcomplex.chain)
++    elif config.REGIONS:
++        lig_region, rec_region = plcomplex.regions
++        lig_selection = select_region(lig_region)
++        cmd.select(ligname, lig_selection)
+     else:
+         cmd.select(ligname, 'resn %s and chain %s and resi %s*' % (hetid, chain, plcomplex.position))
+     logger.debug(f'selecting ligand for PDBID {pdbid} and ligand name {ligname}')
+@@ -105,6 +109,10 @@ def visualize_in_pymol(plcomplex):
+         filename = "%s_PeptideChain%s" % (pdbid.upper(), plcomplex.chain)
+         if config.PYMOL:
+             vis.save_session(config.OUTPATH, override=filename)
++    elif config.REGIONS:
++        filename = f"{pdbid.upper()}_ProteinRegion_{vis.ligname}"
++        if config.PYMOL:
++            vis.save_session(config.OUTPATH, override=filename)
+     elif config.INTRA is not None:
+         filename = "%s_IntraChain%s" % (pdbid.upper(), plcomplex.chain)
+         if config.PYMOL:

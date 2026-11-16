@@ -1,0 +1,607 @@
+diff --git a/src/GLModel.ts b/src/GLModel.ts
+index 21fd42f81..784dd0010 100644
+--- a/src/GLModel.ts
++++ b/src/GLModel.ts
+@@ -131,6 +131,17 @@ export class GLModel {
+     private readonly defaultStickRadius = 0.25;
+     private _drawnAromaticRings: Set<string> = new Set();
+     private _ringCache: Map<string, number[] | null> = new Map();
++    // Per-atom sphere opacity (issue #166), imposter path: translucent atoms are routed into
++    // this SEPARATE geometry during createMolObj's scan, so opaque atoms keep the opaque pass.
++    // One mesh holding both breaks under the renderer's transparentDepth prime: the ghost
++    // surfaces' depth suppresses the opaque atoms BEHIND them in the same mesh, so ghosts
++    // blend against the background and read as dark, not translucent.
++    //
++    // Non-null ONLY while createMolObj runs on the imposter path AND the sphere-styled atoms
++    // disagree about opacity. A model where they all agree is indistinguishable from the
++    // pre-existing whole-model style, so it keeps the legacy material path and this stays
++    // null -- which is what makes the reroute below unreachable for that case.
++    private _transSphereGeo: Geometry | null = null;
+ 
+     constructor(mid, options?, viewer?) {
+ 
+@@ -589,7 +600,7 @@ export class GLModel {
+ 
+     };
+ 
+-    private drawSphereImposter(geo: Geometry, center: XYZ, radius: number, C: Color) {
++    private drawSphereImposter(geo: Geometry, center: XYZ, radius: number, C: Color, alpha: number=1.0) {
+         //create flat square
+         var geoGroup = geo.updateGeoGroup(4);
+         var i;
+@@ -614,6 +625,17 @@ export class GLModel {
+             colorArray[start + 3 * i + 2] = C.b;
+         }
+ 
++        // Stride-1 side array: indexed by VERTEX NUMBER (startv), unlike the stride-3 arrays
++        // around it which use the float offset (start = startv*3). Null when this geometry
++        // didn't opt into alpha (e.g. stick caps) -- those callers render opaque via the
++        // default parameter and no array is touched.
++        var alphaArray = geoGroup.alphaArray;
++        if (alphaArray) {
++            for (i = 0; i < 4; i++) {
++                alphaArray[startv + i] = alpha;
++            }
++        }
++
+         normalArray[start + 0] = -radius;
+         normalArray[start + 1] = radius;
+         normalArray[start + 2] = 0;
+@@ -655,13 +677,20 @@ export class GLModel {
+ 
+         var radius = this.getRadiusFromStyle(atom, style);
+         var C = getColorFromStyle(atom, style);
++        var alpha = (style.opacity !== undefined) ? parseFloat(style.opacity as any) : 1.0;
++        // The twin exists only when this model's sphere opacities disagree (see
++        // _transSphereGeo), so when every atom shares one value this cannot fire and the
++        // whole model renders through the legacy material path exactly as it always has.
++        if (alpha < 1.0 && this._transSphereGeo) {
++            geo = this._transSphereGeo;
++        }
+ 
+         if ((atom.clickable === true || atom.hoverable) && (atom.intersectionShape !== undefined)) {
+             var center = new Vector3(atom.x, atom.y, atom.z);
+             atom.intersectionShape.sphere.push(new Sphere(center, radius));
+         }
+ 
+-        this.drawSphereImposter(geo, atom as XYZ, radius, C);
++        this.drawSphereImposter(geo, atom as XYZ, radius, C, alpha);
+     };
+ 
+     // 3D-aware ring imposter using analytical annulus test.
+@@ -1509,6 +1538,7 @@ export class GLModel {
+ 
+         this._drawnAromaticRings = new Set();
+         this._ringCache = new Map();
++        this._transSphereGeo = null;
+ 
+         var ret = new Object3D();
+         var cartoonAtoms = [];
+@@ -1519,6 +1549,25 @@ export class GLModel {
+         var sphereGeometry: Geometry = null;
+         var stickGeometry: Geometry = null;
+         var torusGeometry: Geometry = null;
++
++        // Per-atom sphere opacity (issue #166) is only meaningful when sphere-styled atoms
++        // actually DISAGREE about opacity -- that is the case the consensus scan below warns
++        // about ("opacity is ambiguous") and then resolves by clamping every sphere to opaque,
++        // discarding the translucency the caller asked for. A model whose spheres share one
++        // value has always rendered correctly through the material, so it must keep doing so:
++        // opacity is a pre-existing whole-model style, and a uniform value is indistinguishable
++        // from that legacy usage. Deciding here, before any geometry exists, is what lets the
++        // draw loop below stay single-pass.
++        var sphereOpacityVaries = false;
++        let seenSphereOpacity: number | null = null;
++        for (let a = 0, na = atoms.length; a < na; a++) {
++            const sstyle = atoms[a]?.style?.sphere;
++            if (!sstyle || sstyle.hidden) continue;
++            const o = (sstyle.opacity !== undefined) ? parseFloat(sstyle.opacity as any) : 1.0;
++            if (seenSphereOpacity === null) seenSphereOpacity = o;
++            else if (o !== seenSphereOpacity) { sphereOpacityVaries = true; break; }
++        }
++
+         if (options.supportsImposters) {
+             torusGeometry = new Geometry(true);
+             torusGeometry.imposter = true;
+@@ -1526,6 +1575,17 @@ export class GLModel {
+             drawSphereFunc = this.drawAtomImposter;
+             sphereGeometry = new Geometry(true);
+             sphereGeometry.imposter = true;
++            // Per-atom opacity (issue #166): translucent atoms get their OWN geometry so the
++            // opaque ones stay in the opaque pass (see _transSphereGeo). Only this twin
++            // allocates alphaArray; drawAtomImposter reroutes atoms with opacity < 1 into it.
++            // Built ONLY when opacities disagree: left null, the reroute in drawAtomImposter
++            // cannot fire, every sphere lands in sphereGeometry, and the whole feature is
++            // inert -- which is what keeps uniform-opacity models on their legacy path.
++            if (sphereOpacityVaries) {
++                this._transSphereGeo = new Geometry(true);
++                this._transSphereGeo.imposter = true;
++                this._transSphereGeo.alpha = true;
++            }
+             stickGeometry = new Geometry(true, true);
+             stickGeometry.imposter = true;
+             stickGeometry.sphereGeometry = new Geometry(true); //for caps
+@@ -1557,6 +1617,12 @@ export class GLModel {
+                 if ((atom.clickable || atom.hoverable) && atom.intersectionShape === undefined)
+                     atom.intersectionShape = { sphere: [], cylinder: [], line: [], triangle: [] };
+ 
++                // PER-ATOM SPHERE OPACITY (issue #166): sphere stays in this scan unconditionally.
++                // When opacities agree it is what sets sphereMaterial.opacity below, i.e. the
++                // legacy whole-model path. When they DISAGREE the scan's own ambiguity branch
++                // clamps opacities.sphere to 1, which is exactly right now: the translucent
++                // atoms have been rerouted to _transSphereGeo and carry their opacity per-vertex,
++                // so what remains in sphereGeometry is the opaque subset.
+                 testOpacities = { line: undefined, cross: undefined, stick: undefined, sphere: undefined };
+                 for (j in testOpacities) {
+                     if (atom.style[j]) {
+@@ -1569,7 +1635,12 @@ export class GLModel {
+ 
+                     if (opacities[j]) {
+                         if (testOpacities[j] != undefined && opacities[j] != testOpacities[j]) {
+-                            console.log("Warning: " + j + " opacity is ambiguous");
++                            // Disagreeing SPHERE opacities are no longer an ambiguity (issue
++                            // #166) -- those atoms render per-vertex out of _transSphereGeo, so
++                            // the warning would fire on correct usage. The clamp still stands:
++                            // it is what leaves the remaining opaque subset opaque.
++                            if (!(j === 'sphere' && sphereOpacityVaries))
++                                console.log("Warning: " + j + " opacity is ambiguous");
+                             opacities[j] = 1;
+                         }
+ 
+@@ -1636,6 +1707,8 @@ export class GLModel {
+                 });
+             }
+             if (opacities.sphere < 1 && opacities.sphere >= 0) {
++                // Legacy whole-model opacity (non-imposter paths; on the imposter path,
++                // per-atom opacity rides the translucent twin below instead).
+                 sphereMaterial.transparent = true;
+                 sphereMaterial.opacity = opacities.sphere;
+             }
+@@ -1644,6 +1717,28 @@ export class GLModel {
+             ret.add(sphere);
+         }
+ 
++        // Translucent sphere imposters (per-atom opacity, issue #166): their own mesh, so
++        // ghosts blend over the opaque atoms behind them instead of depth-suppressing them.
++        // The vertices carry the opacity values; material.opacity stays 1 -- setting it
++        // would double-fade every atom.
++        if (this._transSphereGeo && this._transSphereGeo.vertices > 0) {
++            this._transSphereGeo.initTypedArrays();
++            var sphereMaterialTrans: any = new SphereImposterMaterial({
++                ambient: 0x000000,
++                vertexColors: true,
++                reflectivity: 0
++            });
++            sphereMaterialTrans.transparent = true;
++            // No depth WRITES from ghosts: the renderer's back-to-front quad sort owns
++            // ghost-vs-ghost order now (sortAlphaQuads), and a near ghost stamping the depth
++            // buffer would discard the far ghosts behind it -- the exact single-layer clamp
++            // the sorted path exists to remove. Depth TEST stays on, so opaque geometry in
++            // front still occludes ghosts correctly.
++            sphereMaterialTrans.depthWrite = false;
++            ret.add(new Mesh(this._transSphereGeo, sphereMaterialTrans));
++        }
++        this._transSphereGeo = null;
++
+         // add stick geometry
+         if (stickGeometry.vertices > 0) {
+ 
+diff --git a/src/WebGL/Renderer.ts b/src/WebGL/Renderer.ts
+index 3b33f6626..9691f974b 100644
+--- a/src/WebGL/Renderer.ts
++++ b/src/WebGL/Renderer.ts
+@@ -511,6 +511,21 @@ export class Renderer {
+         this._gl.vertexAttribPointer(attributes.color, 3, this._gl.FLOAT, false, 0, 0);
+       }
+ 
++      // Per-vertex alpha (issue #166) -- optional stride-1 stream. A program can declare the
++      // attribute while a given group lacks the buffer (e.g. imposter stick caps share the
++      // sphere-imposter shader but never allocate alphaArray): the attribute stays disabled
++      // there, so it MUST be given a generic value of 1.0 or those fragments read alpha=0
++      // and the caps vanish. disableAttributes() above has already reset the enable state.
++      if (attributes.alpha >= 0) {
++        if (geometryGroup.__webglAlphaBuffer !== undefined) {
++          this._gl.bindBuffer(this._gl.ARRAY_BUFFER, geometryGroup.__webglAlphaBuffer);
++          this.enableAttribute(attributes.alpha);
++          this._gl.vertexAttribPointer(attributes.alpha, 1, this._gl.FLOAT, false, 0, 0);
++        } else {
++          this._gl.vertexAttrib1f(attributes.alpha, 1.0);
++        }
++      }
++
+       // Normals
+       if (attributes.normal >= 0) {
+         this._gl.bindBuffer(this._gl.ARRAY_BUFFER, geometryGroup.__webglNormalBuffer);
+@@ -533,6 +548,26 @@ export class Renderer {
+       }
+     }
+ 
++    // SORTED TRANSLUCENT PATH (issue #166): a mesh whose geometry carries per-vertex alpha
++    // renders WITHOUT the depth-prime (see unrollBufferMaterial), so blending correctness
++    // comes from draw order instead: sort the imposter quads back-to-front for the current
++    // camera and re-upload the index buffer. Every quad's four vertices share the atom
++    // center, so the sort key is one view-space z per quad, read off the vertex array.
++    // Runs each frame -- the order is view-dependent; ~16k quads/group sorts in well under
++    // a millisecond. (Groups sort independently; cross-group order is not guaranteed, the
++    // same granularity limit the renderer's per-object sort already has.)
++    if (
++      material.transparent &&
++      object.geometry &&
++      object.geometry.alpha &&
++      geometryGroup.faceArray &&
++      geometryGroup.__webglFaceBuffer !== undefined
++    ) {
++      this.sortAlphaQuads(geometryGroup, object);
++      this._gl.bindBuffer(this._gl.ELEMENT_ARRAY_BUFFER, geometryGroup.__webglFaceBuffer);
++      this._gl.bufferData(this._gl.ELEMENT_ARRAY_BUFFER, geometryGroup.faceArray, this._gl.DYNAMIC_DRAW);
++    }
++
+     // Render
+     var faceCount, lineCount;
+     // lambert shaders - draw triangles
+@@ -1317,6 +1352,9 @@ export class Renderer {
+         if (geometryGroup.__webglColorBuffer !== undefined)
+           this._gl.deleteBuffer(geometryGroup.__webglColorBuffer);
+ 
++        if (geometryGroup.__webglAlphaBuffer !== undefined)
++          this._gl.deleteBuffer(geometryGroup.__webglAlphaBuffer);
++
+         if (geometryGroup.__webglNormalBuffer !== undefined)
+           this._gl.deleteBuffer(geometryGroup.__webglNormalBuffer);
+ 
+@@ -1565,6 +1603,7 @@ export class Renderer {
+       "lineDistance",
+       "offset",
+       "radius",
++      "alpha",
+     ];
+ 
+     /*
+@@ -1880,6 +1919,39 @@ export class Renderer {
+     object.__webglActive = false;
+   }
+ 
++  // Scratch for sortAlphaQuads, reused across frames so the per-frame sort allocates nothing.
++  private _sortKeys: Float32Array | null = null;
++  private _sortOrder: number[] = [];
++
++  // Back-to-front quad sort for per-vertex-alpha imposter geometry (issue #166).
++  // Rewrites the group's faceArray in place: quad q's indices are always [4q,4q+1,4q+2,
++  // 4q+2,4q+3,4q] (see GLModel.drawSphereImposter), so regenerating the six-index groups in
++  // sorted order is idempotent and never touches the vertex data.
++  private sortAlphaQuads(geometryGroup, object) {
++    const nQuads = (geometryGroup.vertices / 4) | 0;
++    if (nQuads < 2 || !geometryGroup.vertexArray) return;
++    const va = geometryGroup.vertexArray;
++    const fa = geometryGroup.faceArray;
++    const m = object._modelViewMatrix.elements;
++    if (!this._sortKeys || this._sortKeys.length < nQuads) {
++      this._sortKeys = new Float32Array(nQuads);
++    }
++    const keys = this._sortKeys, order = this._sortOrder;
++    order.length = nQuads;
++    for (let q = 0; q < nQuads; q++) {
++      const o = q * 12; // the quad's first vertex IS the atom center (all four are)
++      keys[q] = m[2] * va[o] + m[6] * va[o + 1] + m[10] * va[o + 2] + m[14];
++      order[q] = q;
++    }
++    // The camera looks down -z in view space: most negative z = farthest = drawn first.
++    order.sort((a, b) => keys[a] - keys[b]);
++    for (let p = 0; p < nQuads; p++) {
++      const v = order[p] * 4, f = p * 6;
++      fa[f] = v; fa[f + 1] = v + 1; fa[f + 2] = v + 2;
++      fa[f + 3] = v + 2; fa[f + 4] = v + 3; fa[f + 5] = v;
++    }
++  }
++
+   private removeInstances(objList, object) {
+     for (var o = objList.length - 1; o >= 0; --o) {
+       if (objList[o].object === object) objList.splice(o, 1);
+@@ -1904,7 +1976,11 @@ export class Renderer {
+       globject.opaque = null;
+       globject.volumetric = null;
+       globject.transparent = material;
+-      if (!material.wireframe) {
++      // SORTED TRANSLUCENT PATH (issue #166): geometry carrying per-vertex alpha skips the
++      // depth-prime. The prime elects one translucent layer per pixel -- correct for a
++      // translucent SURFACE, but per-atom translucency needs LAYERS to accumulate, so these
++      // meshes get back-to-front quad sorting in renderBuffer instead (see sortAlphaQuads).
++      if (!material.wireframe && !object.geometry?.alpha) {
+         let blankMaterial = material.clone();
+         blankMaterial.opacity = 0.0;
+         globject.transparentDepth = blankMaterial;
+@@ -1965,6 +2041,15 @@ export class Renderer {
+       this._gl.bufferData(this._gl.ARRAY_BUFFER, geometryGroup.radiusArray, hint);
+     }
+ 
++    // per-vertex alpha buffers (issue #166)
++    if (
++      geometryGroup.alphaArray &&
++      geometryGroup.__webglAlphaBuffer !== undefined
++    ) {
++      this._gl.bindBuffer(this._gl.ARRAY_BUFFER, geometryGroup.__webglAlphaBuffer);
++      this._gl.bufferData(this._gl.ARRAY_BUFFER, geometryGroup.alphaArray, hint);
++    }
++
+     // face (index) buffers
+     if (
+       geometryGroup.faceArray &&
+@@ -1993,6 +2078,9 @@ export class Renderer {
+     if (geometryGroup.radiusArray) {
+       geometryGroup.__webglRadiusBuffer = this._gl.createBuffer();
+     }
++    if (geometryGroup.alphaArray) {
++      geometryGroup.__webglAlphaBuffer = this._gl.createBuffer();
++    }
+     if (geometryGroup.useOffset) {
+       geometryGroup.__webglOffsetBuffer = this._gl.createBuffer();
+     }
+@@ -2271,7 +2359,10 @@ export class Renderer {
+         if ((this._outlineEnabled || material.outline) &&
+           !material.wireframe &&
+           material.shaderID !== "basic" &&
+-          material.opacity !== 0.0) {
++          material.opacity !== 0.0 &&
++          !object.geometry?.alpha) {
++          // ^ per-vertex-alpha meshes (issue #166) draw NO outline: the outline material is
++          // opaque, so it would overpaint the very translucency the mesh exists to render.
+           let outmat: any = this._outlineMaterial;
+           if (material.shaderID == "sphereimposter") {
+             outmat = this._outlineSphereImposterMaterial;
+diff --git a/src/WebGL/core/Geometry.ts b/src/WebGL/core/Geometry.ts
+index b7d2cc697..f132f0361 100644
+--- a/src/WebGL/core/Geometry.ts
++++ b/src/WebGL/core/Geometry.ts
+@@ -11,6 +11,7 @@ export class GeometryGroup {
+   colorArray: Float32Array | null = null;
+   normalArray: Float32Array | null = null;
+   radiusArray: Float32Array | null = null;
++  alphaArray: Float32Array | null = null;
+   faceArray: Uint16Array | null = null;
+   lineArray: Uint16Array | null = null;
+   atomArray: Array<AtomSpec> = Array<AtomSpec>();
+@@ -331,7 +332,8 @@ export class GeometryGroup {
+       normalArr = this.normalArray,
+       faceArr = this.faceArray,
+       lineArr = this.lineArray,
+-      radiusArr = this.radiusArray;
++      radiusArr = this.radiusArray,
++      alphaArr = this.alphaArray;
+ 
+     //subarray to avoid copying and reallocating memory
+     this.vertexArray = vertexArr?.subarray(0, this.vertices * 3) || null;
+@@ -353,6 +355,9 @@ export class GeometryGroup {
+     if (radiusArr) {
+       this.radiusArray = radiusArr.subarray(0, this.vertices);
+     }
++    if (alphaArr) {
++      this.alphaArray = alphaArr.subarray(0, this.vertices);
++    }
+ 
+     if (reallocatemem) {
+       //actually copy smaller arrays to save memory
+@@ -365,6 +370,8 @@ export class GeometryGroup {
+       if (this.colorArray) this.colorArray = new Float32Array(this.colorArray);
+       if (this.radiusArray)
+         this.radiusArray = new Float32Array(this.radiusArray);
++      if (this.alphaArray)
++        this.alphaArray = new Float32Array(this.alphaArray);
+     }
+     this.__inittedArrays = true;
+   }
+@@ -376,6 +383,7 @@ export class Geometry extends EventDispatcher {
+   hasTangents: boolean =  false;
+   dynamic: boolean = true; // the intermediate typed arrays will be deleted when set to false;
+   radii: boolean;
++  alpha: boolean;
+   mesh: boolean;
+   offset: boolean;
+   verticesNeedUpdate: boolean = false;
+@@ -390,11 +398,12 @@ export class Geometry extends EventDispatcher {
+   sphereGeometry?: Geometry;
+   drawnCaps?: any;
+   
+-  constructor(mesh = false, radii = false, offset = false) {
++  constructor(mesh = false, radii = false, offset = false, alpha=false) {
+     super();
+     this.id = GeometryIDCount++;
+     this.mesh = mesh; // Does this geometry represent a mesh (i.e. do we need Face/Line index buffers?)
+     this.radii = radii;
++    this.alpha = alpha;
+     this.offset = offset; //offset buffer used for instancing
+   }
+ 
+@@ -444,6 +453,9 @@ export class Geometry extends EventDispatcher {
+     if (this.radii) {
+       ret.radiusArray = new Float32Array(BUFFERSIZE);
+     }
++    if (this.alpha) {
++      ret.alphaArray = new Float32Array(BUFFERSIZE);
++    }
+     ret.useOffset = this.offset;
+   
+     return ret;
+diff --git a/src/WebGL/shaders/lib/sphereimposter/sphereimposter.frag b/src/WebGL/shaders/lib/sphereimposter/sphereimposter.frag
+index 47061364e..bbeec725f 100644
+--- a/src/WebGL/shaders/lib/sphereimposter/sphereimposter.frag
++++ b/src/WebGL/shaders/lib/sphereimposter/sphereimposter.frag
+@@ -10,6 +10,7 @@ uniform float uDepth;
+ uniform vec3 directionalLightColor[ 1 ];
+ 
+ varying vec3 vColor;
++varying float vAlpha;
+ varying vec2 mapping;
+ varying float rval;
+ varying vec3 vLight;
+@@ -41,7 +42,16 @@ void main() {
+     float shadowFactor = texture2D(shading,vec2(gl_FragCoord.x/float(dim.x),gl_FragCoord.y/float(dim.y))).r;
+     color *= shadowFactor;
+ #endif    
+-    gl_FragColor = vec4(color, opacity*opacity );
++    // Per-vertex alpha (issue #166) applies LINEARLY: an atom styled opacity:0.5 renders at
++    // 0.5. The material opacity keeps this shader's historical squared response, so existing
++    // whole-model translucency is bit-identical to before -- vAlpha is 1.0 there (the
++    // attribute's generic value, since geometries without an alphaArray never bind one), and
++    // this collapses to the original opacity*opacity.
++    //
++    // The two therefore disagree: whole-model 0.5 renders like 0.25, per-atom 0.5 renders at
++    // 0.5. That is deliberate. Squaring vAlpha to match would make the new API inherit a
++    // legacy quirk, and unsquaring the material would change every committed reference image.
++    gl_FragColor = vec4(color, opacity*opacity*vAlpha );
+ 
+     if(fogNear != fogFar) {
+         float depth = -cameraPos.z;
+diff --git a/src/WebGL/shaders/lib/sphereimposter/sphereimposter.vert b/src/WebGL/shaders/lib/sphereimposter/sphereimposter.vert
+index 00ae11b7d..c35d63d7d 100644
+--- a/src/WebGL/shaders/lib/sphereimposter/sphereimposter.vert
++++ b/src/WebGL/shaders/lib/sphereimposter/sphereimposter.vert
+@@ -8,9 +8,11 @@ uniform vec3 directionalLightDirection[ 1 ];
+ attribute vec3 position;
+ attribute vec3 normal;
+ attribute vec3 color;
++attribute float alpha;
+ 
+ varying vec2 mapping;
+ varying vec3 vColor;
++varying float vAlpha;
+ varying float rval;
+ varying vec3 vLight;
+ varying vec3 center;
+@@ -18,6 +20,7 @@ varying vec3 center;
+ void main() {
+ 
+     vColor = color;
++    vAlpha = alpha;
+     vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+     center = mvPosition.xyz;
+     vec4 projPosition = projectionMatrix * mvPosition;
+diff --git a/tests/jest/opacity.test.js b/tests/jest/opacity.test.js
+new file mode 100644
+index 000000000..36ff4bf81
+--- /dev/null
++++ b/tests/jest/opacity.test.js
+@@ -0,0 +1,124 @@
++
++global.$ = require("jquery");
++global.URL.createObjectURL = function () { };
++let $3Dmol = require("../../build/3Dmol.js");
++
++// Per-atom sphere opacity (issue #166) -- structural tests.
++//
++// Opacity is a visual trait, but pixel comparison is a poor way to test one: a reference
++// image is hostage to whichever renderer produced it, so it fails for reasons unrelated to
++// the code. What IS deterministic is the geometry the model builds, so these assert on
++// structure instead of appearance:
++//
++//   1. no opacity styled          -> nothing new is allocated; the pre-feature shape
++//   2. one opacity for all atoms  -> the legacy material path, exactly as before
++//   3. atoms disagreeing          -> the translucent twin appears, carrying per-vertex alpha
++//
++// Case 2 is the regression guard: sphere opacity is a pre-existing whole-model style, so a
++// uniform value must keep behaving as it always has. Case 3 is the feature itself.
++//
++// The model is driven directly rather than through a viewer -- no canvas, no WebGL context,
++// no mocking -- and globj() is handed supportsImposters explicitly, the same way exportVRML
++// pins its options, so the imposter path is exercised deterministically.
++
++const PDB = [
++    "ATOM      1  N   ALA A   1      0.000   0.000   0.000  1.00 90.00           N",
++    "ATOM      2  CA  ALA A   1      1.500   0.000   0.000  1.00 90.00           C",
++    "ATOM      3  N   ALA A   2      8.000   0.000   0.000  1.00 40.00           N",
++    "ATOM      4  CA  ALA A   2      9.500   0.000   0.000  1.00 40.00           C",
++    "END",
++].join("\n");
++
++// globj() only ever calls add/remove on the group it is given.
++const stubGroup = () => ({ add() { }, remove() { } });
++
++function build(styleFn) {
++    const model = new $3Dmol.GLModel(0, {});
++    model.addMolData(PDB, "pdb", {});
++    styleFn(model);
++    model.globj(stubGroup(), { supportsImposters: true, supportsAIA: false, regen: true });
++    return model.molObj;
++}
++
++const groupsOf = (geo) => (geo.geometryGroups || []).filter((g) => g && g.vertices > 0);
++// Meshes whose geometry carries per-vertex alpha: the translucent twin, and only it.
++const alphaMeshes = (obj) => obj.children.filter((c) => c.geometry && c.geometry.alpha);
++const plainMeshes = (obj) => obj.children.filter((c) => c.geometry && !c.geometry.alpha);
++const anyAlphaArray = (obj) =>
++    plainMeshes(obj).some((m) => groupsOf(m.geometry).some((g) => g.alphaArray));
++
++describe("per-atom sphere opacity (#166)", () => {
++
++    test("no opacity styled: no twin geometry and no alpha buffer", () => {
++        const obj = build((m) => m.setStyle({}, { sphere: {} }));
++
++        expect(alphaMeshes(obj)).toHaveLength(0);
++        expect(anyAlphaArray(obj)).toBe(false);
++    });
++
++    // Swept rather than spot-checked: the legacy path has to hold across the range, and a
++    // single value could pass by luck. Each case also asserts the molecule renders at ONE
++    // opacity -- if the gate ever leaked, some atoms would divert to the twin and the
++    // remaining material value would disagree with what was asked for.
++    test.each([0.1, 0.25, 0.4, 0.5, 0.75, 0.9])(
++        "one opacity for every atom (%p): legacy material path, consistent across the molecule",
++        (value) => {
++            const obj = build((m) => m.setStyle({}, { sphere: { opacity: value } }));
++
++            // Every atom agrees, so this is indistinguishable from the pre-existing
++            // whole-model API and must stay on it: the value rides the material, not a
++            // per-vertex buffer.
++            expect(alphaMeshes(obj)).toHaveLength(0);
++            expect(anyAlphaArray(obj)).toBe(false);
++
++            const translucent = plainMeshes(obj).filter((m) => m.material && m.material.transparent);
++            expect(translucent.length).toBeGreaterThan(0);
++
++            // One value, molecule-wide -- not merely "the first mesh happens to be right".
++            const distinct = [...new Set(translucent.map((m) => m.material.opacity))];
++            expect(distinct).toHaveLength(1);
++            expect(distinct[0]).toBeCloseTo(value);
++        }
++    );
++
++    test("opacity 1.0 for every atom: fully opaque, nothing marked transparent", () => {
++        const obj = build((m) => m.setStyle({}, { sphere: { opacity: 1.0 } }));
++
++        expect(alphaMeshes(obj)).toHaveLength(0);
++        expect(anyAlphaArray(obj)).toBe(false);
++        // 1.0 is not translucency: the material must not be flagged transparent, or the
++        // model would be routed through the blending path for nothing.
++        expect(plainMeshes(obj).some((m) => m.material && m.material.transparent)).toBe(false);
++    });
++
++    test("atoms disagreeing: twin geometry carries per-vertex alpha", () => {
++        const obj = build((m) => {
++            m.setStyle({}, { sphere: { opacity: 1.0 } });
++            m.setStyle({ resi: 2 }, { sphere: { opacity: 0.25 } });
++        });
++
++        const twins = alphaMeshes(obj);
++        expect(twins).toHaveLength(1);
++        const twin = twins[0];
++
++        // material.opacity stays 1: the vertices own the alpha, and setting both would fade
++        // every atom twice.
++        expect(twin.material.transparent).toBe(true);
++        expect(twin.material.opacity).toBeCloseTo(1.0);
++        // No depth writes -- back-to-front ordering owns ghost-vs-ghost, and a near ghost
++        // stamping the depth buffer would discard the far ghosts behind it.
++        expect(twin.material.depthWrite).toBe(false);
++
++        const values = [];
++        for (const g of groupsOf(twin.geometry)) {
++            expect(g.alphaArray).toBeTruthy();
++            values.push(...Array.from(g.alphaArray.slice(0, g.vertices)));
++        }
++        // Only the residue styled 0.25 was rerouted, so every vertex in the twin carries it.
++        expect(values.length).toBeGreaterThan(0);
++        for (const v of values) expect(v).toBeCloseTo(0.25);
++
++        // ...and the opaque atoms stayed behind in the ordinary sphere geometry.
++        expect(plainMeshes(obj).some((m) => groupsOf(m.geometry).length > 0)).toBe(true);
++    });
++});

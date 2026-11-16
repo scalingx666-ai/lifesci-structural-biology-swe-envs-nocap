@@ -1,0 +1,581 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 33ffe99af..bf78a466c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -76,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [[PR #399](https://github.com/nf-core/proteinfold/pulls/399)] - Update alphafold2 and alphafold2_pred Dockerfiles.
+ - [[PR #404](https://github.com/nf-core/proteinfold/pulls/404)] - Boltz cache files moved to workdir, fixed version checks and Boltz stubRun.
+ - [[#401](https://github.com/nf-core/proteinfold/issues/401)] - Get rid of symlinking in the prediction tools processes when using "PREPARE_DBS" subworkflows
++- [[#410](https://github.com/nf-core/proteinfold/issues/410)] - Switch RosettaFold2NA to Boltz-style multi-chain FASTA inputs and drop the interactions sheet.
+ - [[PR #407](https://github.com/nf-core/proteinfold/pulls/407)] - Several changes to meet nf-core standards.
+ - [[PR #409](https://github.com/nf-core/proteinfold/pulls/409)] - Force single pdb workflow outputs to return as a list
+ - [[PR #396](https://github.com/nf-core/proteinfold/pulls/396)] - Split ColabFold into separate optimised containers with version pinning and significant size reduction.
+diff --git a/README.md b/README.md
+index 5a506625c..433193bc3 100644
+--- a/README.md
++++ b/README.md
+@@ -186,7 +186,7 @@ The pipeline takes care of downloading the databases and parameters required by
+       -profile <docker/singularity/podman/shifter/charliecloud/conda/institute>
+   ```
+ 
+-  - The RosettaFold2NA mode can be run using the command below:
++- The RosettaFold2NA mode can be run using the command below:
+ 
+   ```console
+   nextflow run nf-core/proteinfold \
+diff --git a/assets/schema_interactions.json b/assets/schema_interactions.json
+deleted file mode 100644
+index bc463f768..000000000
+--- a/assets/schema_interactions.json
++++ /dev/null
+@@ -1,31 +0,0 @@
+-{
+-    "$schema": "https://json-schema.org/draft/2020-12/schema",
+-    "$id": "https://raw.githubusercontent.com/nf-core/proteinfold/master/assets/schema_interactions.json",
+-    "title": "nf-core/proteinfold pipeline - params.interactions schema",
+-    "description": "Schema for the file provided with params.interactions",
+-    "type": "array",
+-    "items": {
+-        "type": "object",
+-        "properties": {
+-            "protein_id": {
+-                "type": "string",
+-                "pattern": "^\\S+$",
+-                "errorMessage": "Protein sequence name must be provided and cannot contain spaces",
+-                "meta": ["protein_id"]
+-            },
+-            "interaction_id": {
+-                "type": "string",
+-                "pattern": "^\\S+$",
+-                "errorMessage": "Molecule interacting sequence name must be provided and cannot contain spaces",
+-                "meta": ["interaction_id"]
+-            },
+-            "interaction_type": {
+-                "type": "string",
+-                "pattern": "^(P|D|R|S|PR)$",
+-                "errorMessage": "Molecule interacting sequence name must be provided and cannot contain spaces",
+-                "meta": ["interaction_type"]
+-            }
+-        },
+-        "required": ["protein_id", "interaction_id", "interaction_type"]
+-    }
+-}
+diff --git a/bin/fasta_to_rosettafold.py b/bin/fasta_to_rosettafold.py
+new file mode 100755
+index 000000000..09a2057db
+--- /dev/null
++++ b/bin/fasta_to_rosettafold.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python3
++import os
++import re
++import sys
++from pathlib import Path
++
++
++def read_fasta(path, sample_id):
++    entries = []
++    header = None
++    seq_lines = []
++    with open(path, "r") as handle:
++        for raw in handle:
++            line = raw.strip()
++            if not line:
++                continue
++            if line.startswith(">"):
++                if header is not None:
++                    entries.append((header, "".join(seq_lines).upper()))
++                header = line[1:].strip() or f"{sample_id}_chain_{len(entries) + 1}"
++                seq_lines = []
++            else:
++                seq_lines.append(line.replace(" ", "").upper())
++    if header is not None:
++        entries.append((header, "".join(seq_lines).upper()))
++    return entries
++
++
++def infer_type(header, sequence):
++    type_aliases = {
++        "protein": "P",
++        "prot": "P",
++        "aa": "P",
++        "pep": "P",
++        "peptide": "P",
++        "p": "P",
++        "rna": "R",
++        "r": "R",
++        "double": "D",
++        "ds": "D",
++        "dsdna": "D",
++        "double_dna": "D",
++        "single": "S",
++        "ss": "S",
++        "ssdna": "S",
++        "single_dna": "S",
++        "single-strand": "S",
++        "singlestrand": "S",
++    }
++    header_lower = header.lower()
++    match = re.search(r"(?:type|entity|molecule|mol)[:=]\s*([A-Za-z0-9_-]+)", header_lower)
++    if match:
++        candidate = match.group(1).lower()
++        if candidate in type_aliases:
++            return type_aliases[candidate]
++    for alias, code in type_aliases.items():
++        if re.search(r"\b" + re.escape(alias) + r"\b", header_lower):
++            return code
++
++    seq_set = set(sequence)
++    if not sequence:
++        return None
++    if seq_set <= set("ACUGN"):
++        return "R"
++    # Default DNA to double-stranded unless explicitly marked single-strand.
++    if seq_set <= set("ACTGN"):
++        return "D"
++    protein_letters = set("ACDEFGHIKLMNPQRSTVWYBXZOU")
++    if seq_set <= protein_letters and not (seq_set <= set("ACUGTN")):
++        return "P"
++    return "P"
++
++
++def main():
++    if len(sys.argv) != 3:
++        sys.stderr.write("Usage: fasta_to_rosettafold.py <sample_id> <fasta_path>\n")
++        return 1
++
++    sample_id, fasta_path = sys.argv[1], sys.argv[2]
++    allowed_ext = (".fa", ".fasta", ".fas", ".faa", ".fna")
++    if not fasta_path.lower().endswith(allowed_ext):
++        sys.stderr.write(
++            f"[ROSETTAFOLD2NA_FASTA] Input file '{fasta_path}' must be a FASTA file.\n"
++        )
++        return 1
++
++    if not os.path.exists(fasta_path):
++        sys.stderr.write(
++            f"[ROSETTAFOLD2NA_FASTA] Input FASTA '{fasta_path}' does not exist.\n"
++        )
++        return 1
++
++    entries = read_fasta(fasta_path, sample_id)
++    if not entries:
++        sys.stderr.write(
++            f"[ROSETTAFOLD2NA_FASTA] No sequences found in '{fasta_path}'.\n"
++        )
++        return 1
++
++    output_dir = Path("rf2na_input")
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    chain_records = []
++    observed_files = set()
++    for idx, (header, sequence) in enumerate(entries, start=1):
++        chain_type = infer_type(header, sequence)
++        if chain_type is None:
++            sys.stderr.write(
++                f"[ROSETTAFOLD2NA_FASTA] Unable to determine entity type for entry '{header}'. "
++                "Please include a token such as 'type=protein', 'type=double_dna', or 'type=single_dna'.\n"
++            )
++            return 1
++        if chain_type not in {"P", "R", "D", "S"}:
++            sys.stderr.write(
++                f"[ROSETTAFOLD2NA_FASTA] Unable to determine entity type for entry '{header}'. "
++                "Allowed types: protein (P), rna (R), double_dna (D), single_dna (S).\n"
++            )
++            return 1
++        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", header) or f"chain_{idx}"
++        filename = f"chain_{idx:03d}_{safe_name[:40]}.fa"
++        if filename in observed_files:
++            filename = f"chain_{idx:03d}_{idx}.fa"
++        observed_files.add(filename)
++        with open(output_dir / filename, "w") as fh:
++            fh.write(f">{header}\n")
++            for start in range(0, len(sequence), 80):
++                fh.write(sequence[start : start + 80] + "\n")
++        chain_records.append((chain_type, filename, header))
++
++    with open(output_dir / "chain_map.tsv", "w") as mapping:
++        mapping.write("type\tfilename\theader\n")
++        for chain_type, filename, header in chain_records:
++            mapping.write(f"{chain_type}\t{filename}\t{header}\n")
++
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/bin/generate_report.py b/bin/generate_report.py
+index 3a042978b..c16412e99 100755
+--- a/bin/generate_report.py
++++ b/bin/generate_report.py
+@@ -57,6 +57,12 @@ def generate_output_images(msa_path, plddt_data, name, out_dir, in_type, generat
+             for line in in_file:
+                 msa.append([int(x) for x in line.strip().split()])
+ 
++        # Pad jagged MSAs to avoid shape errors in downstream plotting
++        if msa:
++            max_len = max(len(row) for row in msa)
++            if any(len(row) != max_len for row in msa):
++                msa = [row + [21] * (max_len - len(row)) for row in msa]
++
+         seqid = []
+         for sequence in msa:
+             matches = [
+diff --git a/conf/test_rosettafold2na.config b/conf/test_rosettafold2na.config
+index f53d20503..a3ab29b1b 100644
+--- a/conf/test_rosettafold2na.config
++++ b/conf/test_rosettafold2na.config
+@@ -26,8 +26,7 @@ params {
+     // Input data to test rosettafold2na
+     mode                 = 'rosettafold2na'
+     rosettafold2na_db    = "${projectDir}/assets/dummy_db_dir"
+-    input                = params.pipelines_testdata_base_path + 'proteinfold/testdata/samplesheet/v1.2/samplesheet.csv'
+-    interactions         = params.pipelines_testdata_base_path + 'proteinfold/testdata/interactions/v1.2/interactions.csv'
++    input                = params.pipelines_testdata_base_path + 'proteinfold/testdata/samplesheet/v2.0/rna_complex_samplesheet.csv'
+ }
+ 
+ process {
+diff --git a/docs/usage.md b/docs/usage.md
+index e3e1da179..30b185089 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -427,6 +427,9 @@ nextflow run nf-core/proteinfold \
+       -profile <docker/singularity/.../institute>
+ ```
+ 
++> [!NOTE]
++> RosettaFold2NA now expects each samplesheet row to reference a multi-chain FASTA that includes every interacting molecule. Add a `type=` hint to each header (for example `type=protein`, `type=rna`, `type=double_dna`, or `type=single_dna`) so the adaptor can tag chains with the correct RF2NA entity codes (`P`, `R`, `D`, `S`). If no hint is present, the chain type is inferred from sequence composition (pure `ACUGN` → RNA, pure `ACTGN` → DNA which defaults to `D` unless explicitly tagged single-strand, otherwise protein).
++
+ Note that the pipeline will create the following files in your working directory:
+ 
+ ```bash
+diff --git a/main.nf b/main.nf
+index 2c1c49ea6..cd6d45e34 100644
+--- a/main.nf
++++ b/main.nf
+@@ -62,11 +62,9 @@ workflow NFCORE_PROTEINFOLD {
+ 
+     take:
+     samplesheet  // channel: samplesheet read in from --input
+-    interactions // channel: interactions read in from --interactions
+ 
+     main:
+     ch_samplesheet       = samplesheet
+-    ch_interactions      = interactions
+     ch_multiqc           = channel.empty()
+     ch_versions          = channel.empty()
+     ch_report_input      = channel.empty()
+@@ -489,14 +487,12 @@ workflow NFCORE_PROTEINFOLD {
+         //
+         ROSETTAFOLD2NA (
+             ch_samplesheet,
+-            ch_interactions,
+             ch_versions,
+             PREPARE_ROSETTAFOLD2NA_DBS.out.bfd,
+             PREPARE_ROSETTAFOLD2NA_DBS.out.uniref30,
+             PREPARE_ROSETTAFOLD2NA_DBS.out.pdb100,
+             PREPARE_ROSETTAFOLD2NA_DBS.out.rna,
+-            PREPARE_ROSETTAFOLD2NA_DBS.out.rosettafold2na_weights,
+-            ch_dummy_file
++            PREPARE_ROSETTAFOLD2NA_DBS.out.rosettafold2na_weights
+         )
+         ch_multiqc                              = ch_multiqc.mix(ROSETTAFOLD2NA.out.multiqc_report.collect())
+         ch_versions                             = ch_versions.mix(ROSETTAFOLD2NA.out.versions)
+@@ -631,7 +627,6 @@ workflow {
+         args,
+         params.outdir,
+         params.input,
+-        params.interactions,
+         params.help,
+         params.help_full,
+         params.show_hidden
+@@ -641,8 +636,7 @@ workflow {
+     // WORKFLOW: Run main workflow
+     //
+     NFCORE_PROTEINFOLD (
+-        PIPELINE_INITIALISATION.out.samplesheet,
+-        PIPELINE_INITIALISATION.out.interactions
++        PIPELINE_INITIALISATION.out.samplesheet
+     )
+ 
+     //
+diff --git a/modules/local/rosettafold2na_fasta/environment.yml b/modules/local/rosettafold2na_fasta/environment.yml
+new file mode 100644
+index 000000000..238fcb6a5
+--- /dev/null
++++ b/modules/local/rosettafold2na_fasta/environment.yml
+@@ -0,0 +1,6 @@
++name: rosettafold2na_fasta
++channels:
++  - conda-forge
++  - defaults
++dependencies:
++  - python=3.8
+diff --git a/modules/local/rosettafold2na_fasta/main.nf b/modules/local/rosettafold2na_fasta/main.nf
+new file mode 100644
+index 000000000..98f63d021
+--- /dev/null
++++ b/modules/local/rosettafold2na_fasta/main.nf
+@@ -0,0 +1,40 @@
++process ROSETTAFOLD2NA_FASTA {
++    tag   "$meta.id"
++    label 'process_single'
++
++    conda "${moduleDir}/environment.yml"
++    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
++        'https://depot.galaxyproject.org/singularity/python:3.8.3' :
++        'biocontainers/python:3.8.3' }"
++
++    input:
++    tuple val(meta), path(fasta)
++
++    output:
++    tuple val(meta), path("rf2na_input", type: "dir"), emit: rf2na_input
++    path "versions.yml"                              , emit: versions
++
++    when:
++    task.ext.when == null || task.ext.when
++
++    script:
++    """
++    fasta_to_rosettafold.py "${meta.id}" "${fasta}"
++
++    cat <<'END_VERSIONS' > versions.yml
++"${task.process}":
++  python: \$(python3 --version | sed 's/Python //g')
++END_VERSIONS
++    """
++
++    stub:
++    """
++    mkdir -p rf2na_input
++    touch rf2na_input/chain_map.tsv
++
++    cat <<'END_VERSIONS' > versions.yml
++"${task.process}":
++  python: \$(python3 --version | sed 's/Python //g')
++END_VERSIONS
++    """
++}
+diff --git a/modules/local/run_rosettafold2na/main.nf b/modules/local/run_rosettafold2na/main.nf
+index e4de815c6..b55303a76 100644
+--- a/modules/local/run_rosettafold2na/main.nf
++++ b/modules/local/run_rosettafold2na/main.nf
+@@ -9,7 +9,7 @@ process RUN_ROSETTAFOLD2NA {
+     container "nf-core/proteinfold_rosettafold2na:2.0.0"
+ 
+     input:
+-    tuple val(meta), path(protein_fasta), path(interaction_fasta)
++    tuple val(meta), path(rf2na_input)
+     path ('bfd/*')
+     path ('UniRef30_2020_06/*')
+     path ('pdb100_2021Mar03/*')
+@@ -44,7 +44,30 @@ process RUN_ROSETTAFOLD2NA {
+         ln -s /app/RoseTTAFold2NA/network/* ./network
+     fi
+ 
+-    ./run_RF2NA.sh ${meta.id}_rf2na_output $protein_fasta ${meta.interaction_type}:${interaction_fasta}
++    rf2na_input_dir="\${rf2na_input:-rf2na_input}"
++
++    chain_map="\${rf2na_input_dir}/chain_map.tsv"
++    if [ ! -s "\$chain_map" ]; then
++        echo "[ROSETTAFOLD2NA] Missing chain_map.tsv produced by ROSETTAFOLD2NA_FASTA." >&2
++        exit 1
++    fi
++
++    chain_args=()
++    while IFS=\$'\\t' read -r chain_type chain_file _; do
++        [ -z "\$chain_type" ] && continue
++        case "\${chain_type}" in
++            P|R|D|S) ;;
++            *) echo "[ROSETTAFOLD2NA] Unsupported chain type '\${chain_type}'. Allowed types: P, R, D, S." >&2; exit 1 ;;
++        esac
++        chain_args+=( "\${chain_type}:\${rf2na_input_dir}/\${chain_file}" )
++    done < <(tail -n +2 "\$chain_map")
++
++    if [ "\${#chain_args[@]}" -eq 0 ]; then
++        echo "[ROSETTAFOLD2NA] No valid chain specifications found in chain_map.tsv." >&2
++        exit 1
++    fi
++
++    ./run_RF2NA.sh ${meta.id}_rf2na_output "\${chain_args[@]}"
+ 
+     cp ${meta.id}_rf2na_output/models/model_00.pdb ./${meta.id}_rf2na.pdb
+ 
+diff --git a/nextflow.config b/nextflow.config
+index 4fe482f3d..847cc667d 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -11,7 +11,6 @@ params {
+ 
+     // Input options
+     input                       = null
+-    interactions                = null
+     mode                        = 'alphafold2' // {alphafold2, colabfold, esmfold, rosettafold_all_atom, alphafold3, helixfold3, boltz, rosettafold2na}
+     use_gpu                     = false
+     split_fasta                 = false
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 85d711e4c..78b46e345 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -31,17 +31,6 @@
+                     "fa_icon": "fas fa-folder-open",
+                     "errorMessage": "Output directory path must be specified"
+                 },
+-                "interactions": {
+-                    "type": "string",
+-                    "format": "file-path",
+-                    "exists": true,
+-                    "schema": "assets/schema_interactions.json",
+-                    "mimetype": "text/csv",
+-                    "pattern": "^\\S+\\.csv$",
+-                    "description": "Path to comma-separated file containing information about the samples interactions for rosettafold2dna mode.",
+-                    "help_text": "You will need to create a design file with information about the interactions of your samples samples in your experiment before running the pipeline. Use this parameter to specify its location. It has to be a comma-separated file with 3 columns, and a header row. See [usage docs](https://nf-co.re/proteinfold/usage#samplesheet-input).",
+-                    "fa_icon": "fas fa-file-csv"
+-                },
+                 "mode": {
+                     "type": "string",
+                     "default": "alphafold2",
+diff --git a/subworkflows/local/utils_nfcore_proteinfold_pipeline/main.nf b/subworkflows/local/utils_nfcore_proteinfold_pipeline/main.nf
+index 265082b78..779abb243 100644
+--- a/subworkflows/local/utils_nfcore_proteinfold_pipeline/main.nf
++++ b/subworkflows/local/utils_nfcore_proteinfold_pipeline/main.nf
+@@ -33,7 +33,6 @@ workflow PIPELINE_INITIALISATION {
+     nextflow_cli_args //   array: List of positional nextflow CLI args
+     outdir            //  string: The output directory where the results will be saved
+     input             //  string: Path to input samplesheet
+-    interactions      //  string: Path to input interactions
+     help              // boolean: Display help message and exit
+     help_full         // boolean: Show the full help message
+     show_hidden       // boolean: Show hidden parameters in the help message
+@@ -94,7 +93,7 @@ workflow PIPELINE_INITIALISATION {
+     )
+ 
+     //
+-    // Create channel from input file provided through params.input and params.interactions
++    // Create channel from input file provided through params.input
+     //
+     ch_samplesheet = Channel.fromList(samplesheetToList(params.input, "assets/schema_input.json"))
+ 
+@@ -106,46 +105,6 @@ workflow PIPELINE_INITIALISATION {
+             return [[id: identifier], fasta]
+         }
+ 
+-    if (params.interactions) {
+-        if (!params.mode.toLowerCase().split(",").contains("rosettafold2na")) {
+-            log.info "WARNING: The --interactions parameter is only supported in the ROSETTAFOLD2NA mode."
+-        }
+-
+-        //
+-        // Create channel from input file provided through params.interactions
+-        //
+-        ch_interactions = Channel.fromList(samplesheetToList(params.interactions, "assets/schema_interactions.json"))
+-
+-        sample_ids = ch_samplesheet
+-                        .map { meta, file ->
+-                            meta.id
+-                        }
+-                        .collect()
+-                        .toList()
+-
+-        ch_interactions
+-            .combine(sample_ids)
+-            .branch {
+-                meta, ids ->
+-                    valid: ids.contains(meta.protein_id) && ids.contains(meta.interaction_id) ? meta.protein_id : null
+-                    invalid: !(ids.contains(meta.protein_id) && ids.contains(meta.interaction_id)) ? meta.protein_id : null
+-            }
+-            .set { ch_interactions_validated }
+-
+-        ch_interactions_validated.invalid
+-            .subscribe { meta, samples_ids ->
+-                log.info "WARNING: Row \"${meta.protein_id},${meta.interaction_id},${meta.interaction_type}\", in interactions is not valid (check the IDs correspond to those in samplesheet)."
+-            }
+-
+-        ch_interactions_validated.valid
+-            .ifEmpty { log.error "No valid interactions found in the interactions file. Please check the IDs correspond to those in samplesheet." }
+-            .map {
+-                meta, samples_ids ->
+-                    meta
+-            }
+-            .set { interactions }
+-    }
+-
+     if (params.split_fasta) {
+         // TODO: here we have to validate that the ids are unique and valid as an extra step
+         // since it is not done with the samplesheet schema (they are all in the same file)
+@@ -168,7 +127,6 @@ workflow PIPELINE_INITIALISATION {
+ 
+     emit:
+     samplesheet  = ch_samplesheet
+-    interactions = interactions
+     versions     = ch_versions
+ }
+ 
+diff --git a/workflows/rosettafold2na.nf b/workflows/rosettafold2na.nf
+index 3a9b85ca2..de5b1cd0f 100644
+--- a/workflows/rosettafold2na.nf
++++ b/workflows/rosettafold2na.nf
+@@ -7,7 +7,8 @@
+ //
+ // MODULE: Loaded from modules/local/
+ //
+-include { RUN_ROSETTAFOLD2NA } from '../modules/local/run_rosettafold2na'
++include { ROSETTAFOLD2NA_FASTA } from '../modules/local/rosettafold2na_fasta'
++include { RUN_ROSETTAFOLD2NA   } from '../modules/local/run_rosettafold2na'
+ 
+ /*
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+@@ -18,15 +19,13 @@ include { RUN_ROSETTAFOLD2NA } from '../modules/local/run_rosettafold2na'
+ workflow ROSETTAFOLD2NA {
+ 
+     take:
+-    ch_samplesheet          // channel: samplesheet read in from --input
+-    ch_interactions         // channel: interactions read in from --interactions
+-    ch_versions             // channel: [ path(versions.yml) ]
+-    ch_bfd                  // channel: path(bfd)
+-    ch_uniref30             // channel: path(uniref30)
+-    ch_pdb100               // channel: path(pdb100)
+-    ch_rna                  // channel: path(rna)
++    ch_samplesheet            // channel: samplesheet read in from --input
++    ch_versions               // channel: [ path(versions.yml) ]
++    ch_bfd                    // channel: path(bfd)
++    ch_uniref30               // channel: path(uniref30)
++    ch_pdb100                 // channel: path(pdb100)
++    ch_rna                    // channel: path(rna)
+     ch_rosettafold2na_weights // channel: path(rosettafold2na_weights)
+-    ch_dummy_file           // channel: path(NO_FILE)
+ 
+     main:
+     ch_multiqc_files  = channel.empty()
+@@ -34,24 +33,13 @@ workflow ROSETTAFOLD2NA {
+     ch_pdb_msa        = channel.empty()
+     ch_multiqc_report = channel.empty()
+ 
+-    ch_samplesheet_reshaped = ch_samplesheet.map {
+-        meta, file -> [ meta.id, file ] }
+-
+-    ch_protein_interaction = ch_interactions
+-                                .map { it ->
+-                                    [ it.protein_id, it.interaction_id, it.interaction_type ]
+-                                }
+-                                .join(ch_samplesheet_reshaped, by: 0)
+-                                .map { it ->
+-                                    [ it[1], it[0], it[2], it[3] ] // [ protein_id, interaction_id, interaction_type, file ]
+-                                }
+-                                .join(ch_samplesheet_reshaped, by: 0)
+-                                .map { it ->
+-                                    [ [ id: it[1], interaction_id: it[0], interaction_type: it[2] ], it[3], it[4] ] // [ protein_id, interaction_id, interaction_type, file ]
+-                                }
++    ROSETTAFOLD2NA_FASTA(
++        ch_samplesheet
++    )
++    ch_versions = ch_versions.mix(ROSETTAFOLD2NA_FASTA.out.versions)
+ 
+     RUN_ROSETTAFOLD2NA (
+-        ch_protein_interaction,
++        ROSETTAFOLD2NA_FASTA.out.rf2na_input,
+         ch_bfd,
+         ch_uniref30,
+         ch_pdb100,

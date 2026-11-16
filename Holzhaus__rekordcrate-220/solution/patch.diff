@@ -1,0 +1,4880 @@
+diff --git a/src/pdb/bitfields.rs b/src/pdb/bitfields.rs
+index 0ee72703..7b934713 100644
+--- a/src/pdb/bitfields.rs
++++ b/src/pdb/bitfields.rs
+@@ -47,6 +47,27 @@ impl PackedRowCounts {
+     pub(crate) fn num_row_groups(&self) -> u16 {
+         self.num_rows().div_ceil(RowGroup::MAX_ROW_COUNT as u16)
+     }
++
++    /// Get the index of the last row group in the page and
++    /// the index of the last row in that row group.
++    pub(crate) fn last_row_index(&self) -> Option<(u16, u16)> {
++        let rgi = self.num_row_groups().checked_sub(1)?;
++        let rsi = self
++            .num_rows()
++            .checked_sub(1)
++            .map(|n| n % RowGroup::MAX_ROW_COUNT as u16)?;
++        Some((rgi, rsi))
++    }
++
++    /// Increment the number of rows e.g. when we allocate a row in the page.
++    pub(crate) fn increment_num_rows(&mut self) {
++        self.set_num_rows(self.num_rows() + 1);
++    }
++
++    // Increment the number of valid rows e.g. when we insert a row into the page.
++    pub(crate) fn increment_num_rows_valid(&mut self) {
++        self.set_num_rows_valid(self.num_rows_valid() + 1);
++    }
+ }
+ 
+ /// Page flags stored in the page header.
+diff --git a/src/pdb/ext.rs b/src/pdb/ext.rs
+index 730cf8ec..0b337565 100644
+--- a/src/pdb/ext.rs
++++ b/src/pdb/ext.rs
+@@ -19,7 +19,10 @@
+ //! - <https://github.com/henrybetts/Rekordbox-Decoding>
+ //! - <https://github.com/flesniak/python-prodj-link/tree/master/prodj/pdblib>
+ 
+-use crate::pdb::{DeviceSQLString, OffsetArray, OffsetArrayContainer, Subtype, TrackId};
++use crate::pdb::{
++    offset_array::OffsetArrayItems, DeviceSQLString, OffsetArrayContainer, PageHeapObject, Subtype,
++    TrackId,
++};
+ use binrw::binrw;
+ use std::num::NonZero;
+ 
+@@ -29,6 +32,13 @@ use std::num::NonZero;
+ #[brw(little)]
+ pub struct TagId(pub u32);
+ 
++impl PageHeapObject for TagId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+@@ -39,24 +49,36 @@ pub struct ParentId(
+     pub Option<NonZero<u32>>,
+ );
+ 
+-#[binrw]
+-#[brw(little)]
+-#[brw(import(base: i64, offsets: &OffsetArray<2>, args: ()))]
++impl PageHeapObject for ParentId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        let inner: u32 = self.0.map_or(0u32, |v| v.get());
++        inner.heap_bytes_required(())
++    }
++}
++
+ #[derive(Debug, PartialEq, Clone, Eq)]
+ /// The strings associated with a tag or category.
+ pub struct TagOrCategoryStrings {
+-    #[brw(args(base, args))]
+-    #[br(parse_with = offsets.read_offset(0))]
+-    #[bw(write_with = offsets.write_offset(0))]
+     /// The name of the tag or category.
+     pub name: DeviceSQLString,
+-    #[brw(args(base, args))]
+-    #[br(parse_with = offsets.read_offset(1))]
+-    #[bw(write_with = offsets.write_offset(1))]
+     /// String with unknown purpose, often empty.
+     pub unknown: DeviceSQLString,
+ }
+ 
++impl OffsetArrayItems<2> for TagOrCategoryStrings {
++    type Item = DeviceSQLString;
++
++    fn as_items(&self) -> [&Self::Item; 2] {
++        [&self.name, &self.unknown]
++    }
++
++    fn from_items(items: [Self::Item; 2]) -> Self {
++        let [name, unknown] = items;
++        Self { name, unknown }
++    }
++}
++
+ /// A tag or category that can be assigned to tracks for the purpose of categorization.
+ ///
+ /// ## References
+@@ -87,12 +109,31 @@ pub struct TagOrCategory {
+     pub id: TagId,
+     /// Non-zero if this row represents a category rather than a tag.
+     pub raw_is_category: u32,
+-    // Padded at the end by 11 bytes as observed
+-    #[brw(args(0x1C, subtype.get_offset_size(), ()), pad_after = 11)]
+     /// The strings associated with this tag or category.
++    #[brw(args(0x1C, subtype.get_offset_size(), ()))]
+     pub offsets: OffsetArrayContainer<TagOrCategoryStrings, 2>,
+ }
+ 
++impl PageHeapObject for TagOrCategory {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.subtype.heap_bytes_required(()),
++            self.index_shift.heap_bytes_required(()),
++            self.unknown1.heap_bytes_required(()),
++            self.unknown2.heap_bytes_required(()),
++            self.parent_id.heap_bytes_required(()),
++            self.position.heap_bytes_required(()),
++            self.id.heap_bytes_required(()),
++            self.raw_is_category.heap_bytes_required(()),
++            self.offsets
++                .heap_bytes_required(self.subtype.get_offset_size()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ // https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#tag-track-rows
+ /// M*N junction table between tags and tracks.
+ #[binrw]
+@@ -108,6 +149,20 @@ pub struct TrackTag {
+     pub unknown_const: u32, // always 3?
+ }
+ 
++impl PageHeapObject for TrackTag {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            (0u32).heap_bytes_required(()),
++            self.track_id.heap_bytes_required(()),
++            self.tag_id.heap_bytes_required(()),
++            self.unknown_const.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// The type of ext pages found inside a `Table`.
+ #[binrw]
+ #[brw(little)]
+@@ -134,8 +189,18 @@ pub enum ExtPageType {
+ pub enum ExtRow {
+     /// Contains the album name, along with an ID of the corresponding artist.
+     #[br(pre_assert(page_type == ExtPageType::Tag))]
+-    Tag(#[bw(pad_after = 0, align_after = 4)] TagOrCategory),
++    Tag(#[bw(align_after = 4)] TagOrCategory),
+     /// Contains the artist name and ID.
+     #[br(pre_assert(page_type == ExtPageType::TrackTag))]
+-    TrackTag(#[bw(pad_after = 0, align_after = 4)] TrackTag),
++    TrackTag(#[bw(align_after = 4)] TrackTag),
++}
++
++impl PageHeapObject for ExtRow {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        match self {
++            ExtRow::Tag(tag_or_category) => tag_or_category.heap_bytes_required(()),
++            ExtRow::TrackTag(track_tag) => track_tag.heap_bytes_required(()),
++        }
++    }
+ }
+diff --git a/src/pdb/mod.rs b/src/pdb/mod.rs
+index 3efcbaee..833abe91 100644
+--- a/src/pdb/mod.rs
++++ b/src/pdb/mod.rs
+@@ -24,16 +24,19 @@ pub mod offset_array;
+ pub mod string;
+ 
+ use bitfields::{PackedRowCounts, PageFlags};
+-use offset_array::OffsetArrayContainer;
++use offset_array::{OffsetArrayContainer, OffsetArrayItems};
+ 
+ #[cfg(test)]
+-mod test;
++mod test_roundtrip;
++
++#[cfg(test)]
++mod test_modification;
+ 
+ use std::collections::BTreeMap;
+ use std::fmt;
+ 
+ use crate::pdb::ext::{ExtPageType, ExtRow};
+-use crate::pdb::offset_array::{OffsetArray, OffsetSize};
++use crate::pdb::offset_array::OffsetSize;
+ use crate::pdb::string::DeviceSQLString;
+ use crate::util::{parse_at_offsets, write_at_offsets, ColorIndex, FileType};
+ use binrw::{
+@@ -527,6 +530,61 @@ pub struct Page {
+     pub content: PageContent,
+ }
+ 
++impl Page {
++    /// Allocate space for a new row in the page heap and return a function to
++    /// insert the row at the allocated offset. Returns `None` if there is
++    /// insufficient free space in the page.
++    ///
++    /// We do this allocate-then-insert dance so that we only take ownership of
++    /// the Row once we know we can insert it, avoiding unnecessary copies.
++    pub fn allocate_row<'a>(&'a mut self, bytes: u16) -> Option<impl FnOnce(Row) + 'a> {
++        match self.content {
++            PageContent::Index(_) | PageContent::Unknown => None,
++            PageContent::Data(ref mut dpc) => {
++                // Always align rows to 4 bytes.
++                let bytes = bytes.next_multiple_of(4);
++
++                // Assume the upper bound of required space.
++                let required_bytes = bytes + RowGroup::HEADER_SIZE + RowGroup::OFFSET_SIZE;
++                if self.header.free_size < required_bytes {
++                    return None;
++                }
++
++                let offset = self.header.used_size;
++                self.header.used_size += bytes;
++                self.header.free_size -= bytes;
++                let row_counts = &mut self.header.packed_row_counts;
++                row_counts.increment_num_rows();
++                let (row_group_index, row_subindex) = row_counts.last_row_index().unwrap();
++
++                if dpc.row_groups.get(row_group_index as usize).is_none() {
++                    dpc.row_groups.push(RowGroup::empty());
++                    self.header.free_size -= RowGroup::HEADER_SIZE;
++                }
++
++                let row_group = dpc.row_groups.get_mut(row_group_index as usize).unwrap();
++                row_group.insert_offset(row_subindex, offset);
++                self.header.free_size -= RowGroup::OFFSET_SIZE;
++
++                let rows = &mut dpc.rows;
++
++                Some(move |row: Row| {
++                    let prev_entry = rows.insert(offset, row);
++                    if prev_entry.is_some() {
++                        panic!(
++                            "Offset {} was already occupied by row {:?}",
++                            offset,
++                            prev_entry.unwrap()
++                        );
++                    }
++                    row_group.mark_offset_present(row_subindex);
++                    row_counts.increment_num_rows_valid();
++                })
++            }
++        }
++    }
++}
++
+ /// The header of the data-containing part of a page.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -588,6 +646,50 @@ impl DataPageContent {
+     }
+ }
+ 
++// Usage of PageHeapObject is coming in a future PR.
++#[allow(dead_code)]
++trait PageHeapObject {
++    type Args<'a>;
++
++    /// Required page heap space in bytes to store the object.
++    fn heap_bytes_required(&self, args: Self::Args<'_>) -> u16;
++}
++
++impl PageHeapObject for u8 {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        std::mem::size_of::<u8>() as u16
++    }
++}
++
++impl PageHeapObject for u16 {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        std::mem::size_of::<u16>() as u16
++    }
++}
++
++impl PageHeapObject for u32 {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        std::mem::size_of::<u32>() as u16
++    }
++}
++
++impl PageHeapObject for ColorIndex {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        (0u8).heap_bytes_required(())
++    }
++}
++
++impl PageHeapObject for FileType {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        (0u16).heap_bytes_required(())
++    }
++}
++
+ /// A group of row indices, which are built backwards from the end of the page. Holds up to sixteen
+ /// row offsets, along with a bit mask that indicates whether each row is actually present in the
+ /// table.
+@@ -626,7 +728,17 @@ pub struct RowGroup {
+ 
+ impl RowGroup {
+     const MAX_ROW_COUNT: usize = 16;
+-    const BINARY_SIZE: u32 = (Self::MAX_ROW_COUNT as u32) * 2 + 4; // size the serialized structure
++    const HEADER_SIZE: u16 = 4; // row_presence_flags and unknown fields.
++    const OFFSET_SIZE: u16 = 2;
++    const BINARY_SIZE: u16 = (Self::MAX_ROW_COUNT as u16) * Self::OFFSET_SIZE + Self::HEADER_SIZE;
++
++    fn empty() -> Self {
++        Self {
++            row_offsets: [0; Self::MAX_ROW_COUNT],
++            row_presence_flags: 0,
++            unknown: 0,
++        }
++    }
+ 
+     fn present_rows_offsets(&self) -> impl Iterator<Item = u16> + '_ {
+         self.row_offsets
+@@ -655,6 +767,23 @@ impl RowGroup {
+         }
+         Ok(())
+     }
++
++    /// Insert a row offset into the group at the given subindex
++    /// but do not mark it present yet (see `mark_offset_present`).
++    fn insert_offset(&mut self, subindex: u16, offset: u16) {
++        self.row_offsets[(Self::MAX_ROW_COUNT as u16 - 1 - subindex) as usize] = offset;
++    }
++
++    /// Mark an inserted row offset as present.
++    fn mark_offset_present(&mut self, subindex: u16) {
++        self.row_presence_flags |= 1 << subindex;
++    }
++}
++
++impl Default for RowGroup {
++    fn default() -> Self {
++        Self::empty()
++    }
+ }
+ 
+ impl PartialEq for RowGroup {
+@@ -670,6 +799,13 @@ impl PartialEq for RowGroup {
+ #[brw(little)]
+ pub struct Subtype(pub u16);
+ 
++impl PageHeapObject for Subtype {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ impl Subtype {
+     /// Returns the offset size (`OffsetSize`) used for this subtype.
+     ///
+@@ -691,67 +827,137 @@ impl Subtype {
+ #[brw(little)]
+ pub struct TrackId(pub u32);
+ 
++impl PageHeapObject for TrackId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies an artwork item.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct ArtworkId(pub u32);
+ 
++impl PageHeapObject for ArtworkId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies an album.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct AlbumId(pub u32);
+ 
++impl PageHeapObject for AlbumId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies an artist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct ArtistId(pub u32);
+ 
++impl PageHeapObject for ArtistId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies a genre.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct GenreId(pub u32);
+ 
++impl PageHeapObject for GenreId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies a key.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct KeyId(pub u32);
+ 
++impl PageHeapObject for KeyId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies a label.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct LabelId(pub u32);
+ 
++impl PageHeapObject for LabelId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies a playlist tree node.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct PlaylistTreeNodeId(pub u32);
+ 
++impl PageHeapObject for PlaylistTreeNodeId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ /// Identifies a history playlist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+ #[brw(little)]
+ pub struct HistoryPlaylistId(pub u32);
+ 
+-#[binrw]
+-#[brw(little)]
+-#[brw(import(base: i64, offsets: &OffsetArray<1>, args: ()))]
++impl PageHeapObject for HistoryPlaylistId {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        self.0.heap_bytes_required(())
++    }
++}
++
+ #[derive(Debug, PartialEq, Clone, Eq)]
+ /// Represents a trailing name field at the end of a row, used for album and artist names.
+ pub struct TrailingName {
+-    #[brw(args(base, args))]
+-    #[br(parse_with = offsets.read_offset(0))]
+-    #[bw(write_with = offsets.write_offset(0))]
+     /// The name a the end of the row this is used in
+     pub name: DeviceSQLString,
+ }
+ 
++impl OffsetArrayItems<1> for TrailingName {
++    type Item = DeviceSQLString;
++
++    fn as_items(&self) -> [&Self::Item; 1] {
++        [&self.name]
++    }
++
++    fn from_items(items: [Self::Item; 1]) -> Self {
++        let [name] = items;
++        Self { name }
++    }
++}
++
+ /// Contains the album name, along with an ID of the corresponding artist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -775,6 +981,24 @@ pub struct Album {
+     offsets: OffsetArrayContainer<TrailingName, 1>,
+ }
+ 
++impl PageHeapObject for Album {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.subtype.heap_bytes_required(()),
++            self.index_shift.heap_bytes_required(()),
++            self.unknown2.heap_bytes_required(()),
++            self.artist_id.heap_bytes_required(()),
++            self.id.heap_bytes_required(()),
++            self.unknown3.heap_bytes_required(()),
++            self.offsets
++                .heap_bytes_required(self.subtype.get_offset_size()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Contains the artist name and ID.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -792,6 +1016,21 @@ pub struct Artist {
+     pub offsets: OffsetArrayContainer<TrailingName, 1>,
+ }
+ 
++impl PageHeapObject for Artist {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.subtype.heap_bytes_required(()),
++            self.index_shift.heap_bytes_required(()),
++            self.id.heap_bytes_required(()),
++            self.offsets
++                .heap_bytes_required(self.subtype.get_offset_size()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Contains the artwork path and ID.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -803,6 +1042,18 @@ pub struct Artwork {
+     path: DeviceSQLString,
+ }
+ 
++impl PageHeapObject for Artwork {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.id.heap_bytes_required(()),
++            self.path.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Contains numeric color ID
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -820,6 +1071,21 @@ pub struct Color {
+     name: DeviceSQLString,
+ }
+ 
++impl PageHeapObject for Color {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.unknown1.heap_bytes_required(()),
++            self.unknown2.heap_bytes_required(()),
++            self.color.heap_bytes_required(()),
++            self.unknown3.heap_bytes_required(()),
++            self.name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a musical genre.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -831,6 +1097,18 @@ pub struct Genre {
+     name: DeviceSQLString,
+ }
+ 
++impl PageHeapObject for Genre {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.id.heap_bytes_required(()),
++            self.name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a history playlist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -842,6 +1120,18 @@ pub struct HistoryPlaylist {
+     name: DeviceSQLString,
+ }
+ 
++impl PageHeapObject for HistoryPlaylist {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.id.heap_bytes_required(()),
++            self.name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a history playlist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -855,6 +1145,19 @@ pub struct HistoryEntry {
+     entry_index: u32,
+ }
+ 
++impl PageHeapObject for HistoryEntry {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.track_id.heap_bytes_required(()),
++            self.playlist_id.heap_bytes_required(()),
++            self.entry_index.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a musical key.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -868,6 +1171,19 @@ pub struct Key {
+     name: DeviceSQLString,
+ }
+ 
++impl PageHeapObject for Key {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.id.heap_bytes_required(()),
++            self.id2.heap_bytes_required(()),
++            self.name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a record label.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -879,6 +1195,18 @@ pub struct Label {
+     name: DeviceSQLString,
+ }
+ 
++impl PageHeapObject for Label {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.id.heap_bytes_required(()),
++            self.name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a node in the playlist tree (either a folder or a playlist).
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -906,6 +1234,22 @@ impl PlaylistTreeNode {
+     }
+ }
+ 
++impl PageHeapObject for PlaylistTreeNode {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.parent_id.heap_bytes_required(()),
++            self.unknown.heap_bytes_required(()),
++            self.sort_order.heap_bytes_required(()),
++            self.id.heap_bytes_required(()),
++            self.node_is_folder.heap_bytes_required(()),
++            self.name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Represents a track entry in a playlist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -919,6 +1263,19 @@ pub struct PlaylistEntry {
+     pub playlist_id: PlaylistTreeNodeId,
+ }
+ 
++impl PageHeapObject for PlaylistEntry {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.entry_index.heap_bytes_required(()),
++            self.track_id.heap_bytes_required(()),
++            self.playlist_id.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Contains the kinds of Metadata Categories tracks can be browsed by
+ /// on CDJs.
+ #[binrw]
+@@ -942,121 +1299,126 @@ pub struct ColumnEntry {
+     pub column_name: DeviceSQLString,
+ }
+ 
+-#[binrw]
+-#[brw(little)]
+-#[brw(import(base: i64, offsets: &OffsetArray<21>, _args: ()))]
++impl PageHeapObject for ColumnEntry {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.id.heap_bytes_required(()),
++            self.unknown0.heap_bytes_required(()),
++            self.column_name.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ #[derive(Debug, PartialEq, Clone, Eq)]
+ /// String fields stored via the offset table in Track rows
+ pub struct TrackStrings {
+     /// International Standard Recording Code (ISRC), in mangled format.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(0))]
+-    #[bw(write_with = offsets.write_offset(0))]
+     isrc: DeviceSQLString,
+     /// Lyricist of the track.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(1))]
+-    #[bw(write_with = offsets.write_offset(1))]
+     lyricist: DeviceSQLString,
+     /// Unknown string field containing a number.
+     /// Appears to increment when the track is exported or modified in Rekordbox.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(2))]
+-    #[bw(write_with = offsets.write_offset(2))]
+     unknown_string2: DeviceSQLString,
+     /// Unknown string field containing a number.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(3))]
+-    #[bw(write_with = offsets.write_offset(3))]
+     unknown_string3: DeviceSQLString,
+     /// Unknown string field.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(4))]
+-    #[bw(write_with = offsets.write_offset(4))]
+     unknown_string4: DeviceSQLString,
+     /// Track "message", a field in the Rekordbox UI.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(5))]
+-    #[bw(write_with = offsets.write_offset(5))]
+     message: DeviceSQLString,
+     /// "Publish track information" in Rekordbox, value is either "ON" or empty string.
+     /// Appears related to the Stagehand product to control DJ equipment remotely.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(6))]
+-    #[bw(write_with = offsets.write_offset(6))]
+     publish_track_information: DeviceSQLString,
+     /// Determines if hotcues should be autoloaded. Value is either "ON" or empty string.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(7))]
+-    #[bw(write_with = offsets.write_offset(7))]
+     autoload_hotcues: DeviceSQLString,
+     /// Unknown string field (usually empty).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(8))]
+-    #[bw(write_with = offsets.write_offset(8))]
+     unknown_string5: DeviceSQLString,
+     /// Unknown string field (usually empty).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(9))]
+-    #[bw(write_with = offsets.write_offset(9))]
+     unknown_string6: DeviceSQLString,
+     /// Date when the track was added to the Rekordbox collection (YYYY-MM-DD).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(10))]
+-    #[bw(write_with = offsets.write_offset(10))]
+     date_added: DeviceSQLString,
+     /// Date when the track was released (YYYY-MM-DD).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(11))]
+-    #[bw(write_with = offsets.write_offset(11))]
+     release_date: DeviceSQLString,
+     /// Name of the remix (if any).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(12))]
+-    #[bw(write_with = offsets.write_offset(12))]
+     mix_name: DeviceSQLString,
+     /// Unknown string field (usually empty).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(13))]
+-    #[bw(write_with = offsets.write_offset(13))]
+     unknown_string7: DeviceSQLString,
+     /// File path of the track analysis file.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(14))]
+-    #[bw(write_with = offsets.write_offset(14))]
+     analyze_path: DeviceSQLString,
+     /// Date when the track analysis was performed (YYYY-MM-DD).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(15))]
+-    #[bw(write_with = offsets.write_offset(15))]
+     analyze_date: DeviceSQLString,
+     /// Track comment.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(16))]
+-    #[bw(write_with = offsets.write_offset(16))]
+     comment: DeviceSQLString,
+     /// Track title.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(17))]
+-    #[bw(write_with = offsets.write_offset(17))]
+     pub title: DeviceSQLString,
+     /// Unknown string field (usually empty).
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(18))]
+-    #[bw(write_with = offsets.write_offset(18))]
+     unknown_string8: DeviceSQLString,
+     /// Name of the file.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(19))]
+-    #[bw(write_with = offsets.write_offset(19))]
+     filename: DeviceSQLString,
+     /// Path of the file.
+-    #[brw(args(base, ()))]
+-    #[br(parse_with = offsets.read_offset(20))]
+-    #[bw(write_with = offsets.write_offset(20))]
+     pub file_path: DeviceSQLString,
+ }
+ 
++impl OffsetArrayItems<21> for TrackStrings {
++    type Item = DeviceSQLString;
++
++    fn as_items(&self) -> [&Self::Item; 21] {
++        [
++            &self.isrc,
++            &self.lyricist,
++            &self.unknown_string2,
++            &self.unknown_string3,
++            &self.unknown_string4,
++            &self.message,
++            &self.publish_track_information,
++            &self.autoload_hotcues,
++            &self.unknown_string5,
++            &self.unknown_string6,
++            &self.date_added,
++            &self.release_date,
++            &self.mix_name,
++            &self.unknown_string7,
++            &self.analyze_path,
++            &self.analyze_date,
++            &self.comment,
++            &self.title,
++            &self.unknown_string8,
++            &self.filename,
++            &self.file_path,
++        ]
++    }
++
++    fn from_items(items: [Self::Item; 21]) -> Self {
++        let [isrc, lyricist, unknown_string2, unknown_string3, unknown_string4, message, publish_track_information, autoload_hotcues, unknown_string5, unknown_string6, date_added, release_date, mix_name, unknown_string7, analyze_path, analyze_date, comment, title, unknown_string8, filename, file_path] =
++            items;
++        Self {
++            isrc,
++            lyricist,
++            unknown_string2,
++            unknown_string3,
++            unknown_string4,
++            message,
++            publish_track_information,
++            autoload_hotcues,
++            unknown_string5,
++            unknown_string6,
++            date_added,
++            release_date,
++            mix_name,
++            unknown_string7,
++            analyze_path,
++            analyze_date,
++            comment,
++            title,
++            unknown_string8,
++            filename,
++            file_path,
++        }
++    }
++}
++
+ /// Contains the album name, along with an ID of the corresponding artist.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -1131,6 +1493,48 @@ pub struct Track {
+     pub offsets: OffsetArrayContainer<TrackStrings, 21>,
+ }
+ 
++impl PageHeapObject for Track {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.subtype.heap_bytes_required(()),
++            self.index_shift.heap_bytes_required(()),
++            self.bitmask.heap_bytes_required(()),
++            self.sample_rate.heap_bytes_required(()),
++            self.composer_id.heap_bytes_required(()),
++            self.file_size.heap_bytes_required(()),
++            self.unknown2.heap_bytes_required(()),
++            self.unknown3.heap_bytes_required(()),
++            self.unknown4.heap_bytes_required(()),
++            self.artwork_id.heap_bytes_required(()),
++            self.key_id.heap_bytes_required(()),
++            self.orig_artist_id.heap_bytes_required(()),
++            self.label_id.heap_bytes_required(()),
++            self.remixer_id.heap_bytes_required(()),
++            self.bitrate.heap_bytes_required(()),
++            self.track_number.heap_bytes_required(()),
++            self.tempo.heap_bytes_required(()),
++            self.genre_id.heap_bytes_required(()),
++            self.album_id.heap_bytes_required(()),
++            self.artist_id.heap_bytes_required(()),
++            self.id.heap_bytes_required(()),
++            self.disc_number.heap_bytes_required(()),
++            self.play_count.heap_bytes_required(()),
++            self.year.heap_bytes_required(()),
++            self.sample_depth.heap_bytes_required(()),
++            self.duration.heap_bytes_required(()),
++            self.unknown5.heap_bytes_required(()),
++            self.color.heap_bytes_required(()),
++            self.rating.heap_bytes_required(()),
++            self.file_type.heap_bytes_required(()),
++            self.offsets
++                .heap_bytes_required(self.subtype.get_offset_size()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// Visibility state for a Menu on the CDJ.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+@@ -1146,6 +1550,13 @@ pub enum MenuVisibility {
+     Unknown(u8),
+ }
+ 
++impl PageHeapObject for MenuVisibility {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        (0u8).heap_bytes_required(())
++    }
++}
++
+ /// This table defines the active menus on the CDJ.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -1179,6 +1590,21 @@ pub struct Menu {
+     pub sort_order: u16,
+ }
+ 
++impl PageHeapObject for Menu {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        [
++            self.category_id.heap_bytes_required(()),
++            self.content_pointer.heap_bytes_required(()),
++            self.unknown.heap_bytes_required(()),
++            self.visibility.heap_bytes_required(()),
++            self.sort_order.heap_bytes_required(()),
++        ]
++        .iter()
++        .sum()
++    }
++}
++
+ /// A table row contains the actual data.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -1195,52 +1621,76 @@ pub enum PlainRow {
+     /// Fresh album rows typically have a bit of padding, presumably to allow
+     /// edits on DJ gear.
+     #[br(pre_assert(page_type == PlainPageType::Albums))]
+-    Album(#[bw(pad_after = 6, align_after = 4)] Album),
++    Album(#[bw(align_after = 4)] Album),
+     /// Contains the artist name and ID.
+     ///
+     /// Fresh artist rows typically have a bit of padding, presumably to allow
+     /// edits on DJ gear.
+     #[br(pre_assert(page_type == PlainPageType::Artists))]
+-    Artist(#[bw(pad_after = 6, align_after = 4)] Artist),
++    Artist(#[bw(align_after = 4)] Artist),
+     /// Contains the artwork path and ID.
+     #[br(pre_assert(page_type == PlainPageType::Artwork))]
+-    Artwork(#[bw(pad_after = 0, align_after = 4)] Artwork),
++    Artwork(#[bw(align_after = 4)] Artwork),
+     /// Contains numeric color ID
+     #[br(pre_assert(page_type == PlainPageType::Colors))]
+-    Color(#[bw(pad_after = 0, align_after = 4)] Color),
++    Color(#[bw(align_after = 4)] Color),
+     /// Represents a musical genre.
+     #[br(pre_assert(page_type == PlainPageType::Genres))]
+-    Genre(#[bw(pad_after = 0, align_after = 4)] Genre),
++    Genre(#[bw(align_after = 4)] Genre),
+     /// Represents a history playlist.
+     #[br(pre_assert(page_type == PlainPageType::HistoryPlaylists))]
+-    HistoryPlaylist(#[bw(pad_after = 0, align_after = 4)] HistoryPlaylist),
++    HistoryPlaylist(#[bw(align_after = 4)] HistoryPlaylist),
+     /// Represents a history playlist.
+     #[br(pre_assert(page_type == PlainPageType::HistoryEntries))]
+-    HistoryEntry(#[bw(pad_after = 0, align_after = 4)] HistoryEntry),
++    HistoryEntry(#[bw(align_after = 4)] HistoryEntry),
+     /// Represents a musical key.
+     #[br(pre_assert(page_type == PlainPageType::Keys))]
+-    Key(#[bw(pad_after = 0, align_after = 4)] Key),
++    Key(#[bw(align_after = 4)] Key),
+     /// Represents a record label.
+     #[br(pre_assert(page_type == PlainPageType::Labels))]
+-    Label(#[bw(pad_after = 0, align_after = 4)] Label),
++    Label(#[bw(align_after = 4)] Label),
+     /// Represents a node in the playlist tree (either a folder or a playlist).
+     #[br(pre_assert(page_type == PlainPageType::PlaylistTree))]
+-    PlaylistTreeNode(#[bw(pad_after = 0, align_after = 4)] PlaylistTreeNode),
++    PlaylistTreeNode(#[bw(align_after = 4)] PlaylistTreeNode),
+     /// Represents a track entry in a playlist.
+     #[br(pre_assert(page_type == PlainPageType::PlaylistEntries))]
+-    PlaylistEntry(#[bw(pad_after = 0, align_after = 4)] PlaylistEntry),
++    PlaylistEntry(#[bw(align_after = 4)] PlaylistEntry),
+     /// Contains the metadata categories by which Tracks can be browsed by.
+     #[br(pre_assert(page_type == PlainPageType::Columns))]
+-    ColumnEntry(#[bw(pad_after = 0, align_after = 4)] ColumnEntry),
++    ColumnEntry(#[bw(align_after = 4)] ColumnEntry),
+     /// Manages the active menus on the CDJ.
+     #[br(pre_assert(page_type == PlainPageType::Menu))]
+-    Menu(#[bw(pad_after = 0, align_after = 4)] Menu),
++    Menu(#[bw(align_after = 4)] Menu),
+     /// Contains a track entry.
+     ///
+     /// Fresh track rows typically have a bit of padding, presumably to allow
+     /// edits on DJ gear.
+     #[br(pre_assert(page_type == PlainPageType::Tracks))]
+-    Track(#[bw(pad_after = 0x30, align_after = 4)] Track),
++    Track(#[bw(align_after = 4)] Track),
++}
++
++impl PageHeapObject for PlainRow {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        match self {
++            PlainRow::Album(album) => album.heap_bytes_required(()),
++            PlainRow::Artist(artist) => artist.heap_bytes_required(()),
++            PlainRow::Artwork(artwork) => artwork.heap_bytes_required(()),
++            PlainRow::Color(color) => color.heap_bytes_required(()),
++            PlainRow::Genre(genre) => genre.heap_bytes_required(()),
++            PlainRow::HistoryPlaylist(history_playlist) => history_playlist.heap_bytes_required(()),
++            PlainRow::HistoryEntry(history_entry) => history_entry.heap_bytes_required(()),
++            PlainRow::Key(key) => key.heap_bytes_required(()),
++            PlainRow::Label(label) => label.heap_bytes_required(()),
++            PlainRow::PlaylistTreeNode(playlist_tree_node) => {
++                playlist_tree_node.heap_bytes_required(())
++            }
++            PlainRow::PlaylistEntry(playlist_entry) => playlist_entry.heap_bytes_required(()),
++            PlainRow::ColumnEntry(column_entry) => column_entry.heap_bytes_required(()),
++            PlainRow::Menu(menu) => menu.heap_bytes_required(()),
++            PlainRow::Track(track) => track.heap_bytes_required(()),
++        }
++    }
+ }
+ 
+ /// A table row contains the actual data.
+@@ -1277,3 +1727,14 @@ pub enum Row {
+     #[br(pre_assert(matches!(page_type, PageType::Plain(PlainPageType::History) | PageType::Unknown(_))))]
+     Unknown,
+ }
++
++impl PageHeapObject for Row {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        match self {
++            Row::Plain(plain_row) => plain_row.heap_bytes_required(()),
++            Row::Ext(ext_row) => ext_row.heap_bytes_required(()),
++            Row::Unknown => panic!("Unable to determine required bytes for unknown row type"),
++        }
++    }
++}
+diff --git a/src/pdb/offset_array.rs b/src/pdb/offset_array.rs
+index a1786a72..33dab91c 100644
+--- a/src/pdb/offset_array.rs
++++ b/src/pdb/offset_array.rs
+@@ -7,42 +7,44 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ //! Module for reading and writing offset arrays.
++//!
+ //! An offset array consists of an array of offsets, followed by data at those offsets.
+ //! The offsets can be either u8 or u16, specified by the `OffsetSize` enum.
+-//! The inner type `T` is read/written with the offsets and a base offset passed as arguments.
+-//! The inner type `T` must implement `BinRead` and `BinWrite`, and its `Args` must be a tuple of
+-//! `(i64, &OffsetArray<N>, IA)`, where the first argument is the base offset,
+-//! the second argument is a reference to the `OffsetArray<N>`, and the third argument is any additional
+-//! arguments required by `T`.
+-//! The `OffsetArray` itself takes as arguments a tuple of `(usize, OffsetSize, IA)`, where the first argument is the
+-//! offset to subtract from the start of the offset array to get the base offset, the second argument is the
+-//! `OffsetSize`, and the third argument is any additional arguments required by `T`.
+-//! The number of offsets is determined by the const generic parameter `N`.
+-//! For example, an `OffsetArray<T, 3>` will read/write 3 offsets, followed by the data for `T`.
+-//! The offsets are read/written in little-endian format.
+-//! The inner type `T` is also read/written in little-endian format.
+-//! This struct implements `Deref` to `T`, so the inner value can be accessed directly.
+-//!! Example:
++//! The inner type `T` is constructed from an N-array of `U`, read from the positions at
++//! N offsets. The offsets are read/written in little-endian format.
++//! For example, an `OffsetArrayContainer<T, 3>` where `T` implements `OffsetArrayItems`
++//! will read/write 3 offsets, followed by 3 instances of `T::Item` at the offsets which
++//! are used to construct an inner `T`.
++//!
++//! Example:
+ //! ```
+ //! # use binrw::{binrw, BinRead, BinWrite};
+-//! # use rekordcrate::pdb::offset_array::{OffsetArrayContainer, OffsetArray, OffsetSize};
+-//! #[binrw]
+-//! #[brw(little)]
+-//! #[br(import(base: i64, offsets: &OffsetArray<1>, args: <T as BinRead>::Args<'_>))]
+-//! #[bw(import(base: i64, offsets: &OffsetArray<1>, args: <T as BinWrite>::Args<'_>))]
++//! # use rekordcrate::pdb::offset_array::{OffsetArrayContainer, OffsetArrayItems};
+ //! #[derive(Debug, PartialEq)]
+-//! struct SingleTarget<T: BinRead + BinWrite>(
+-//!     #[brw(args(base, args))]
+-//!     #[br(parse_with = offsets.read_offset(0))]
+-//!     #[bw(write_with = offsets.write_offset(0))]
+-//!     T,
+-//! );
++//! struct SingleTarget<T: BinRead + BinWrite>(T);
++//!
++//! impl<T: BinRead + BinWrite> OffsetArrayItems<1> for SingleTarget<T> {
++//!     type Item = T;
++//!
++//!     fn as_items(&self) -> [&Self::Item; 1] {
++//!         [&self.0]
++//!     }
++//!
++//!     fn from_items(items: [Self::Item; 1]) -> Self {
++//!      let [v] = items;
++//!         Self(v)
++//!     }
++//! }
++//!
++//! use rekordcrate::util::MaybeCalculated::*;
+ //! let near_u8_tail = OffsetArrayContainer {
+-//!     offsets: [1u8].into(),
++//!     offsets: Provided([1u8].into()),
+ //!     inner: SingleTarget(42u8),
+ //! };
+ //! ```
+ 
++use super::PageHeapObject;
++use crate::util::{ArrayPolyfills, MaybeCalculated};
+ use binrw::{binrw, io::SeekFrom, BinRead, BinResult, BinWrite};
+ 
+ /// Specifies whether the offsets are stored as u8 or u16.
+@@ -53,48 +55,24 @@ pub enum OffsetSize {
+     /// Offsets are stored as u16.
+     U16,
+ }
+-/// An array of offsets, followed by data at those offsets.
+-/// The offsets are relative to the start of the offset array, minus an optional offset.
+-/// The offsets can be either u8 or u16, specified by the `OffsetSize`
+-/// The inner type `T` is read/written with the offsets and a base offset passed as arguments.
+-/// The inner type `T` must implement `BinRead` and `BinWrite`, and its `Args` must be a tuple of
+-/// `(i64, &OffsetArray<N>, IA)`, where the first argument is the base offset,
+-/// the second argument is a reference to the `OffsetArray<N>`, and the third argument is any additional
+-/// arguments required by `T`.
+-/// The `OffsetArray` itself takes as arguments a tuple of `(usize, OffsetSize, IA)`, where the first argument is the
+-/// offset to subtract from the start of the offset array to get the base offset, the second argument is the
+-/// `OffsetSize`, and the third argument is any additional arguments required by `T`.
+-/// The number of offsets is determined by the const generic parameter `N`.
+-/// For example, an `OffsetArray<T, 3>` will read/write 3 offsets, followed by the data for `T`.
+-/// The offsets are read/written in little-endian format.
+-/// The inner type `T` is also read/written in little-endian format.
+-/// This struct implements `Deref` to `T`, so the inner value can be accessed directly.
+-/// Example:
+-/// ```
+-/// # use binrw::{binrw, BinRead, BinWrite};
+-/// # use rekordcrate::pdb::offset_array::{OffsetArrayContainer, OffsetArray, OffsetSize};
+-/// # use binrw::VecArgs;
+-/// #[binrw]
+-/// #[brw(little)]
+-/// #[br(import(base: i64, offsets: &OffsetArray<1>, args: <T as BinRead>::Args<'_>))]
+-/// #[bw(import(base: i64, offsets: &OffsetArray<1>, args: <T as BinWrite>::Args<'_>))]
+-/// #[derive(Debug, PartialEq)]
+-/// struct SingleTarget<T: BinRead + BinWrite>(
+-///     #[brw(args(base, args))]
+-///     #[br(parse_with = offsets.read_offset(0))]
+-///     #[bw(write_with = offsets.write_offset(0))]
+-///     T,
+-/// );
+-///
+-/// let near_u8_tail = OffsetArrayContainer {
+-///     offsets: [1u8].into(),
+-///     inner: SingleTarget(42u8),
+-/// };
+-/// ```
++
++impl OffsetSize {
++    fn bytes(&self) -> usize {
++        match self {
++            OffsetSize::U8 => std::mem::size_of::<u8>(),
++            OffsetSize::U16 => std::mem::size_of::<u16>(),
++        }
++    }
++}
++
++/// A container for an array of offsets and the indirectly-addressed data at those offsets.
++/// See the module documentation for an example.
+ #[derive(Debug, PartialEq, Clone, Eq)]
+ pub struct OffsetArrayContainer<T, const N: usize> {
+     /// The offsets, either u8 or u16.
+-    pub offsets: OffsetArray<N>,
++    /// May be calculated from the inner data during serialization.
++    pub offsets: MaybeCalculated<OffsetArray<N>>,
++
+     /// The inner value, read/written with the offsets.
+     pub inner: T,
+ }
+@@ -106,32 +84,29 @@ impl<T, const N: usize> std::ops::Deref for OffsetArrayContainer<T, N> {
+     }
+ }
+ 
+-impl<T: BinRead + BinWrite, const N: usize> binrw::meta::WriteEndian for OffsetArrayContainer<T, N>
++impl<T, U, const N: usize> binrw::meta::WriteEndian for OffsetArrayContainer<T, N>
+ where
+-    for<'a> <T as BinRead>::Args<'a>: Clone,
+-    for<'a> <T as BinWrite>::Args<'a>: Clone,
++    T: OffsetArrayItems<N, Item = U>,
++    U: BinRead + BinWrite,
++    for<'a> <U as BinRead>::Args<'a>: Clone,
++    for<'a> <U as BinWrite>::Args<'a>: Clone,
+ {
+     const ENDIAN: binrw::meta::EndianKind = binrw::meta::EndianKind::Endian(binrw::Endian::Little);
+ }
+-impl<T: BinRead + BinWrite, const N: usize> binrw::meta::ReadEndian for OffsetArrayContainer<T, N>
++impl<T, U, const N: usize> binrw::meta::ReadEndian for OffsetArrayContainer<T, N>
+ where
+-    for<'a> <T as BinRead>::Args<'a>: Clone,
+-    for<'a> <T as BinWrite>::Args<'a>: Clone,
++    T: OffsetArrayItems<N, Item = U>,
++    U: BinRead + BinWrite,
++    for<'a> <U as BinRead>::Args<'a>: Clone,
++    for<'a> <U as BinWrite>::Args<'a>: Clone,
+ {
+     const ENDIAN: binrw::meta::EndianKind = binrw::meta::EndianKind::Endian(binrw::Endian::Little);
+ }
+ 
+ impl<T, const N: usize> OffsetArrayContainer<T, N> {
+-    fn calculate_base(start: u64, offset: usize) -> BinResult<i64> {
+-        let base = i64::try_from(start).map_err(|err| binrw::Error::AssertFail {
+-            pos: start,
+-            message: format!("{err}"),
+-        })?;
+-        let offset = i64::try_from(offset).map_err(|err| binrw::Error::AssertFail {
+-            pos: start,
+-            message: format!("{err}"),
+-        })?;
+-        base.checked_sub(offset)
++    fn calculate_base(start: u64, offset: u64) -> BinResult<u64> {
++        start
++            .checked_sub(offset)
+             .ok_or_else(|| binrw::Error::AssertFail {
+                 pos: start,
+                 message: format!("Stream position underflow: {start}-{offset}"),
+@@ -139,11 +114,13 @@ impl<T, const N: usize> OffsetArrayContainer<T, N> {
+     }
+ }
+ 
+-impl<T, const N: usize, IA> BinRead for OffsetArrayContainer<T, N>
++impl<T, U, const N: usize, IA> BinRead for OffsetArrayContainer<T, N>
+ where
+-    for<'a> T: BinRead<Args<'a> = (i64, &'a OffsetArray<N>, IA)>,
++    T: OffsetArrayItems<N, Item = U>,
++    U: for<'a> BinRead<Args<'a> = IA>,
++    IA: Clone,
+ {
+-    type Args<'a> = (usize, OffsetSize, IA);
++    type Args<'a> = (u64, OffsetSize, IA);
+ 
+     fn read_options<R: std::io::Read + std::io::Seek>(
+         reader: &mut R,
+@@ -159,16 +136,29 @@ where
+             });
+         }
+         let base = Self::calculate_base(start, offset)?;
+-        let inner = T::read_options(reader, endian, (base, &offsets, args))?;
+-        Ok(Self { offsets, inner })
++        reader.seek(SeekFrom::Start(base))?;
++        let seeks = offsets.as_seeks();
++        let parsed = seeks.try_map_polyfill(|seek| {
++            reader.seek(seek)?;
++            let v = U::read_options(reader, endian, args.clone())?;
++            // Restore position after each item.
++            reader.seek(SeekFrom::Start(base))?;
++            Ok::<U, binrw::Error>(v)
++        })?;
++        Ok(Self {
++            offsets: MaybeCalculated::Provided(offsets),
++            inner: T::from_items(parsed),
++        })
+     }
+ }
+ 
+-impl<T, const N: usize, IA> BinWrite for OffsetArrayContainer<T, N>
++impl<T, U, const N: usize, IA> BinWrite for OffsetArrayContainer<T, N>
+ where
+-    for<'a> T: BinWrite<Args<'a> = (i64, &'a OffsetArray<N>, IA)>,
++    T: OffsetArrayItems<N, Item = U>,
++    U: for<'a> BinWrite<Args<'a> = IA>,
++    IA: Clone,
+ {
+-    type Args<'a> = (usize, OffsetSize, IA);
++    type Args<'a> = (u64, OffsetSize, IA);
+ 
+     fn write_options<W: std::io::Write + std::io::Seek>(
+         &self,
+@@ -177,20 +167,90 @@ where
+         (offset, offset_size, args): Self::Args<'_>,
+     ) -> BinResult<()> {
+         let start = writer.stream_position()?;
+-        if !self.offsets.assert_offset_size_matches(offset_size) {
+-            return Err(binrw::Error::AssertFail {
+-                pos: start,
+-                message: format!("offsetsize mismatch! {offset_size:?}"),
+-            });
+-        }
+-        self.offsets.write_options(writer, endian, ())?;
+         let base = Self::calculate_base(start, offset)?;
+-        self.inner
+-            .write_options(writer, endian, (base, &self.offsets, args))?;
++        let items = self.inner.as_items();
++        match &self.offsets {
++            MaybeCalculated::Calculated => {
++                let offsets_bytes = (N + 1) * offset_size.bytes();
++                writer.seek(SeekFrom::Current(offsets_bytes as i64))?;
++                let offsets_raw = items.try_map_polyfill(|v| {
++                    let offset = writer.stream_position()? - base;
++                    v.write_options(writer, endian, args.clone())?;
++                    Ok::<_, binrw::Error>(offset)
++                })?;
++                let offsets = OffsetArray::new(offsets_raw, offset_size).map_err(|err| {
++                    binrw::Error::AssertFail {
++                        pos: start,
++                        message: format!("{err}"),
++                    }
++                })?;
++                writer.seek(SeekFrom::Start(start))?;
++                offsets.write_options(writer, endian, ())?;
++            }
++            MaybeCalculated::Provided(offsets) => {
++                if !offsets.assert_offset_size_matches(offset_size) {
++                    return Err(binrw::Error::AssertFail {
++                        pos: start,
++                        message: format!("offsetsize mismatch! {offset_size:?}"),
++                    });
++                }
++                offsets.write_options(writer, endian, ())?;
++
++                writer.seek(SeekFrom::Start(base))?;
++                let seeks = offsets.as_seeks();
++                items.zip_polyfill(seeks).try_map_polyfill(|(v, seek)| {
++                    writer.seek(seek)?;
++                    v.write_options(writer, endian, args.clone())?;
++                    // Restore position after each item.
++                    writer.seek(SeekFrom::Start(base))?;
++                    Ok::<(), binrw::Error>(())
++                })?;
++            }
++        }
+         Ok(())
+     }
+ }
+ 
++impl<T, U, const N: usize> PageHeapObject for OffsetArrayContainer<T, N>
++where
++    T: OffsetArrayItems<N, Item = U> + 'static,
++    U: for<'a> PageHeapObject<Args<'a> = ()>,
++{
++    type Args<'a> = OffsetSize;
++    fn heap_bytes_required(&self, offset_size: OffsetSize) -> u16 {
++        let offsets_bytes = (N + 1) * offset_size.bytes();
++        offsets_bytes as u16
++            + self
++                .inner
++                .as_items()
++                .into_iter()
++                .map(|item| item.heap_bytes_required(()))
++                .sum::<u16>()
++    }
++}
++
++/// Inner type that can be stored in an OffsetArrayContainer.
++pub trait OffsetArrayItems<const N: usize> {
++    /// Type of the items pointed to by the offsets.
++    type Item;
++
++    /// Returns the items as an array of references.
++    fn as_items(&self) -> [&Self::Item; N];
++
++    /// Constructs the composite type from an array of items.
++    fn from_items(items: [Self::Item; N]) -> Self;
++}
++
++impl OffsetArrayItems<0> for () {
++    type Item = ();
++
++    fn as_items(&self) -> [&Self::Item; 0] {
++        []
++    }
++
++    fn from_items(_items: [Self::Item; 0]) -> Self {}
++}
++
+ /// The implementation of the offset array, which can be either u8 or u16.
+ /// This is a private implementation detail, use `OffsetArrayContainer` instead.
+ /// This enum is used to read/write the offsets, and to provide the `read_offset` and
+@@ -211,6 +271,13 @@ pub enum OffsetArray<const N: usize> {
+     U16(#[brw(magic(0x0003u16))] [u16; N]),
+ }
+ 
++impl<const N: usize> PageHeapObject for OffsetArray<N> {
++    type Args<'a> = OffsetSize;
++    fn heap_bytes_required(&self, offset_size: OffsetSize) -> u16 {
++        ((N + 1) * offset_size.bytes()) as u16
++    }
++}
++
+ impl<const N: usize> OffsetArray<N> {
+     fn assert_offset_size_matches(&self, offset_size: OffsetSize) -> bool {
+         matches!(
+@@ -218,61 +285,19 @@ impl<const N: usize> OffsetArray<N> {
+             (Self::U8(_), OffsetSize::U8) | (Self::U16(_), OffsetSize::U16)
+         )
+     }
+-    fn calculate_start(&self, index: usize, base: i64) -> BinResult<u64> {
++
++    fn as_seeks(&self) -> [SeekFrom; N] {
+         match self {
+-            OffsetArray::U8(offsets) => Self::calculate_start_helper(offsets, index, base),
+-            OffsetArray::U16(offsets) => Self::calculate_start_helper(offsets, index, base),
+-        }
+-    }
+-    /// This abstracts over the inner u8/u16
+-    fn calculate_start_helper<Num>(offsets: &[Num; N], index: usize, base: i64) -> BinResult<u64>
+-    where
+-        i64: From<Num>,
+-        Num: std::fmt::Display + std::fmt::Debug + Copy,
+-    {
+-        let offset = offsets.get(index).ok_or_else(|| binrw::Error::AssertFail {
+-            pos: base.try_into().unwrap_or_default(),
+-            message: format!("can't get offset at index {index} for offsets {offsets:?}"),
+-        })?;
+-        let start =
+-            (base + i64::from(*offset))
+-                .try_into()
+-                .map_err(|err| binrw::Error::AssertFail {
+-                    pos: base.try_into().unwrap_or_default(),
+-                    message: format!("{err}: {base}+{offset}"),
+-                })?;
+-        Ok(start)
+-    }
+-    /// Returns a parser that reads a type  `T` at the specified index.
+-    /// The parser takes as arguments a tuple of `(i64, T::Args<'_>)`, where the first argument is the base offset,
+-    /// and the second argument is any additional arguments required by `T`.
+-    /// The parser seeks to the calculated start position, and then reads `T` with the provided arguments.
+-    /// The parser returns a `BinResult<T>`.
+-    pub fn read_offset<'a, T: BinRead, R: binrw::io::Read + binrw::io::Seek>(
+-        &'a self,
+-        index: usize,
+-    ) -> impl FnOnce(&mut R, binrw::Endian, (i64, T::Args<'_>)) -> BinResult<T> + 'a {
+-        move |reader, endian, (base, inner_args)| {
+-            let start = self.calculate_start(index, base)?;
+-            reader.seek(SeekFrom::Start(start))?;
+-            T::read_options(reader, endian, inner_args)
++            OffsetArray::U8(offsets) => offsets.map(|offset| SeekFrom::Current(offset.into())),
++            OffsetArray::U16(offsets) => offsets.map(|offset| SeekFrom::Current(offset.into())),
+         }
+     }
+ 
+-    /// Returns a writer that writes a type `T` at the specified index.
+-    /// The writer takes as arguments a tuple of `(i64, T::Args<'_})`, where the first argument is the base offset,
+-    /// and the second argument is any additional arguments required by `T`.
+-    /// The writer seeks to the calculated start position, and then writes `T` with the provided arguments.
+-    /// The writer returns a `BinResult<()>`.
+-    pub fn write_offset<'a, T: BinWrite, R: binrw::io::Write + binrw::io::Seek>(
+-        &'a self,
+-        index: usize,
+-    ) -> impl FnOnce(&T, &mut R, binrw::Endian, (i64, T::Args<'_>)) -> BinResult<()> + 'a {
+-        move |element, writer, endian, (base, inner_args)| {
+-            let start = self.calculate_start(index, base)?;
+-            writer.seek(SeekFrom::Start(start))?;
+-            element.write_options(writer, endian, inner_args)
+-        }
++    fn new(offsets: [u64; N], offset_size: OffsetSize) -> Result<Self, std::num::TryFromIntError> {
++        Ok(match offset_size {
++            OffsetSize::U8 => OffsetArray::U8(offsets.try_map_polyfill(|o| o.try_into())?),
++            OffsetSize::U16 => OffsetArray::U16(offsets.try_map_polyfill(|o| o.try_into())?),
++        })
+     }
+ }
+ 
+@@ -291,30 +316,26 @@ impl<const N: usize> From<[u16; N]> for OffsetArray<N> {
+ #[cfg(test)]
+ mod test {
+ 
+-    use binrw::VecArgs;
+-
+     use super::*;
+-    use crate::util::testing::test_roundtrip_with_args;
++    use crate::util::testing::{test_roundtrip_with_args, test_write};
++    use crate::util::MaybeCalculated::*;
+ 
+-    #[binrw]
+-    #[brw(little)]
+-    #[br(import(_base: i64, _offsets: &OffsetArray<N>, args: <T as BinRead>::Args<'_>))]
+-    #[bw(import(_base: i64, _offsets: &OffsetArray<N>, args: <T as BinWrite>::Args<'_>))]
+-    #[derive(Debug, PartialEq)]
+-    struct IgnoreArgs<T: BinRead + BinWrite, const N: usize>(#[brw(args_raw = args)] T);
+-
+-    #[binrw]
+-    #[brw(little)]
+-    #[br(import(base: i64, offsets: &OffsetArray<1>, args: <T as BinRead>::Args<'_>))]
+-    #[bw(import(base: i64, offsets: &OffsetArray<1>, args: <T as BinWrite>::Args<'_>))]
+     #[derive(Debug, PartialEq)]
+     // This could also be used outside of tests, it just isn't yet (though a version is, called "TrailingName")
+-    pub struct SingleTarget<T: BinRead + BinWrite>(
+-        #[brw(args(base, args))]
+-        #[br(parse_with = offsets.read_offset(0))]
+-        #[bw(write_with = offsets.write_offset(0))]
+-        T,
+-    );
++    pub struct SingleTarget<T: BinRead + BinWrite>(T);
++
++    impl<T: BinRead + BinWrite> OffsetArrayItems<1> for SingleTarget<T> {
++        type Item = T;
++
++        fn as_items(&self) -> [&Self::Item; 1] {
++            [&self.0]
++        }
++
++        fn from_items(items: [Self::Item; 1]) -> Self {
++            let [v] = items;
++            Self(v)
++        }
++    }
+ 
+     impl<T: BinRead + BinWrite> std::ops::Deref for SingleTarget<T> {
+         type Target = T;
+@@ -326,8 +347,8 @@ mod test {
+     #[test]
+     fn empty() {
+         let empty_offset_tail_u8 = OffsetArrayContainer {
+-            offsets: OffsetArray::U8([]),
+-            inner: IgnoreArgs(()),
++            offsets: Provided(OffsetArray::U8([])),
++            inner: (),
+         };
+         test_roundtrip_with_args(
+             &[0x03],
+@@ -336,27 +357,20 @@ mod test {
+             (0, OffsetSize::U8, ()),
+         );
+         let empty_offset_tail_u16 = OffsetArrayContainer {
+-            offsets: OffsetArray::U16([]),
+-            inner: IgnoreArgs(vec![(); 0]),
++            offsets: Provided(OffsetArray::U16([])),
++            inner: (),
+         };
+         test_roundtrip_with_args(
+             &[0x03, 0x00],
+             empty_offset_tail_u16,
+-            (
+-                0,
+-                OffsetSize::U16,
+-                VecArgs {
+-                    count: 0,
+-                    inner: (),
+-                },
+-            ),
++            (0, OffsetSize::U16, ()),
+             (0, OffsetSize::U16, ()),
+         );
+     }
+     #[test]
+     fn near_u8() {
+         let near_u8_tail = OffsetArrayContainer {
+-            offsets: [2u8].into(),
++            offsets: Provided([2u8].into()),
+             inner: SingleTarget(42u8),
+         };
+         test_roundtrip_with_args(
+@@ -369,7 +383,7 @@ mod test {
+     #[test]
+     fn buffer() {
+         let buffer = OffsetArrayContainer {
+-            offsets: [2u8].into(),
++            offsets: Provided([2u8].into()),
+             inner: SingleTarget(0xDEADBEEF_u32.to_be_bytes()),
+         };
+         test_roundtrip_with_args(
+@@ -382,7 +396,7 @@ mod test {
+     #[test]
+     fn near_remote() {
+         let near_remote = OffsetArrayContainer {
+-            offsets: [5u8].into(),
++            offsets: Provided([5u8].into()),
+             inner: SingleTarget(42u8),
+         };
+         test_roundtrip_with_args(
+@@ -395,7 +409,7 @@ mod test {
+     #[test]
+     fn far_remote() {
+         let far_remote = OffsetArrayContainer {
+-            offsets: [5u16].into(),
++            offsets: Provided([5u16].into()),
+             inner: SingleTarget(42u8),
+         };
+         test_roundtrip_with_args(
+@@ -407,43 +421,55 @@ mod test {
+     }
+     #[test]
+     fn near_offset() {
+-        let near_offset = OffsetArrayContainer {
+-            offsets: [5u8].into(),
+-            inner: SingleTarget(42u8),
++        #[binrw]
++        #[brw(little)]
++        #[derive(Debug, PartialEq)]
++        struct Data {
++            padding: [u8; 3],
++            #[brw(args(3, OffsetSize::U8, ()))]
++            offsets: OffsetArrayContainer<SingleTarget<u8>, 1>,
++        }
++        let data = Data {
++            padding: [0u8; 3],
++            offsets: OffsetArrayContainer {
++                offsets: Provided([5u8].into()),
++                inner: SingleTarget(42u8),
++            },
+         };
+-        let offset = 3;
+-        test_roundtrip_with_args(
+-            &[0x03, 0x05, 42],
+-            near_offset,
+-            (offset, OffsetSize::U8, ()),
+-            (offset, OffsetSize::U8, ()),
+-        );
++        test_roundtrip_with_args(&[0, 0, 0, 0x03, 0x05, 42], data, (), ());
+     }
+ 
+-    #[binrw]
+-    #[brw(little)]
+-    #[br(import(base: i64, offsets: &OffsetArray<N>, args: <T as BinRead>::Args<'_>))]
+-    #[bw(import(base: i64, offsets: &OffsetArray<N>, args: <T as BinWrite>::Args<'_>))]
+     #[derive(Debug, PartialEq)]
+-    struct Multiple<T: BinRead + BinWrite, const N: usize>
++    struct Multiple<T: BinRead + BinWrite>
+     where
+         for<'a> <T as BinRead>::Args<'a>: Clone,
+         for<'a> <T as BinWrite>::Args<'a>: Clone,
+     {
+-        #[brw(args(base, args.clone()))]
+-        #[br(parse_with = offsets.read_offset(0))]
+-        #[bw(write_with = offsets.write_offset(0))]
+         a: T,
+-        #[brw(args(base, args))]
+-        #[br(parse_with = offsets.read_offset(1))]
+-        #[bw(write_with = offsets.write_offset(1))]
+         b: T,
+     }
+ 
++    impl<T: BinRead + BinWrite> OffsetArrayItems<2> for Multiple<T>
++    where
++        for<'a> <T as BinRead>::Args<'a>: Clone,
++        for<'a> <T as BinWrite>::Args<'a>: Clone,
++    {
++        type Item = T;
++
++        fn as_items(&self) -> [&Self::Item; 2] {
++            [&self.a, &self.b]
++        }
++
++        fn from_items(items: [Self::Item; 2]) -> Self {
++            let [a, b] = items;
++            Self { a, b }
++        }
++    }
++
+     #[test]
+     fn multiple() {
+         let multiple = OffsetArrayContainer {
+-            offsets: [3u8, 4u8].into(),
++            offsets: Provided([3u8, 4u8].into()),
+             inner: Multiple {
+                 a: 0xC0u8,
+                 b: 0xDEu8,
+@@ -459,7 +485,7 @@ mod test {
+     #[test]
+     fn switched_ordering() {
+         let multiple = OffsetArrayContainer {
+-            offsets: [4u8, 3u8].into(),
++            offsets: Provided([4u8, 3u8].into()),
+             inner: Multiple {
+                 a: 0xC0u8,
+                 b: 0xDEu8,
+@@ -472,4 +498,19 @@ mod test {
+             (0, OffsetSize::U8, ()),
+         );
+     }
++    #[test]
++    fn calculated() {
++        let multiple = OffsetArrayContainer {
++            offsets: Calculated,
++            inner: Multiple {
++                a: 0xC0u8,
++                b: 0xDEu8,
++            },
++        };
++        test_write(
++            &[0x03, 0x03, 0x04, 0xC0, 0xDE],
++            &multiple,
++            (0, OffsetSize::U8, ()),
++        );
++    }
+ }
+diff --git a/src/pdb/string.rs b/src/pdb/string.rs
+index 44951943..ff630c6b 100644
+--- a/src/pdb/string.rs
++++ b/src/pdb/string.rs
+@@ -11,6 +11,7 @@
+ //!
+ //! See <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
+ 
++use super::PageHeapObject;
+ use binrw::binrw;
+ use std::{convert::TryInto, fmt, str::FromStr};
+ use thiserror::Error;
+@@ -179,6 +180,23 @@ impl FromStr for DeviceSQLString {
+     }
+ }
+ 
++impl PageHeapObject for DeviceSQLString {
++    type Args<'a> = ();
++    fn heap_bytes_required(&self, _: ()) -> u16 {
++        match &self.0 {
++            DeviceSQLStringImpl::ShortASCII { content } => {
++                (0u8).heap_bytes_required(()) + content.len() as u16
++            }
++            DeviceSQLStringImpl::Long { content } => {
++                (0u8).heap_bytes_required(())
++                    + (0u16).heap_bytes_required(())
++                    + (0u8).heap_bytes_required(())
++                    + content.byte_count().unwrap()
++            }
++        }
++    }
++}
++
+ /// A String encapsulating how DeviceSQL VARCHAR's are structured
+ ///
+ /// This implementation forces them to be immutable for now
+diff --git a/src/pdb/test_modification.rs b/src/pdb/test_modification.rs
+new file mode 100644
+index 00000000..626e9919
+--- /dev/null
++++ b/src/pdb/test_modification.rs
+@@ -0,0 +1,740 @@
++// Copyright (c) 2026 Jan Holthuis <jan.holthuis@rub.de>
++//
++// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy
++// of the MPL was not distributed with this file, You can obtain one at
++// http://mozilla.org/MPL/2.0/.
++//
++// SPDX-License-Identifier: MPL-2.0
++use super::*;
++
++#[test]
++fn allocate_row_empty_page() {
++    let page = {
++        let row_groups = vec![];
++        let rows = BTreeMap::<u16, Row>::new();
++
++        let mut page = Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(0)
++                    .with_num_rows_valid(0),
++                page_flags: PageFlags::new_data_page(),
++                free_size: 3000,
++                used_size: 0,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        };
++
++        let row = Row::Plain(PlainRow::Key(Key {
++            id: KeyId(1),
++            id2: 1,
++            name: "Emin".parse().unwrap(),
++        }));
++        let bytes_required = row.heap_bytes_required(());
++        let insert = page.allocate_row(bytes_required).unwrap();
++        insert(row);
++
++        page
++    };
++
++    let expected_page = {
++        let row_groups = vec![RowGroup {
++            row_offsets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0000],
++            row_presence_flags: 0x0001,
++            unknown: 0x0000,
++        }];
++
++        let rows: BTreeMap<u16, Row> = vec![(
++            0x0000,
++            Row::Plain(PlainRow::Key(Key {
++                id: KeyId(1),
++                id2: 1,
++                name: "Emin".parse().unwrap(),
++            })),
++        )]
++        .into_iter()
++        .collect();
++
++        Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(1)
++                    .with_num_rows_valid(1),
++                page_flags: PageFlags::new_data_page(),
++                // The row requires 13 bytes but we align to 4 bytes => 16 bytes.
++                // The row group and offset require 4 + 2 = 6 bytes, deducted from free_size.
++                free_size: 2978,
++                used_size: 16,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        }
++    };
++
++    assert_eq!(expected_page, page);
++}
++
++#[test]
++fn allocate_row_existing_row_group() {
++    let page = {
++        let row_groups = vec![RowGroup {
++            row_offsets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0000],
++            row_presence_flags: 0x0001,
++            unknown: 0x0000,
++        }];
++
++        let rows: BTreeMap<u16, Row> = vec![(
++            0x0000,
++            Row::Plain(PlainRow::Key(Key {
++                id: KeyId(1),
++                id2: 1,
++                name: "Emin".parse().unwrap(),
++            })),
++        )]
++        .into_iter()
++        .collect();
++
++        let mut page = Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(1)
++                    .with_num_rows_valid(1),
++                page_flags: PageFlags::new_data_page(),
++                free_size: 2978,
++                used_size: 16,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        };
++
++        let row = Row::Plain(PlainRow::Key(Key {
++            id: KeyId(2),
++            id2: 2,
++            name: "Fmaj".parse().unwrap(),
++        }));
++        let bytes_required = row.heap_bytes_required(());
++        let insert = page.allocate_row(bytes_required).unwrap();
++        insert(row);
++
++        page
++    };
++
++    let expected_page = {
++        let row_groups = vec![RowGroup {
++            row_offsets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0010, 0x0000],
++            row_presence_flags: 0x0003,
++            unknown: 0x0000,
++        }];
++
++        let rows: BTreeMap<u16, Row> = vec![
++            (
++                0x0000,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(1),
++                    id2: 1,
++                    name: "Emin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0010,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(2),
++                    id2: 2,
++                    name: "Fmaj".parse().unwrap(),
++                })),
++            ),
++        ]
++        .into_iter()
++        .collect();
++
++        Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(2)
++                    .with_num_rows_valid(2),
++                page_flags: PageFlags::new_data_page(),
++                // The row requires 13 bytes but we align to 4 bytes => 16 bytes.
++                // The additional row group space is just 2 bytes for the offset.
++                free_size: 2960,
++                used_size: 32,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        }
++    };
++
++    assert_eq!(expected_page, page);
++}
++
++#[test]
++fn allocate_row_interrupted() {
++    let page = {
++        let row_groups = vec![RowGroup {
++            row_offsets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0000],
++            row_presence_flags: 0x0001,
++            unknown: 0x0000,
++        }];
++
++        let rows: BTreeMap<u16, Row> = vec![(
++            0x0000,
++            Row::Plain(PlainRow::Key(Key {
++                id: KeyId(1),
++                id2: 1,
++                name: "Emin".parse().unwrap(),
++            })),
++        )]
++        .into_iter()
++        .collect();
++
++        let mut page = Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(1)
++                    .with_num_rows_valid(1),
++                page_flags: PageFlags::new_data_page(),
++                free_size: 2978,
++                used_size: 16,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        };
++
++        let bytes_required = 16;
++        let insert = page.allocate_row(bytes_required).unwrap();
++        drop(insert);
++
++        page
++    };
++
++    let expected_page = {
++        // The insert was interrupted so we should have an offset
++        // but no matching presence flag.
++        let row_groups = vec![RowGroup {
++            row_offsets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0010, 0x0000],
++            row_presence_flags: 0x0001,
++            unknown: 0x0000,
++        }];
++
++        let rows: BTreeMap<u16, Row> = vec![(
++            0x0000,
++            Row::Plain(PlainRow::Key(Key {
++                id: KeyId(1),
++                id2: 1,
++                name: "Emin".parse().unwrap(),
++            })),
++        )]
++        .into_iter()
++        .collect();
++
++        Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                // The insert was interrupted so we should have an
++                // extra allocated row but no extra valid rows.
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(2)
++                    .with_num_rows_valid(1),
++                page_flags: PageFlags::new_data_page(),
++                // We allocated 16 bytes for the row we didn't insert.
++                // The additional row group space is just 2 bytes for the offset.
++                free_size: 2960,
++                used_size: 32,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        }
++    };
++
++    assert_eq!(expected_page, page);
++}
++
++#[test]
++fn allocate_row_full_row_group() {
++    let page = {
++        let row_groups = vec![RowGroup {
++            row_offsets: [
++                0x00dc, 0x00cc, 0x00c0, 0x00b4, 0x00a8, 0x0098, 0x0088, 0x0078, 0x0068, 0x0058,
++                0x0048, 0x003c, 0x002c, 0x0020, 0x0010, 0x0000,
++            ],
++            row_presence_flags: 0xffff,
++            unknown: 0x0000,
++        }];
++
++        let rows: BTreeMap<u16, Row> = vec![
++            (
++                0x0000,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(1),
++                    id2: 1,
++                    name: "Emin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0010,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(2),
++                    id2: 2,
++                    name: "Fmaj".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0020,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(3),
++                    id2: 3,
++                    name: "E".parse().unwrap(),
++                })),
++            ),
++            (
++                0x002c,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(4),
++                    id2: 4,
++                    name: "Amin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x003c,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(5),
++                    id2: 5,
++                    name: "2d".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0048,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(6),
++                    id2: 6,
++                    name: "Bmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0058,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(7),
++                    id2: 7,
++                    name: "Cmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0068,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(8),
++                    id2: 8,
++                    name: "Cmaj".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0078,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(9),
++                    id2: 9,
++                    name: "Abmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0088,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(10),
++                    id2: 10,
++                    name: "Dmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0098,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(11),
++                    id2: 11,
++                    name: "Gmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00a8,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(12),
++                    id2: 12,
++                    name: "Dm".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00b4,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(13),
++                    id2: 13,
++                    name: "Am".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00c0,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(14),
++                    id2: 14,
++                    name: "A#".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00cc,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(15),
++                    id2: 15,
++                    name: "G#min".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00dc,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(16),
++                    id2: 16,
++                    name: "A#min".parse().unwrap(),
++                })),
++            ),
++        ]
++        .into_iter()
++        .collect();
++
++        let mut page = Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(16)
++                    .with_num_rows_valid(16),
++                page_flags: PageFlags::new_data_page(),
++                free_size: 2000,
++                used_size: 0x00ec,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        };
++
++        let new_row = Row::Plain(PlainRow::Key(Key {
++            id: KeyId(17),
++            id2: 17,
++            name: "Amaj".parse().unwrap(),
++        }));
++        let bytes_required = new_row.heap_bytes_required(());
++        let insert = page.allocate_row(bytes_required).unwrap();
++        insert(new_row);
++
++        page
++    };
++
++    let expected_page = {
++        let row_groups = vec![
++            RowGroup {
++                row_offsets: [
++                    0x00dc, 0x00cc, 0x00c0, 0x00b4, 0x00a8, 0x0098, 0x0088, 0x0078, 0x0068, 0x0058,
++                    0x0048, 0x003c, 0x002c, 0x0020, 0x0010, 0x0000,
++                ],
++                row_presence_flags: 0xffff,
++                unknown: 0x0000,
++            },
++            RowGroup {
++                row_offsets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00ec],
++                row_presence_flags: 0x0001,
++                unknown: 0x0000,
++            },
++        ];
++
++        let rows: BTreeMap<u16, Row> = vec![
++            (
++                0x0000,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(1),
++                    id2: 1,
++                    name: "Emin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0010,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(2),
++                    id2: 2,
++                    name: "Fmaj".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0020,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(3),
++                    id2: 3,
++                    name: "E".parse().unwrap(),
++                })),
++            ),
++            (
++                0x002c,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(4),
++                    id2: 4,
++                    name: "Amin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x003c,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(5),
++                    id2: 5,
++                    name: "2d".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0048,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(6),
++                    id2: 6,
++                    name: "Bmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0058,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(7),
++                    id2: 7,
++                    name: "Cmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0068,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(8),
++                    id2: 8,
++                    name: "Cmaj".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0078,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(9),
++                    id2: 9,
++                    name: "Abmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0088,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(10),
++                    id2: 10,
++                    name: "Dmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x0098,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(11),
++                    id2: 11,
++                    name: "Gmin".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00a8,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(12),
++                    id2: 12,
++                    name: "Dm".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00b4,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(13),
++                    id2: 13,
++                    name: "Am".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00c0,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(14),
++                    id2: 14,
++                    name: "A#".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00cc,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(15),
++                    id2: 15,
++                    name: "G#min".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00dc,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(16),
++                    id2: 16,
++                    name: "A#min".parse().unwrap(),
++                })),
++            ),
++            (
++                0x00ec,
++                Row::Plain(PlainRow::Key(Key {
++                    id: KeyId(17),
++                    id2: 17,
++                    name: "Amaj".parse().unwrap(),
++                })),
++            ),
++        ]
++        .into_iter()
++        .collect();
++
++        Page {
++            header: PageHeader {
++                page_index: PageIndex::try_from(12).unwrap(),
++                page_type: PageType::Plain(PlainPageType::Keys),
++                next_page: PageIndex::try_from(51).unwrap(),
++                unknown1: 13484,
++                unknown2: 0,
++                packed_row_counts: PackedRowCounts::new()
++                    .with_num_rows(17)
++                    .with_num_rows_valid(17),
++                page_flags: PageFlags::new_data_page(),
++                free_size: 1978,
++                used_size: 0x00fc,
++            },
++            content: PageContent::Data(DataPageContent {
++                header: DataPageHeader {
++                    unknown5: 0,
++                    unknown_not_num_rows_large: 0,
++                    unknown6: 0,
++                    unknown7: 0,
++                },
++                row_groups,
++                rows,
++            }),
++        }
++    };
++
++    assert_eq!(expected_page, page);
++}
++
++#[test]
++fn allocate_row_full_page() {
++    let mut page = Page {
++        header: PageHeader {
++            page_index: PageIndex::try_from(12).unwrap(),
++            page_type: PageType::Plain(PlainPageType::Keys),
++            next_page: PageIndex::try_from(51).unwrap(),
++            unknown1: 13484,
++            unknown2: 0,
++            packed_row_counts: PackedRowCounts::new()
++                .with_num_rows(0)
++                .with_num_rows_valid(0),
++            page_flags: PageFlags::new_data_page(),
++            // Intentionally tiny to fake a full page without constructing any rows.
++            free_size: 1,
++            used_size: 0,
++        },
++        content: PageContent::Data(DataPageContent {
++            header: DataPageHeader {
++                unknown5: 0,
++                unknown_not_num_rows_large: 0,
++                unknown6: 0,
++                unknown7: 0,
++            },
++            row_groups: vec![],
++            rows: BTreeMap::new(),
++        }),
++    };
++
++    let row = Row::Plain(PlainRow::Key(Key {
++        id: KeyId(1),
++        id2: 1,
++        name: "Emin".parse().unwrap(),
++    }));
++    let bytes_required = row.heap_bytes_required(());
++
++    let insert = page.allocate_row(bytes_required);
++    assert!(insert.is_none());
++    drop(insert);
++    assert_eq!(0, page.header.used_size);
++}
+diff --git a/src/pdb/test.rs b/src/pdb/test_roundtrip.rs
+similarity index 96%
+rename from src/pdb/test.rs
+rename to src/pdb/test_roundtrip.rs
+index 139a2825..b1816521 100644
+--- a/src/pdb/test.rs
++++ b/src/pdb/test_roundtrip.rs
+@@ -8,6 +8,7 @@
+ use super::ext::*;
+ use super::*;
+ use crate::util::testing::{test_roundtrip, test_roundtrip_with_args};
++use crate::util::MaybeCalculated::*;
+ use std::num::NonZero;
+ 
+ #[test]
+@@ -215,11 +216,13 @@ fn track_row() {
+         rating: 0,
+         file_type: FileType::Mp3,
+         offsets: OffsetArrayContainer {
+-            offsets: [
+-                136u16, 137, 138, 140, 142, 143, 144, 145, 148, 149, 150, 161, 162, 163, 164, 208,
+-                219, 249, 262, 263, 280,
+-            ]
+-            .into(),
++            offsets: Provided(
++                [
++                    136u16, 137, 138, 140, 142, 143, 144, 145, 148, 149, 150, 161, 162, 163, 164,
++                    208, 219, 249, 262, 263, 280,
++                ]
++                .into(),
++            ),
+             inner: TrackStrings {
+                 isrc: DeviceSQLString::new_isrc("".to_string()).unwrap(),
+                 lyricist: DeviceSQLString::empty(),
+@@ -279,7 +282,7 @@ fn artist_row() {
+         index_shift: 0x0000,
+         id: ArtistId(1),
+         offsets: OffsetArrayContainer {
+-            offsets: [10u8].into(),
++            offsets: Provided([10u8].into()),
+             inner: TrailingName {
+                 name: "Loopmasters".parse().unwrap(),
+             },
+@@ -303,7 +306,7 @@ fn album_row() {
+         id: AlbumId(2),
+         unknown3: 0,
+         offsets: OffsetArrayContainer {
+-            offsets: [0x16u8].into(),
++            offsets: Provided([0x16u8].into()),
+             inner: TrailingName {
+                 name: "GOOD LUCK".parse().unwrap(),
+             },
+@@ -326,7 +329,7 @@ fn album_row() {
+         id: AlbumId(3),
+         unknown3: 0,
+         offsets: OffsetArrayContainer {
+-            offsets: [0x16u8].into(),
++            offsets: Provided([0x16u8].into()),
+             inner: TrailingName {
+                 name: "Techno Rave 2023".parse().unwrap(),
+             },
+@@ -483,11 +486,13 @@ fn track_page() {
+                 rating: 0,
+                 file_type: FileType::Wav,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [
+-                        0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98, 0xa3,
+-                        0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe4, 0xe5, 0xef,
+-                    ]
+-                    .into(),
++                    offsets: Provided(
++                        [
++                            0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98,
++                            0xa3, 0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe4, 0xe5, 0xef,
++                        ]
++                        .into(),
++                    ),
+                     inner: TrackStrings {
+                         isrc: DeviceSQLString::new_isrc(String::new()).unwrap(),
+                         lyricist: "".parse().unwrap(),
+@@ -552,11 +557,13 @@ fn track_page() {
+                 rating: 0,
+                 file_type: FileType::Wav,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [
+-                        0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98, 0xa3,
+-                        0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe7, 0xe8, 0xf5,
+-                    ]
+-                    .into(),
++                    offsets: Provided(
++                        [
++                            0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98,
++                            0xa3, 0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe7, 0xe8, 0xf5,
++                        ]
++                        .into(),
++                    ),
+                     inner: TrackStrings {
+                         isrc: DeviceSQLString::new_isrc(String::new()).unwrap(),
+                         lyricist: "".parse().unwrap(),
+@@ -621,11 +628,13 @@ fn track_page() {
+                 rating: 0,
+                 file_type: FileType::Wav,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [
+-                        0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98, 0xa3,
+-                        0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe4, 0xe5, 0xef,
+-                    ]
+-                    .into(),
++                    offsets: Provided(
++                        [
++                            0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98,
++                            0xa3, 0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe4, 0xe5, 0xef,
++                        ]
++                        .into(),
++                    ),
+                     inner: TrackStrings {
+                         isrc: DeviceSQLString::new_isrc(String::new()).unwrap(),
+                         lyricist: "".parse().unwrap(),
+@@ -690,11 +699,13 @@ fn track_page() {
+                 rating: 0,
+                 file_type: FileType::Wav,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [
+-                        0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98, 0xa3,
+-                        0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe3, 0xe4, 0xed,
+-                    ]
+-                    .into(),
++                    offsets: Provided(
++                        [
++                            0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98,
++                            0xa3, 0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xde, 0xe3, 0xe4, 0xed,
++                        ]
++                        .into(),
++                    ),
+                     inner: TrackStrings {
+                         isrc: DeviceSQLString::new_isrc(String::new()).unwrap(),
+                         lyricist: "".parse().unwrap(),
+@@ -759,11 +770,13 @@ fn track_page() {
+                 rating: 0,
+                 file_type: FileType::Mp3,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [
+-                        0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98, 0xa3,
+-                        0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xfb, 0x108, 0x109, 0x11a,
+-                    ]
+-                    .into(),
++                    offsets: Provided(
++                        [
++                            0x88u16, 0x89, 0x8a, 0x8c, 0x8e, 0x8f, 0x90, 0x93, 0x96, 0x97, 0x98,
++                            0xa3, 0xa4, 0xa5, 0xa6, 0xd2, 0xdd, 0xfb, 0x108, 0x109, 0x11a,
++                        ]
++                        .into(),
++                    ),
+                     inner: TrackStrings {
+                         isrc: DeviceSQLString::new_isrc(String::new()).unwrap(),
+                         lyricist: "".parse().unwrap(),
+@@ -1094,7 +1107,7 @@ fn artists_page() {
+                 index_shift: 0x0000,
+                 id: ArtistId(1),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Andreas Gehm".parse().unwrap(),
+                     },
+@@ -1108,7 +1121,7 @@ fn artists_page() {
+                 index_shift: 0x0020,
+                 id: ArtistId(2),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "D'marc Cantu".parse().unwrap(),
+                     },
+@@ -1122,7 +1135,7 @@ fn artists_page() {
+                 index_shift: 0x0040,
+                 id: ArtistId(3),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DJ Plant Texture".parse().unwrap(),
+                     },
+@@ -1136,7 +1149,7 @@ fn artists_page() {
+                 index_shift: 0x0060,
+                 id: ArtistId(4),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DVS1".parse().unwrap(),
+                     },
+@@ -1150,7 +1163,7 @@ fn artists_page() {
+                 index_shift: 0x0080,
+                 id: ArtistId(5),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Florian Kupfer".parse().unwrap(),
+                     },
+@@ -1164,7 +1177,7 @@ fn artists_page() {
+                 index_shift: 0x00a0,
+                 id: ArtistId(6),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Frak".parse().unwrap(),
+                     },
+@@ -1178,7 +1191,7 @@ fn artists_page() {
+                 index_shift: 0x00c0,
+                 id: ArtistId(7),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Frankie Knuckles".parse().unwrap(),
+                     },
+@@ -1192,7 +1205,7 @@ fn artists_page() {
+                 index_shift: 0x00e0,
+                 id: ArtistId(8),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "House Of Jezebel".parse().unwrap(),
+                     },
+@@ -1206,7 +1219,7 @@ fn artists_page() {
+                 index_shift: 0x0100,
+                 id: ArtistId(9),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Innerspace Halflife".parse().unwrap(),
+                     },
+@@ -1220,7 +1233,7 @@ fn artists_page() {
+                 index_shift: 0x0120,
+                 id: ArtistId(10),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "James T. Cotton".parse().unwrap(),
+                     },
+@@ -1234,7 +1247,7 @@ fn artists_page() {
+                 index_shift: 0x0140,
+                 id: ArtistId(11),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "jozef k".parse().unwrap(),
+                     },
+@@ -1248,7 +1261,7 @@ fn artists_page() {
+                 index_shift: 0x0160,
+                 id: ArtistId(12),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Juanpablo".parse().unwrap(),
+                     },
+@@ -1262,7 +1275,7 @@ fn artists_page() {
+                 index_shift: 0x0180,
+                 id: ArtistId(13),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Juniper".parse().unwrap(),
+                     },
+@@ -1276,7 +1289,7 @@ fn artists_page() {
+                 index_shift: 0x01a0,
+                 id: ArtistId(14),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Kovyazin D".parse().unwrap(),
+                     },
+@@ -1290,7 +1303,7 @@ fn artists_page() {
+                 index_shift: 0x01c0,
+                 id: ArtistId(15),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Le Melange Inc. Ft China".parse().unwrap(),
+                     },
+@@ -1304,7 +1317,7 @@ fn artists_page() {
+                 index_shift: 0x01e0,
+                 id: ArtistId(16),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Louis Guilliaume".parse().unwrap(),
+                     },
+@@ -1318,7 +1331,7 @@ fn artists_page() {
+                 index_shift: 0x0200,
+                 id: ArtistId(17),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Maxwell Church".parse().unwrap(),
+                     },
+@@ -1332,7 +1345,7 @@ fn artists_page() {
+                 index_shift: 0x0220,
+                 id: ArtistId(18),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Various Artists".parse().unwrap(),
+                     },
+@@ -1346,7 +1359,7 @@ fn artists_page() {
+                 index_shift: 0x0240,
+                 id: ArtistId(19),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Mutant Beat Dance".parse().unwrap(),
+                     },
+@@ -1360,7 +1373,7 @@ fn artists_page() {
+                 index_shift: 0x0260,
+                 id: ArtistId(20),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Mutant beat dance".parse().unwrap(),
+                     },
+@@ -1374,7 +1387,7 @@ fn artists_page() {
+                 index_shift: 0x0280,
+                 id: ArtistId(21),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Ron Trent".parse().unwrap(),
+                     },
+@@ -1388,7 +1401,7 @@ fn artists_page() {
+                 index_shift: 0x02a0,
+                 id: ArtistId(22),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Salvation REMIX".parse().unwrap(),
+                     },
+@@ -1402,7 +1415,7 @@ fn artists_page() {
+                 index_shift: 0x02c0,
+                 id: ArtistId(23),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Salvation".parse().unwrap(),
+                     },
+@@ -1416,7 +1429,7 @@ fn artists_page() {
+                 index_shift: 0x02e0,
+                 id: ArtistId(24),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Simoncino".parse().unwrap(),
+                     },
+@@ -1430,7 +1443,7 @@ fn artists_page() {
+                 index_shift: 0x0300,
+                 id: ArtistId(25),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "HOTMIX RECORDS / NICK ANTHONY SIMONCINO".parse().unwrap(),
+                     },
+@@ -1444,7 +1457,7 @@ fn artists_page() {
+                 index_shift: 0x0320,
+                 id: ArtistId(26),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Sneaker REMIX".parse().unwrap(),
+                     },
+@@ -1458,7 +1471,7 @@ fn artists_page() {
+                 index_shift: 0x0340,
+                 id: ArtistId(27),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Tinman REMIX".parse().unwrap(),
+                     },
+@@ -1472,7 +1485,7 @@ fn artists_page() {
+                 index_shift: 0x0360,
+                 id: ArtistId(28),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Alienata".parse().unwrap(),
+                     },
+@@ -1486,7 +1499,7 @@ fn artists_page() {
+                 index_shift: 0x0380,
+                 id: ArtistId(29),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "AS1".parse().unwrap(),
+                     },
+@@ -1500,7 +1513,7 @@ fn artists_page() {
+                 index_shift: 0x03a0,
+                 id: ArtistId(30),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DJ Hell".parse().unwrap(),
+                     },
+@@ -1514,7 +1527,7 @@ fn artists_page() {
+                 index_shift: 0x03c0,
+                 id: ArtistId(31),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Innershades & Robert D".parse().unwrap(),
+                     },
+@@ -1528,7 +1541,7 @@ fn artists_page() {
+                 index_shift: 0x03e0,
+                 id: ArtistId(32),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "intersterllar funk".parse().unwrap(),
+                     },
+@@ -1542,7 +1555,7 @@ fn artists_page() {
+                 index_shift: 0x0400,
+                 id: ArtistId(33),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Kyle Hall, KMFH".parse().unwrap(),
+                     },
+@@ -1556,7 +1569,7 @@ fn artists_page() {
+                 index_shift: 0x0420,
+                 id: ArtistId(34),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Luke's Anger".parse().unwrap(),
+                     },
+@@ -1570,7 +1583,7 @@ fn artists_page() {
+                 index_shift: 0x0440,
+                 id: ArtistId(35),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [12u8].into(),
++                    offsets: Provided([12u8].into()),
+                     inner: TrailingName {
+                         name: "Manie Sans Délire".parse().unwrap(),
+                     },
+@@ -1584,7 +1597,7 @@ fn artists_page() {
+                 index_shift: 0x0460,
+                 id: ArtistId(36),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Paul du Lac".parse().unwrap(),
+                     },
+@@ -1598,7 +1611,7 @@ fn artists_page() {
+                 index_shift: 0x0480,
+                 id: ArtistId(37),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Ron Hardy".parse().unwrap(),
+                     },
+@@ -1612,7 +1625,7 @@ fn artists_page() {
+                 index_shift: 0x04a0,
+                 id: ArtistId(38),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Saturn V".parse().unwrap(),
+                     },
+@@ -1626,7 +1639,7 @@ fn artists_page() {
+                 index_shift: 0x04c0,
+                 id: ArtistId(39),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "VA".parse().unwrap(),
+                     },
+@@ -1640,7 +1653,7 @@ fn artists_page() {
+                 index_shift: 0x04e0,
+                 id: ArtistId(40),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "traxx   ".parse().unwrap(),
+                     },
+@@ -1654,7 +1667,7 @@ fn artists_page() {
+                 index_shift: 0x0500,
+                 id: ArtistId(41),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "traxx feat Naughty wood".parse().unwrap(),
+                     },
+@@ -1668,7 +1681,7 @@ fn artists_page() {
+                 index_shift: 0x0520,
+                 id: ArtistId(42),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Truncate ".parse().unwrap(),
+                     },
+@@ -1682,7 +1695,7 @@ fn artists_page() {
+                 index_shift: 0x0540,
+                 id: ArtistId(43),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Ultrastation".parse().unwrap(),
+                     },
+@@ -1696,7 +1709,7 @@ fn artists_page() {
+                 index_shift: 0x0560,
+                 id: ArtistId(44),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "2AM/FM".parse().unwrap(),
+                     },
+@@ -1710,7 +1723,7 @@ fn artists_page() {
+                 index_shift: 0x0580,
+                 id: ArtistId(45),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Sepehr".parse().unwrap(),
+                     },
+@@ -1724,7 +1737,7 @@ fn artists_page() {
+                 index_shift: 0x05a0,
+                 id: ArtistId(46),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Cfade".parse().unwrap(),
+                     },
+@@ -1738,7 +1751,7 @@ fn artists_page() {
+                 index_shift: 0x05c0,
+                 id: ArtistId(47),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Miss Kittin & The Hacker".parse().unwrap(),
+                     },
+@@ -1752,7 +1765,7 @@ fn artists_page() {
+                 index_shift: 0x05e0,
+                 id: ArtistId(48),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Paul Du Lac".parse().unwrap(),
+                     },
+@@ -1766,7 +1779,7 @@ fn artists_page() {
+                 index_shift: 0x0600,
+                 id: ArtistId(49),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Tyree Cooper".parse().unwrap(),
+                     },
+@@ -1780,7 +1793,7 @@ fn artists_page() {
+                 index_shift: 0x0620,
+                 id: ArtistId(50),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Elbee Bad".parse().unwrap(),
+                     },
+@@ -1794,7 +1807,7 @@ fn artists_page() {
+                 index_shift: 0x0640,
+                 id: ArtistId(51),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "The Prince of Dance".parse().unwrap(),
+                     },
+@@ -1808,7 +1821,7 @@ fn artists_page() {
+                 index_shift: 0x0660,
+                 id: ArtistId(52),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Body Beat Ritual".parse().unwrap(),
+                     },
+@@ -1822,7 +1835,7 @@ fn artists_page() {
+                 index_shift: 0x0680,
+                 id: ArtistId(53),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Nehuen".parse().unwrap(),
+                     },
+@@ -1836,7 +1849,7 @@ fn artists_page() {
+                 index_shift: 0x06a0,
+                 id: ArtistId(54),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "TRAXX Saturn V & X2".parse().unwrap(),
+                     },
+@@ -1850,7 +1863,7 @@ fn artists_page() {
+                 index_shift: 0x06c0,
+                 id: ArtistId(55),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Broken English Club".parse().unwrap(),
+                     },
+@@ -1864,7 +1877,7 @@ fn artists_page() {
+                 index_shift: 0x06e0,
+                 id: ArtistId(56),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "terrace".parse().unwrap(),
+                     },
+@@ -1878,7 +1891,7 @@ fn artists_page() {
+                 index_shift: 0x0700,
+                 id: ArtistId(57),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Byron The Aquarius".parse().unwrap(),
+                     },
+@@ -1892,7 +1905,7 @@ fn artists_page() {
+                 index_shift: 0x0720,
+                 id: ArtistId(58),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Konstantin Tschechow".parse().unwrap(),
+                     },
+@@ -1906,7 +1919,7 @@ fn artists_page() {
+                 index_shift: 0x0740,
+                 id: ArtistId(59),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Romansoff".parse().unwrap(),
+                     },
+@@ -1920,7 +1933,7 @@ fn artists_page() {
+                 index_shift: 0x0760,
+                 id: ArtistId(60),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "D'Marc Cantu".parse().unwrap(),
+                     },
+@@ -1934,7 +1947,7 @@ fn artists_page() {
+                 index_shift: 0x0780,
+                 id: ArtistId(61),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "SvengalisGhost".parse().unwrap(),
+                     },
+@@ -1948,7 +1961,7 @@ fn artists_page() {
+                 index_shift: 0x07a0,
+                 id: ArtistId(62),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "X2".parse().unwrap(),
+                     },
+@@ -1962,7 +1975,7 @@ fn artists_page() {
+                 index_shift: 0x07c0,
+                 id: ArtistId(63),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Cardopusher".parse().unwrap(),
+                     },
+@@ -1976,7 +1989,7 @@ fn artists_page() {
+                 index_shift: 0x07e0,
+                 id: ArtistId(64),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Steven Julien".parse().unwrap(),
+                     },
+@@ -1990,7 +2003,7 @@ fn artists_page() {
+                 index_shift: 0x0800,
+                 id: ArtistId(65),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Advent".parse().unwrap(),
+                     },
+@@ -2004,7 +2017,7 @@ fn artists_page() {
+                 index_shift: 0x0820,
+                 id: ArtistId(66),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Aleksi Perala".parse().unwrap(),
+                     },
+@@ -2018,7 +2031,7 @@ fn artists_page() {
+                 index_shift: 0x0840,
+                 id: ArtistId(67),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Andre Kronert".parse().unwrap(),
+                     },
+@@ -2032,7 +2045,7 @@ fn artists_page() {
+                 index_shift: 0x0860,
+                 id: ArtistId(68),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Andy Stott".parse().unwrap(),
+                     },
+@@ -2046,7 +2059,7 @@ fn artists_page() {
+                 index_shift: 0x0880,
+                 id: ArtistId(69),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "ANOPOLIS".parse().unwrap(),
+                     },
+@@ -2060,7 +2073,7 @@ fn artists_page() {
+                 index_shift: 0x08a0,
+                 id: ArtistId(70),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Anthony Rother".parse().unwrap(),
+                     },
+@@ -2074,7 +2087,7 @@ fn artists_page() {
+                 index_shift: 0x08c0,
+                 id: ArtistId(71),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Anthony Rother UNRELEASED".parse().unwrap(),
+                     },
+@@ -2088,7 +2101,7 @@ fn artists_page() {
+                 index_shift: 0x08e0,
+                 id: ArtistId(72),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Area".parse().unwrap(),
+                     },
+@@ -2102,7 +2115,7 @@ fn artists_page() {
+                 index_shift: 0x0900,
+                 id: ArtistId(73),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Aubrey".parse().unwrap(),
+                     },
+@@ -2116,7 +2129,7 @@ fn artists_page() {
+                 index_shift: 0x0920,
+                 id: ArtistId(74),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Audion".parse().unwrap(),
+                     },
+@@ -2130,7 +2143,7 @@ fn artists_page() {
+                 index_shift: 0x0940,
+                 id: ArtistId(75),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Audion - Black Strobe".parse().unwrap(),
+                     },
+@@ -2144,7 +2157,7 @@ fn artists_page() {
+                 index_shift: 0x0960,
+                 id: ArtistId(76),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Cari Lekebusch & Jesper Dahlback".parse().unwrap(),
+                     },
+@@ -2158,7 +2171,7 @@ fn artists_page() {
+                 index_shift: 0x0980,
+                 id: ArtistId(77),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Claro Intelecto".parse().unwrap(),
+                     },
+@@ -2172,7 +2185,7 @@ fn artists_page() {
+                 index_shift: 0x09a0,
+                 id: ArtistId(78),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Conforce".parse().unwrap(),
+                     },
+@@ -2186,7 +2199,7 @@ fn artists_page() {
+                 index_shift: 0x09c0,
+                 id: ArtistId(79),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "CT Trax".parse().unwrap(),
+                     },
+@@ -2200,7 +2213,7 @@ fn artists_page() {
+                 index_shift: 0x09e0,
+                 id: ArtistId(80),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "D-56m".parse().unwrap(),
+                     },
+@@ -2214,7 +2227,7 @@ fn artists_page() {
+                 index_shift: 0x0a00,
+                 id: ArtistId(81),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Deniro".parse().unwrap(),
+                     },
+@@ -2228,7 +2241,7 @@ fn artists_page() {
+                 index_shift: 0x0a20,
+                 id: ArtistId(82),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DJ QU".parse().unwrap(),
+                     },
+@@ -2242,7 +2255,7 @@ fn artists_page() {
+                 index_shift: 0x0a40,
+                 id: ArtistId(83),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DJ Qu REMIX".parse().unwrap(),
+                     },
+@@ -2256,7 +2269,7 @@ fn artists_page() {
+                 index_shift: 0x0a60,
+                 id: ArtistId(84),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Don williams remix".parse().unwrap(),
+                     },
+@@ -2270,7 +2283,7 @@ fn artists_page() {
+                 index_shift: 0x0a80,
+                 id: ArtistId(85),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Don Williams".parse().unwrap(),
+                     },
+@@ -2284,7 +2297,7 @@ fn artists_page() {
+                 index_shift: 0x0aa0,
+                 id: ArtistId(86),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Dustmite".parse().unwrap(),
+                     },
+@@ -2298,7 +2311,7 @@ fn artists_page() {
+                 index_shift: 0x0ac0,
+                 id: ArtistId(87),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DVS1 ".parse().unwrap(),
+                     },
+@@ -2312,7 +2325,7 @@ fn artists_page() {
+                 index_shift: 0x0ae0,
+                 id: ArtistId(88),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "DVS1 tesT".parse().unwrap(),
+                     },
+@@ -2326,7 +2339,7 @@ fn artists_page() {
+                 index_shift: 0x0b00,
+                 id: ArtistId(89),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Emmanuel Top".parse().unwrap(),
+                     },
+@@ -2340,7 +2353,7 @@ fn artists_page() {
+                 index_shift: 0x0b20,
+                 id: ArtistId(90),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Erika".parse().unwrap(),
+                     },
+@@ -2354,7 +2367,7 @@ fn artists_page() {
+                 index_shift: 0x0b40,
+                 id: ArtistId(91),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Jensen Interceptor REMIX ".parse().unwrap(),
+                     },
+@@ -2368,7 +2381,7 @@ fn artists_page() {
+                 index_shift: 0x0b60,
+                 id: ArtistId(92),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Jeroen Search".parse().unwrap(),
+                     },
+@@ -2382,7 +2395,7 @@ fn artists_page() {
+                 index_shift: 0x0b80,
+                 id: ArtistId(93),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Juho Kahilainen".parse().unwrap(),
+                     },
+@@ -2396,7 +2409,7 @@ fn artists_page() {
+                 index_shift: 0x0ba0,
+                 id: ArtistId(94),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Juxta Position".parse().unwrap(),
+                     },
+@@ -2410,7 +2423,7 @@ fn artists_page() {
+                 index_shift: 0x0bc0,
+                 id: ArtistId(95),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Kenny Larkin".parse().unwrap(),
+                     },
+@@ -2424,7 +2437,7 @@ fn artists_page() {
+                 index_shift: 0x0be0,
+                 id: ArtistId(96),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Kirill Mamin".parse().unwrap(),
+                     },
+@@ -2438,7 +2451,7 @@ fn artists_page() {
+                 index_shift: 0x0c00,
+                 id: ArtistId(97),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "L.B. Dub Corp".parse().unwrap(),
+                     },
+@@ -2452,7 +2465,7 @@ fn artists_page() {
+                 index_shift: 0x0c20,
+                 id: ArtistId(98),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Levon Vincent".parse().unwrap(),
+                     },
+@@ -2466,7 +2479,7 @@ fn artists_page() {
+                 index_shift: 0x0c40,
+                 id: ArtistId(99),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "LEVON VINCENT".parse().unwrap(),
+                     },
+@@ -2480,7 +2493,7 @@ fn artists_page() {
+                 index_shift: 0x0c60,
+                 id: ArtistId(100),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Lil Tony".parse().unwrap(),
+                     },
+@@ -2494,7 +2507,7 @@ fn artists_page() {
+                 index_shift: 0x0c80,
+                 id: ArtistId(101),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Malin Genie".parse().unwrap(),
+                     },
+@@ -2508,7 +2521,7 @@ fn artists_page() {
+                 index_shift: 0x0ca0,
+                 id: ArtistId(102),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Marcel Dettmann".parse().unwrap(),
+                     },
+@@ -2522,7 +2535,7 @@ fn artists_page() {
+                 index_shift: 0x0cc0,
+                 id: ArtistId(103),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Marco Bernardi".parse().unwrap(),
+                     },
+@@ -2536,7 +2549,7 @@ fn artists_page() {
+                 index_shift: 0x0ce0,
+                 id: ArtistId(104),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Mary Velo".parse().unwrap(),
+                     },
+@@ -2550,7 +2563,7 @@ fn artists_page() {
+                 index_shift: 0x0d00,
+                 id: ArtistId(105),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Mike Dearborn".parse().unwrap(),
+                     },
+@@ -2564,7 +2577,7 @@ fn artists_page() {
+                 index_shift: 0x0d20,
+                 id: ArtistId(106),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Mike Dunn JU EDIT".parse().unwrap(),
+                     },
+@@ -2578,7 +2591,7 @@ fn artists_page() {
+                 index_shift: 0x0d40,
+                 id: ArtistId(107),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Nina Kraviz".parse().unwrap(),
+                     },
+@@ -2592,7 +2605,7 @@ fn artists_page() {
+                 index_shift: 0x0d60,
+                 id: ArtistId(108),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Obsolete Music Technology".parse().unwrap(),
+                     },
+@@ -2606,7 +2619,7 @@ fn artists_page() {
+                 index_shift: 0x0d80,
+                 id: ArtistId(109),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Oliver Deutschmann REMIX".parse().unwrap(),
+                     },
+@@ -2620,7 +2633,7 @@ fn artists_page() {
+                 index_shift: 0x0da0,
+                 id: ArtistId(110),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Oliver Deutschmann".parse().unwrap(),
+                     },
+@@ -2634,7 +2647,7 @@ fn artists_page() {
+                 index_shift: 0x0dc0,
+                 id: ArtistId(111),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Oliver Kapp".parse().unwrap(),
+                     },
+@@ -2648,7 +2661,7 @@ fn artists_page() {
+                 index_shift: 0x0de0,
+                 id: ArtistId(112),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Pacou".parse().unwrap(),
+                     },
+@@ -2662,7 +2675,7 @@ fn artists_page() {
+                 index_shift: 0x0e00,
+                 id: ArtistId(113),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Patrik Carrera".parse().unwrap(),
+                     },
+@@ -2676,7 +2689,7 @@ fn artists_page() {
+                 index_shift: 0x0e20,
+                 id: ArtistId(114),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Patrik Carrera (GER)".parse().unwrap(),
+                     },
+@@ -2690,7 +2703,7 @@ fn artists_page() {
+                 index_shift: 0x0e40,
+                 id: ArtistId(115),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Phil Kieran".parse().unwrap(),
+                     },
+@@ -2704,7 +2717,7 @@ fn artists_page() {
+                 index_shift: 0x0e60,
+                 id: ArtistId(116),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Planetary Assault Systems".parse().unwrap(),
+                     },
+@@ -2718,7 +2731,7 @@ fn artists_page() {
+                 index_shift: 0x0e80,
+                 id: ArtistId(117),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Planetary Assault Systems ".parse().unwrap(),
+                     },
+@@ -2732,7 +2745,7 @@ fn artists_page() {
+                 index_shift: 0x0ea0,
+                 id: ArtistId(118),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Plastikman".parse().unwrap(),
+                     },
+@@ -2746,7 +2759,7 @@ fn artists_page() {
+                 index_shift: 0x0ec0,
+                 id: ArtistId(119),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "QNA".parse().unwrap(),
+                     },
+@@ -2760,7 +2773,7 @@ fn artists_page() {
+                 index_shift: 0x0ee0,
+                 id: ArtistId(120),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Radial".parse().unwrap(),
+                     },
+@@ -2824,7 +2837,7 @@ fn artist_page_long() {
+                 index_shift: 0x0000,
+                 id: ArtistId(1),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [12u16].into(),
++                    offsets: Provided([12u16].into()),
+                     inner: TrailingName {
+                         name: repeat_n('D', 256).collect::<String>().parse().unwrap(),
+                     },
+@@ -2838,7 +2851,7 @@ fn artist_page_long() {
+                 index_shift: 0x0020,
+                 id: ArtistId(2),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Insert 2".parse().unwrap(),
+                     },
+@@ -2852,7 +2865,7 @@ fn artist_page_long() {
+                 index_shift: 0x0040,
+                 id: ArtistId(3),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [12u16].into(),
++                    offsets: Provided([12u16].into()),
+                     inner: TrailingName {
+                         name: repeat_n('C', 256).collect::<String>().parse().unwrap(),
+                     },
+@@ -2866,7 +2879,7 @@ fn artist_page_long() {
+                 index_shift: 0x0060,
+                 id: ArtistId(4),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [10u8].into(),
++                    offsets: Provided([10u8].into()),
+                     inner: TrailingName {
+                         name: "Insert 1".parse().unwrap(),
+                     },
+@@ -2880,7 +2893,7 @@ fn artist_page_long() {
+                 index_shift: 0x0080,
+                 id: ArtistId(5),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [12u16].into(),
++                    offsets: Provided([12u16].into()),
+                     inner: TrailingName {
+                         name: repeat_n('B', 254).collect::<String>().parse().unwrap(),
+                     },
+@@ -2894,7 +2907,7 @@ fn artist_page_long() {
+                 index_shift: 0x00a0,
+                 id: ArtistId(6),
+                 offsets: OffsetArrayContainer {
+-                    offsets: [12u16].into(),
++                    offsets: Provided([12u16].into()),
+                     inner: TrailingName {
+                         name: repeat_n('❤', 256).collect::<String>().parse().unwrap(),
+                     },
+@@ -3000,7 +3013,7 @@ fn albums_page() {
+                 id: AlbumId(1),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "The Worst of Gehm".parse().unwrap(),
+                     },
+@@ -3017,7 +3030,7 @@ fn albums_page() {
+                 id: AlbumId(2),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [24u8].into(),
++                    offsets: Provided([24u8].into()),
+                     inner: TrailingName {
+                         name: "1ØPILLS003 MASTER MP3s".parse().unwrap(),
+                     },
+@@ -3034,7 +3047,7 @@ fn albums_page() {
+                 id: AlbumId(3),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Love & Happiness".parse().unwrap(),
+                     },
+@@ -3051,7 +3064,7 @@ fn albums_page() {
+                 id: AlbumId(4),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Wind / Phazzled".parse().unwrap(),
+                     },
+@@ -3068,7 +3081,7 @@ fn albums_page() {
+                 id: AlbumId(5),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Spectral Sound Volume 3".parse().unwrap(),
+                     },
+@@ -3085,7 +3098,7 @@ fn albums_page() {
+                 id: AlbumId(6),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "The Hideout (Mini-Lp)".parse().unwrap(),
+                     },
+@@ -3102,7 +3115,7 @@ fn albums_page() {
+                 id: AlbumId(7),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Sweet Dreams EP".parse().unwrap(),
+                     },
+@@ -3119,7 +3132,7 @@ fn albums_page() {
+                 id: AlbumId(8),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Lab.our 05".parse().unwrap(),
+                     },
+@@ -3136,7 +3149,7 @@ fn albums_page() {
+                 id: AlbumId(9),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "PolyfonikDizko".parse().unwrap(),
+                     },
+@@ -3153,7 +3166,7 @@ fn albums_page() {
+                 id: AlbumId(10),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Altered States EP".parse().unwrap(),
+                     },
+@@ -3170,7 +3183,7 @@ fn albums_page() {
+                 id: AlbumId(11),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "My So Called Robot Life EP".parse().unwrap(),
+                     },
+@@ -3187,7 +3200,7 @@ fn albums_page() {
+                 id: AlbumId(12),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Deep Ep".parse().unwrap(),
+                     },
+@@ -3204,7 +3217,7 @@ fn albums_page() {
+                 id: AlbumId(13),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [24u8].into(),
++                    offsets: Provided([24u8].into()),
+                     inner: TrailingName {
+                         name: "Simoncino \u{200e}– Mystic Adventures".parse().unwrap(),
+                     },
+@@ -3221,7 +3234,7 @@ fn albums_page() {
+                 id: AlbumId(14),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Smu Is The Key EP".parse().unwrap(),
+                     },
+@@ -3238,7 +3251,7 @@ fn albums_page() {
+                 id: AlbumId(15),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "SOM Compilation Volume 2".parse().unwrap(), // codespell:ignore
+                     },
+@@ -3255,7 +3268,7 @@ fn albums_page() {
+                 id: AlbumId(16),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "NY Muscle".parse().unwrap(),
+                     },
+@@ -3272,7 +3285,7 @@ fn albums_page() {
+                 id: AlbumId(17),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Point of No Return EP".parse().unwrap(),
+                     },
+@@ -3289,7 +3302,7 @@ fn albums_page() {
+                 id: AlbumId(18),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Tapes 08".parse().unwrap(),
+                     },
+@@ -3306,7 +3319,7 @@ fn albums_page() {
+                 id: AlbumId(19),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Like No One".parse().unwrap(),
+                     },
+@@ -3323,7 +3336,7 @@ fn albums_page() {
+                 id: AlbumId(20),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "The Boat Party".parse().unwrap(),
+                     },
+@@ -3340,7 +3353,7 @@ fn albums_page() {
+                 id: AlbumId(21),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Raw & Unreleased".parse().unwrap(),
+                     },
+@@ -3357,7 +3370,7 @@ fn albums_page() {
+                 id: AlbumId(22),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Living Low".parse().unwrap(),
+                     },
+@@ -3374,7 +3387,7 @@ fn albums_page() {
+                 id: AlbumId(23),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Muzic Box Classics #7".parse().unwrap(),
+                     },
+@@ -3391,7 +3404,7 @@ fn albums_page() {
+                 id: AlbumId(24),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Stranger In The Strangest Of Lands".parse().unwrap(),
+                     },
+@@ -3408,7 +3421,7 @@ fn albums_page() {
+                 id: AlbumId(25),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Pt. 1".parse().unwrap(),
+                     },
+@@ -3425,7 +3438,7 @@ fn albums_page() {
+                 id: AlbumId(26),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Body Mechanics EP".parse().unwrap(),
+                     },
+@@ -3442,7 +3455,7 @@ fn albums_page() {
+                 id: AlbumId(27),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "EAUX1091 ".parse().unwrap(),
+                     },
+@@ -3459,7 +3472,7 @@ fn albums_page() {
+                 id: AlbumId(28),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Lost Tracks, Vol. 2".parse().unwrap(),
+                     },
+@@ -3476,7 +3489,7 @@ fn albums_page() {
+                 id: AlbumId(29),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Dubbelbrein EP".parse().unwrap(),
+                     },
+@@ -3493,7 +3506,7 @@ fn albums_page() {
+                 id: AlbumId(30),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Vx, Vol. 1".parse().unwrap(),
+                     },
+@@ -3510,7 +3523,7 @@ fn albums_page() {
+                 id: AlbumId(31),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "The Trax Records Anthology Compiled By Bill Brewster"
+                             .parse()
+@@ -3529,7 +3542,7 @@ fn albums_page() {
+                 id: AlbumId(32),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "AfriOrker".parse().unwrap(),
+                     },
+@@ -3546,7 +3559,7 @@ fn albums_page() {
+                 id: AlbumId(33),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mortal Sin EP".parse().unwrap(),
+                     },
+@@ -3563,7 +3576,7 @@ fn albums_page() {
+                 id: AlbumId(34),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Psyops part one EP".parse().unwrap(),
+                     },
+@@ -3580,7 +3593,7 @@ fn albums_page() {
+                 id: AlbumId(35),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "White Rats III".parse().unwrap(),
+                     },
+@@ -3597,7 +3610,7 @@ fn albums_page() {
+                 id: AlbumId(36),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "far from reality".parse().unwrap(),
+                     },
+@@ -3614,7 +3627,7 @@ fn albums_page() {
+                 id: AlbumId(37),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "EP1".parse().unwrap(),
+                     },
+@@ -3631,7 +3644,7 @@ fn albums_page() {
+                 id: AlbumId(38),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Alpha Omega".parse().unwrap(),
+                     },
+@@ -3648,7 +3661,7 @@ fn albums_page() {
+                 id: AlbumId(39),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Decay".parse().unwrap(),
+                     },
+@@ -3665,7 +3678,7 @@ fn albums_page() {
+                 id: AlbumId(40),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "[LIES 009] Mind Control 320".parse().unwrap(),
+                     },
+@@ -3682,7 +3695,7 @@ fn albums_page() {
+                 id: AlbumId(41),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Nation".parse().unwrap(),
+                     },
+@@ -3699,7 +3712,7 @@ fn albums_page() {
+                 id: AlbumId(42),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Split 02".parse().unwrap(),
+                     },
+@@ -3716,7 +3729,7 @@ fn albums_page() {
+                 id: AlbumId(43),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Another Number".parse().unwrap(),
+                     },
+@@ -3733,7 +3746,7 @@ fn albums_page() {
+                 id: AlbumId(44),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "8 Ball".parse().unwrap(),
+                     },
+@@ -3750,7 +3763,7 @@ fn albums_page() {
+                 id: AlbumId(45),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "H-Productions presents_Mutations 101 (HPX60)"
+                             .parse()
+@@ -3769,7 +3782,7 @@ fn albums_page() {
+                 id: AlbumId(46),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "CBS024X".parse().unwrap(),
+                     },
+@@ -3786,7 +3799,7 @@ fn albums_page() {
+                 id: AlbumId(47),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Ben Sims pres Tribology".parse().unwrap(), // codespell:ignore
+                     },
+@@ -3803,7 +3816,7 @@ fn albums_page() {
+                 id: AlbumId(48),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Night Jewel".parse().unwrap(),
+                     },
+@@ -3820,7 +3833,7 @@ fn albums_page() {
+                 id: AlbumId(49),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "AKROPOLEOS".parse().unwrap(),
+                     },
+@@ -3837,7 +3850,7 @@ fn albums_page() {
+                 id: AlbumId(50),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mistress 12".parse().unwrap(),
+                     },
+@@ -3854,7 +3867,7 @@ fn albums_page() {
+                 id: AlbumId(51),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mistress 12.5".parse().unwrap(),
+                     },
+@@ -3871,7 +3884,7 @@ fn albums_page() {
+                 id: AlbumId(52),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Remember Each Moment Of Freedom".parse().unwrap(),
+                     },
+@@ -3888,7 +3901,7 @@ fn albums_page() {
+                 id: AlbumId(53),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mood Sequences".parse().unwrap(),
+                     },
+@@ -3905,7 +3918,7 @@ fn albums_page() {
+                 id: AlbumId(54),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Death Is Nothing To Fear 1".parse().unwrap(),
+                     },
+@@ -3922,7 +3935,7 @@ fn albums_page() {
+                 id: AlbumId(55),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "I'm A Man".parse().unwrap(),
+                     },
+@@ -3939,7 +3952,7 @@ fn albums_page() {
+                 id: AlbumId(56),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Cari Lekebusch & Jesper Dahlback - Hands on experience"
+                             .parse()
+@@ -3958,7 +3971,7 @@ fn albums_page() {
+                 id: AlbumId(57),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "New Life EP".parse().unwrap(),
+                     },
+@@ -3975,7 +3988,7 @@ fn albums_page() {
+                 id: AlbumId(58),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "State of Mind EP".parse().unwrap(),
+                     },
+@@ -3992,7 +4005,7 @@ fn albums_page() {
+                 id: AlbumId(59),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "DABJ Allstars".parse().unwrap(),
+                     },
+@@ -4009,7 +4022,7 @@ fn albums_page() {
+                 id: AlbumId(60),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mendoza".parse().unwrap(),
+                     },
+@@ -4026,7 +4039,7 @@ fn albums_page() {
+                 id: AlbumId(61),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "CD Thirteen".parse().unwrap(),
+                     },
+@@ -4043,7 +4056,7 @@ fn albums_page() {
+                 id: AlbumId(62),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Raw 7".parse().unwrap(),
+                     },
+@@ -4060,7 +4073,7 @@ fn albums_page() {
+                 id: AlbumId(63),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Endurance - UNDERGROUND QUALITY".parse().unwrap(),
+                     },
+@@ -4077,7 +4090,7 @@ fn albums_page() {
+                 id: AlbumId(64),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "EFDEMIN - DECAY VERSIONS PT.2".parse().unwrap(),
+                     },
+@@ -4094,7 +4107,7 @@ fn albums_page() {
+                 id: AlbumId(65),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "HUSH 03".parse().unwrap(),
+                     },
+@@ -4111,7 +4124,7 @@ fn albums_page() {
+                 id: AlbumId(66),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mistress 20".parse().unwrap(),
+                     },
+@@ -4128,7 +4141,7 @@ fn albums_page() {
+                 id: AlbumId(67),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Love under pressure ".parse().unwrap(),
+                     },
+@@ -4145,7 +4158,7 @@ fn albums_page() {
+                 id: AlbumId(68),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Release".parse().unwrap(),
+                     },
+@@ -4162,7 +4175,7 @@ fn albums_page() {
+                 id: AlbumId(69),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Hexagon Cloud".parse().unwrap(),
+                     },
+@@ -4179,7 +4192,7 @@ fn albums_page() {
+                 id: AlbumId(70),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "NRDR 011".parse().unwrap(),
+                     },
+@@ -4196,7 +4209,7 @@ fn albums_page() {
+                 id: AlbumId(71),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Diptych".parse().unwrap(),
+                     },
+@@ -4213,7 +4226,7 @@ fn albums_page() {
+                 id: AlbumId(72),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Seven Days".parse().unwrap(),
+                     },
+@@ -4230,7 +4243,7 @@ fn albums_page() {
+                 id: AlbumId(73),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Unknown Origin".parse().unwrap(),
+                     },
+@@ -4247,7 +4260,7 @@ fn albums_page() {
+                 id: AlbumId(74),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Arpeggiator".parse().unwrap(),
+                     },
+@@ -4264,7 +4277,7 @@ fn albums_page() {
+                 id: AlbumId(75),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "DECONSTRUCT MUSIC DEC-02".parse().unwrap(),
+                     },
+@@ -4281,7 +4294,7 @@ fn albums_page() {
+                 id: AlbumId(76),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Basement Tracks EP".parse().unwrap(),
+                     },
+@@ -4298,7 +4311,7 @@ fn albums_page() {
+                 id: AlbumId(77),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Corpse Grinder".parse().unwrap(),
+                     },
+@@ -4315,7 +4328,7 @@ fn albums_page() {
+                 id: AlbumId(78),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Kamm / Plain".parse().unwrap(),
+                     },
+@@ -4332,7 +4345,7 @@ fn albums_page() {
+                 id: AlbumId(79),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Fluxus_Digital_006".parse().unwrap(),
+                     },
+@@ -4349,7 +4362,7 @@ fn albums_page() {
+                 id: AlbumId(80),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Minutes In Ice".parse().unwrap(),
+                     },
+@@ -4366,7 +4379,7 @@ fn albums_page() {
+                 id: AlbumId(81),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "TRP001".parse().unwrap(),
+                     },
+@@ -4383,7 +4396,7 @@ fn albums_page() {
+                 id: AlbumId(82),
+                 unknown3: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: [22u8].into(),
++                    offsets: Provided([22u8].into()),
+                     inner: TrailingName {
+                         name: "Mmmmmusic".parse().unwrap(),
+                     },
+@@ -10123,7 +10136,7 @@ fn tag_page() {
+                 id: TagId(1),
+                 raw_is_category: 16777216,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 44]),
++                    offsets: Provided([31u8, 44].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "TagCategory1".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10143,7 +10156,7 @@ fn tag_page() {
+                 id: TagId(3456350885),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag1Cat1".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10163,7 +10176,7 @@ fn tag_page() {
+                 id: TagId(246010797),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag2Cat1".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10183,7 +10196,7 @@ fn tag_page() {
+                 id: TagId(2),
+                 raw_is_category: 16777216,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 44]),
++                    offsets: Provided([31u8, 44].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "TagCategory2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10203,7 +10216,7 @@ fn tag_page() {
+                 id: TagId(2923592519),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag1Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10223,7 +10236,7 @@ fn tag_page() {
+                 id: TagId(3518593467),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 48]),
++                    offsets: Provided([31u8, 48].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag2Cat2LongName".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10243,7 +10256,7 @@ fn tag_page() {
+                 id: TagId(870902105),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag3Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10263,7 +10276,7 @@ fn tag_page() {
+                 id: TagId(3211624224),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag4Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10283,7 +10296,7 @@ fn tag_page() {
+                 id: TagId(3216792858),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag5Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10303,7 +10316,7 @@ fn tag_page() {
+                 id: TagId(712200756),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag6Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10323,7 +10336,7 @@ fn tag_page() {
+                 id: TagId(4166869272),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag7Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10343,7 +10356,7 @@ fn tag_page() {
+                 id: TagId(4052665282),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag8Cat2".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10363,7 +10376,7 @@ fn tag_page() {
+                 id: TagId(3),
+                 raw_is_category: 16777216,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 44]),
++                    offsets: Provided([31u8, 44].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "TagCategory3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10383,7 +10396,7 @@ fn tag_page() {
+                 id: TagId(2498240426),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag1Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10403,7 +10416,7 @@ fn tag_page() {
+                 id: TagId(598441108),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag2Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10423,7 +10436,7 @@ fn tag_page() {
+                 id: TagId(4263562201),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag3Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10443,7 +10456,7 @@ fn tag_page() {
+                 id: TagId(926017397),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag4Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10463,7 +10476,7 @@ fn tag_page() {
+                 id: TagId(707481115),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag5Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10483,7 +10496,7 @@ fn tag_page() {
+                 id: TagId(3043071597),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag6Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10503,7 +10516,7 @@ fn tag_page() {
+                 id: TagId(4026144338),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag7Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10523,7 +10536,7 @@ fn tag_page() {
+                 id: TagId(218937570),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 40]),
++                    offsets: Provided([31u8, 40].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag8Cat3".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10543,7 +10556,7 @@ fn tag_page() {
+                 id: TagId(4),
+                 raw_is_category: 16777216,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 44]),
++                    offsets: Provided([31u8, 44].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "TagCategory4".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+@@ -10563,7 +10576,7 @@ fn tag_page() {
+                 id: TagId(3074636465),
+                 raw_is_category: 0,
+                 offsets: OffsetArrayContainer {
+-                    offsets: OffsetArray::U8([31, 54]),
++                    offsets: Provided([31u8, 54].into()),
+                     inner: TagOrCategoryStrings {
+                         name: "Tag1Cat4EvenLongerName".parse().unwrap(),
+                         unknown: "".parse().unwrap(),
+diff --git a/src/util.rs b/src/util.rs
+index e51cb9f5..e3acb585 100644
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -42,6 +42,16 @@ pub enum RekordcrateError {
+ /// Type alias for results where the error is a `RekordcrateError`.
+ pub type RekordcrateResult<T> = std::result::Result<T, RekordcrateError>;
+ 
++/// Wrapper for types which may be automatically calculated if not
++/// provided by the user, or may be explicitly set when parsing existing data.
++#[derive(Debug, PartialEq, Clone, Eq)]
++pub enum MaybeCalculated<T> {
++    /// Value is calculated from some other value during serialization.
++    Calculated,
++    /// Value is explicitly provided.
++    Provided(T),
++}
++
+ /// Indexed Color identifiers used for memory cues and tracks.
+ #[binrw]
+ #[derive(Debug, PartialEq, Eq, Clone)]
+@@ -169,6 +179,40 @@ pub const fn align_by(alignment: u64, mut offset: u64) -> u64 {
+     offset
+ }
+ 
++pub(crate) trait ArrayPolyfills<T, const N: usize> {
++    fn try_map_polyfill<U, E>(self, f: impl FnMut(T) -> Result<U, E>) -> Result<[U; N], E>;
++    fn zip_polyfill<U>(self, other: [U; N]) -> [(T, U); N];
++}
++
++impl<T, const N: usize> ArrayPolyfills<T, N> for [T; N] {
++    fn try_map_polyfill<U, E>(self, f: impl FnMut(T) -> Result<U, E>) -> Result<[U; N], E> {
++        let results = self.map(f);
++        let has_error = results.iter().any(|r| r.is_err());
++        if has_error {
++            return Err(results.into_iter().find_map(|r| r.err()).unwrap());
++        }
++        Ok(results.map(|r| match r {
++            Ok(v) => v,
++            Err(_) => unreachable!(),
++        }))
++    }
++
++    fn zip_polyfill<U>(self, other: [U; N]) -> [(T, U); N] {
++        // With a bit of luck the compiler will optimize all of this to avoid
++        // all of the Option packing and unpacking.
++        let mut a = self.map(Some);
++        let mut b = other.map(Some);
++        let mut result: [Option<(T, U)>; N] = [const { None }; _];
++        for i in 0..N {
++            result[i] = Some((a[i].take().unwrap(), b[i].take().unwrap()));
++        }
++        result.map(|opt| match opt {
++            Some(v) => v,
++            None => unreachable!(),
++        })
++    }
++}
++
+ #[cfg(test)]
+ pub(crate) mod testing {
+     use binrw::{
+@@ -185,6 +229,17 @@ pub(crate) mod testing {
+         };
+     }
+ 
++    pub fn test_write<'a, T>(bin: &[u8], obj: &T, args: <T as binrw::BinWrite>::Args<'a>)
++    where
++        T: BinWrite + PartialEq + core::fmt::Debug + WriteEndian,
++    {
++        let endian = Endian::NATIVE;
++        // T->binary
++        let mut writer = binrw::io::Cursor::new(Vec::with_capacity(bin.len()));
++        obj.write_options(&mut writer, endian, args).unwrap();
++        assert_eq_hex!(&writer.get_ref(), &bin);
++    }
++
+     pub fn test_roundtrip_with_args<'a, T>(
+         bin: &[u8],
+         obj: T,

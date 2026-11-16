@@ -1,0 +1,325 @@
+diff --git a/src/main.rs b/src/main.rs
+index 12410ede..bce96d1f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -109,7 +109,6 @@ fn list_playlists(path: &PathBuf) -> rekordcrate::Result<()> {
+                 .flat_map(|data_content| data_content.row_groups.into_iter())
+                 .flat_map(|row_group| {
+                     row_group
+-                        .present_rows()
+                         .iter()
+                         .map(|row| {
+                             if let Row::Plain(PlainRow::PlaylistTreeNode(playlist_tree)) = row {
+@@ -159,7 +158,7 @@ fn dump_pdb(path: &PathBuf, typ: DatabaseType) -> rekordcrate::Result<()> {
+                 PageContent::Data(data_content) => {
+                     data_content.row_groups.iter().for_each(|row_group| {
+                         println!("    {:?}", row_group);
+-                        for row in row_group.present_rows() {
++                        for row in row_group {
+                             println!("      {:?}", row);
+                         }
+                     })
+diff --git a/src/pdb/mod.rs b/src/pdb/mod.rs
+index 34cf9849..008fc823 100644
+--- a/src/pdb/mod.rs
++++ b/src/pdb/mod.rs
+@@ -650,8 +650,9 @@ pub struct RowGroup {
+     /// bits in `row_present_flags`. This instance allows the row itself to be lazily loaded, unless it
+     /// is not present, in which case there is no content to be loaded.
+     // rustc doesn't seem to recognize that this is used below, ignore for now
+-    #[allow(dead_code)]
++    #[br(temp)]
+     row_offsets: [u16; Self::MAX_ROW_COUNT],
++    #[br(temp)]
+     row_presence_flags: u16,
+     /// Unknown field.
+     /// Often zero, sometimes a multiple of 2, rarely something else.
+@@ -674,18 +675,11 @@ impl RowGroup {
+     const MAX_ROW_COUNT: usize = 16;
+     const BINARY_SIZE: u32 = (Self::MAX_ROW_COUNT as u32) * 2 + 4; // size the serialized structure
+ 
+-    /// Get all rows present in this rowgroup
+-    #[must_use]
+-    pub fn present_rows(&self) -> &[Row] {
+-        &self.rows
+-    }
+-
+     /// Add a row to this rowgroup
+     pub fn add_row(&mut self, row: Row) -> Result<(), PdbError> {
+         if self.rows.len() >= Self::MAX_ROW_COUNT {
+             return Err(PdbError::RowGroupFull);
+         }
+-        self.row_presence_flags |= 1 << self.rows.len() as u16;
+         self.rows.push(row);
+         Ok(())
+     }
+@@ -704,6 +698,38 @@ impl RowGroup {
+     }
+ }
+ 
++impl std::ops::Deref for RowGroup {
++    type Target = [Row];
++
++    fn deref(&self) -> &Self::Target {
++        &self.rows
++    }
++}
++
++impl std::ops::DerefMut for RowGroup {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        &mut self.rows
++    }
++}
++
++impl<'a> IntoIterator for &'a RowGroup {
++    type Item = &'a Row;
++    type IntoIter = std::slice::Iter<'a, Row>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.iter()
++    }
++}
++
++impl<'a> IntoIterator for &'a mut RowGroup {
++    type Item = &'a mut Row;
++    type IntoIter = std::slice::IterMut<'a, Row>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.iter_mut()
++    }
++}
++
+ impl PartialEq for RowGroup {
+     fn eq(&self, other: &Self) -> bool {
+         self.rows == other.rows
+@@ -724,10 +750,11 @@ impl RowGroup {
+         let free_space_start = heap_start + relative_row_offset;
+         const INVALID_ROW_OFFSET: u16 = u16::MAX;
+         let mut row_offsets = [INVALID_ROW_OFFSET; Self::MAX_ROW_COUNT];
++        let mut row_presence_flags: u16 = 0;
+ 
+         // Write rows
+         writer.seek(SeekFrom::Start(free_space_start))?;
+-        for (i, row) in self.present_rows().iter().enumerate() {
++        for (i, row) in self.rows.iter().enumerate() {
+             let row_position = writer.stream_position()?;
+             let aligned_position = row.align_by(row_position);
+             writer.seek(SeekFrom::Start(aligned_position))?;
+@@ -745,6 +772,7 @@ impl RowGroup {
+                     pos: aligned_position,
+                     message: format!("Error converting offset: {:?}", error),
+                 })?;
++            row_presence_flags |= 1 << i;
+         }
+         let written_space_end = writer.stream_position()?;
+         writer.seek(SeekFrom::Start(rowgroup_start))?;
+@@ -759,7 +787,7 @@ impl RowGroup {
+                 offset.write_options(writer, endian, ())?;
+             }
+         }
+-        self.row_presence_flags.write_options(writer, endian, ())?;
++        row_presence_flags.write_options(writer, endian, ())?;
+         self.unknown.write_options(writer, endian, ())?;
+         // Seek back to the beginning of this rowgroup (which is the end of the next rowgroup)
+         writer.seek(SeekFrom::Start(rowgroup_start))?;
+diff --git a/src/pdb/test.rs b/src/pdb/test.rs
+index 13380665..4d6f99fa 100644
+--- a/src/pdb/test.rs
++++ b/src/pdb/test.rs
+@@ -426,8 +426,6 @@ fn column_entry() {
+ #[test]
+ fn track_page() {
+     let mut row_groups = RowGroup {
+-        row_offsets: Default::default(),
+-        row_presence_flags: 0,
+         unknown: 16,
+         rows: vec![],
+     };
+@@ -806,14 +804,10 @@ fn track_page() {
+ fn genres_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0, // This is different from the usual
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 2, // This is different from the usual
+             rows: vec![],
+         },
+@@ -962,51 +956,35 @@ fn genres_page() {
+ fn artists_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 0,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+         RowGroup {
+-            row_offsets: Default::default(),
+             unknown: 128,
+-            row_presence_flags: 0,
+             rows: vec![],
+         },
+     ];
+@@ -2609,8 +2587,6 @@ fn artists_page() {
+ fn artist_page_long() {
+     use std::iter::repeat_n;
+     let mut rowgroup = RowGroup {
+-        row_offsets: [0; RowGroup::MAX_ROW_COUNT],
+-        row_presence_flags: 7,
+         unknown: 0x20,
+         rows: Default::default(),
+     };
+@@ -2727,8 +2703,6 @@ fn artist_page_long() {
+ fn albums_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -4088,8 +4062,6 @@ fn albums_page() {
+ fn labels_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -5204,8 +5176,6 @@ fn labels_page() {
+ fn keys_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -5615,8 +5585,6 @@ fn keys_page() {
+ #[test]
+ fn colors_page() {
+     let mut row_groups = vec![RowGroup {
+-        row_offsets: Default::default(),
+-        row_presence_flags: 0,
+         unknown: 255,
+         rows: vec![],
+     }];
+@@ -5728,8 +5696,6 @@ fn colors_page() {
+ fn playlist_tree_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -6044,8 +6010,6 @@ fn playlist_tree_page() {
+ fn playlist_entries_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -8094,8 +8058,6 @@ fn playlist_entries_page() {
+ fn artworks_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -8781,8 +8743,6 @@ fn artworks_page() {
+ fn tag_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -9265,8 +9225,6 @@ fn tag_page() {
+ fn track_tag_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -9679,8 +9637,6 @@ Find a player that properly fills a page and improve this test. */
+ fn history_playlists_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+@@ -9730,8 +9686,6 @@ fn history_playlists_page() {
+ fn history_entries_page() {
+     let mut row_groups = vec![
+         RowGroup {
+-            row_offsets: Default::default(),
+-            row_presence_flags: 0,
+             unknown: 0,
+             rows: vec![],
+         };
+diff --git a/tests/test_pdb_num_rows.rs b/tests/test_pdb_num_rows.rs
+index a12b3fe7..a4eff695 100644
+--- a/tests/test_pdb_num_rows.rs
++++ b/tests/test_pdb_num_rows.rs
+@@ -32,7 +32,7 @@ fn assert_pdb_row_count(page_type: PlainPageType, expected_row_count: usize) {
+         .into_iter()
+         .filter_map(|page| page.content.into_data())
+         .flat_map(|data_content| data_content.row_groups.into_iter())
+-        .map(|row_group| row_group.present_rows().len())
++        .map(|row_group| row_group.len())
+         .sum();
+     assert_eq!(
+         actual_row_count, expected_row_count,

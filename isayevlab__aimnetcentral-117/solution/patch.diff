@@ -1,0 +1,483 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1b3bddb..bba71d0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Validated Python class and function references in model YAML against a default trusted set. Direct local and Hugging Face artifacts can extend or replace that set, or explicitly select unsafe loading for trusted custom code; registry models always use the fixed default set.
+ - Enriched and structurally validated complete Hugging Face metadata before weight access, including unambiguous `SRCoulomb` parameter recovery. Registry-backed HF fallback now treats digest-verified registry YAML and metadata as authoritative and rejects conflicting family metadata.
+ - Bumped the locked torch from 2.9.1 to 2.12.1 (with triton 3.7.1), staying inside the supported 2.8-2.13 matrix. This clears the low-severity `torch.lstm_cell` memory-corruption advisory (patched in 2.10.0; the earlier note that both torch advisories required 2.13 no longer matches the updated advisory data) and moves the default CI lane onto an inductor with the upstream fusion-legality fix (pytorch/pytorch#172301). The torch.jit.script advisory is resolvable now that the supported matrix includes 2.13; clearing it requires bumping the locked torch to 2.13.
++- Forbade the `ptfile` constructor kwarg anywhere in artifact `model_yaml`. `DispParam.__init__` runs `torch.load(ptfile, weights_only=True)` on a YAML-supplied path, and the import-path walker never inspected constructor kwargs, so a default-trusted artifact could carry an arbitrary-path read/probe/DoS primitive. The exporter always strips `ptfile` before an artifact is produced, so no legitimate artifact is affected; training-config loading is untouched.
++- Cross-checked D3TS presence between `model_yaml` and the `has_embedded_d3ts` metadata flag during artifact validation. Previously the two were validated independently, so a mislabeled artifact could silently double-count or entirely lose dispersion depending on which direction it was mislabeled.
++- Validated D3TS damping parameters (`a1`, `a2`, `s8`, `s6`) supplied via artifact `model_yaml`: they must be finite, non-negative real numbers. These are plain constructor floats outside the state dict, so nothing previously stopped a NaN/Inf value or `a1=a2=0` (an undamped `1/d**6` collapse) from loading silently.
+ 
+ ### Added
+ 
+@@ -42,6 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ ### Fixed
+ 
+ - Excluded the local weight cache (`aimnet/calculators/assets/`) from wheels and sdists explicitly, instead of relying on hatchling's `.gitignore` handling.
++- Trusted the `aimnet.modules.lr.D3TS` submodule spelling of the D3TS class in the default artifact allowlist, alongside the existing `aimnet.modules.D3TS` barrel spelling. The loader machinery that detects D3TS by class name matches the "D3TS" substring regardless of spelling, so an artifact using this spelling was recognized as D3TS by the export layer but rejected by the exact-match allowlist.
+ - Fixed `DataGroup.cv_split` corrupting cross-validation folds: building each fold's train split mutated the shared parts in place via `cat()`, so later folds contained duplicated samples and validation splits larger than the dataset. Folds are now built without mutating the shared parts.
+ - Fixed a crash when torch has CUDA but warp-lang does not (possible with conda-forge variant packages): the AEV kernel gate now checks warp CUDA availability and falls back to the pure-torch path with a one-time warning.
+ 
+diff --git a/aimnet/models/artifact_validation.py b/aimnet/models/artifact_validation.py
+index e7d3375..5906379 100644
+--- a/aimnet/models/artifact_validation.py
++++ b/aimnet/models/artifact_validation.py
+@@ -19,7 +19,30 @@
+ from torch import Tensor
+ 
+ from aimnet.config import ImportRole
+-
++from aimnet.models.utils import has_d3ts_in_config
++
++# Admission criteria for `_DEFAULT_CLASS_IMPORT_PATHS` (the registry/default
++# trust boundary for model-artifact `class:` entries). A path may be added
++# only when ALL of the following hold:
++#
++#   (i)   It names a first-party class (defined inside this package).
++#   (ii)  Its constructor is free of side effects: no file I/O, no network
++#         access, no environment reads. Anything else must be closed off with
++#         a forbidden-key check instead (see `_FORBIDDEN_CONSTRUCTOR_KEYS`
++#         below, added for `DispParam`'s `ptfile` kwarg) rather than kept out
++#         of the allowlist entirely, since the class itself is still needed.
++#   (iii) It is referenced by a released first-party artifact's `model_yaml`,
++#         or is required to satisfy an artifact-schema capability flag (e.g.
++#         `has_embedded_d3ts`).
++#   (iv)  It is simultaneously pinned in `_FROZEN_CLASS_PATHS`
++#         (tests/test_serialization_abi.py), enforced by
++#         `test_default_class_import_paths_are_frozen`: trusted implies
++#         frozen, so a name cannot be silently added to the trust boundary
++#         without also being pinned as a serialization ABI commitment.
++#
++# External-artifact-only needs (a custom class used by one third-party
++# checkpoint) do not qualify for the default set; use the per-load
++# `--model-import-path` / `model_import_paths` extension instead.
+ _DEFAULT_CLASS_IMPORT_PATHS = frozenset({
+     "aimnet.models.AIMNet2",
+     "aimnet.models.aimnet2.AIMNet2",
+@@ -33,6 +56,17 @@
+     # aimnet/modules/lr.py and both are referenced by the shipped CPCM(water)
+     # solvation artifact, which could not load without them.
+     "aimnet.modules.D3TS",
++    # The submodule spelling of the same class. The barrel re-export
++    # (aimnet.modules.D3TS, above) and this fully qualified path both resolve
++    # to the identical object and are both valid imports, but this allowlist
++    # matches paths exactly while the loader machinery that detects D3TS by
++    # class name (aimnet/models/utils.py) matches on the "D3TS" substring.
++    # Without this entry an artifact whose model_yaml happened to spell the
++    # class this way would be recognized as D3TS by the export layer yet
++    # rejected here. DispParam is intentionally NOT given a second spelling:
++    # "aimnet.modules.lr.DispParam" is its only resolvable path (there is no
++    # barrel re-export of DispParam in aimnet/modules/__init__.py).
++    "aimnet.modules.lr.D3TS",
+     "aimnet.modules.lr.DispParam",
+ })
+ _DEFAULT_ACTIVATION_IMPORT_PATHS = frozenset({"torch.nn.GELU"})
+@@ -51,6 +85,45 @@
+ _ALWAYS_FORBIDDEN_IMPORT_KEYS = frozenset({"fn", "trainer", "evaluator"})
+ _RECOGNIZED_IMPORT_KEYS = frozenset(_MODEL_IMPORT_KEYS) | _ALWAYS_FORBIDDEN_IMPORT_KEYS
+ 
++# Constructor kwargs that are forbidden anywhere in artifact model_yaml,
++# independent of which class they are attached to. Unlike
++# `_ALWAYS_FORBIDDEN_IMPORT_KEYS`, these are not dotted import paths -- they
++# are plain values that grant a side-effecting primitive at construction
++# time. `DispParam.__init__` (aimnet/modules/lr.py) runs
++# `torch.load(ptfile, weights_only=True)` on whatever path its `ptfile` kwarg
++# names, and the YAML walker never inspects constructor kwargs, so a
++# default-trusted artifact could turn this into an arbitrary-path
++# read/probe/DoS primitive. The exporter always strips `ptfile` before an
++# artifact is produced (aimnet/models/utils.py), so no legitimate artifact
++# carries it. Training configs use `ptfile` legitimately and never route
++# through this walker (aimnet/config.py does not import this module).
++_FORBIDDEN_CONSTRUCTOR_KEYS = frozenset({"ptfile"})
++
++# Class paths recognized as the D3TS dispersion module for the purpose of
++# validating its damping-parameter kwargs (see `_validate_d3ts_damping_kwargs`
++# below). Both spellings that resolve to the same class must be matched here.
++_D3TS_CLASS_PATHS = frozenset({"aimnet.modules.D3TS", "aimnet.modules.lr.D3TS"})
++_D3TS_DAMPING_KWARGS = ("a1", "a2", "s8", "s6")
++
++
++def _validate_d3ts_damping_kwargs(kwargs: object) -> None:
++    """Reject non-finite or negative D3TS damping parameters from YAML.
++
++    ``D3TS.__init__`` (aimnet/modules/lr.py) takes ``a1``, ``a2``, ``s8``,
++    ``s6`` as plain floats straight from YAML kwargs. They are not part of the
++    state dict and nothing downstream validates them, so a malformed artifact
++    (NaN/Inf, or ``a1=a2=0`` collapsing the damping term to an undamped
++    ``1/d**6`` singularity) would load silently.
++    """
++    if not isinstance(kwargs, Mapping):
++        return
++    for name in _D3TS_DAMPING_KWARGS:
++        if name not in kwargs:
++            continue
++        value = kwargs[name]
++        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)) or value < 0:
++            raise ValueError(f"D3TS parameter {name!r} must be a finite, non-negative real number, got {value!r}.")
++
+ 
+ @dataclass(frozen=True)
+ class ModelImportPolicy:
+@@ -191,6 +264,8 @@ def walk(value: object) -> None:
+         visited.add(value_id)
+         if isinstance(value, dict):
+             for key, child in value.items():
++                if key in _FORBIDDEN_CONSTRUCTOR_KEYS:
++                    raise ValueError(f"Key {key!r} is forbidden in model artifacts.")
+                 if key in _RECOGNIZED_IMPORT_KEYS:
+                     if key in _ALWAYS_FORBIDDEN_IMPORT_KEYS:
+                         raise ValueError(f"Import key {key!r} is forbidden in model artifacts.")
+@@ -198,6 +273,9 @@ def walk(value: object) -> None:
+                         raise ValueError(f"Import key {key!r} must contain a string path.")
+                     policy.require_allowed(child, _MODEL_IMPORT_KEYS[key])
+                 walk(child)
++            class_path = value.get("class")
++            if isinstance(class_path, str) and class_path in _D3TS_CLASS_PATHS:
++                _validate_d3ts_damping_kwargs(value.get("kwargs"))
+         else:
+             for child in value:
+                 walk(child)
+@@ -230,6 +308,25 @@ def _validate_registry_model_yaml(model_yaml: str) -> dict[str, Any]:
+     return _walk_model_yaml(model_yaml, REGISTRY_IMPORT_POLICY)
+ 
+ 
++def _validate_d3ts_metadata_consistency(model_config: Mapping[str, Any], metadata: Mapping[str, Any]) -> None:
++    """Cross-check D3TS presence in the parsed YAML against declared metadata.
++
++    The metadata validators (``validate_model_metadata``) only compare
++    declared flags against each other. A mislabeled artifact that embeds D3TS
++    in ``model_yaml`` but declares ``has_embedded_d3ts: false`` (with
++    ``needs_dispersion: true``) would pass and silently double-count
++    dispersion; the converse mislabeling silently loses dispersion entirely.
++    This compares the YAML-derived truth directly against the declared flag.
++    """
++    yaml_has_d3ts = has_d3ts_in_config(model_config)
++    declared_has_d3ts = bool(metadata.get("has_embedded_d3ts", False))
++    if yaml_has_d3ts != declared_has_d3ts:
++        raise ValueError(
++            f"model metadata field 'has_embedded_d3ts' ({declared_has_d3ts}) disagrees with "
++            f"D3TS presence in model_yaml ({yaml_has_d3ts})."
++        )
++
++
+ def validate_v2_artifact_with_policy(
+     data: object,
+     policy: ModelImportPolicy,
+@@ -254,6 +351,7 @@ def validate_v2_artifact_with_policy(
+         require_structural_consistency=True,
+         require_cross_field_consistency=validation == "canonical",
+     )
++    _validate_d3ts_metadata_consistency(model_config, data)
+ 
+     state_dict = data.get("state_dict")
+     if not isinstance(state_dict, Mapping):
+diff --git a/tests/test_model_artifact_security.py b/tests/test_model_artifact_security.py
+index 4dcefb7..c24290e 100644
+--- a/tests/test_model_artifact_security.py
++++ b/tests/test_model_artifact_security.py
+@@ -1372,18 +1372,23 @@ def test_hf_registry_fallback_fails_on_unexpected_key_without_extra(
+     "path",
+     [
+         "aimnet.modules.D3TS",
++        "aimnet.modules.lr.D3TS",
+         "aimnet.modules.lr.DispParam",
+     ],
+ )
+ def test_embedded_dispersion_modules_are_trusted(path: str) -> None:
+     """The shipped CPCM(water) artifact references these and cannot load without them.
+ 
+-    Both are first-party ``nn.Module`` subclasses in ``aimnet/modules/lr.py``.
+-    When the artifact trust boundary was introduced they were absent from the
+-    default allowlist, so the solvation model failed to load with
+-    ``Untrusted import path for 'class'``. Downstream that surfaced only as a
+-    run aborting hours in, since nothing loads the solvation model until it is
+-    needed.
++    All are first-party ``nn.Module`` subclasses (or spellings of one) in
++    ``aimnet/modules/lr.py``. When the artifact trust boundary was introduced
++    they were absent from the default allowlist, so the solvation model
++    failed to load with ``Untrusted import path for 'class'``. Downstream that
++    surfaced only as a run aborting hours in, since nothing loads the
++    solvation model until it is needed. ``aimnet.modules.lr.D3TS`` is the
++    fully qualified spelling of the same class as ``aimnet.modules.D3TS``
++    (the barrel re-export); the loader machinery that detects D3TS matches
++    the "D3TS" substring regardless of spelling, so the exact-match allowlist
++    must trust both.
+     """
+     assert path in ALLOWED_MODEL_IMPORT_PATHS
+ 
+@@ -1395,7 +1400,176 @@ def test_trusted_dispersion_paths_resolve_to_real_modules() -> None:
+ 
+     from torch import nn
+ 
+-    for path in ("aimnet.modules.D3TS", "aimnet.modules.lr.DispParam"):
++    for path in ("aimnet.modules.D3TS", "aimnet.modules.lr.D3TS", "aimnet.modules.lr.DispParam"):
+         module_name, class_name = path.rsplit(".", 1)
+         obj = getattr(importlib.import_module(module_name), class_name)
+         assert isinstance(obj, type) and issubclass(obj, nn.Module)
++
++
++def test_d3ts_barrel_and_submodule_spellings_are_the_same_class() -> None:
++    """Both allowlisted D3TS spellings must resolve to the identical object,
++    not merely to two classes that happen to share a name."""
++    from aimnet.modules import D3TS as barrel_d3ts
++    from aimnet.modules.lr import D3TS as submodule_d3ts
++
++    assert barrel_d3ts is submodule_d3ts
++
++
++# --- Finding 1: ptfile forbidden in artifact model_yaml ---------------------
++
++
++def test_ptfile_kwarg_is_forbidden_in_artifact_yaml() -> None:
++    """DispParam.__init__ runs torch.load(ptfile, weights_only=True) on a
++    YAML-supplied path; the walker must reject it wherever it appears."""
++    with pytest.raises(ValueError, match="ptfile"):
++        validate_model_yaml(
++            "class: aimnet.modules.lr.DispParam\nkwargs:\n  ptfile: /etc/passwd\n",
++        )
++
++
++def test_ptfile_kwarg_is_forbidden_anywhere_in_the_tree() -> None:
++    """The forbidden key is rejected regardless of which class it is nested under."""
++    with pytest.raises(ValueError, match="ptfile"):
++        validate_model_yaml(
++            """
++class: aimnet.models.AIMNet2
++kwargs:
++  nested:
++    - ptfile: /etc/passwd
++"""
++        )
++
++
++def test_dispparam_without_ptfile_passes_import_policy() -> None:
++    validate_model_yaml(
++        "class: aimnet.modules.lr.DispParam\nkwargs:\n  key_in: disp_param\n  key_out: disp_param\n",
++    )
++
++
++def test_ptfile_remains_forbidden_under_unsafe_import_mode() -> None:
++    """Unsafe mode only skips path matching; forbidden-key checks stay active."""
++    with pytest.raises(ValueError, match="ptfile"):
++        validate_model_yaml(
++            "class: aimnet.modules.lr.DispParam\nkwargs:\n  ptfile: /etc/passwd\n",
++            model_import_mode="unsafe",
++        )
++
++
++# --- Finding 2: YAML<->metadata D3TS consistency -----------------------------
++
++_D3TS_MODEL_YAML = """
++class: aimnet.models.AIMNet2
++kwargs:
++  outputs:
++    disp_param:
++      class: aimnet.modules.lr.DispParam
++      kwargs:
++        key_in: disp_param
++        key_out: disp_param
++    d3ts:
++      class: aimnet.modules.D3TS
++      kwargs:
++        a1: 0.55
++        a2: 3.1
++        s8: 1.5
++        s6: 1.0
++"""
++
++
++def test_rejects_d3ts_in_yaml_not_declared_in_metadata() -> None:
++    """D3TS embedded in model_yaml but has_embedded_d3ts=False must be rejected.
++
++    Left unchecked, needs_dispersion could be set True alongside this and the
++    calculator would silently double-count dispersion (embedded D3TS plus an
++    external correction)."""
++    with pytest.raises(ValueError, match="has_embedded_d3ts"):
++        validate_v2_artifact(
++            _v2_data(
++                _D3TS_MODEL_YAML,
++                has_embedded_lr=True,
++                has_embedded_d3ts=False,
++            )
++        )
++
++
++def test_rejects_declared_d3ts_absent_from_yaml() -> None:
++    """has_embedded_d3ts=True with no D3TS in model_yaml must be rejected.
++
++    Left unchecked, the calculator would trust an embedded-dispersion flag
++    that no module actually backs, silently losing dispersion entirely."""
++    with pytest.raises(ValueError, match="has_embedded_d3ts"):
++        validate_v2_artifact(
++            _v2_data(
++                "class: aimnet.models.AIMNet2",
++                has_embedded_lr=True,
++                has_embedded_d3ts=True,
++            )
++        )
++
++
++def test_truthful_embedded_d3ts_config_passes() -> None:
++    model_config, _ = validate_v2_artifact(
++        _v2_data(
++            _D3TS_MODEL_YAML,
++            needs_coulomb=False,
++            needs_dispersion=False,
++            coulomb_mode="none",
++            has_embedded_lr=True,
++            has_embedded_d3ts=True,
++        )
++    )
++    assert model_config["kwargs"]["outputs"]["d3ts"]["class"] == "aimnet.modules.D3TS"
++
++
++def test_registry_policy_admits_embedded_d3ts_and_disp_param_artifact_shape() -> None:
++    """Finding 4 completeness fixture: the allowlist must admit the artifact
++    shape this whole change exists for -- a DispParam module feeding a D3TS
++    module -- validated end-to-end under REGISTRY_IMPORT_POLICY, the fixed
++    default policy the registry loader uses."""
++    model_config, state_dict = validate_registry_v2_artifact(
++        _v2_data(
++            _D3TS_MODEL_YAML,
++            needs_coulomb=False,
++            needs_dispersion=False,
++            coulomb_mode="none",
++            has_embedded_lr=True,
++            has_embedded_d3ts=True,
++        )
++    )
++    assert state_dict == {}
++    outputs = model_config["kwargs"]["outputs"]
++    assert outputs["disp_param"]["class"] == "aimnet.modules.lr.DispParam"
++    assert outputs["d3ts"]["class"] == "aimnet.modules.D3TS"
++
++
++# --- Finding 3: D3TS damping numerics ----------------------------------------
++
++
++@pytest.mark.parametrize("d3ts_class", ["aimnet.modules.D3TS", "aimnet.modules.lr.D3TS"])
++def test_d3ts_rejects_non_finite_damping_kwarg(d3ts_class: str) -> None:
++    with pytest.raises(ValueError, match="s8"):
++        validate_model_yaml(f"class: {d3ts_class}\nkwargs:\n  a1: 0.5\n  a2: 3.0\n  s8: .nan\n")
++
++
++def test_d3ts_rejects_infinite_damping_kwarg() -> None:
++    with pytest.raises(ValueError, match="a2"):
++        validate_model_yaml("class: aimnet.modules.D3TS\nkwargs:\n  a1: 0.5\n  a2: .inf\n  s8: 1.0\n")
++
++
++def test_d3ts_rejects_negative_damping_kwarg() -> None:
++    with pytest.raises(ValueError, match="a1"):
++        validate_model_yaml("class: aimnet.modules.D3TS\nkwargs:\n  a1: -1.0\n  a2: 3.0\n  s8: 1.0\n")
++
++
++def test_d3ts_accepts_normal_damping_kwargs() -> None:
++    validate_model_yaml("class: aimnet.modules.D3TS\nkwargs:\n  a1: 0.55\n  a2: 3.1\n  s8: 1.5\n  s6: 1.0\n")
++
++
++def test_d3ts_accepts_absent_damping_kwargs() -> None:
++    """Absent kwargs fall back to the class's own defaults and are not our concern."""
++    validate_model_yaml("class: aimnet.modules.D3TS\nkwargs:\n  key_in: disp_param\n  key_out: energy\n")
++
++
++def test_d3ts_damping_validation_applies_to_the_submodule_spelling_too() -> None:
++    with pytest.raises(ValueError, match="s6"):
++        validate_model_yaml("class: aimnet.modules.lr.D3TS\nkwargs:\n  s6: -1.0\n")
+diff --git a/tests/test_serialization_abi.py b/tests/test_serialization_abi.py
+index cf18c0e..80ea8fc 100644
+--- a/tests/test_serialization_abi.py
++++ b/tests/test_serialization_abi.py
+@@ -80,6 +80,11 @@
+     "aimnet.modules.LRCoulomb",
+     "aimnet.modules.DFTD3",
+     "aimnet.modules.D3TS",
++    # Submodule spelling of the same D3TS class (barrel re-export above and
++    # this fully qualified path resolve to the identical object). The loader
++    # machinery that detects D3TS by class name matches the "D3TS" substring
++    # regardless of spelling, so both spellings must be pinned here too.
++    "aimnet.modules.lr.D3TS",
+     # Dispersion-parameter module carried by the shipped CPCM(water) artifact
+     # alongside D3TS; released artifacts reference it, so it is ABI.
+     "aimnet.modules.lr.DispParam",
+@@ -187,6 +192,26 @@ def test_frozen_list_covers_shipped_model_yamls(self):
+             "Add them to _FROZEN_CLASS_PATHS (they become part of the serialization ABI)."
+         )
+ 
++    def test_default_class_import_paths_are_frozen(self):
++        """Trusted-by-default class imports must be pinned as serialization ABI.
++
++        `_DEFAULT_CLASS_IMPORT_PATHS` (aimnet/models/artifact_validation.py) is
++        the registry trust boundary; its own admission rule (iv) requires every
++        entry to be simultaneously pinned in `_FROZEN_CLASS_PATHS`. Checking it
++        here closes the drift class where the allowlist and the ABI pin list
++        could gain or lose entries independently without either test noticing.
++        Class role only: `_DEFAULT_CLASS_IMPORT_PATHS` never contains
++        activation or initializer paths, so no exclusion is needed for those.
++        """
++        from aimnet.models.artifact_validation import _DEFAULT_CLASS_IMPORT_PATHS
++
++        frozen = set(_FROZEN_CLASS_PATHS) | set(_FROZEN_FACTORY_PATHS)
++        missing = _DEFAULT_CLASS_IMPORT_PATHS - frozen
++        assert not missing, (
++            f"Default class import paths are trusted but not pinned as ABI: {sorted(missing)}. "
++            "Add them to _FROZEN_CLASS_PATHS (trusted implies frozen)."
++        )
++
+ 
+ _ASSET_FILES = sorted(_ASSETS_DIR.glob("*.pt")) if _ASSETS_DIR.is_dir() else []
+ 
+@@ -208,6 +233,12 @@ def test_allowed_model_import_paths_are_shared_and_immutable():
+         # the runtime allowlist did not, and that inconsistency is what stopped
+         # the model loading.
+         "aimnet.modules.D3TS",
++        # Submodule spelling of the same D3TS class: the loader machinery
++        # matches "D3TS" by substring regardless of which spelling an artifact
++        # uses, so the exact-match allowlist must trust both. DispParam has no
++        # second spelling -- "aimnet.modules.lr.DispParam" is its only
++        # resolvable path (no barrel re-export).
++        "aimnet.modules.lr.D3TS",
+         "aimnet.modules.lr.DispParam",
+         "torch.nn.GELU",
+         "torch.nn.init.xavier_normal_",
+diff --git a/tests/test_train_utils.py b/tests/test_train_utils.py
+index b75da27..c7ead5b 100644
+--- a/tests/test_train_utils.py
++++ b/tests/test_train_utils.py
+@@ -329,9 +329,26 @@ def test_export_model_includes_embedded_d3ts_flag(monkeypatch, tmp_path):
+     d3ts:
+       class: custom.D3TS
+ """
++    # The mocked core_config below stands in for what strip_lr_modules_from_yaml
++    # actually returns: a "d3ts"-keyed output entry passes through unchanged
++    # (aimnet/models/utils.py's rebuild-outputs loop only special-cases
++    # "lrcoulomb"/"dftd3"/"d3bj"). It must keep a D3TS entry -- using the
++    # allowlisted class spelling, since the real exported model_yaml goes
++    # through the artifact-validation import policy -- so this stays
++    # consistent with the has_embedded_d3ts flag the export computes from the
++    # original (unmocked) model_config above.
+     core_config = {
+         "class": "aimnet.modules.AtomicSum",
+-        "kwargs": {"key_in": "energy", "key_out": "energy"},
++        "kwargs": {
++            "key_in": "energy",
++            "key_out": "energy",
++            "outputs": {
++                "d3ts": {
++                    "class": "aimnet.modules.D3TS",
++                    "kwargs": {"a1": 0.5, "a2": 3.0, "s8": 1.0},
++                },
++            },
++        },
+     }
+     weights, model_config, sae = _write_export_inputs(tmp_path, config)
+     output = tmp_path / "export.pt"
+@@ -340,6 +357,7 @@ def test_export_model_includes_embedded_d3ts_flag(monkeypatch, tmp_path):
+         "strip_lr_modules_from_yaml",
+         Mock(return_value=(core_config, "none", False, None, None, "exp", None)),
+     )
++    monkeypatch.setattr(export_module, "build_module", Mock(return_value=torch.nn.Identity()))
+     _patch_minimal_export_model(monkeypatch)
+ 
+     export_module.export_model.callback(

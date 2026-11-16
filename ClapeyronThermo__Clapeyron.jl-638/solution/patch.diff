@@ -1,0 +1,157 @@
+diff --git a/src/methods/pT.jl b/src/methods/pT.jl
+index 338a539b2..edabdb4ab 100755
+--- a/src/methods/pT.jl
++++ b/src/methods/pT.jl
+@@ -1122,37 +1122,31 @@ end
+ 
+ Returns the excess value of a bulk property relative to its ideal mixing value.
+ 
+-By default this delegates to [`mixing`](@ref). For some properties (e.g.
+-`entropy` and `gibbs_energy`) specialized implementations are provided to
+-use residual contributions.
++By default this delegates to [`mixing`](@ref). For properties with a non-zero
++ideal mixing contribution (`gibbs_energy`, `helmholtz_energy` and `entropy`),
++that contribution is subtracted as well.
+ """
+ function excess(model::EoSModel, p, T, z, property; phase=:unknown, threaded=true, vol0=nothing, output=nothing)
+     mixing(model, p, T, z, property; phase, threaded, vol0, output)
+ end
+ 
+-function excess(model::EoSModel, p, T, z, ::typeof(entropy); phase=:unknown, threaded=true, vol0=nothing, output=nothing)
+-    TT = typeof(p+T+first(z))
+-    pure = split_pure_model(model)
+-    s_mix = entropy_res(model, p, T, z; phase, threaded, vol0)
+-    for i in 1:length(z)
+-        s_mix -= z[i]*entropy_res(pure[i], p, T; phase, threaded)
+-    end
+-    #s_pure = entropy_res.(pure,p,T)
+-    return s_mix::TT
+-end
++# excess = mixing - ideal mixing. the ideal mixing term is R̄*T*∑z*log(x) for g and a, -R̄*∑z*log(x) for s
++for (prop,fac) in ((:gibbs_energy,:T),(:helmholtz_energy,:T),(:entropy,:(-one(T))))
++    @eval begin
++        function excess(model::EoSModel, p, T, z, ::typeof($prop); phase=:unknown, threaded=true, vol0=nothing, output=nothing)
++            TT = typeof(p+T+first(z))
++            pure = split_pure_model(model)
++            y_mix = $prop(model, p, T, z; phase, threaded, vol0)
++            log∑z = log(sum(z))
++            R̄ = Rgas(model)
++            for i in 1:length(z)
++                lnxi = R̄*$fac*(log(z[i]) - log∑z)
++                y_mix -= z[i]*($prop(pure[i], p, T; phase, threaded) + lnxi)
++            end
+ 
+-function excess(model::EoSModel, p, T, z, ::typeof(gibbs_energy); phase=:unknown, threaded=true, vol0=nothing, output=nothing)
+-    TT = typeof(p+T+first(z))
+-    pure = split_pure_model(model)
+-    g_mix = gibbs_energy(model, p, T, z; phase, threaded, vol0)
+-    log∑z = log(sum(z))
+-    R̄ = Rgas(model)
+-    for i in 1:length(z)
+-        lnxi = R̄*T*(log(z[i]) - log∑z)
+-        g_mix -= z[i]*(gibbs_energy(pure[i], p, T; phase, threaded) + lnxi)
++            return y_mix::TT
++        end
+     end
+-
+-    return g_mix::TT
+ end
+ 
+ 
+diff --git a/src/models/Activity/equations.jl b/src/models/Activity/equations.jl
+index b1d1d47de..cfffe9056 100755
+--- a/src/models/Activity/equations.jl
++++ b/src/models/Activity/equations.jl
+@@ -167,6 +167,54 @@ function mixing(model::ActivityModel,p,T,z,::typeof(entropy))
+     return -dg*T-g
+ end
+ 
++# excess properties for activity models, obtained from derivatives of the excess gibbs energy
++function excess(model::ActivityModel, p, T, z, property::ℜ; phase=:unknown, threaded=true, vol0=nothing, output=nothing) where {ℜ}
++    return __excess_activity(model,p,T,z,property)
++end
++
++for f in (:entropy,:gibbs_energy,:helmholtz_energy)
++    @eval function excess(model::ActivityModel, p, T, z, property::typeof($f); phase=:unknown, threaded=true, vol0=nothing, output=nothing)
++        return __excess_activity(model,p,T,z,property)
++    end
++end
++
++__excess_activity(model,p,T,z,::typeof(gibbs_energy)) = excess_gibbs_free_energy(model,p,T,z)
++
++function __excess_activity(model,p,T,z,::typeof(entropy))
++    f(x) = excess_gibbs_free_energy(model,p,x,z)
++    return -Solvers.derivative(f,T)
++end
++
++function __excess_activity(model,p,T,z,::typeof(enthalpy))
++    f(x) = excess_gibbs_free_energy(model,p,x,z)/x
++    return -Solvers.derivative(f,T)*T*T
++end
++
++function __excess_activity(model,p,T,z,::typeof(volume))
++    f(x) = excess_gibbs_free_energy(model,x,T,z)
++    return Solvers.derivative(f,p)
++end
++
++function __excess_activity(model,p,T,z,::typeof(helmholtz_energy))
++    gE = excess_gibbs_free_energy(model,p,T,z)
++    return gE - p*__excess_activity(model,p,T,z,volume)
++end
++
++function __excess_activity(model,p,T,z,::typeof(internal_energy))
++    hE = __excess_activity(model,p,T,z,enthalpy)
++    return hE - p*__excess_activity(model,p,T,z,volume)
++end
++
++function __excess_activity(model,p,T,z,::typeof(isobaric_heat_capacity))
++    f(x) = excess_gibbs_free_energy(model,p,x,z)
++    _,_,d2f = Solvers.f∂f∂2f(f,T)
++    return -T*d2f
++end
++
++function __excess_activity(model,p,T,z,property)
++    throw(ArgumentError("excess $property is not available for activity models."))
++end
++
+ function gibbs_solvation(model::ActivityModel,T)
+     binary_component_check(gibbs_solvation,model)
+     return gibbs_solvation(__act_to_gammaphi(model,gibbs_solvation),T)
+diff --git a/src/models/CompositeModel/FluidCorrelation.jl b/src/models/CompositeModel/FluidCorrelation.jl
+index 7cda7673a..e5f0eaf3f 100644
+--- a/src/models/CompositeModel/FluidCorrelation.jl
++++ b/src/models/CompositeModel/FluidCorrelation.jl
+@@ -78,7 +78,7 @@ function PT_property(model::FluidCorrelation,p,T,z,phase,threaded,vol0,f::F,vol:
+         return PT_property(model.gas,p,T,z,phase,threaded,vol0,f,vol)
+     else #liquid or unknown
+         wrapper = PTFlashWrapper(model,p,T,z,:vle)
+-        return PT_property(wrapper,p,T,z,phase,threaded,vol0,vol)
++        return PT_property(wrapper,p,T,z,phase,threaded,vol0,f,vol)
+     end
+ end
+ 
+diff --git a/test/methods/eos_pcsaft.jl b/test/methods/eos_pcsaft.jl
+index 5a0daf78f..565076eac 100644
+--- a/test/methods/eos_pcsaft.jl
++++ b/test/methods/eos_pcsaft.jl
+@@ -94,7 +94,7 @@
+         @test Clapeyron.fugacity_coefficient(system, p, T, z)[1] ≈ 0.5582931304564298 rtol = 1E-6
+         @test Clapeyron.mixing(system, p, T, z, Clapeyron.gibbs_energy) ≈ -178.10797973342596 rtol = 1E-6
+         @test Clapeyron.excess(system, p, T, z, Clapeyron.volume) ≈ 1.004651584989827e-6 rtol = 1E-6
+-        @test Clapeyron.excess(system, p, T, z, Clapeyron.entropy) ≈ -2.832281578281112 rtol = 1E-6
++        @test Clapeyron.excess(system, p, T, z, Clapeyron.entropy) ≈ -1.720401840763504 rtol = 1E-6
+         @test Clapeyron.excess(system, p, T, z, Clapeyron.gibbs_energy) ≈ 1626.6212908893858 rtol = 1E-6
+     end
+     @printline
+diff --git a/test/models/others.jl b/test/models/others.jl
+index f2541b457..c1903104e 100644
+--- a/test/models/others.jl
++++ b/test/models/others.jl
+@@ -50,6 +50,7 @@
+     @testset "UNIFAC" begin
+         system = UNIFAC(["methanol","benzene"])
+         @test Clapeyron.activity_coefficient(system,p,T,z)[1] ≈ 1.5322232657797463 rtol = 1e-6
++        @test Clapeyron.excess(system,p,T,z,enthalpy) ≈ -T*T*Clapeyron.Solvers.derivative(_T -> Clapeyron.excess_gibbs_free_energy(system,p,_T,z)/_T, T) rtol = 1e-6
+         #when fast UNIFAC works, it should pass this test.
+         # system2 = UNIFAC(["methanol","benzene"])
+         # prop2 = ()

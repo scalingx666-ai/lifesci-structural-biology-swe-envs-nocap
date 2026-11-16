@@ -1,0 +1,273 @@
+diff --git a/.github/workflows/deploy.yaml b/.github/workflows/deploy.yaml
+index 47000ea3..004ff027 100644
+--- a/.github/workflows/deploy.yaml
++++ b/.github/workflows/deploy.yaml
+@@ -26,6 +26,8 @@ jobs:
+         uses: actions/setup-node@v4
+         with:
+           node-version: "20.x"
++      - name: Patch JupyterLite service worker (COOP/COEP for the Notebook iframe)
++        run: node scripts/patch-jupyterlite-sw.mjs
+       - name: Install Packages
+         run: npm install
+       - name: Run Typecheck
+diff --git a/.gitignore b/.gitignore
+index d242e5c4..6084dc11 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,9 @@ node_modules
+ cpp/lammps
+ cpp/obj
+ /dist
++# JupyterLite build output (built in CI, or locally via `jupyter lite build`)
++/public/jupyter
++.jupyterlite.doit.db
+ .DS_Store
+ cpp/lammps.mjs
+ cpp/lammps.wasm
+diff --git a/README.md b/README.md
+index db60badb..f06b5d81 100644
+--- a/README.md
++++ b/README.md
+@@ -161,8 +161,16 @@ Build JupyterLite
+ 
+ ```
+ jupyter lite build --contents jupyterlite/content --output-dir public/jupyter
++node scripts/patch-jupyterlite-sw.mjs
+ ```
+ 
++The second command patches the JupyterLite service worker to inject the
++COOP/COEP headers the cross-origin-isolated app requires (the deploy
++workflow does the same). If a deployed service worker ever misbehaves,
++visiting https://andeplane.github.io/atomify/?sw-reset unregisters
++Atomify's service workers and deletes JupyterLite's response cache for a
++fresh start (notebook contents are stored in IndexedDB and are preserved).
++
+ ### Run locally
+ 
+ `npm run start`
+diff --git a/index.html b/index.html
+index f2a7762d..25733c7a 100644
+--- a/index.html
++++ b/index.html
+@@ -18,8 +18,67 @@
+     requiring CORP headers. In dev, vite sets the same headers directly.
+     Must load before the app module.
+   -->
++  <!--
++    Service worker lifecycle. Two workers serve /atomify/: the COOP/COEP
++    shim below and JupyterLite's (patched at build time to inject the same
++    COEP header — see scripts/patch-jupyterlite-sw.mjs). Both update with
++    skipWaiting + clients.claim.
++
++    Normal visits: explicitly check both registrations for updates so a
++    newly deployed fix takes over on the next load, instead of whenever
++    the browser's own update heuristics get around to it.
++
++    Escape hatch: /atomify/?sw-reset deterministically unregisters the
++    /atomify/ service workers and deletes JupyterLite's response cache,
++    then reloads without the flag — guaranteed recovery if a deployed
++    worker ever leaves clients stuck. GitHub Pages projects share the
++    andeplane.github.io origin, so both cleanups stay scoped to Atomify
++    (other projects' workers and caches are untouched), and notebook
++    contents live in IndexedDB, which is preserved. src/index.tsx skips
++    booting the app while the reset is in flight.
++  -->
+   <script>
+-    window.coi = { coepCredentialless: () => true };
++    (() => {
++      const resetting = new URLSearchParams(window.location.search).has(
++        "sw-reset",
++      );
++      window.coi = {
++        coepCredentialless: () => true,
++        shouldRegister: () => !resetting,
++      };
++      if (resetting) {
++        const done = () => {
++          const url = new URL(window.location.href);
++          url.searchParams.delete("sw-reset");
++          window.location.replace(url);
++        };
++        if (!("serviceWorker" in navigator)) {
++          done();
++          return;
++        }
++        Promise.all([
++          navigator.serviceWorker.getRegistrations().then((regs) =>
++            Promise.all(
++              regs
++                .filter((reg) =>
++                  new URL(reg.scope).pathname.startsWith("/atomify/"),
++                )
++                .map((reg) => reg.unregister()),
++            ),
++          ),
++          "caches" in window ? caches.delete("precache") : null,
++        ]).then(done, done);
++        return;
++      }
++      if ("serviceWorker" in navigator) {
++        navigator.serviceWorker
++          .getRegistrations()
++          .then((regs) =>
++            regs.forEach((reg) => reg.update().catch(() => {})),
++          )
++          .catch(() => {});
++      }
++    })();
+   </script>
+   <script src="coi-serviceworker.min.js"></script>
+ </head>
+diff --git a/scripts/patch-jupyterlite-sw.mjs b/scripts/patch-jupyterlite-sw.mjs
+new file mode 100644
+index 00000000..2a0e26aa
+--- /dev/null
++++ b/scripts/patch-jupyterlite-sw.mjs
+@@ -0,0 +1,99 @@
++/**
++ * Patch the built JupyterLite service worker to inject COOP/COEP headers.
++ *
++ * The Atomify page is cross-origin isolated (COOP/COEP, required for
++ * SharedArrayBuffer in the KOKKOS wasm build). A cross-origin-isolated
++ * document may only embed iframes whose responses also carry a COEP
++ * header. GitHub Pages cannot set response headers, and the Notebook
++ * iframe (/jupyter/lab/) is controlled by JupyterLite's own service
++ * worker — its scope is more specific than the coi-serviceworker shim's,
++ * so the shim never sees those requests. Without this patch the browser
++ * blocks the iframe with ERR_BLOCKED_BY_RESPONSE (blocked:COEP).
++ *
++ * The patch wraps FetchEvent.prototype.respondWith so every response the
++ * service worker serves gets the headers, regardless of which internal
++ * code path produced it. Re-running after editing the template below
++ * replaces a previously applied patch.
++ *
++ * Run after `jupyter lite build` (see .github/workflows/deploy.yaml):
++ *   node scripts/patch-jupyterlite-sw.mjs [path/to/jupyter/output]
++ */
++import { readFileSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++
++const outputDir = process.argv[2] ?? "public/jupyter";
++const swPath = join(outputDir, "service-worker.js");
++
++const MARKER = "/* atomify-coi-patch */";
++
++const PATCH = `
++${MARKER}
++const atomifyWithCoiHeaders = (response) => {
++  if (
++    !(response instanceof Response) ||
++    response.status === 0 ||
++    response.type === "opaque" ||
++    response.type === "opaqueredirect"
++  ) {
++    return response;
++  }
++  try {
++    const headers = new Headers(response.headers);
++    headers.set("Cross-Origin-Embedder-Policy", "credentialless");
++    headers.set("Cross-Origin-Opener-Policy", "same-origin");
++    // Null-body statuses reject a body stream in the Response constructor.
++    const body = [204, 205, 304].includes(response.status)
++      ? null
++      : response.body;
++    const patched = new Response(body, {
++      status: response.status,
++      statusText: response.statusText,
++      headers,
++    });
++    // The Response constructor resets url/redirected; restore them for
++    // consumers that read them.
++    if (response.url) {
++      Object.defineProperty(patched, "url", { value: response.url });
++    }
++    if (response.redirected) {
++      Object.defineProperty(patched, "redirected", { value: true });
++    }
++    return patched;
++  } catch (error) {
++    // Never wedge the service worker on an unexpected response shape;
++    // worst case the un-patched response re-blocks the notebook iframe.
++    console.warn(
++      "atomify-coi-patch: could not inject COOP/COEP headers",
++      error,
++    );
++    return response;
++  }
++};
++const atomifyOriginalRespondWith = FetchEvent.prototype.respondWith;
++FetchEvent.prototype.respondWith = function (response) {
++  return atomifyOriginalRespondWith.call(
++    this,
++    Promise.resolve(response).then(atomifyWithCoiHeaders),
++  );
++};
++`;
++
++let source = readFileSync(swPath, "utf8");
++
++if (!source.includes('addEventListener("fetch"')) {
++  throw new Error(
++    `${swPath} does not register a fetch handler — the JupyterLite ` +
++      "service worker changed upstream; update scripts/patch-jupyterlite-sw.mjs",
++  );
++}
++
++const markerIndex = source.indexOf(MARKER);
++if (markerIndex !== -1) {
++  // Already patched (possibly by an older version of this script):
++  // strip the previous patch so the current template always applies.
++  source = source.slice(0, markerIndex).trimEnd() + "\n";
++  console.log(`${swPath} was already patched, replacing the patch`);
++}
++
++writeFileSync(swPath, source + PATCH);
++console.log(`Patched ${swPath} with COOP/COEP header injection`);
+diff --git a/src/index.tsx b/src/index.tsx
+index 4bdf7ef6..7185659c 100644
+--- a/src/index.tsx
++++ b/src/index.tsx
+@@ -8,20 +8,29 @@ import store from "./store";
+ import mixpanel from "mixpanel-browser";
+ import { track, getEmbeddingParams } from "./utils/metrics";
+ 
+-mixpanel.init("b5022dd7fe5b3cd0396d84284ae647e6", { debug: false });
++// index.html's ?sw-reset escape hatch is unregistering the service workers
++// and reloads without the flag when done; don't boot the app (and kick off
++// wasm downloads) in the meantime.
++const swResetting = new URLSearchParams(window.location.search).has(
++  "sw-reset",
++);
++
++if (!swResetting) {
++  mixpanel.init("b5022dd7fe5b3cd0396d84284ae647e6", { debug: false });
++
++  track("Page.Load", getEmbeddingParams());
+ 
+-track("Page.Load", getEmbeddingParams());
++  const container = document.getElementById("root");
++  if (!container) {
++    throw new Error(
++      "Failed to find the root element. Please ensure an element with id 'root' exists in your index.html.",
++    );
++  }
+ 
+-const container = document.getElementById("root");
+-if (!container) {
+-  throw new Error(
+-    "Failed to find the root element. Please ensure an element with id 'root' exists in your index.html.",
++  const root = createRoot(container);
++  root.render(
++    <StoreProvider store={store}>
++      <App />
++    </StoreProvider>,
+   );
+ }
+-
+-const root = createRoot(container);
+-root.render(
+-  <StoreProvider store={store}>
+-    <App />
+-  </StoreProvider>,
+-);

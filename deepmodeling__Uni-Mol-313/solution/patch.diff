@@ -1,0 +1,354 @@
+diff --git a/unimol_tools/unimol_tools/config/default.yaml b/unimol_tools/unimol_tools/config/default.yaml
+index 7ea854e..f490e31 100644
+--- a/unimol_tools/unimol_tools/config/default.yaml
++++ b/unimol_tools/unimol_tools/config/default.yaml
+@@ -2,7 +2,7 @@
+ smiles_col: "SMILES"
+ target_col_prefix: "TARGET"
+ target_normalize: "auto"
+-anomaly_clean: True
++anomaly_clean: False
+ smi_strict: False
+ ### model
+ model_name: "unimolv1"
+diff --git a/unimol_tools/unimol_tools/models/nnmodel.py b/unimol_tools/unimol_tools/models/nnmodel.py
+index 11aa80b..10eb2af 100644
+--- a/unimol_tools/unimol_tools/models/nnmodel.py
++++ b/unimol_tools/unimol_tools/models/nnmodel.py
+@@ -103,6 +103,11 @@ def _init_model(self, model_name, **params):
+         :return: An instance of the specified neural network model.
+         :raises ValueError: If the model name is not recognized.
+         """
++        if self.task in ['regression', 'multilabel_regression']:
++            params['pooler_dropout'] = 0
++            logger.debug("set pooler_dropout to 0 for regression task")
++        else:
++            pass
+         freeze_layers = params.get('freeze_layers', None)
+         freeze_layers_reversed = params.get('freeze_layers_reversed', False)
+         if model_name in NNMODEL_REGISTER:
+@@ -158,6 +163,8 @@ def run(self):
+             if fold > 0:
+                 # need to initalize model for next fold training
+                 self.model = self._init_model(**self.model_params)
++
++            # TODO: move the following code to model.load_pretrained_weights
+             if self.model_params.get('load_model_dir', None) is not None:
+                 load_model_path = os.path.join(self.model_params['load_model_dir'], f'model_{fold}.pth')
+                 model_dict = torch.load(load_model_path, map_location=self.model_params['device'])["model_state_dict"]
+@@ -222,8 +229,7 @@ def evaluate(self, trainer=None,  checkpoints_path=None):
+         testdataset = NNDataset(self.features, np.asarray(self.data['target']))
+         for fold in range(self.data['kfold']):
+             model_path = os.path.join(checkpoints_path, f'model_{fold}.pth')
+-            self.model.load_state_dict(torch.load(
+-                model_path, map_location=self.trainer.device)['model_state_dict'])
++            self.model.load_pretrained_weights(model_path, strict=True)
+             _y_pred, _, __ = trainer.predict(self.model, testdataset, self.loss_func, self.activation_fn,
+                                              self.save_path, fold, self.target_scaler, epoch=1, load_model=True)
+             if fold == 0:
+diff --git a/unimol_tools/unimol_tools/models/unimol.py b/unimol_tools/unimol_tools/models/unimol.py
+index e1dd8b0..9f65c57 100644
+--- a/unimol_tools/unimol_tools/models/unimol.py
++++ b/unimol_tools/unimol_tools/models/unimol.py
+@@ -101,6 +101,8 @@ def __init__(self, output_dim=2, data_type='molecule', **params):
+             self.gbf = GaussianLayer(K, n_edge_type)
+         else:
+             self.gbf = NumericalEmbed(K, n_edge_type)
++        """
++        # To be deprecated in the future.
+         self.classification_head = ClassificationHead(
+             input_dim=self.args.encoder_embed_dim,
+             inner_dim=self.args.encoder_embed_dim,
+@@ -108,9 +110,17 @@ def __init__(self, output_dim=2, data_type='molecule', **params):
+             activation_fn=self.args.pooler_activation_fn,
+             pooler_dropout=self.args.pooler_dropout,
+         )
++        """
++        if 'pooler_dropout' in params:
++            self.args.pooler_dropout = params['pooler_dropout']
++        self.classification_head = LinearHead(
++            input_dim=self.args.encoder_embed_dim,
++            num_classes=self.output_dim,
++            pooler_dropout=self.args.pooler_dropout,
++        )
+         self.load_pretrained_weights(path=self.pretrain_path)
+ 
+-    def load_pretrained_weights(self, path):
++    def load_pretrained_weights(self, path, strict=False):
+         """
+         Loads pretrained weights into the model.
+ 
+@@ -119,7 +129,25 @@ def load_pretrained_weights(self, path):
+         if path is not None:
+             logger.info("Loading pretrained weights from {}".format(path))
+             state_dict = torch.load(path, map_location=lambda storage, loc: storage)
+-            self.load_state_dict(state_dict['model'], strict=False)
++            if 'model' in state_dict:
++                state_dict = state_dict['model']
++            elif 'model_state_dict' in state_dict:
++                state_dict = state_dict['model_state_dict']
++            try:
++                self.load_state_dict(state_dict, strict=strict)
++            except RuntimeError as e:
++                if 'classification_head.dense.weight' in state_dict:
++                    self.classification_head = ClassificationHead(
++                        input_dim=self.args.encoder_embed_dim,
++                        inner_dim=self.args.encoder_embed_dim,
++                        num_classes=self.output_dim,
++                        activation_fn=self.args.pooler_activation_fn,
++                        pooler_dropout=self.args.pooler_dropout,
++                    )
++                    self.load_state_dict(state_dict, strict=strict)
++                    logger.warning("This model is trained with the previous version. The classification_head is reset to previous version to load the model. This will be deprecated in the future. We recommend using the latest version of the model.")
++                else:
++                    raise e
+ 
+     @classmethod
+     def build_model(cls, args):
+@@ -237,6 +265,38 @@ def batch_collate_fn(self, samples):
+             label = None
+         return batch, label
+ 
++class LinearHead(nn.Module):
++    """Linear head."""
++
++    def __init__(
++        self,
++        input_dim,
++        num_classes,
++        pooler_dropout,
++    ):
++        """
++        Initialize the Linear head.
++
++        :param input_dim: Dimension of input features.
++        :param num_classes: Number of classes for output.
++        """
++        super().__init__()
++        self.out_proj = nn.Linear(input_dim, num_classes)
++        self.dropout = nn.Dropout(p=pooler_dropout)
++
++    def forward(self, features, **kwargs):
++        """
++        Forward pass for the Linear head.
++
++        :param features: Input features.
++
++        :return: Output from the Linear head.
++        """
++        x = features
++        x = self.dropout(x)
++        x = self.out_proj(x)
++        return x
++
+ class ClassificationHead(nn.Module):
+     """Head for sentence-level classification tasks."""
+ 
+diff --git a/unimol_tools/unimol_tools/models/unimolv2.py b/unimol_tools/unimol_tools/models/unimolv2.py
+index eda34cb..39874ff 100644
+--- a/unimol_tools/unimol_tools/models/unimolv2.py
++++ b/unimol_tools/unimol_tools/models/unimolv2.py
+@@ -16,7 +16,6 @@
+ from .transformersv2 import AtomFeature, EdgeFeature, SE3InvariantKernel, MovementPredictionHead
+ from ..utils import logger
+ from ..config import MODEL_CONFIG_V2
+-from ..data import Dictionary
+ from ..weights import weight_download_v2, WEIGHT_DIR
+ 
+ BACKBONE = {
+@@ -125,6 +124,8 @@ def __init__(self, output_dim=2, model_size='84m', **params):
+         self.classification_heads = nn.ModuleDict()
+         self.dtype = torch.float32
+ 
++        """
++        # To be deprecated in the future.
+         self.classification_head = ClassificationHead(
+             input_dim=self.args.encoder_embed_dim,
+             inner_dim=self.args.encoder_embed_dim,
+@@ -132,9 +133,17 @@ def __init__(self, output_dim=2, model_size='84m', **params):
+             activation_fn=self.args.pooler_activation_fn,
+             pooler_dropout=self.args.pooler_dropout,
+         )
++        """
++        if 'pooler_dropout' in params:
++            self.args.pooler_dropout = params['pooler_dropout']
++        self.classification_head = LinearHead(
++            input_dim=self.args.encoder_embed_dim,
++            num_classes=self.output_dim,
++            pooler_dropout=self.args.pooler_dropout,
++        )
+         self.load_pretrained_weights(path=self.pretrain_path)
+ 
+-    def load_pretrained_weights(self, path):
++    def load_pretrained_weights(self, path, strict=False):
+         """
+         Loads pretrained weights into the model.
+ 
+@@ -143,7 +152,25 @@ def load_pretrained_weights(self, path):
+         if path is not None:
+             logger.info("Loading pretrained weights from {}".format(path))
+             state_dict = torch.load(path, map_location=lambda storage, loc: storage)
+-            self.load_state_dict(state_dict['model'], strict=False)
++            if 'model' in state_dict:
++                state_dict = state_dict['model']
++            elif 'model_state_dict' in state_dict:
++                state_dict = state_dict['model_state_dict']
++            try:
++                self.load_state_dict(state_dict, strict=strict)
++            except RuntimeError as e:
++                if 'classification_head.dense.weight' in state_dict:
++                    self.classification_head = ClassificationHead(
++                        input_dim=self.args.encoder_embed_dim,
++                        inner_dim=self.args.encoder_embed_dim,
++                        num_classes=self.output_dim,
++                        activation_fn=self.args.pooler_activation_fn,
++                        pooler_dropout=self.args.pooler_dropout,
++                    )
++                    self.load_state_dict(state_dict, strict=strict)
++                    logger.warning("This model is trained with the previous version. The classification_head is reset to previous version to load the model. This will be deprecated in the future. We recommend using the latest version of the model.")
++                else:
++                    raise e
+ 
+     @classmethod
+     def build_model(cls, args):
+@@ -323,6 +350,38 @@ def batch_collate_fn(self, samples):
+         except:
+             label = None
+         return batch, label
++    
++class LinearHead(nn.Module):
++    """Linear head."""
++
++    def __init__(
++        self,
++        input_dim,
++        num_classes,
++        pooler_dropout,
++    ):
++        """
++        Initialize the Linear head.
++
++        :param input_dim: Dimension of input features.
++        :param num_classes: Number of classes for output.
++        """
++        super().__init__()
++        self.out_proj = nn.Linear(input_dim, num_classes)
++        self.dropout = nn.Dropout(p=pooler_dropout)
++
++    def forward(self, features, **kwargs):
++        """
++        Forward pass for the Linear head.
++
++        :param features: Input features.
++
++        :return: Output from the Linear head.
++        """
++        x = features
++        x = self.dropout(x)
++        x = self.out_proj(x)
++        return x
+ 
+ class ClassificationHead(nn.Module):
+     """Head for sentence-level classification tasks."""
+diff --git a/unimol_tools/unimol_tools/tasks/trainer.py b/unimol_tools/unimol_tools/tasks/trainer.py
+index 4a3e227..9aae5dc 100644
+--- a/unimol_tools/unimol_tools/tasks/trainer.py
++++ b/unimol_tools/unimol_tools/tasks/trainer.py
+@@ -292,9 +292,7 @@ def predict(self, model, dataset, loss_func, activation_fn, dump_dir, fold, targ
+         model = model.to(self.device)
+         if load_model == True:
+             load_model_path = os.path.join(dump_dir, f'model_{fold}.pth')
+-            model_dict = torch.load(load_model_path, map_location=self.device)[
+-                "model_state_dict"]
+-            model.load_state_dict(model_dict)
++            model.load_pretrained_weights(load_model_path, strict=True)
+             logger.info("load model success!")
+         dataloader = NNDataLoader(
+             feature_name=feature_name,
+diff --git a/unimol_tools/unimol_tools/train.py b/unimol_tools/unimol_tools/train.py
+index 8b5e850..2084f0b 100644
+--- a/unimol_tools/unimol_tools/train.py
++++ b/unimol_tools/unimol_tools/train.py
+@@ -36,7 +36,7 @@ def __init__(self,
+                 smiles_col='SMILES',
+                 target_cols=None,
+                 target_col_prefix='TARGET',
+-                target_anomaly_check="filter",
++                target_anomaly_check=False,
+                 smiles_check="filter",
+                 target_normalize="auto",
+                 max_norm=5.0,
+@@ -94,7 +94,7 @@ def __init__(self,
+         :param smiles_col: str, default='SMILES', column name of SMILES.
+         :param target_cols: list or str, default=None, column names of target values.
+         :param target_col_prefix: str, default='TARGET', prefix of target column name.
+-        :param target_anomaly_check: str, default='filter', how to deal with anomaly target values. currently support: filter, none.
++        :param target_anomaly_check: str, default=False, how to deal with anomaly target values. currently support: filter, none.
+         :param smiles_check: str, default='filter', how to deal with invalid SMILES. currently support: filter, none.
+         :param target_normalize: str, default='auto', how to normalize target values. 'auto' means we will choose the normalize strategy by automatic. \
+             currently support: auto, minmax, standard, robust, log1p, none.
+@@ -130,7 +130,7 @@ def __init__(self,
+         config.smiles_col = smiles_col
+         config.target_cols = target_cols
+         config.target_col_prefix = target_col_prefix
+-        config.anomaly_clean = target_anomaly_check in ['filter']
++        config.anomaly_clean = target_anomaly_check or target_anomaly_check in ['filter']
+         config.smi_strict = smiles_check in ['filter']
+         config.target_normalize = target_normalize
+         config.max_norm = max_norm
+diff --git a/unimol_tools/unimol_tools/utils/base_logger.py b/unimol_tools/unimol_tools/utils/base_logger.py
+index 5ba18e4..6d629cb 100644
+--- a/unimol_tools/unimol_tools/utils/base_logger.py
++++ b/unimol_tools/unimol_tools/utils/base_logger.py
+@@ -31,13 +31,15 @@ def filter(self, record):
+ 
+ class Logger(object):
+     """A custom logger class that provides logging functionality to console and file."""
++    DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
++    LOG_FORMAT = "%(asctime)s | %(relativepath)s | %(lineno)s | %(levelname)s | %(name)s | %(message)s"
+     def __init__(self, logger_name='None'):
+         """
+         :param logger_name: (str) The name of the logger (default: 'None')
+         """
+         self.logger = logging.getLogger(logger_name)
+         logging.root.setLevel(logging.NOTSET)
+-        self.log_file_name = 'uniqsar_{0}.log'.format(
++        self.log_file_name = 'unimol_tools_{0}.log'.format(
+             datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+         )
+ 
+@@ -50,9 +52,9 @@ def __init__(self, logger_name='None'):
+ 
+         self.console_output_level = 'INFO'
+         self.file_output_level = 'INFO'
+-        self.DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
++
+         self.formatter = logging.Formatter(
+-            "%(asctime)s | %(relativepath)s | %(lineno)s | %(levelname)s | %(name)s | %(message)s",
++            self.LOG_FORMAT,
+             self.DATE_FORMAT
+         )
+ 
+@@ -82,6 +84,18 @@ def get_logger(self):
+             file_handler.setLevel(self.file_output_level)
+             self.logger.addHandler(file_handler)
+         return self.logger
+-
++    
++# add highlight formatter to logger
++class HighlightFormatter(logging.Formatter):
++    def format(self, record):
++        if record.levelno == logging.WARNING:
++            record.msg = "\033[93m{}\033[0m".format(record.msg)  # 黄色高亮
++        return super().format(record)
++    
+ logger = Logger('Uni-Mol Tools').get_logger()
+-logger.setLevel(logging.INFO)
+\ No newline at end of file
++logger.setLevel(logging.INFO)
++
++# highlight warning messages in console
++for handler in logger.handlers:
++    if isinstance(handler, logging.StreamHandler):
++        handler.setFormatter(HighlightFormatter(Logger.LOG_FORMAT, Logger.DATE_FORMAT))
+\ No newline at end of file

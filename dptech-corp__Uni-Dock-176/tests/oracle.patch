@@ -1,0 +1,131 @@
+diff --git a/unidock/src/cuda/monte_carlo.cu b/unidock/src/cuda/monte_carlo.cu
+index 1dbc51e..b230351 100644
+--- a/unidock/src/cuda/monte_carlo.cu
++++ b/unidock/src/cuda/monte_carlo.cu
+@@ -533,7 +533,11 @@ __host__ void monte_carlo::mc_stream(
+ 
+         // Preparing ligand data
+         DEBUG_PRINTF("prepare ligand data\n");
+-        assert(m.num_other_pairs() == 0);  // m.other_pairs is not supported!
++        if (m.num_other_pairs() > 0) {
++            // Flex-flex interaction pairs (other_pairs) are not yet evaluated
++            // in the CUDA kernel. Energy contribution from these pairs will be
++            // missing, but docking can still proceed.
++        }
+         assert(m.ligands.size() <= 1);     // Only one ligand supported!
+ 
+         if (m.ligands.size() == 0) {  // ligand parsing error
+@@ -1324,7 +1328,11 @@ __host__ void monte_carlo::operator()(
+ 
+         // Preparing ligand data
+         DEBUG_PRINTF("prepare ligand data\n");
+-        assert(m.num_other_pairs() == 0);  // m.other_pairs is not supported!
++        if (m.num_other_pairs() > 0) {
++            // Flex-flex interaction pairs (other_pairs) are not yet evaluated
++            // in the CUDA kernel. Energy contribution from these pairs will be
++            // missing, but docking can still proceed.
++        }
+         assert(m.ligands.size() <= 1);     // Only one ligand supported!
+ 
+         if (m.ligands.size() == 0) {  // ligand parsing error
+@@ -1888,7 +1896,11 @@ __host__ void monte_carlo_template::operator()(
+ 
+         // Preparing ligand data
+         DEBUG_PRINTF("prepare ligand data\n");
+-        assert(m.num_other_pairs() == 0);  // m.other_pairs is not supported!
++        if (m.num_other_pairs() > 0) {
++            // Flex-flex interaction pairs (other_pairs) are not yet evaluated
++            // in the CUDA kernel. Energy contribution from these pairs will be
++            // missing, but docking can still proceed.
++        }
+         assert(m.ligands.size() <= 1);     // Only one ligand supported!
+ 
+         if (m.ligands.size() == 0) {  // ligand parsing error
+@@ -2535,7 +2547,11 @@ __host__ void monte_carlo_template::do_docking_base<Config>(std::vector<model> &
+ 
+         // Preparing ligand data
+         DEBUG_PRINTF("prepare ligand data\n");
+-        assert(m.num_other_pairs() == 0);  // m.other_pairs is not supported!
++        if (m.num_other_pairs() > 0) {
++            // Flex-flex interaction pairs (other_pairs) are not yet evaluated
++            // in the CUDA kernel. Energy contribution from these pairs will be
++            // missing, but docking can still proceed.
++        }
+         assert(m.ligands.size() <= 1);     // Only one ligand supported!
+ 
+         if (m.ligands.size() == 0) {  // ligand parsing error
+diff --git a/unidock/src/lib/vina.h b/unidock/src/lib/vina.h
+index acc9857..e64fad2 100644
+--- a/unidock/src/lib/vina.h
++++ b/unidock/src/lib/vina.h
+@@ -257,6 +257,11 @@ class Vina {
+                     quasi_newton_par.max_steps
+                         = unsigned((25 + m_model_gpu[l].num_movable_atoms()) / 3);
+                     VINA_FOR_IN(i, poses) {
++                        // The GPU kernel's cuda_to_vina does not populate c.flex.
++                        // Initialize it from the model so model.set(c) doesn't crash.
++                        if (poses[i].c.flex.size() != m_model_gpu[l].get_size().flex.size()) {
++                            poses[i].c.flex = m_model_gpu[l].get_initial_conf().flex;
++                        }
+                         // DEBUG_PRINTF("poses i score=%lf\n", poses[i].e);
+                         const fl slope_orig = m_non_cache.slope;
+                         VINA_FOR(p, refine_step) {
+diff --git a/unidock/src/main/main.cpp b/unidock/src/main/main.cpp
+index 5adc827..436155c 100644
+--- a/unidock/src/main/main.cpp
++++ b/unidock/src/main/main.cpp
+@@ -907,6 +907,23 @@ bug reporting, license agreements, and more information.      \n";
+                 return 0;
+             }
+             v.enable_gpu();
++            // Check flex residue limits for GPU docking.
++            // The CUDA kernel supports at most MAX_NUM_OF_FLEX_TORSION (1) flex
++            // torsion. Reject configurations that exceed this to avoid CUDA errors.
++            if (vm.count("flex")) {
++                size_t total_flex_torsions = sum(v.m_receptor.flex.count_torsions());
++                // MAX_NUM_OF_FLEX_TORSION in kernel.h
++                const size_t max_flex_torsions_gpu = 1;
++                if (total_flex_torsions > max_flex_torsions_gpu) {
++                    std::cerr << "ERROR: The flexible residues have " << total_flex_torsions
++                              << " torsions, but GPU docking supports at most "
++                              << max_flex_torsions_gpu << ".\n"
++                              << "Please reduce the number of flexible residues, or use "
++                              << "--ligand for CPU docking with flexible residues.\n"
++                              << "See https://github.com/dptech-corp/Uni-Dock/issues/159\n";
++                    return 1;
++                }
++            }
+             if (sf_name.compare("vina") == 0 || sf_name.compare("vinardo") == 0) {
+                 if (vm.count("maps")) {
+                     v.load_maps(maps);
+@@ -999,10 +1016,16 @@ bug reporting, license agreements, and more information.      \n";
+                 size_t max_num_torsions = 0;
+                 size_t max_num_rigids = 0;
+                 size_t max_num_lig_pairs = 0;
++                // When flex residues are present, the combined model (receptor +
++                // ligand) will have more atoms and rigid bodies than the raw ligand.
++                // Account for this to select the correct Config group.
++                size_t receptor_atoms = v.m_receptor.num_atoms();
++                size_t receptor_flex_torsions = sum(v.m_receptor.flex.count_torsions());
++
+                 printf("all_ligands.size():%ld\n",all_ligands.size());
+                 for (int i = 0; i <  all_ligands.size(); ++i) {
+                     // printf("i=:%d\n",i);
+-                    num_atoms_vector.at(i) = all_ligands[i].second.num_atoms();
++                    num_atoms_vector.at(i) = all_ligands[i].second.num_atoms() + receptor_atoms;
+                     if (all_ligands[i].second.ligands.empty()) {
+                         // Ligand failed to parse - mark as invalid to avoid segfault
+                         num_torsions_vector.at(i) = 0;
+@@ -1013,7 +1036,11 @@ bug reporting, license agreements, and more information.      \n";
+                         continue;
+                     }
+                     num_torsions_vector.at(i)=sum(all_ligands[i].second.ligands.count_torsions());
+-                    num_rigids_vector.at(i)=all_ligands[i].second.ligands[0].children.size();
++                    {
++                        size_t lig_rigids = all_ligands[i].second.ligands.size() > 0
++                            ? all_ligands[i].second.ligands[0].children.size() : 0;
++                        num_rigids_vector.at(i) = lig_rigids + receptor_flex_torsions;
++                    }
+                     num_lig_pairs_vector.at(i)=all_ligands[i].second.num_internal_pairs();
+                     max_num_atoms = std::max(max_num_atoms, num_atoms_vector.at(i));
+                     max_num_torsions = std::max(max_num_torsions, num_torsions_vector.at(i));

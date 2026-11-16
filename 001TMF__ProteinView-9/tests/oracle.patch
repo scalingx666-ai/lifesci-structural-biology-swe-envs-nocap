@@ -1,0 +1,508 @@
+diff --git a/src/app.rs b/src/app.rs
+index 78374ff..11aa1c1 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -112,6 +112,10 @@ pub struct App {
+     /// `terminal.clear()` before the next draw, forcing ratatui to redraw
+     /// every cell and preventing stale content from the previous mode.
+     pub needs_clear: bool,
++    /// Saved color scheme type to restore when leaving interface mode.
++    /// When interface mode is active, we display Interface colors but
++    /// preserve the user's chosen scheme so it can be restored on exit.
++    saved_color_scheme_type: ColorSchemeType,
+ }
+ 
+ impl App {
+@@ -122,6 +126,7 @@ impl App {
+         term_rows: u16,
+         picker: Picker,
+         color_override: Option<ColorSchemeType>,
++        viz_mode: VizMode,
+     ) -> Self {
+         protein.center();
+         // If user explicitly requested pLDDT via CLI, trust that even if
+@@ -182,7 +187,7 @@ impl App {
+             protein,
+             camera,
+             color_scheme,
+-            viz_mode: VizMode::Cartoon,
++            viz_mode,
+             current_chain: 0,
+             render_mode,
+             show_help: false,
+@@ -199,13 +204,20 @@ impl App {
+             ssh_hd_warning: false,
+             ssh_hd_warning_frames: 0,
+             needs_clear: false,
++            saved_color_scheme_type: initial_scheme,
+         }
+     }
+ 
+     pub fn cycle_color(&mut self) {
+-        let next = self.color_scheme.scheme_type.next(self.has_plddt);
+-        self.color_scheme = ColorScheme::new(next, self.protein.residue_count());
+-        self.mesh_dirty = true;
++        if self.show_interface {
++            // While interface mode is active, cycle the saved scheme so the
++            // user's preference is tracked, but keep displaying Interface colors.
++            self.saved_color_scheme_type = self.saved_color_scheme_type.next(self.has_plddt);
++        } else {
++            let next = self.color_scheme.scheme_type.next(self.has_plddt);
++            self.color_scheme = ColorScheme::new(next, self.protein.residue_count());
++            self.mesh_dirty = true;
++        }
+     }
+ 
+     pub fn cycle_viz_mode(&mut self) {
+@@ -225,11 +237,14 @@ impl App {
+     pub fn toggle_interface(&mut self) {
+         self.show_interface = !self.show_interface;
+         if self.show_interface {
++            // Save the user's current color scheme before switching to Interface
++            self.saved_color_scheme_type = self.color_scheme.scheme_type;
+             self.rebuild_interface_colors();
+         } else {
+             self.show_interactions = false;
++            // Restore the user's saved color scheme instead of hardcoding Structure
+             self.color_scheme = ColorScheme::new(
+-                ColorSchemeType::Structure,
++                self.saved_color_scheme_type,
+                 self.protein.residue_count(),
+             );
+             self.mesh_dirty = true;
+@@ -293,6 +308,12 @@ impl App {
+         }
+     }
+ 
++    /// Mark the ribbon mesh cache as dirty, forcing a rebuild on the next frame.
++    /// Called when terminal resize occurs or other events invalidate the mesh.
++    pub fn mesh_dirty_flag(&mut self) {
++        self.mesh_dirty = true;
++    }
++
+     /// Recalculate the zoom factor based on current render mode and terminal size.
+     /// Call this after changing `render_mode` so the protein fills the viewport
+     /// correctly for the new framebuffer dimensions.
+@@ -320,12 +341,14 @@ impl App {
+         self.camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
+     }
+ 
+-    /// Toggle between Braille and HalfBlock (HD) mode.
++    /// Cycle lower render tiers: Braille -> HalfBlock -> Braille.
++    /// From FullHD, steps down to HalfBlock (next lower tier).
+     /// Bound to `m`.
+     pub fn toggle_hd(&mut self, term_cols: u16, term_rows: u16) {
+         self.render_mode = match self.render_mode {
+             RenderMode::Braille => RenderMode::HalfBlock,
+-            _ => RenderMode::Braille,
++            RenderMode::HalfBlock => RenderMode::Braille,
++            RenderMode::FullHD => RenderMode::HalfBlock,
+         };
+         // Dismiss any stale SSH warning (no longer in FullHD)
+         self.ssh_hd_warning = false;
+diff --git a/src/event.rs b/src/event.rs
+index f3994bd..723130b 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -6,10 +6,18 @@ use std::time::Duration;
+ 
+ use crossterm::event::{self, Event, KeyEvent};
+ 
+-/// Spawns a dedicated input thread that sends key events through a channel.
++/// Application-level event that wraps terminal events we care about.
++pub enum AppEvent {
++    /// A keyboard input event.
++    Key(KeyEvent),
++    /// The terminal was resized to (columns, rows).
++    Resize(u16, u16),
++}
++
++/// Spawns a dedicated input thread that sends key and resize events through a channel.
+ /// The thread checks `quit_flag` each iteration and stops when it's set.
+ /// Returns (receiver, quit_flag).
+-pub fn spawn_input_thread() -> (mpsc::Receiver<KeyEvent>, Arc<AtomicBool>) {
++pub fn spawn_input_thread() -> (mpsc::Receiver<AppEvent>, Arc<AtomicBool>) {
+     let (tx, rx) = mpsc::channel();
+     let quit_flag = Arc::new(AtomicBool::new(false));
+     let quit = quit_flag.clone();
+@@ -21,10 +29,18 @@ pub fn spawn_input_thread() -> (mpsc::Receiver<KeyEvent>, Arc<AtomicBool>) {
+             }
+             // Poll with short timeout so we can check quit_flag regularly
+             if event::poll(Duration::from_millis(10)).unwrap_or(false) {
+-                if let Ok(Event::Key(key)) = event::read() {
+-                    if tx.send(key).is_err() {
+-                        break; // receiver dropped
++                match event::read() {
++                    Ok(Event::Key(key)) => {
++                        if tx.send(AppEvent::Key(key)).is_err() {
++                            break; // receiver dropped
++                        }
++                    }
++                    Ok(Event::Resize(w, h)) => {
++                        if tx.send(AppEvent::Resize(w, h)).is_err() {
++                            break; // receiver dropped
++                        }
+                     }
++                    _ => {}
+                 }
+             }
+         }
+diff --git a/src/main.rs b/src/main.rs
+index 03790dc..315c7d9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -18,7 +18,7 @@ use crossterm::{
+ use ratatui::prelude::*;
+ use ratatui::layout::{Constraint, Direction, Layout};
+ 
+-use app::{App, ConnectionType, RenderMode};
++use app::{App, ConnectionType, RenderMode, VizMode};
+ 
+ macro_rules! log {
+     ($file:expr, $($arg:tt)*) => {
+@@ -53,8 +53,8 @@ struct Cli {
+     #[arg(long, default_value = "structure")]
+     color: String,
+ 
+-    /// Visualization mode: backbone, wireframe
+-    #[arg(long, default_value = "backbone")]
++    /// Visualization mode: cartoon, backbone, wireframe
++    #[arg(long, default_value = "cartoon")]
+     mode: String,
+ 
+     /// Fetch structure from RCSB PDB by ID
+@@ -167,8 +167,19 @@ fn main() -> Result<()> {
+         }
+     };
+ 
++    // Parse CLI visualization mode override
++    let viz_mode = match cli.mode.to_ascii_lowercase().as_str() {
++        "cartoon" => VizMode::Cartoon,
++        "backbone" => VizMode::Backbone,
++        "wireframe" => VizMode::Wireframe,
++        _ => {
++            eprintln!("Warning: unknown visualization mode '{}', using cartoon", cli.mode);
++            VizMode::Cartoon
++        }
++    };
++
+     // Create app with actual terminal dimensions for dynamic zoom
+-    let mut app = App::new(protein, render_mode, term_cols, term_rows, picker, color_override);
++    let mut app = App::new(protein, render_mode, term_cols, term_rows, picker, color_override, viz_mode);
+     log!(logfile, "app created: render_mode={:?} chains={} zoom={:.2}", app.render_mode, app.protein.chains.len(), app.camera.zoom);
+ 
+     // Spawn dedicated input thread — decouples input from rendering so
+@@ -186,48 +197,57 @@ fn main() -> Result<()> {
+     loop {
+         // Drain all queued input from the dedicated input thread
+         let mut had_input = false;
+-        while let Ok(key) = input_rx.try_recv() {
++        while let Ok(app_event) = input_rx.try_recv() {
+             had_input = true;
+-            log!(logfile, "key: {:?}", key.code);
+-            match key.code {
+-                KeyCode::Char('q') => app.should_quit = true,
+-                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => app.should_quit = true,
+-                KeyCode::Char('h') | KeyCode::Left => app.camera.rotate_y(-1.0),
+-                KeyCode::Char('l') | KeyCode::Right => app.camera.rotate_y(1.0),
+-                KeyCode::Char('j') | KeyCode::Down => app.camera.rotate_x(1.0),
+-                KeyCode::Char('k') | KeyCode::Up => app.camera.rotate_x(-1.0),
+-                KeyCode::Char('u') => app.camera.rotate_z(-1.0),
+-                KeyCode::Char('i') => app.camera.rotate_z(1.0),
+-                KeyCode::Char('+') | KeyCode::Char('=') => app.camera.zoom_in(),
+-                KeyCode::Char('-') => app.camera.zoom_out(),
+-                KeyCode::Char('w') => app.camera.pan(0.0, 1.0),
+-                KeyCode::Char('s') => app.camera.pan(0.0, -1.0),
+-                KeyCode::Char('a') => app.camera.pan(-1.0, 0.0),
+-                KeyCode::Char('d') => app.camera.pan(1.0, 0.0),
+-                KeyCode::Char('r') => {
+-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+-                    app.camera.reset();
++            match app_event {
++                event::AppEvent::Resize(cols, rows) => {
++                    log!(logfile, "resize: {}x{}", cols, rows);
+                     app.recalculate_zoom(cols, rows);
+-                },
+-                KeyCode::Char('c') => app.cycle_color(),
+-                KeyCode::Char('v') => app.cycle_viz_mode(),
+-                KeyCode::Char('m') => {
+-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+-                    app.toggle_hd(cols, rows);
+-                },
+-                KeyCode::Char('M') => {
+-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+-                    app.toggle_fullhd(cols, rows);
+-                },
+-                KeyCode::Char('[') => app.prev_chain(),
+-                KeyCode::Char(']') => app.next_chain(),
+-                KeyCode::Char(' ') => app.camera.auto_rotate = !app.camera.auto_rotate,
+-                KeyCode::Char('f') => app.toggle_interface(),
+-                KeyCode::Char('I') => app.toggle_interactions(),
+-                KeyCode::Char('g') => app.toggle_ligands(),
+-                KeyCode::Char('?') => app.show_help = !app.show_help,
+-                KeyCode::Esc => { if app.show_help { app.show_help = false; } },
+-                _ => {}
++                    app.mesh_dirty_flag();
++                }
++                event::AppEvent::Key(key) => {
++                    log!(logfile, "key: {:?}", key.code);
++                    match key.code {
++                        KeyCode::Char('q') => app.should_quit = true,
++                        KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => app.should_quit = true,
++                        KeyCode::Char('h') | KeyCode::Left => app.camera.rotate_y(-1.0),
++                        KeyCode::Char('l') | KeyCode::Right => app.camera.rotate_y(1.0),
++                        KeyCode::Char('j') | KeyCode::Down => app.camera.rotate_x(1.0),
++                        KeyCode::Char('k') | KeyCode::Up => app.camera.rotate_x(-1.0),
++                        KeyCode::Char('u') => app.camera.rotate_z(-1.0),
++                        KeyCode::Char('i') => app.camera.rotate_z(1.0),
++                        KeyCode::Char('+') | KeyCode::Char('=') => app.camera.zoom_in(),
++                        KeyCode::Char('-') => app.camera.zoom_out(),
++                        KeyCode::Char('w') => app.camera.pan(0.0, 1.0),
++                        KeyCode::Char('s') => app.camera.pan(0.0, -1.0),
++                        KeyCode::Char('a') => app.camera.pan(-1.0, 0.0),
++                        KeyCode::Char('d') => app.camera.pan(1.0, 0.0),
++                        KeyCode::Char('r') => {
++                            let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
++                            app.camera.reset();
++                            app.recalculate_zoom(cols, rows);
++                        },
++                        KeyCode::Char('c') => app.cycle_color(),
++                        KeyCode::Char('v') => app.cycle_viz_mode(),
++                        KeyCode::Char('m') => {
++                            let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
++                            app.toggle_hd(cols, rows);
++                        },
++                        KeyCode::Char('M') => {
++                            let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
++                            app.toggle_fullhd(cols, rows);
++                        },
++                        KeyCode::Char('[') => app.prev_chain(),
++                        KeyCode::Char(']') => app.next_chain(),
++                        KeyCode::Char(' ') => app.camera.auto_rotate = !app.camera.auto_rotate,
++                        KeyCode::Char('f') => app.toggle_interface(),
++                        KeyCode::Char('I') => app.toggle_interactions(),
++                        KeyCode::Char('g') => app.toggle_ligands(),
++                        KeyCode::Char('?') => app.show_help = !app.show_help,
++                        KeyCode::Esc => { if app.show_help { app.show_help = false; } },
++                        _ => {}
++                    }
++                }
+             }
+         }
+ 
+diff --git a/src/render/framebuffer.rs b/src/render/framebuffer.rs
+index 19fc42e..33fc769 100644
+--- a/src/render/framebuffer.rs
++++ b/src/render/framebuffer.rs
+@@ -210,23 +210,116 @@ impl Framebuffer {
+         }
+     }
+ 
++    /// Cohen-Sutherland line clipping against framebuffer bounds [0, width) x [0, height).
++    ///
++    /// Returns `Some((clipped_p1, clipped_p2))` with z interpolated at clipped
++    /// endpoints, or `None` if the line is entirely outside the framebuffer.
++    fn clip_line_3d(&self, p1: [f64; 3], p2: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
++        // Outcode bit flags
++        const INSIDE: u8 = 0b0000;
++        const LEFT:   u8 = 0b0001;
++        const RIGHT:  u8 = 0b0010;
++        const BOTTOM: u8 = 0b0100;
++        const TOP:    u8 = 0b1000;
++
++        let x_min = 0.0_f64;
++        let y_min = 0.0_f64;
++        let x_max = (self.width as f64) - 1.0;
++        let y_max = (self.height as f64) - 1.0;
++
++        let outcode = |x: f64, y: f64| -> u8 {
++            let mut code = INSIDE;
++            if x < x_min { code |= LEFT; }
++            else if x > x_max { code |= RIGHT; }
++            if y < y_min { code |= TOP; }
++            else if y > y_max { code |= BOTTOM; }
++            code
++        };
++
++        let mut x0 = p1[0];
++        let mut y0 = p1[1];
++        let mut z0 = p1[2];
++        let mut x1 = p2[0];
++        let mut y1 = p2[1];
++        let mut z1 = p2[2];
++
++        let mut code0 = outcode(x0, y0);
++        let mut code1 = outcode(x1, y1);
++
++        loop {
++            if (code0 | code1) == INSIDE {
++                // Both inside — accept
++                return Some(([x0, y0, z0], [x1, y1, z1]));
++            }
++            if (code0 & code1) != INSIDE {
++                // Both on same side — trivial reject
++                return None;
++            }
++
++            // Pick the endpoint that is outside
++            let code_out = if code0 != INSIDE { code0 } else { code1 };
++
++            // Find intersection with clip boundary
++            let dx = x1 - x0;
++            let dy = y1 - y0;
++
++            let (x, y, t);
++            if (code_out & TOP) != 0 {
++                // Clip against top edge (y_min)
++                t = (y_min - y0) / dy;
++                x = x0 + dx * t;
++                y = y_min;
++            } else if (code_out & BOTTOM) != 0 {
++                // Clip against bottom edge (y_max)
++                t = (y_max - y0) / dy;
++                x = x0 + dx * t;
++                y = y_max;
++            } else if (code_out & RIGHT) != 0 {
++                // Clip against right edge (x_max)
++                t = (x_max - x0) / dx;
++                x = x_max;
++                y = y0 + dy * t;
++            } else {
++                // Clip against left edge (x_min)
++                t = (x_min - x0) / dx;
++                x = x_min;
++                y = y0 + dy * t;
++            }
++
++            // Interpolate z at the clipped point
++            let z = z0 + (z1 - z0) * t;
++
++            if code_out == code0 {
++                x0 = x;
++                y0 = y;
++                z0 = z;
++                code0 = outcode(x0, y0);
++            } else {
++                x1 = x;
++                y1 = y;
++                z1 = z;
++                code1 = outcode(x1, y1);
++            }
++        }
++    }
++
+     /// Draw a 3D line with Bresenham's algorithm and z-interpolation.
+     ///
+     /// Useful for wireframe and ball-and-stick rendering modes.
+     /// `p1` and `p2` are `[x, y, z]` in screen/pixel space.
++    /// Uses Cohen-Sutherland clipping to avoid long Bresenham walks for
++    /// mostly off-screen lines.
+     pub fn draw_line_3d(&mut self, p1: [f64; 3], p2: [f64; 3], color: [u8; 3]) {
+-        let mut x0 = p1[0].round() as isize;
+-        let mut y0 = p1[1].round() as isize;
+-        let x1 = p2[0].round() as isize;
+-        let y1 = p2[1].round() as isize;
+-
+-        // Skip lines where both endpoints are entirely off the same side of the screen.
+-        let w = self.width as isize;
+-        let h = self.height as isize;
+-        if (x0 < 0 && x1 < 0) || (x0 >= w && x1 >= w) ||
+-           (y0 < 0 && y1 < 0) || (y0 >= h && y1 >= h) {
+-            return;
+-        }
++        // Clip the line to framebuffer bounds before rasterizing.
++        let (cp1, cp2) = match self.clip_line_3d(p1, p2) {
++            Some(clipped) => clipped,
++            None => return,
++        };
++
++        let mut x0 = cp1[0].round() as isize;
++        let mut y0 = cp1[1].round() as isize;
++        let x1 = cp2[0].round() as isize;
++        let y1 = cp2[1].round() as isize;
+ 
+         let dx = (x1 - x0).abs();
+         let dy = -(y1 - y0).abs();
+@@ -240,14 +333,15 @@ impl Framebuffer {
+         loop {
+             // Compute interpolation parameter t
+             let t = if total_steps > 0.0 {
+-                let from_start_x = (x0 - p1[0].round() as isize).unsigned_abs() as f64;
+-                let from_start_y = (y0 - p1[1].round() as isize).unsigned_abs() as f64;
++                let from_start_x = (x0 - cp1[0].round() as isize).unsigned_abs() as f64;
++                let from_start_y = (y0 - cp1[1].round() as isize).unsigned_abs() as f64;
+                 from_start_x.max(from_start_y) / total_steps
+             } else {
+                 0.0
+             };
+-            let z = (p1[2] * (1.0 - t) + p2[2] * t) as f32;
++            let z = (cp1[2] * (1.0 - t) + cp2[2] * t) as f32;
+ 
++            // After clipping, all pixels should be in bounds, but guard anyway
+             if x0 >= 0 && y0 >= 0 && (x0 as usize) < self.width && (y0 as usize) < self.height {
+                 self.set_pixel(x0 as usize, y0 as usize, z, color);
+             }
+@@ -274,6 +368,8 @@ impl Framebuffer {
+     /// and skipping (`gap_len` pixels) based on accumulated pixel distance
+     /// along the line.  Z-interpolation is maintained throughout so that the
+     /// dashed segments interact correctly with the z-buffer.
++    /// Uses Cohen-Sutherland clipping to avoid long Bresenham walks for
++    /// mostly off-screen lines.
+     pub fn draw_dashed_line_3d(
+         &mut self,
+         p1: [f64; 3],
+@@ -290,19 +386,16 @@ impl Framebuffer {
+             return;
+         }
+ 
+-        let mut x0 = p1[0].round() as isize;
+-        let mut y0 = p1[1].round() as isize;
+-        let x1 = p2[0].round() as isize;
+-        let y1 = p2[1].round() as isize;
+-
+-        // Skip lines where both endpoints are entirely off the same side.
+-        let w = self.width as isize;
+-        let h = self.height as isize;
+-        if (x0 < 0 && x1 < 0) || (x0 >= w && x1 >= w)
+-            || (y0 < 0 && y1 < 0) || (y0 >= h && y1 >= h)
+-        {
+-            return;
+-        }
++        // Clip the line to framebuffer bounds before rasterizing.
++        let (cp1, cp2) = match self.clip_line_3d(p1, p2) {
++            Some(clipped) => clipped,
++            None => return,
++        };
++
++        let mut x0 = cp1[0].round() as isize;
++        let mut y0 = cp1[1].round() as isize;
++        let x1 = cp2[0].round() as isize;
++        let y1 = cp2[1].round() as isize;
+ 
+         let dx = (x1 - x0).abs();
+         let dy = -(y1 - y0).abs();
+@@ -320,13 +413,13 @@ impl Framebuffer {
+         loop {
+             // Compute interpolation parameter t for z.
+             let t = if total_steps > 0.0 {
+-                let from_start_x = (x0 - p1[0].round() as isize).unsigned_abs() as f64;
+-                let from_start_y = (y0 - p1[1].round() as isize).unsigned_abs() as f64;
++                let from_start_x = (x0 - cp1[0].round() as isize).unsigned_abs() as f64;
++                let from_start_y = (y0 - cp1[1].round() as isize).unsigned_abs() as f64;
+                 from_start_x.max(from_start_y) / total_steps
+             } else {
+                 0.0
+             };
+-            let z = (p1[2] * (1.0 - t) + p2[2] * t) as f32;
++            let z = (cp1[2] * (1.0 - t) + cp2[2] * t) as f32;
+ 
+             // Accumulate Euclidean distance from previous pixel.
+             let step_dx = (x0 - prev_x) as f64;
+@@ -339,6 +432,7 @@ impl Framebuffer {
+             let phase = accumulated % cycle;
+             let drawing = phase < dash_len;
+ 
++            // After clipping, all pixels should be in bounds, but guard anyway
+             if drawing
+                 && x0 >= 0
+                 && y0 >= 0

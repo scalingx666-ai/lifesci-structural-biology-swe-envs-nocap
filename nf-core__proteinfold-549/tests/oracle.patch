@@ -1,0 +1,590 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e38e42eef..7c3c05da5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -122,6 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [[#507](https://github.com/nf-core/proteinfold/issues/507)] - Implement missing full tests and check that the others work before release 2.0.0.
+ - [[PR #509](https://github.com/nf-core/proteinfold/pulls/509)] - Setup gpu environment for AWS full tests.
+ - [[PR #538](https://github.com/nf-core/proteinfold/pulls/538)] - Fix alphafold2_random_seed type.
++- [[PR #549](https://github.com/nf-core/proteinfold/pulls/549)] - Create `EXTRACT_METRICS` module and remove extract_metrics.py from AlphaFold2 module.
+ 
+ ### Parameters
+ 
+diff --git a/conf/modules_alphafold2.config b/conf/modules_alphafold2.config
+index 19e67a880..53649e39f 100644
+--- a/conf/modules_alphafold2.config
++++ b/conf/modules_alphafold2.config
+@@ -102,16 +102,6 @@ process {
+             params.alphafold2_random_seed ? "--random_seed=${params.alphafold2_random_seed}" : ''
+         ].join(' ').trim()
+         publishDir = [
+-            [
+-                path: { "${params.outdir}/alphafold2/${params.alphafold2_mode}/${meta.id}" },
+-                mode: 'copy',
+-                saveAs: { filename ->
+-                    if(filename.endsWith('_pae.tsv')){
+-                        "paes/$filename"
+-                    } else { filename }
+-                },
+-                pattern: '*.tsv'
+-            ],
+             [
+                 enabled: params.save_intermediates,
+                 path: { "${params.outdir}/alphafold2/${params.alphafold2_mode}/${meta.id}/" },
+@@ -163,16 +153,6 @@ process {
+             params.alphafold2_random_seed ? "--random_seed=${params.alphafold2_random_seed}" : ''
+         ].join(' ').trim()
+         publishDir = [
+-            [
+-                path: { "${params.outdir}/alphafold2/${params.alphafold2_mode}/${meta.id}" },
+-                mode: 'copy',
+-                saveAs: { filename ->
+-                    if(filename.endsWith('_pae.tsv')){
+-                        "paes/$filename"
+-                    } else { filename }
+-                },
+-                pattern: '*.tsv'
+-            ],
+             [
+                 enabled: params.save_intermediates,
+                 path: { "${params.outdir}/alphafold2/${params.alphafold2_mode}/${meta.id}/" },
+@@ -187,4 +167,27 @@ process {
+             ]
+         ]
+     }
++
++    withName: 'EXTRACT_METRICS_AF2_STANDARD' {
++        container = 'nf-core/proteinfold_alphafold2_standard:2.0.0'
++    }
++
++    withName: 'EXTRACT_METRICS_AF2_PRED' {
++        container = 'nf-core/proteinfold_alphafold2_pred:2.0.0'
++    }
++
++    withName: 'EXTRACT_METRICS_AF2_STANDARD|EXTRACT_METRICS_AF2_PRED|EXTRACT_METRICS' {
++        publishDir = [
++            [
++                path: { "${params.outdir}/alphafold2/${params.alphafold2_mode}/${meta.id}" },
++                mode: 'copy',
++                saveAs: { filename ->
++                    if(filename.endsWith('_pae.tsv')){
++                        "paes/$filename"
++                    } else { filename }
++                },
++                pattern: '*.tsv'
++            ]
++        ]
++    }
+ }
+diff --git a/modules/local/extract_metrics/environment.yml b/modules/local/extract_metrics/environment.yml
+new file mode 100644
+index 000000000..596ce5d42
+--- /dev/null
++++ b/modules/local/extract_metrics/environment.yml
+@@ -0,0 +1,9 @@
++channels:
++  - conda-forge
++  - bioconda
++dependencies:
++  - python=3.11
++  - numpy
++  - biopython
++  - jax
++  - jaxlib
+diff --git a/modules/local/extract_metrics/main.nf b/modules/local/extract_metrics/main.nf
+new file mode 100644
+index 000000000..e6fc04b69
+--- /dev/null
++++ b/modules/local/extract_metrics/main.nf
+@@ -0,0 +1,77 @@
++/*
++ * Extract metrics from structure prediction serialized outputs
++ */
++process EXTRACT_METRICS {
++    tag "$meta.id"
++    label 'process_single'
++
++    conda "${moduleDir}/environment.yml"
++
++    input:
++    tuple val(meta), path(raw), val(mode), path(features)
++
++    output:
++    tuple val(meta), path("${meta.id}_plddt.tsv")          , emit: multiqc
++    tuple val(meta), path("${meta.id}_alphafold2_msa.tsv") , emit: msa
++    tuple val(meta), path("${meta.id}_*_pae.tsv")          , optional: true, emit: paes
++    tuple val(meta), path("${meta.id}_0_pae.tsv")          , optional: true, emit: pae
++    tuple val(meta), path("${meta.id}_ptm.tsv")            , optional: true, emit: ptms
++    tuple val(meta), path("${meta.id}_iptm.tsv")           , optional: true, emit: iptms
++    path "versions.yml"                                    , emit: versions
++
++    when:
++    task.ext.when == null || task.ext.when
++
++    script:
++    """
++    if [[ "${mode}" != "alphafold2" ]]; then
++        echo "Unsupported mode for EXTRACT_METRICS: ${mode}" >&2
++        exit 1
++    fi
++
++    # Handle both regular files and symlink-staged files from Nextflow work dirs.
++    mapfile -t ranked_structs < <(find -L . -name "ranked*.pdb" | sort)
++    if [[ "${'$'}{#ranked_structs[@]}" -eq 0 ]]; then
++        echo "Could not find ranked AlphaFold2 structures in raw output" >&2
++        exit 1
++    fi
++
++    features_pkl=\$(find -L . -name "features.pkl" | head -n 1)
++    if [[ -z "\$features_pkl" && "${features}" != "NO_FILE" ]]; then
++        features_pkl="${features}"
++    fi
++    if [[ -z "\$features_pkl" ]]; then
++        echo "Could not find features.pkl in raw output" >&2
++        exit 1
++    fi
++
++    mapfile -t pkl_files < <(find -L . -name "*.pkl" | sort)
++
++    extract_metrics.py --name ${meta.id} \
++        --pkls "\$features_pkl" "${'$'}{pkl_files[@]}" \
++        --structs "${'$'}{ranked_structs[@]}"
++
++    mv "${meta.id}_msa.tsv" "${meta.id}_alphafold2_msa.tsv"
++
++    cat <<-END_VERSIONS > versions.yml
++    "${task.process}":
++        python: \$(python3 --version 2>/dev/null | sed 's/Python //g' || echo "unknown")
++        numpy: \$(python3 -c "import numpy; print(numpy.__version__)" 2>/dev/null || echo "unknown")
++    END_VERSIONS
++    """
++
++    stub:
++    """
++    touch "${meta.id}_plddt.tsv"
++    touch "${meta.id}_alphafold2_msa.tsv"
++    touch "${meta.id}_0_pae.tsv"
++    touch "${meta.id}_ptm.tsv"
++    touch "${meta.id}_iptm.tsv"
++
++    cat <<-END_VERSIONS > versions.yml
++    "${task.process}":
++        python: \$(python3 --version 2>/dev/null | sed 's/Python //g' || echo "unknown")
++        numpy: \$(python3 -c "import numpy; print(numpy.__version__)" 2>/dev/null || echo "unknown")
++    END_VERSIONS
++    """
++}
+diff --git a/modules/local/run_alphafold2/main.nf b/modules/local/run_alphafold2/main.nf
+index eea900702..c8bf31acb 100644
+--- a/modules/local/run_alphafold2/main.nf
++++ b/modules/local/run_alphafold2/main.nf
+@@ -26,16 +26,9 @@ process RUN_ALPHAFOLD2 {
+     path ('uniprot/*')
+ 
+     output:
+-    path ("raw/**")                                         , emit: raw
++    tuple val(meta), path ("raw/**")                        , emit: raw
+     tuple val(meta), path ("${meta.id}_alphafold2.pdb")     , emit: top_ranked_pdb
+     tuple val(meta), path ("raw/ranked*.pdb")               , emit: pdb
+-    tuple val(meta), path ("${meta.id}_plddt.tsv")          , emit: multiqc
+-    tuple val(meta), path ("${meta.id}_alphafold2_msa.tsv") , emit: msa
+-    // Note: alphafold2_model_preset == "monomer" the pae file won't exist, thus the optional
+-    tuple val(meta), path ("${meta.id}_*_pae.tsv")          , optional: true, emit: paes
+-    tuple val(meta), path ("${meta.id}_0_pae.tsv")          , optional: true, emit: pae
+-    tuple val(meta), path ("${meta.id}_ptm.tsv")            , optional: true, emit: ptms
+-    tuple val(meta), path ("${meta.id}_iptm.tsv")           , optional: true, emit: iptms
+     path "versions.yml"                                     , emit: versions
+ 
+     when:
+@@ -76,12 +69,6 @@ process RUN_ALPHAFOLD2 {
+ 
+     cp "${fasta.baseName}"/ranked_0.pdb ./"${meta.id}"_alphafold2.pdb
+ 
+-    extract_metrics.py --name ${meta.id} \\
+-        --pkls ${fasta.baseName}/features.pkl ${fasta.baseName}/*.pkl \\
+-        --structs ${fasta.baseName}/ranked*.pdb
+-
+-    mv "${meta.id}_msa.tsv" "${meta.id}_alphafold2_msa.tsv"
+-
+     # Can't use fasta.baseName to batch outputs in publishDir
+     mv "${fasta.baseName}" raw/
+ 
+@@ -99,11 +86,6 @@ process RUN_ALPHAFOLD2 {
+     stub:
+     """
+     touch "${meta.id}_alphafold2.pdb"
+-    touch "${meta.id}_plddt.tsv"
+-    touch "${meta.id}_alphafold2_msa.tsv"
+-    touch "${meta.id}_0_pae.tsv"
+-    touch "${meta.id}_ptm.tsv"
+-    touch "${meta.id}_iptm.tsv"
+     mkdir "raw"
+     touch "raw/ranked_0.pdb"
+     touch "raw/ranked_1.pdb"
+diff --git a/modules/local/run_alphafold2_pred/main.nf b/modules/local/run_alphafold2_pred/main.nf
+index 30a581a32..374548137 100644
+--- a/modules/local/run_alphafold2_pred/main.nf
++++ b/modules/local/run_alphafold2_pred/main.nf
+@@ -24,16 +24,9 @@ process RUN_ALPHAFOLD2_PRED {
+     path ('uniprot/*')
+ 
+     output:
+-    path ("raw/**")                                         , emit: raw
++    tuple val(meta), path ("raw/**")                         , emit: raw
+     tuple val(meta), path ("${meta.id}_alphafold2.pdb")     , emit: top_ranked_pdb
+     tuple val(meta), path ("raw/ranked*.pdb")               , emit: pdb
+-    tuple val(meta), path ("${meta.id}_alphafold2_msa.tsv") , emit: msa
+-    tuple val(meta), path ("${meta.id}_plddt.tsv")          , emit: multiqc
+-    //Note: alphafold2_model_preset == "monomer" the pae file won't exist.
+-    tuple val(meta), path ("${meta.id}_*_pae.tsv")          , optional: true, emit: paes
+-    tuple val(meta), path ("${meta.id}_0_pae.tsv")          , optional: true, emit: pae
+-    tuple val(meta), path ("${meta.id}_ptm.tsv")            , optional: true, emit: ptms
+-    tuple val(meta), path ("${meta.id}_iptm.tsv")           , optional: true, emit: iptms
+     path "versions.yml"                                     , emit: versions
+ 
+     when:
+@@ -55,12 +48,6 @@ process RUN_ALPHAFOLD2_PRED {
+ 
+     cp "${fasta.baseName}"/ranked_0.pdb ./"${meta.id}"_alphafold2.pdb
+ 
+-    extract_metrics.py --name ${meta.id} \\
+-        --pkls ${features} ${fasta.baseName}/*.pkl \\
+-        --structs ${fasta.baseName}/ranked*.pdb
+-
+-    mv "${meta.id}_msa.tsv" "${meta.id}_alphafold2_msa.tsv"
+-
+     # Can't use fasta.baseName to batch outputs in publishDir
+     mv "${fasta.baseName}" raw/
+ 
+@@ -78,9 +65,6 @@ process RUN_ALPHAFOLD2_PRED {
+     stub:
+     """
+     touch "${meta.id}_alphafold2.pdb"
+-    touch "${meta.id}_plddt.tsv"
+-    touch "${meta.id}_alphafold2_msa.tsv"
+-    touch "${meta.id}_0_pae.tsv"
+     mkdir "raw/"
+     touch "raw/ranked_0.pdb"
+     touch "raw/ranked_1.pdb"
+diff --git a/tests/alphafold2_download.nf.test.snap b/tests/alphafold2_download.nf.test.snap
+index 48d464d74..7d0183949 100644
+--- a/tests/alphafold2_download.nf.test.snap
++++ b/tests/alphafold2_download.nf.test.snap
+@@ -1,7 +1,7 @@
+ {
+     "-profile test_alphafold2_download": {
+         "content": [
+-            25,
++            23,
+             {
+                 "ARIA2": {
+                     "aria2": null
+@@ -16,10 +16,6 @@
+                     "sed": 4.9,
+                     "rsync": "3.3.0"
+                 },
+-                "GENERATE_REPORT": {
+-                    "python": "3.12.7",
+-                    "generate_report.py": "Python 3.12.7"
+-                },
+                 "RUN_ALPHAFOLD2": {
+                     "python": "unknown",
+                     "alphafold2": "unknown",
+@@ -56,20 +52,6 @@
+                 "DBs/alphafold2/uniref90/uniref90.fasta",
+                 "alphafold2",
+                 "alphafold2/standard",
+-                "alphafold2/standard/T1024",
+-                "alphafold2/standard/T1024/T1024_alphafold2_msa.tsv",
+-                "alphafold2/standard/T1024/T1024_iptm.tsv",
+-                "alphafold2/standard/T1024/T1024_plddt.tsv",
+-                "alphafold2/standard/T1024/T1024_ptm.tsv",
+-                "alphafold2/standard/T1024/paes",
+-                "alphafold2/standard/T1024/paes/T1024_0_pae.tsv",
+-                "alphafold2/standard/T1026",
+-                "alphafold2/standard/T1026/T1026_alphafold2_msa.tsv",
+-                "alphafold2/standard/T1026/T1026_iptm.tsv",
+-                "alphafold2/standard/T1026/T1026_plddt.tsv",
+-                "alphafold2/standard/T1026/T1026_ptm.tsv",
+-                "alphafold2/standard/T1026/paes",
+-                "alphafold2/standard/T1026/paes/T1026_0_pae.tsv",
+                 "alphafold2/standard/top_ranked_structures",
+                 "alphafold2/standard/top_ranked_structures/T1024.pdb",
+                 "alphafold2/standard/top_ranked_structures/T1026.pdb",
+@@ -78,9 +60,7 @@
+                 "multiqc/alphafold2_multiqc_plots",
+                 "multiqc/alphafold2_multiqc_report.html",
+                 "pipeline_info",
+-                "pipeline_info/nf_core_proteinfold_software_mqc_versions.yml",
+-                "reports",
+-                "reports/test_alphafold2_report.html"
++                "pipeline_info/nf_core_proteinfold_software_mqc_versions.yml"
+             ],
+             [
+                 "mgy_clusters.fa:md5,d41d8cd98f00b204e9800998ecf8427e",
+@@ -103,26 +83,15 @@
+                     "file.txt:md5,d41d8cd98f00b204e9800998ecf8427e"
+                 ],
+                 "uniref90.fasta:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_alphafold2_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_iptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_ptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_alphafold2_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_iptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_ptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "alphafold2_multiqc_report.html:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "test_alphafold2_report.html:md5,d41d8cd98f00b204e9800998ecf8427e"
++                "alphafold2_multiqc_report.html:md5,d41d8cd98f00b204e9800998ecf8427e"
+             ]
+         ],
+         "meta": {
+-            "nf-test": "0.9.3",
++            "nf-test": "0.9.2",
+             "nextflow": "25.10.4"
+         },
+-        "timestamp": "2026-03-12T16:09:42.635737909"
++        "timestamp": "2026-03-13T12:18:25.902988924"
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/alphafold2_split.nf.test.snap b/tests/alphafold2_split.nf.test.snap
+index ef128e119..cbad4a1e4 100644
+--- a/tests/alphafold2_split.nf.test.snap
++++ b/tests/alphafold2_split.nf.test.snap
+@@ -1,8 +1,12 @@
+ {
+     "-profile test_alphafold2_split": {
+         "content": [
+-            7,
++            9,
+             {
++                "EXTRACT_METRICS_AF2_PRED": {
++                    "python": "3.11.14",
++                    "numpy": "1.24.3"
++                },
+                 "GENERATE_REPORT": {
+                     "python": "3.12.7",
+                     "generate_report.py": "Python 3.12.7"
+@@ -30,14 +34,18 @@
+                 "alphafold2/split_msa_prediction",
+                 "alphafold2/split_msa_prediction/T1024",
+                 "alphafold2/split_msa_prediction/T1024/T1024_alphafold2_msa.tsv",
++                "alphafold2/split_msa_prediction/T1024/T1024_iptm.tsv",
+                 "alphafold2/split_msa_prediction/T1024/T1024_plddt.tsv",
++                "alphafold2/split_msa_prediction/T1024/T1024_ptm.tsv",
+                 "alphafold2/split_msa_prediction/T1024/msa",
+                 "alphafold2/split_msa_prediction/T1024/msa/features.pkl",
+                 "alphafold2/split_msa_prediction/T1024/paes",
+                 "alphafold2/split_msa_prediction/T1024/paes/T1024_0_pae.tsv",
+                 "alphafold2/split_msa_prediction/T1026",
+                 "alphafold2/split_msa_prediction/T1026/T1026_alphafold2_msa.tsv",
++                "alphafold2/split_msa_prediction/T1026/T1026_iptm.tsv",
+                 "alphafold2/split_msa_prediction/T1026/T1026_plddt.tsv",
++                "alphafold2/split_msa_prediction/T1026/T1026_ptm.tsv",
+                 "alphafold2/split_msa_prediction/T1026/msa",
+                 "alphafold2/split_msa_prediction/T1026/msa/features.pkl",
+                 "alphafold2/split_msa_prediction/T1026/paes",
+@@ -56,11 +64,15 @@
+             ],
+             [
+                 "T1024_alphafold2_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1024_iptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1024_ptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "features.pkl:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_alphafold2_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1026_iptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1026_ptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "features.pkl:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+@@ -70,9 +82,9 @@
+             ]
+         ],
+         "meta": {
+-            "nf-test": "0.9.3",
++            "nf-test": "0.9.2",
+             "nextflow": "25.10.4"
+         },
+-        "timestamp": "2026-03-12T16:12:35.47858571"
++        "timestamp": "2026-03-13T12:18:45.007250364"
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/default.nf.test.snap b/tests/default.nf.test.snap
+index 2cd8ceba2..101ce838f 100644
+--- a/tests/default.nf.test.snap
++++ b/tests/default.nf.test.snap
+@@ -2,10 +2,6 @@
+     "-profile test": {
+         "content": [
+             {
+-                "GENERATE_REPORT": {
+-                    "python": "3.12.7",
+-                    "generate_report.py": "Python 3.12.7"
+-                },
+                 "RUN_ALPHAFOLD2": {
+                     "python": "unknown",
+                     "alphafold2": "unknown",
+@@ -21,20 +17,6 @@
+             [
+                 "alphafold2",
+                 "alphafold2/standard",
+-                "alphafold2/standard/T1024",
+-                "alphafold2/standard/T1024/T1024_alphafold2_msa.tsv",
+-                "alphafold2/standard/T1024/T1024_iptm.tsv",
+-                "alphafold2/standard/T1024/T1024_plddt.tsv",
+-                "alphafold2/standard/T1024/T1024_ptm.tsv",
+-                "alphafold2/standard/T1024/paes",
+-                "alphafold2/standard/T1024/paes/T1024_0_pae.tsv",
+-                "alphafold2/standard/T1026",
+-                "alphafold2/standard/T1026/T1026_alphafold2_msa.tsv",
+-                "alphafold2/standard/T1026/T1026_iptm.tsv",
+-                "alphafold2/standard/T1026/T1026_plddt.tsv",
+-                "alphafold2/standard/T1026/T1026_ptm.tsv",
+-                "alphafold2/standard/T1026/paes",
+-                "alphafold2/standard/T1026/paes/T1026_0_pae.tsv",
+                 "alphafold2/standard/top_ranked_structures",
+                 "alphafold2/standard/top_ranked_structures/T1024.pdb",
+                 "alphafold2/standard/top_ranked_structures/T1026.pdb",
+@@ -43,31 +25,18 @@
+                 "multiqc/alphafold2_multiqc_plots",
+                 "multiqc/alphafold2_multiqc_report.html",
+                 "pipeline_info",
+-                "pipeline_info/nf_core_proteinfold_software_mqc_versions.yml",
+-                "reports",
+-                "reports/test_alphafold2_report.html"
++                "pipeline_info/nf_core_proteinfold_software_mqc_versions.yml"
+             ],
+             [
+-                "T1024_alphafold2_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_iptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_ptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_alphafold2_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_iptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_ptm.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "alphafold2_multiqc_report.html:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "test_alphafold2_report.html:md5,d41d8cd98f00b204e9800998ecf8427e"
++                "alphafold2_multiqc_report.html:md5,d41d8cd98f00b204e9800998ecf8427e"
+             ]
+         ],
+         "meta": {
+-            "nf-test": "0.9.3",
++            "nf-test": "0.9.2",
+             "nextflow": "25.10.4"
+         },
+-        "timestamp": "2026-03-12T16:13:26.007551223"
++        "timestamp": "2026-03-13T12:20:19.924333101"
+     }
+ }
+\ No newline at end of file
+diff --git a/workflows/alphafold2.nf b/workflows/alphafold2.nf
+index 1c17cea1c..1ee1c1150 100644
+--- a/workflows/alphafold2.nf
++++ b/workflows/alphafold2.nf
+@@ -10,6 +10,8 @@
+ include { RUN_ALPHAFOLD2      } from '../modules/local/run_alphafold2'
+ include { RUN_ALPHAFOLD2_MSA  } from '../modules/local/run_alphafold2_msa'
+ include { RUN_ALPHAFOLD2_PRED } from '../modules/local/run_alphafold2_pred'
++include { EXTRACT_METRICS as EXTRACT_METRICS_AF2_STANDARD } from '../modules/local/extract_metrics'
++include { EXTRACT_METRICS as EXTRACT_METRICS_AF2_PRED } from '../modules/local/extract_metrics'
+ 
+ /*
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+@@ -50,6 +52,7 @@ workflow ALPHAFOLD2 {
+     ch_msa            = channel.empty()
+     ch_pae            = channel.empty()
+     ch_multiqc_report = channel.empty()
++    ch_no_file        = channel.fromPath("$projectDir/assets/NO_FILE")
+ 
+     if (alphafold2_model_preset != 'multimer') {
+         ch_samplesheet
+@@ -83,7 +86,17 @@ workflow ALPHAFOLD2 {
+             ch_uniprot
+         )
+ 
+-        RUN_ALPHAFOLD2
++        EXTRACT_METRICS_AF2_STANDARD(
++            RUN_ALPHAFOLD2
++                .out
++                .raw
++                .join(ch_no_file)
++                .map { meta, raw, no_file ->
++                    [ meta, raw, "alphafold2", no_file ]
++                }
++        )
++
++        EXTRACT_METRICS_AF2_STANDARD
+             .out
+             .multiqc
+             .map { it -> it[1] }
+@@ -95,9 +108,10 @@ workflow ALPHAFOLD2 {
+ 
+         ch_pdb            = ch_pdb.mix(RUN_ALPHAFOLD2.out.pdb)
+         ch_top_ranked_pdb = ch_top_ranked_pdb.mix(RUN_ALPHAFOLD2.out.top_ranked_pdb)
+-        ch_msa            = ch_msa.mix(RUN_ALPHAFOLD2.out.msa)
+-        ch_pae            = ch_pae.mix(RUN_ALPHAFOLD2.out.pae)
++        ch_msa            = ch_msa.mix(EXTRACT_METRICS_AF2_STANDARD.out.msa)
++        ch_pae            = ch_pae.mix(EXTRACT_METRICS_AF2_STANDARD.out.pae)
+         ch_versions       = ch_versions.mix(RUN_ALPHAFOLD2.out.versions)
++        ch_versions       = ch_versions.mix(EXTRACT_METRICS_AF2_STANDARD.out.versions)
+ 
+     } else if (alphafold2_mode == 'split_msa_prediction') {
+         //
+@@ -127,6 +141,12 @@ workflow ALPHAFOLD2 {
+             .join(RUN_ALPHAFOLD2_MSA.out.features)
+             .set { ch_fasta_features }
+ 
++        ch_fasta_features
++            .map { meta, _fasta, features ->
++                [ meta, features ]
++            }
++            .set { ch_split_features }
++
+         RUN_ALPHAFOLD2_PRED (
+             ch_fasta_features,
+             alphafold2_model_preset,
+@@ -143,7 +163,15 @@ workflow ALPHAFOLD2 {
+             ch_uniprot
+         )
+ 
+-        RUN_ALPHAFOLD2_PRED
++        EXTRACT_METRICS_AF2_PRED(
++            RUN_ALPHAFOLD2_PRED
++                .out
++                .raw
++                .join(ch_split_features)
++                .map { meta, raw, features -> [ meta, raw, "alphafold2", features ] }
++        )
++
++        EXTRACT_METRICS_AF2_PRED
+             .out
+             .multiqc
+             .map { it -> it[1] }
+@@ -155,9 +183,10 @@ workflow ALPHAFOLD2 {
+ 
+         ch_top_ranked_pdb = ch_top_ranked_pdb.mix(RUN_ALPHAFOLD2_PRED.out.top_ranked_pdb)
+         ch_pdb            = ch_pdb.mix(RUN_ALPHAFOLD2_PRED.out.pdb)
+-        ch_msa            = ch_msa.mix(RUN_ALPHAFOLD2_PRED.out.msa)
+-        ch_pae            = ch_pae.mix(RUN_ALPHAFOLD2_PRED.out.pae)
++        ch_msa            = ch_msa.mix(EXTRACT_METRICS_AF2_PRED.out.msa)
++        ch_pae            = ch_pae.mix(EXTRACT_METRICS_AF2_PRED.out.pae)
+         ch_versions       = ch_versions.mix(RUN_ALPHAFOLD2_PRED.out.versions)
++        ch_versions       = ch_versions.mix(EXTRACT_METRICS_AF2_PRED.out.versions)
+     }
+ 
+     ch_pdb

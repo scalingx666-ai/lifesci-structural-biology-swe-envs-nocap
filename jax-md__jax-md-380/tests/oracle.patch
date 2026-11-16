@@ -1,0 +1,865 @@
+diff --git a/jax_md/custom_partition.py b/jax_md/custom_partition.py
+index 2c9cde82..b230a121 100644
+--- a/jax_md/custom_partition.py
++++ b/jax_md/custom_partition.py
+@@ -861,7 +861,9 @@ def neighbor_list_multi_image(
+   Returns:
+     ``NeighborListMultiImageFns`` with:
+ 
+-    - ``allocate(position)``: Create new neighbor list from positions ``[N, dim]``.
++    - ``allocate(position, box=None)``: Create new neighbor list from
++      positions ``[N, dim]``.  Pass ``box=new_box`` to rebuild for a
++      different box geometry (e.g. during cell optimization).
+     - ``update(position, neighbors)``: Update existing neighbor list.
+   """
+   del displacement_or_metric  # Unused - multi-image uses explicit shifts
+@@ -869,8 +871,8 @@ def neighbor_list_multi_image(
+   # Configuration constants
+   DEFAULT_MAX_NEIGHBORS = 256  # Default max neighbors per atom if not specified
+ 
+-  box = jnp.asarray(box)  # [dim, dim]
+-  dim = box.shape[0]
++  default_box = jnp.asarray(box)  # [dim, dim]
++  dim = default_box.shape[0]
+   use_dense = format is NeighborListFormat.Dense
+   use_ordered = ordered or (format is NeighborListFormat.OrderedSparse)
+ 
+@@ -882,8 +884,9 @@ def neighbor_list_multi_image(
+   search_cutoff = r_cutoff + dr_threshold
+ 
+   # Pre-compute shift vectors using reciprocal lattice heights
+-  shifts = _compute_shift_ranges(box, search_cutoff, pbc)  # [num_shifts, dim]
+-  shifts_real = shifts @ box.T  # [num_shifts, dim]
++  shifts = _compute_shift_ranges(
++    default_box, search_cutoff, pbc
++  )  # [num_shifts, dim]
+   zero_shift_idx = int(jnp.argmin(jnp.sum(shifts**2, axis=1)))
+ 
+   # Compute neighbors_per_atom from max_neighbors or default
+@@ -915,60 +918,55 @@ def compute_capacity(N: int) -> int:
+         cap = cap // 2 + N  # Ordered stores ~half the edges
+       return cap
+ 
+-  def get_build_fn(capacity: int):
+-    """Get or create JIT-compiled build function for given capacity."""
+-    if capacity in build_fn_cache:
+-      return build_fn_cache[capacity]
++  # Select format-specific build function once at construction time
++  if use_dense:
++    build_nl_fn = _build_neighbor_list_dense
++  elif use_ordered:
++    build_nl_fn = _build_neighbor_list_orderedsparse
++  else:
++    build_nl_fn = _build_neighbor_list_sparse
++
++  def make_build_fn(capacity, nl_shifts, zero_idx):
++    """Create a build function for given capacity and shifts."""
++
++    @jax.jit
++    def build_fn(pos, box):
++      shifts_real = nl_shifts @ box.T
++      return build_nl_fn(
++        pos,
++        box,
++        nl_shifts,
++        shifts_real,
++        zero_idx,
++        search_cutoff,
++        capacity,
++        fractional_coordinates,
++        update_fn_ref[0],
++      )
+ 
+-    # Create build function for this capacity
+-    if use_dense:
++    return build_fn
+ 
+-      @jax.jit
+-      def build_fn(pos):  # pos: [N, dim]
+-        return _build_neighbor_list_dense(
+-          pos,
+-          box,
+-          shifts,
+-          shifts_real,
+-          zero_shift_idx,
+-          search_cutoff,
+-          capacity,
+-          fractional_coordinates,
+-          update_fn_ref[0],
+-        )
+-
+-    elif use_ordered:
+-
+-      @jax.jit
+-      def build_fn(pos):  # pos: [N, dim]
+-        return _build_neighbor_list_orderedsparse(
+-          pos,
+-          box,
+-          shifts,
+-          shifts_real,
+-          zero_shift_idx,
+-          search_cutoff,
+-          capacity,
+-          fractional_coordinates,
+-          update_fn_ref[0],
+-        )
++  def get_build_fn(capacity: int, box_override=None):
++    """Get or create a build function for given capacity.
+ 
+-    else:
++    When ``box_override`` is provided (only from ``allocate_fn``,
++    never inside JIT) the integer shift vectors are recomputed for
++    the new geometry.  These are not cached because different boxes
++    can produce the same shift count but different shift vectors.
+ 
+-      @jax.jit
+-      def build_fn(pos):  # pos: [N, dim]
+-        return _build_neighbor_list_sparse(
+-          pos,
+-          box,
+-          shifts,
+-          shifts_real,
+-          zero_shift_idx,
+-          search_cutoff,
+-          capacity,
+-          fractional_coordinates,
+-          update_fn_ref[0],
+-        )
++    Without ``box_override``, the precomputed shifts for the default
++    box are used and the result is cached by capacity.
++    """
++    if box_override is not None:
++      override_box = jnp.asarray(box_override)
++      nl_shifts = _compute_shift_ranges(override_box, search_cutoff, pbc)
++      zero_idx = int(jnp.argmin(jnp.sum(nl_shifts**2, axis=1)))
++      return make_build_fn(capacity, nl_shifts, zero_idx)
++
++    if capacity in build_fn_cache:
++      return build_fn_cache[capacity]
+ 
++    build_fn = make_build_fn(capacity, shifts, zero_shift_idx)
+     build_fn_cache[capacity] = build_fn
+     return build_fn
+ 
+@@ -979,8 +977,8 @@ def check_needs_rebuild(
+   ) -> Array:  # scalar bool
+     """Check if maximum displacement exceeds threshold."""
+     if fractional_coordinates:
+-      pos_new = position @ box.T  # [N, dim]
+-      pos_old = reference_position @ box.T
++      pos_new = position @ default_box.T  # [N, dim]
++      pos_old = reference_position @ default_box.T
+     else:
+       pos_new = position
+       pos_old = reference_position
+@@ -991,7 +989,7 @@ def check_needs_rebuild(
+   use_threshold = dr_threshold > 0
+ 
+   def allocate_fn(
+-    position: Array, extra_capacity: int = 0, **kwargs
++    position: Array, extra_capacity: int = 0, box: Array = None, **kwargs
+   ) -> NeighborListMultiImage:
+     """Allocate a new neighbor list from positions [N, dim].
+ 
+@@ -1002,6 +1000,9 @@ def allocate_fn(
+       position: Atom positions. Shape ``[N, dim]``.
+       extra_capacity: Additional capacity to add (multiplied by N for Sparse).
+         Use this to recover from buffer overflow.
++      box: Override box for this allocation.  If provided, shift vectors
++        are recomputed for the new box geometry.  This is needed when
++        the cell changes during cell optimization.
+ 
+     Returns:
+       New neighbor list.
+@@ -1014,8 +1015,11 @@ def allocate_fn(
+       capacity = base_capacity + extra_capacity
+     else:
+       capacity = base_capacity + N * extra_capacity
+-    build_fn = get_build_fn(capacity)
+-    return build_fn(position)
++
++    current_box = jnp.asarray(box) if box is not None else default_box
++    build_fn = get_build_fn(capacity, box_override=box)
++
++    return build_fn(position, current_box)
+ 
+   def neighbor_list_fn(
+     position: Array,  # [N, dim]
+@@ -1027,7 +1031,8 @@ def neighbor_list_fn(
+     Args:
+       position: Atom positions. Shape ``[N, dim]``.
+       neighbors: Existing neighbor list, or None to allocate new.
+-      **kwargs: Additional arguments (unused, for API compatibility).
++      **kwargs: Accepts ``box=`` to rebuild with a different box
++        geometry.
+ 
+     Returns:
+       Updated neighbor list.
+@@ -1038,20 +1043,24 @@ def neighbor_list_fn(
+       # First call: allocate with capacity computed from position
+       return allocate_fn(position, **kwargs)
+ 
+-    # Update: reuse existing capacity from neighbor list
++    # Update: reuse existing capacity and precomputed integer shifts.
++    # Real-space shifts (shifts @ box.T) are recomputed inside build_fn
++    # using the traced box argument, so this is safe inside JIT.
++    current_box = jnp.asarray(kwargs.get('box', default_box))
+     capacity = neighbors.max_occupancy
+     build_fn = get_build_fn(capacity)
+ 
+-    # Check if rebuild needed based on displacement threshold
+-    if use_threshold:
++    # If box= was provided the geometry has changed; always rebuild.
++    # The displacement threshold only applies when the box is unchanged.
++    if use_threshold and 'box' not in kwargs:
+       return jax.lax.cond(
+         check_needs_rebuild(position, neighbors.reference_position),
+-        build_fn,  # True branch: rebuild
+-        lambda pos: neighbors,  # False branch: return existing
++        lambda pos: build_fn(pos, current_box),
++        lambda pos: neighbors,
+         position,
+       )
+ 
+-    return build_fn(position)
++    return build_fn(position, current_box)
+ 
+   # Close the circular reference
+   update_fn_ref[0] = neighbor_list_fn
+diff --git a/jax_md/minimize.py b/jax_md/minimize.py
+index 6bdff5f3..587212c1 100644
+--- a/jax_md/minimize.py
++++ b/jax_md/minimize.py
+@@ -24,17 +24,16 @@
+ init_fn:
+   Function that initializes the  state of an optimizer. Should take
+   positions as an ndarray of shape `[n, output_dimension]`. Returns a state
+-  which will be a namedtuple.
++  which will be a dataclass.
+ 
+ apply_fn:
+   Function that takes a state and produces a new state after one
+   step of optimization.
+ """
+ 
+-from collections import namedtuple
+-
+ from typing import TypeVar, Callable, Tuple, Union, Any
+ 
++import jax
+ import jax.numpy as jnp
+ from jax.tree_util import tree_map, tree_reduce
+ 
+@@ -98,13 +97,15 @@ class FireDescentState:
+   Attributes:
+     position: The current position of particles. An ndarray of floats
+       with shape `[n, spatial_dimension]`.
+-    velocity: The current velocity of particles. An ndarray of floats
++    momentum: The current momentum of particles. An ndarray of floats
+       with shape `[n, spatial_dimension]`.
+     force: The current force on particles. An ndarray of floats
+       with shape `[n, spatial_dimension]`.
++    mass: The mass of particles. A float or an ndarray of floats
++      with shape `[n]`.
+     dt: A float specifying the current step size.
+-    alpha: A float specifying the current momentum.
+-    n_pos: The number of steps in the right direction, so far.
++    alpha: A float specifying the current FIRE mixing parameter.
++    n_pos: The number of consecutive steps with positive power.
+   """
+ 
+   position: Array
+@@ -138,8 +139,6 @@ def fire_descent(
+       `[n, spatial_dimension]`.
+     shift_fn: A function that displaces positions `R`, by an amount `dR`. Both
+       `R` and `dR` should be ndarrays of shape `[n, spatial_dimension]`.
+-    quant: Either a quantity.Energy or a quantity. Force specifying whether
+-      energy_or_force is an energy or force respectively.
+     dt_start: The initial step size during minimization as a float.
+     dt_max: The maximum step size during minimization as a float.
+     n_min: An integer specifying the minimum number of steps moving in the
+@@ -219,3 +218,266 @@ def apply_fn(state: FireDescentState, **kwargs) -> FireDescentState:
+     )  # pytype: disable=wrong-arg-count
+ 
+   return init_fn, apply_fn
++
++
++# Box optimization
++
++
++@dataclasses.dataclass
++class FireBoxDescentState:
++  """State for the combined atom + box FIRE minimizer.
++
++  Box degrees of freedom are parameterized by the deformation gradient
++  ``F`` relative to a reference box, following Tadmor et al. (1999).
++  The current box is reconstructed as ``F @ reference_box``.
++
++  The ``box_factor`` (default ``N``) scales
++  the deformation-gradient DOFs to be comparable to atomic positions,
++  acting as a preconditioner.
++
++  Attributes:
++    position: Atomic fractional positions, shape ``(N, dim)``.
++    momentum: Atomic momenta, shape ``(N, dim)``.
++    force: Atomic forces, shape ``(N, dim)``.
++    mass: Atomic masses.
++    box: Current simulation box (``F @ reference_box``), shape ``(dim, dim)``.
++    reference_box: Initial box (constant), shape ``(dim, dim)``.
++    box_position: ``box_factor * F``, shape ``(dim, dim)``.
++    box_momentum: Momentum in deformation-gradient space, ``(dim, dim)``.
++    box_force: Force in deformation-gradient space, ``(dim, dim)``.
++    box_mass: Box mass (scalar).
++    box_factor: Scaling preconditioner (scalar, default ``N``).
++    dt: Current FIRE step size.
++    alpha: Current FIRE momentum-mixing parameter.
++    n_pos: Number of consecutive steps with positive power.
++  """
++
++  position: Array
++  momentum: Array
++  force: Array
++  mass: Array
++  box: Array
++  reference_box: Array
++  box_position: Array
++  box_momentum: Array
++  box_force: Array
++  box_mass: Array
++  box_factor: Array
++  dt: float
++  alpha: float
++  n_pos: int
++
++
++def fire_descent_box(
++  energy_fn: Callable[..., Array],
++  shift_fn: ShiftFn,
++  dt_start: float = 0.1,
++  dt_max: float = 0.4,
++  n_min: float = 5,
++  f_inc: float = 1.1,
++  f_dec: float = 0.5,
++  alpha_start: float = 0.1,
++  f_alpha: float = 0.99,
++  scalar_pressure: float = 0.0,
++  hydrostatic_strain: bool = False,
++  constant_volume: bool = False,
++  mask: Array = None,
++) -> Minimizer[FireBoxDescentState]:
++  """FIRE minimization of both atomic positions and the simulation box.
++
++  Args:
++    energy_fn: Energy function taking ``(R, box=box, **kwargs)``.
++    shift_fn: Shift function from :func:`~jax_md.space.periodic_general`
++      (``fractional_coordinates=True``).
++    dt_start: Initial FIRE step size.
++    dt_max: Maximum FIRE step size.
++    n_min: Minimum positive-power steps before increasing dt.
++    f_inc: Factor to increase dt.
++    f_dec: Factor to decrease dt on overshoot.
++    alpha_start: Initial FIRE mixing parameter.
++    f_alpha: Factor to decrease alpha.
++    scalar_pressure: Target external pressure.
++    hydrostatic_strain: Constrain box to isotropic deformation.
++    constant_volume: Project out volume changes.
++    mask: Strain-component mask, ``(dim, dim)``.
++
++  Returns:
++    ``(init_fn, apply_fn)`` pair.
++  """
++  dt_start, dt_max, n_min, f_inc, f_dec, alpha_start, f_alpha = (
++    util.static_cast(
++      dt_start, dt_max, n_min, f_inc, f_dec, alpha_start, f_alpha
++    )
++  )
++  force_fn = quantity.canonicalize_force(energy_fn)
++
++  def virial_fn(R, box, **kwargs):
++    """Compute the constrained virial for the box force.
++
++    The virial is ``W = -dE/deps - P_ext * V * I`` where ``dE/deps`` is
++    the strain derivative obtained via autodiff.  The sign follows
++    JAX-MD's stress convention (``quantity.stress`` returns
++    ``(1/V)(-dU/deps)`` with positive = tension).  ``-dE/deps`` points
++    in the direction of energy decrease, matching the simple
++    ``cell_step`` approach (``box += dt * stress``).
++
++    Optional constraint projections (hydrostatic, mask, constant-volume)
++    are applied before returning.
++    """
++    dim = R.shape[1]
++    I_d = jnp.eye(dim, dtype=box.dtype)
++    zero = jnp.zeros((dim, dim), dtype=box.dtype)
++
++    def U(eps):
++      return energy_fn(R, box=box, perturbation=(I_d + eps), **kwargs)
++
++    dUdeps = jax.grad(U)(zero)
++
++    v = -dUdeps
++    if scalar_pressure != 0.0:
++      vol = quantity.volume(dim, box)
++      v = v - scalar_pressure * vol * I_d
++
++    if hydrostatic_strain:
++      tr = jnp.trace(v)
++      v = jnp.eye(dim, dtype=v.dtype) * (tr / dim)
++
++    if mask is not None:
++      v = v * jnp.asarray(mask, dtype=v.dtype)
++
++    if constant_volume:
++      tr = jnp.trace(v)
++      v = v - jnp.eye(dim, dtype=v.dtype) * (tr / dim)
++
++    return v
++
++  def box_force_fn(virial, F_deform, bf):
++    """Transform virial to deformation-gradient space and scale.
++
++    Maps the virial from box-space to F-space via the Jacobian
++    ``F^{-T}``: ``virial_F = solve(F, virial^T)^T``.  This matches
++    ASE ``UnitCellFilter.get_forces`` and TorchSim
++    ``compute_cell_forces``.  At ``F = I`` the transformation is
++    identity.
++    """
++    W_F = jnp.linalg.solve(F_deform, virial.T).T
++    return W_F / bf
++
++  def init_fn(
++    R: Array,
++    box: Array,
++    mass: Array = 1.0,
++    box_mass: Array = None,
++    box_factor: Array = None,
++    **kwargs,
++  ) -> FireBoxDescentState:
++    N = R.shape[0]
++    dim = R.shape[1]
++    if box_mass is None:
++      box_mass = f32(1.0)
++    if box_factor is None:
++      box_factor = f32(N)
++    F_atom = force_fn(R, box=box, **kwargs)
++    I_d = jnp.eye(dim, dtype=box.dtype)
++    virial = virial_fn(R, box, **kwargs)
++    F_b = box_force_fn(virial, I_d, box_factor)
++    state = FireBoxDescentState(
++      R,
++      jnp.zeros_like(R),
++      F_atom,
++      mass,
++      box,
++      box,
++      box_factor * I_d,
++      jnp.zeros_like(box),
++      F_b,
++      box_mass,
++      box_factor,
++      dt_start,
++      alpha_start,
++      jnp.zeros((), jnp.int32),
++    )  # pytype: disable=wrong-arg-count
++    return simulate.canonicalize_mass(state)
++
++  def apply_fn(
++    state: FireBoxDescentState,
++    **kwargs,
++  ) -> FireBoxDescentState:
++    (R, P, F, M, _, ref_box, X_b, P_b, F_b, M_b, bf, dt, alpha, n_pos) = (
++      dataclasses.unpack(state)
++    )
++
++    dt_2 = f32(dt / 2)
++
++    # TODO(ag): Add different integration schemes following:
++    # https://doi.org/10.1016/j.commatsci.2020.109584
++    # velocity Verlet: half-step momenta
++    P = P + dt_2 * F
++    P_b = P_b + dt_2 * F_b
++
++    # position update
++    F_deform = X_b / bf
++    box = F_deform @ ref_box
++    R = shift_fn(R, dt * P / M, box=box, **kwargs)
++    X_b = X_b + dt * P_b / M_b
++    F_deform = X_b / bf
++    box = F_deform @ ref_box
++
++    # recompute forces at new (R, box)
++    F = force_fn(R, box=box, **kwargs)
++    virial = virial_fn(R, box, **kwargs)
++    F_b = box_force_fn(virial, F_deform, bf)
++
++    # velocity Verlet: half-step momenta
++    P = P + dt_2 * F
++    P_b = P_b + dt_2 * F_b
++
++    # FIRE: combined power check
++    F_dot_P = jnp.sum(F * P) + jnp.sum(F_b * P_b)
++
++    F_norm = jnp.sqrt(jnp.sum(F**2) + jnp.sum(F_b**2) + 1e-6)
++    P_norm = jnp.sqrt(jnp.sum(P**2) + jnp.sum(P_b**2))
++
++    # FIRE: momentum mixing
++    P = P + alpha * (F * P_norm / F_norm - P)
++    P_b = P_b + alpha * (F_b * P_norm / F_norm - P_b)
++
++    # FIRE: adaptive dt / alpha
++    n_pos = jnp.where(F_dot_P >= 0, n_pos + 1, 0)
++    dt_choice = jnp.array([dt * f_inc, dt_max])
++    dt = jnp.where(
++      F_dot_P > 0,
++      jnp.where(n_pos > n_min, jnp.min(dt_choice), dt),
++      dt,
++    )
++    dt = jnp.where(F_dot_P < 0, dt * f_dec, dt)
++    alpha = jnp.where(
++      F_dot_P > 0,
++      jnp.where(n_pos > n_min, alpha * f_alpha, alpha),
++      alpha,
++    )
++    alpha = jnp.where(F_dot_P < 0, alpha_start, alpha)
++
++    # reset momenta on overshoot
++    keep = f32(F_dot_P >= 0)
++    P = keep * P
++    P_b = keep * P_b
++
++    return FireBoxDescentState(
++      R,
++      P,
++      F,
++      M,
++      box,
++      ref_box,
++      X_b,
++      P_b,
++      F_b,
++      M_b,
++      bf,
++      dt,
++      alpha,
++      n_pos,
++    )  # pytype: disable=wrong-arg-count
++
++  return init_fn, apply_fn
+diff --git a/jax_md/test_util.py b/jax_md/test_util.py
+index 91d5201e..e049a795 100644
+--- a/jax_md/test_util.py
++++ b/jax_md/test_util.py
+@@ -245,6 +245,32 @@ def assert_close(x, y):
+ # JAX MD specific utilities.
+ 
+ 
++def make_fcc_fractional(n_cells, a, dtype):
++  """Create an FCC crystal in fractional coordinates.
++
++  Args:
++    n_cells: Number of unit cells along each axis.
++    a: Lattice parameter.
++    dtype: Data type for positions and box.
++
++  Returns:
++    ``(R, box)`` where ``R`` has shape ``[4 * n_cells**3, 3]`` in ``[0, 1)``
++    and ``box`` is a ``(3, 3)`` diagonal matrix.
++  """
++  basis = onp.array(
++    [[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5]]
++  )
++  positions = []
++  for i in range(n_cells):
++    for j in range(n_cells):
++      for k in range(n_cells):
++        for b in basis:
++          positions.append((onp.array([i, j, k]) + b) / n_cells)
++  R = jnp.array(positions, dtype=dtype)
++  box = jnp.eye(3, dtype=dtype) * a * n_cells
++  return R, box
++
++
+ def update_test_tolerance(f32_tol=5e-3, f64_tol=1e-5):
+   _DEFAULT_TOLERANCE[onp.dtype(onp.float32)] = f32_tol
+   _DEFAULT_TOLERANCE[onp.dtype(onp.float64)] = f64_tol
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index cc469e72..1a968646 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -1542,20 +1542,7 @@ def test_coulomb_recip_octions(self):
+     )
+ 
+ 
+-def make_fcc_fractional(n_cells, a, dtype):
+-  """Create FCC crystal in fractional coordinates."""
+-  basis = onp.array(
+-    [[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5]]
+-  )
+-  positions = []
+-  for i in range(n_cells):
+-    for j in range(n_cells):
+-      for k in range(n_cells):
+-        for b in basis:
+-          positions.append((onp.array([i, j, k]) + b) / n_cells)
+-  R = jnp.array(positions, dtype=dtype)
+-  box = jnp.eye(3, dtype=dtype) * a * n_cells
+-  return R, box
++make_fcc_fractional = test_util.make_fcc_fractional
+ 
+ 
+ class MultiImageNeighborListTest(test_util.JAXMDTestCase):
+diff --git a/tests/minimize_test.py b/tests/minimize_test.py
+index 3012d382..45ac8f02 100644
+--- a/tests/minimize_test.py
++++ b/tests/minimize_test.py
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-"""Tests for google3.third_party.py.jax_md.dynamics."""
++"""Tests for jax_md.minimize."""
+ 
+ import numpy as onp
+ 
+@@ -23,13 +23,20 @@
+ from jax import random
+ from jax import jit
+ from jax import lax
+-import jax.numpy as np
++import jax.numpy as jnp
+ 
+ from jax_md import space
++from jax_md import energy
+ from jax_md import minimize
+ from jax_md import quantity
++from jax_md import partition
+ from jax_md.util import *
+ from jax_md import test_util
++from jax_md.custom_partition import (
++  neighbor_list_multi_image,
++  estimate_max_neighbors_from_box,
++)
++from jax_md.custom_smap import pair_neighbor_list_multi_image
+ 
+ jax.config.parse_flags_with_absl()
+ 
+@@ -69,7 +76,7 @@ def test_gradient_descent(self, spatial_dimension, dtype):
+         split0, (PARTICLE_COUNT, spatial_dimension), dtype=dtype
+       )
+ 
+-      energy = lambda R, **kwargs: np.sum((R - R0) ** 2)
++      energy = lambda R, **kwargs: jnp.sum((R - R0) ** 2)
+       _, shift_fn = space.free()
+ 
+       opt_init, opt_apply = minimize.gradient_descent(
+@@ -77,12 +84,12 @@ def test_gradient_descent(self, spatial_dimension, dtype):
+       )
+ 
+       E_current = energy(R)
+-      dr_current = np.sum((R - R0) ** 2)
++      dr_current = jnp.sum((R - R0) ** 2)
+ 
+       for _ in range(OPTIMIZATION_STEPS):
+         R = opt_apply(R)
+         E_new = energy(R)
+-        dr_new = np.sum((R - R0) ** 2)
++        dr_new = jnp.sum((R - R0) ** 2)
+         assert E_new < E_current
+         assert E_new.dtype == dtype
+         assert dr_new < dr_current
+@@ -113,14 +120,14 @@ def test_fire_descent(self, spatial_dimension, dtype):
+         split0, (PARTICLE_COUNT, spatial_dimension), dtype=dtype
+       )
+ 
+-      energy = lambda R, **kwargs: np.sum((R - R0) ** 2)
++      energy = lambda R, **kwargs: jnp.sum((R - R0) ** 2)
+       _, shift_fn = space.free()
+ 
+       opt_init, opt_apply = minimize.fire_descent(energy, shift_fn)
+ 
+       opt_state = opt_init(R)
+       E_current = energy(R)
+-      dr_current = np.sum((R - R0) ** 2)
++      dr_current = jnp.sum((R - R0) ** 2)
+ 
+       # NOTE(schsam): We add this to test to make sure we can jit through the
+       # creation of FireDescentState.
+@@ -134,7 +141,7 @@ def three_steps(state):
+         opt_state = three_steps(opt_state)
+         R = opt_state.position
+         E_new = energy(R)
+-        dr_new = np.sum((R - R0) ** 2)
++        dr_new = jnp.sum((R - R0) ** 2)
+         assert E_new < E_current
+         assert E_new.dtype == dtype
+         assert dr_new < dr_current
+@@ -143,5 +150,169 @@ def three_steps(state):
+         dr_current = dr_new
+ 
+ 
++class FireDescentBoxTest(test_util.JAXMDTestCase):
++  """Tests for fire_descent and fire_descent_box with multi-image NL."""
++
++  def setUp(self):
++    super().setUp()
++    dtype = jnp.float64
++    R_frac, cubic_box = test_util.make_fcc_fractional(
++      n_cells=1, a=1.55, dtype=dtype
++    )
++    strain = jnp.array(
++      [[1.03, 0.01, 0.005], [0.01, 0.98, 0.005], [0.005, 0.005, 1.01]],
++      dtype=dtype,
++    )
++    self.box = strain @ cubic_box
++    key = random.PRNGKey(42)
++    self.R = jnp.mod(
++      R_frac + random.normal(key, R_frac.shape, dtype=dtype) * 0.002, 1.0
++    )
++    self.N = len(self.R)
++    self.dtype = dtype
++
++    disp_fn, self.shift_fn = space.periodic_general(
++      self.box, fractional_coordinates=True
++    )
++    r_cutoff = 2.5
++    max_nbrs = estimate_max_neighbors_from_box(
++      self.box, r_cutoff, n_atoms=self.N, safety_factor=3.0
++    )
++    self.neighbor_fn, raw_energy_fn = energy.lennard_jones_neighbor_list(
++      disp_fn,
++      self.box,
++      r_cutoff=r_cutoff,
++      r_onset=2.0,
++      dr_threshold=0.0,
++      fractional_coordinates=True,
++      neighbor_list_fn=neighbor_list_multi_image,
++      pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++      max_neighbors=max_nbrs,
++      format=partition.Sparse,
++    )
++
++    def energy_fn(R, box=None, neighbor=None, **kwargs):
++      if box is not None and neighbor is not None:
++        neighbor = neighbor.set(
++          box=box, shifts=neighbor.shifts.astype(box.dtype)
++        )
++      return raw_energy_fn(R, neighbor=neighbor, **kwargs)
++
++    self.energy_fn = energy_fn
++    self.nbrs = self.neighbor_fn.allocate(self.R, box=self.box)
++
++  def test_fire_descent_relaxation(self):
++    """Position-only FIRE must reduce energy."""
++    nbrs = self.nbrs
++    E_init = float(self.energy_fn(self.R, box=self.box, neighbor=nbrs))
++
++    init_fn, apply_fn = minimize.fire_descent(
++      self.energy_fn,
++      self.shift_fn,
++      dt_start=0.001,
++      dt_max=0.01,
++    )
++    state = init_fn(self.R, box=self.box, neighbor=nbrs)
++
++    for _ in range(100):
++      state = apply_fn(state, box=self.box, neighbor=nbrs)
++      nbrs = nbrs.update(state.position, box=self.box)
++
++    E_final = float(self.energy_fn(state.position, box=self.box, neighbor=nbrs))
++    self.assertLess(E_final, E_init, 'Energy must decrease.')
++
++  def test_fire_descent_box_relaxation(self):
++    """Box FIRE must reduce energy and change the box."""
++    nbrs = self.nbrs
++    E_init = float(self.energy_fn(self.R, box=self.box, neighbor=nbrs))
++
++    init_fn, apply_fn = minimize.fire_descent_box(
++      self.energy_fn,
++      self.shift_fn,
++      dt_start=0.001,
++      dt_max=0.01,
++    )
++    state = init_fn(self.R, self.box, neighbor=nbrs)
++
++    for _ in range(100):
++      state = apply_fn(state, neighbor=nbrs)
++      nbrs = nbrs.update(state.position, box=state.box)
++
++    E_final = float(
++      self.energy_fn(state.position, box=state.box, neighbor=nbrs)
++    )
++    self.assertLess(E_final, E_init, 'Energy must decrease.')
++    self.assertGreater(
++      float(jnp.linalg.norm(state.box - self.box)),
++      1e-3,
++      'Box should have changed.',
++    )
++
++  def test_fire_descent_box_with_threshold(self):
++    """Box FIRE with dr_threshold > 0 must still reduce energy."""
++    dtype = self.dtype
++    R_frac, cubic_box = test_util.make_fcc_fractional(
++      n_cells=1, a=1.55, dtype=dtype
++    )
++    strain = jnp.array(
++      [[1.03, 0.01, 0.005], [0.01, 0.98, 0.005], [0.005, 0.005, 1.01]],
++      dtype=dtype,
++    )
++    box = strain @ cubic_box
++    key = random.PRNGKey(42)
++    R = jnp.mod(
++      R_frac + random.normal(key, R_frac.shape, dtype=dtype) * 0.002, 1.0
++    )
++    N = len(R)
++
++    disp_fn, shift_fn = space.periodic_general(box, fractional_coordinates=True)
++    r_cutoff = 2.5
++    max_nbrs = estimate_max_neighbors_from_box(
++      box, r_cutoff, n_atoms=N, safety_factor=3.0
++    )
++    neighbor_fn, raw_energy_fn = energy.lennard_jones_neighbor_list(
++      disp_fn,
++      box,
++      r_cutoff=r_cutoff,
++      r_onset=2.0,
++      dr_threshold=0.5,
++      fractional_coordinates=True,
++      neighbor_list_fn=neighbor_list_multi_image,
++      pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++      max_neighbors=max_nbrs,
++      format=partition.Sparse,
++    )
++
++    def energy_fn(R, box=None, neighbor=None, **kwargs):
++      if box is not None and neighbor is not None:
++        neighbor = neighbor.set(
++          box=box, shifts=neighbor.shifts.astype(box.dtype)
++        )
++      return raw_energy_fn(R, neighbor=neighbor, **kwargs)
++
++    nbrs = neighbor_fn.allocate(R, box=box)
++    E_init = float(energy_fn(R, box=box, neighbor=nbrs))
++
++    init_fn, apply_fn = minimize.fire_descent_box(
++      energy_fn,
++      shift_fn,
++      dt_start=0.001,
++      dt_max=0.01,
++    )
++    state = init_fn(R, box, neighbor=nbrs)
++
++    for _ in range(100):
++      state = apply_fn(state, neighbor=nbrs)
++      nbrs = nbrs.update(state.position, box=state.box)
++
++    E_final = float(energy_fn(state.position, box=state.box, neighbor=nbrs))
++    self.assertLess(E_final, E_init, 'Energy must decrease with threshold.')
++    self.assertGreater(
++      float(jnp.linalg.norm(state.box - box)),
++      1e-3,
++      'Box should have changed.',
++    )
++
++
+ if __name__ == '__main__':
+   absltest.main()

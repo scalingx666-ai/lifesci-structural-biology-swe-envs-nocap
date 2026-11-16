@@ -1,0 +1,238 @@
+diff --git a/src/store/projects.integration.test.ts b/src/store/projects.integration.test.ts
+index 2a62d12e..1487c024 100644
+--- a/src/store/projects.integration.test.ts
++++ b/src/store/projects.integration.test.ts
+@@ -367,25 +367,59 @@ describe("projects store integration", () => {
+       ).toBe("completed");
+     });
+ 
+-    it("sends no user content (simulationId, errorMessage) to metrics", async () => {
++    it("sends the project dir name as simulationId for user projects, and never errorMessage", async () => {
+       const engine = createFakeEngine();
+       const { store } = await createTestStore(engine);
+       await store.getActions().projects.createProject({
+-        displayName: "Acme Corp NDA polymer study",
++        displayName: "Polymer study",
+         files: [{ fileName: "in.lmp", content: SCRIPT }],
+       });
++      const dirName = activeDirName(store);
+       engine.setErrorMessage("ERROR: quotes script content");
+       vi.mocked(track).mockClear();
+ 
+       await store.getActions().projects.startRuns([runRequest()]);
+ 
+-      expect(vi.mocked(track).mock.calls.length).toBeGreaterThan(0);
++      // A user project has no curated example id: simulationId is the
++      // project dir name so the dashboard can tell simulations apart.
++      expect(byName("Simulation.Start")[0]).toMatchObject({
++        simulationId: dirName,
++      });
++      expect(byName("Simulation.Stop")[0]).toMatchObject({
++        simulationId: dirName,
++      });
++      // errorMessage quotes script content and stays out of metrics.
+       for (const [, payload] of vi.mocked(track).mock.calls) {
+-        expect(payload ?? {}).not.toHaveProperty("simulationId");
+         expect(payload ?? {}).not.toHaveProperty("errorMessage");
+       }
+     });
+ 
++    it("sends the curated example id to metrics for example-sourced projects", async () => {
++      const engine = createFakeEngine();
++      const { store } = await createTestStore(engine);
++      await store.getActions().projects.createProject({
++        displayName: "Water vapor",
++        files: [{ fileName: "in.lmp", content: SCRIPT }],
++        source: { type: "example", exampleId: "watervapor" },
++      });
++      vi.mocked(track).mockClear();
++
++      await store.getActions().projects.startRuns([runRequest()]);
++
++      expect(byName("Simulation.Start")[0]).toMatchObject({
++        simulationId: "watervapor",
++      });
++      expect(byName("Simulation.Stop")[0]).toMatchObject({
++        simulationId: "watervapor",
++      });
++      expect(byName("Run.Start")[0]).toMatchObject({
++        exampleId: "watervapor",
++      });
++      expect(byName("Run.Finish")[0]).toMatchObject({
++        exampleId: "watervapor",
++      });
++    });
++
+     it("records a failed run with the engine's error message", async () => {
+       const engine = createFakeEngine();
+       const { store, libraryStorage } = await createTestStore(engine);
+@@ -1204,6 +1238,14 @@ function runRequest(
+   };
+ }
+ 
++/** track() calls' payloads for one event name, in call order. */
++function byName(name: string): unknown[] {
++  return vi
++    .mocked(track)
++    .mock.calls.filter(([event]) => event === name)
++    .map(([, payload]) => payload);
++}
++
+ function activeDirName(store: Store<StoreModel>): string {
+   const active = store.getState().projects.active;
+   if (!active) {
+diff --git a/src/store/projects.ts b/src/store/projects.ts
+index ad71ee35..bf3a8feb 100644
+--- a/src/store/projects.ts
++++ b/src/store/projects.ts
+@@ -25,6 +25,7 @@ import {
+   allocateRunDir,
+   bytesToWriteContent,
+   listRuns,
++  PROJECT_META_PATH,
+   readRunMeta,
+   reconcileRuns,
+   RUNS_DIR,
+@@ -1090,6 +1091,24 @@ export const projectsModel: ProjectsModel = {
+ 
+     await actions.flushPendingSaves();
+ 
++    // Metrics provenance: the curated example id when the project came from
++    // the example library. Best-effort — a missing project.json never blocks
++    // the run.
++    let exampleId: string | undefined;
++    try {
++      const rawMeta = await storage.read(request.dirName, PROJECT_META_PATH);
++      const text =
++        typeof rawMeta === "string"
++          ? rawMeta
++          : new TextDecoder().decode(rawMeta);
++      const meta = JSON.parse(text) as ProjectMeta;
++      if (meta.source?.type === "example") {
++        exampleId = meta.source.exampleId;
++      }
++    } catch {
++      // Provenance is optional metadata for metrics only.
++    }
++
+     // 1. Claim the run directory and snapshot the working tree (ADR-001 §5).
+     const runId = await allocateRunDir(storage, request.dirName);
+     // Record the real run id immediately: reconcileRuns (window focus, tab
+@@ -1123,6 +1142,7 @@ export const projectsModel: ProjectsModel = {
+       origin: request.sweepId ? "sweep" : (request.origin ?? "button"),
+       kokkos: request.useKokkos,
+       hasVars: Object.keys(request.vars).length > 0,
++      exampleId,
+     });
+     actions.setScreen({
+       name: "project",
+@@ -1183,6 +1203,7 @@ export const projectsModel: ProjectsModel = {
+       inputScript: request.inputScript,
+       start: false,
+       vars: Object.keys(request.vars).length ? request.vars : undefined,
++      metricsId: exampleId ?? request.dirName,
+     };
+ 
+     // 3. Copy outputs out of the worker FS into project storage on a
+@@ -1300,6 +1321,7 @@ export const projectsModel: ProjectsModel = {
+       status: runMeta.status,
+       wallSeconds: runMeta.stats?.wallSeconds,
+       timesteps: runMeta.stats?.timesteps,
++      exampleId,
+     });
+     const frame = await captureViewport();
+     if (frame) {
+diff --git a/src/store/simulation.ts b/src/store/simulation.ts
+index 5be431d6..4d3cbee2 100644
+--- a/src/store/simulation.ts
++++ b/src/store/simulation.ts
+@@ -81,6 +81,8 @@ export interface RunResultContext {
+     timestepsPerSecond: string;
+     numAtoms: number;
+     computes: string[];
++    /** Curated example id or the project dir name. */
++    simulationId?: string;
+   };
+   actions: {
+     setRunning: (running: boolean) => void;
+@@ -96,9 +98,9 @@ export interface RunResultContext {
+  * Routes a run result to the appropriate canceled / failed / completed path,
+  * fires side-effects (error state, tracking), and returns the stop reason.
+  *
+- * Metrics carry no simulationId (it embeds the project dir slug — user
+- * content, PII policy) and no errorMessage (it quotes script content); the
+- * sanitized signal is stopReason + numeric metricsData.
++ * Metrics carry no errorMessage (it quotes script content); the signal is
++ * stopReason + numeric metricsData + a simulationId that is the curated
++ * example id or the project dir name.
+  */
+ export function handleRunResult(ctx: RunResultContext): StopReason {
+   const { errorMessage, metricsData, actions, allActions } = ctx;
+@@ -150,6 +152,12 @@ export interface Simulation {
+   analysisScript?: string;
+   start: boolean;
+   vars?: Record<string, number>;
++  /**
++   * Identity sent to metrics as simulationId: the curated example id when
++   * the project came from the example library, else the project dir name.
++   * Falls back to `id` when unset.
++   */
++  metricsId?: string;
+ }
+ 
+ // The full console of the active run, outside the store: state.lammpsOutput
+@@ -383,12 +391,9 @@ export const simulationModel: SimulationModel = {
+ 
+       await actions.syncFilesWasm(undefined);
+ 
+-      lammps.start();
+-      actions.setRunning(true);
+-      // No simulationId — it embeds the project dir slug (user content).
+-      track("Simulation.Start", {});
+-      time_event("Simulation.Stop");
+-
++      // Guard before Simulation.Start/time_event fire: an aborted run must
++      // not leave an unmatched Start or a stale Stop timer that would be
++      // charged to the next run.
+       const inputScriptFile = simulation.files.find(
+         (file) => file.fileName === simulation.inputScript,
+       );
+@@ -396,9 +401,16 @@ export const simulationModel: SimulationModel = {
+         actions.setLastError(
+           `Input script ${simulation.inputScript} was not found among the simulation files.`,
+         );
+-        actions.setRunning(false);
+         return;
+       }
++
++      lammps.start();
++      actions.setRunning(true);
++      // simulationId is the curated example id or the project dir name —
++      // the Mixpanel dashboard breaks simulations down by it.
++      const simulationId = simulation.metricsId ?? simulation.id;
++      track("Simulation.Start", { simulationId });
++      time_event("Simulation.Stop");
+       if (inputScriptFile.content) {
+         actions.extractAndApplyAtomifyCommands(inputScriptFile.content);
+       }
+@@ -443,7 +455,7 @@ export const simulationModel: SimulationModel = {
+ 
+       const stopReason = handleRunResult({
+         errorMessage,
+-        metricsData,
++        metricsData: { ...metricsData, simulationId },
+         actions,
+         allActions,
+       });
+@@ -546,8 +558,9 @@ export const simulationModel: SimulationModel = {
+           allActions.app.setSelectedFile(inputScriptFile);
+         }
+       }
+-      // No simulationId — it embeds the project dir slug (user content).
+-      track("Simulation.New", {});
++      track("Simulation.New", {
++        simulationId: simulation.metricsId ?? simulation.id,
++      });
+     },
+   ),
+   setLastError: action((state, error: string | undefined) => {

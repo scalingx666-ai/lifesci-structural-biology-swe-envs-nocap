@@ -1,0 +1,645 @@
+diff --git a/README.md b/README.md
+index 73ea0b2..311cb88 100644
+--- a/README.md
++++ b/README.md
+@@ -23,7 +23,7 @@ After installation, you can run accelerated molecular dynamics as follows:
+ import ase.build
+ import ase.units
+ import torch
+-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
++from ase.md.velocitydistribution import thermalize_momenta
+ 
+ from flashmd import get_pretrained
+ from flashmd.ase import EnergyCalculator
+@@ -35,7 +35,7 @@ time_step = 64  # 64 fs; also available: 1, 2, 4, 8, 16, 32, 128 fs
+ 
+ # Create a structure and initialize velocities
+ atoms = ase.build.bulk("Al", "fcc", cubic=True)
+-MaxwellBoltzmannDistribution(atoms, temperature_K=300)
++thermalize_momenta(atoms, temperature_K=300)
+ atoms.set_velocities(  # it is generally a good idea to remove any net velocity
+     atoms.get_velocities() - atoms.get_momenta().sum(axis=0) / atoms.get_masses().sum()
+ )
+diff --git a/pyproject.toml b/pyproject.toml
+index 86548c5..98750b5 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -9,11 +9,11 @@ description = "Accelerated molecular dynamics with large-time-step predictions"
+ authors = [{name = "flashmd developers"}]
+ 
+ dependencies = [
+-    "metatrain==2026.2",
++    "metatrain==2026.3.1",
+     "metatomic-ase",
+     "vesin>=0.5.4",
+     "nvalchemi-toolkit-ops==0.3.0",  # tricks metatomic-ase into avoiding buggy vesin
+-    "ase",
++    "ase>=3.29.0",  # thermalize_momenta replaces MaxwellBoltzmannDistribution
+     "huggingface_hub",
+ ]
+ 
+@@ -84,11 +84,19 @@ filterwarnings = [
+     "ignore:`torch.jit.load` is deprecated:DeprecationWarning",
+     "ignore:`compute_requested_neighbors_from_options` is deprecated and will be removed in a future version:UserWarning",
+     "ignore:hf_xet\\.download_files\\(\\) is deprecated:DeprecationWarning",
+-    "ignore:Due to '_pack_', the 'APICLaunchParamRecord' Structure will use memory layout compatible with MSVC:DeprecationWarning",
++    "ignore:Due to '_pack_', the '.*' Structure will use memory layout compatible with MSVC:DeprecationWarning",
++    "ignore:warp.config.quiet is deprecated:DeprecationWarning",
+     "ignore:`torch.jit.script` is not supported:DeprecationWarning",
+     "ignore:`torch.jit.script_method` is not supported:DeprecationWarning",
+     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
+     "ignore:`torch.jit.load` is not supported:DeprecationWarning",
+     "ignore:The 'nvalchemiops.neighborlist' module has been renamed to 'nvalchemiops.neighbors':DeprecationWarning",
+     "ignore:From version 0.3.0 onwards, PyTorch is now an optional dependency:DeprecationWarning",
++    "ignore:`torch.jit.interface` is deprecated:DeprecationWarning",
++    "ignore:`torch.jit.set_fusion_strategy` is deprecated:DeprecationWarning",
++    "ignore:the '.*' output name is deprecated:UserWarning",
++    "ignore:the '.*' quantity is deprecated:UserWarning",
++    "ignore:the '.*' quantity is deprecated:DeprecationWarning",
++    "ignore:ModelOutput.quantity is deprecated:DeprecationWarning",
++    "ignore:Setting the shape on a NumPy array has been deprecated in NumPy 2.5:DeprecationWarning",
+ ]
+diff --git a/src/flashmd/ase/velocity_verlet.py b/src/flashmd/ase/velocity_verlet.py
+index 087a382..a035907 100644
+--- a/src/flashmd/ase/velocity_verlet.py
++++ b/src/flashmd/ase/velocity_verlet.py
+@@ -5,10 +5,11 @@
+ from ase.md.md import MolecularDynamics
+ from metatensor.torch import Labels, TensorBlock, TensorMap
+ from metatomic.torch import AtomisticModel, System
+-from metatomic.torch.ase_calculator import _ase_to_torch_data
++from metatomic_ase._calculator import _ase_to_torch_data
+ from scipy.spatial.transform import Rotation
+ 
+ from ..stepper import FlashMDStepper
++from ..symplectic_stepper import SymplecticStepper
+ 
+ 
+ class VelocityVerlet(MolecularDynamics):
+@@ -24,9 +25,18 @@ def __init__(
+     ):
+         super().__init__(atoms, timestep, **kwargs)
+ 
+-        capabilities = model.capabilities()
++        if isinstance(model, tuple):
++            flashmd_model, symplectic_part = model
++            if isinstance(symplectic_part, tuple):
++                symplectic_model, symplectic_config = symplectic_part
++            else:
++                symplectic_model, symplectic_config = symplectic_part, None
++        else:
++            flashmd_model, symplectic_model, symplectic_config = model, None, None
++
++        capabilities = flashmd_model.capabilities()
+ 
+-        model_timestep = float(model.module.timestep)
++        model_timestep = float(flashmd_model.module.timestep)
+         if not np.allclose(model_timestep, self.dt / ase.units.fs):
+             raise ValueError(
+                 f"Mismatch between timestep ({self.dt / ase.units.fs} fs) "
+@@ -40,7 +50,14 @@ def __init__(
+         self.device = torch.device(device)
+         self.dtype = getattr(torch, capabilities.dtype)
+ 
+-        self.stepper = FlashMDStepper(model, self.device)
++        flashmd_stepper = FlashMDStepper(flashmd_model, self.device)
++        self.stepper: FlashMDStepper | SymplecticStepper
++        if symplectic_model is not None:
++            self.stepper = SymplecticStepper(
++                flashmd_stepper, symplectic_model, symplectic_config
++            )
++        else:
++            self.stepper = flashmd_stepper
+         self.rescale_energy = rescale_energy
+         self.random_rotation = random_rotation
+ 
+diff --git a/src/flashmd/fpi.py b/src/flashmd/fpi.py
+new file mode 100644
+index 0000000..15a7242
+--- /dev/null
++++ b/src/flashmd/fpi.py
+@@ -0,0 +1,86 @@
++from typing import Callable
++
++import torch
++
++
++def anderson_solver(
++    f: Callable[[torch.Tensor], torch.Tensor],
++    x0: torch.Tensor,
++    m: int = 5,
++    max_iter: int = 50,
++    tol: float = 1e-5,
++    beta: float = 1.0,
++    lambda_reg: float = 1e-4,
++    return_residual_norms: bool = False,
++) -> torch.Tensor | tuple[torch.Tensor, list[float]]:
++    """
++    Solve fixed-point problem x = f(x) using Anderson acceleration.
++
++    Args:
++        f: Fixed-point mapping.
++        x0: Initial guess.
++        m: Number of previous iterates to use for acceleration.
++        max_iter: Maximum number of iterations.
++        tol: Convergence tolerance based on residual norm.
++        beta: Mixing parameter for the fixed-point step.
++        lambda_reg: Regularization parameter for least-squares solve.
++        return_residual_norms: If True, also return list of residual norms.
++
++    Returns:
++        Approximate solution x, and optionally list of residual norms.
++    """
++    # history buffers
++    delta_xs: list[torch.Tensor] = []
++    delta_gs: list[torch.Tensor] = []
++    residual_norms = []
++
++    # run fixed-pointer iteration
++    x = x0
++    fx = f(x)
++    g = fx - x
++    x_prev, g_prev = None, None
++    for k in range(max_iter):
++        # evaluate residual and compute convergence
++        res_norm = torch.norm(g).item()
++        residual_norms.append(res_norm)
++        if res_norm < tol:
++            break
++
++        # update history
++        if k > 0:
++            assert x_prev is not None and g_prev is not None
++            delta_xs.append(x - x_prev)
++            delta_gs.append(g - g_prev)
++
++            # truncate history to hold at most m elements
++            if len(delta_xs) > m:
++                delta_xs.pop(0)
++                delta_gs.pop(0)
++        x_prev, g_prev = x, g
++
++        # compute Anderson acceleration step
++        if len(delta_xs) > 0:
++            # create matrices from history of shape (features, history_length)
++            X = torch.stack(delta_xs, dim=1)  # (n, k)
++            G = torch.stack(delta_gs, dim=1)  # (n, k)
++
++            # solve regularized least-squares problem
++            A = G.T @ G + lambda_reg * torch.eye(G.shape[1], device=G.device)
++            b = G.T @ g
++            try:
++                coeffs = torch.linalg.solve(A, b)
++                # update iterate with momentum + Anderson step
++                x = x + beta * g - (X + beta * G) @ coeffs
++            except RuntimeError:
++                x = x + beta * g  # fallback to fixed-point step if matrix is singular
++        else:
++            x = x + beta * g  # fixed-point step if there is no history
++
++        # update iterate and residual
++        fx = f(x)
++        g = fx - x
++
++    if return_residual_norms:
++        return x, residual_norms
++    else:
++        return x
+diff --git a/src/flashmd/ipi.py b/src/flashmd/ipi.py
+index 1ba00f6..1cbdbaf 100644
+--- a/src/flashmd/ipi.py
++++ b/src/flashmd/ipi.py
+@@ -11,6 +11,7 @@
+ from metatomic.torch import System
+ 
+ from flashmd.stepper import FlashMDStepper
++from flashmd.symplectic_stepper import SymplecticStepper
+ 
+ 
+ def get_standard_vv_step(
+@@ -58,9 +59,18 @@ def vv_step(motion):
+ def get_flashmd_vv_step(
+     sim, model, device, rescale_energy=False, random_rotation=False
+ ):
+-    capabilities = model.capabilities()
++    if isinstance(model, tuple):
++        flashmd_model, second = model
++        if isinstance(second, tuple):
++            symplectic_model, symplectic_config = second
++        else:
++            symplectic_model, symplectic_config = second, {}
++    else:
++        flashmd_model, symplectic_model, symplectic_config = model, None, None
++
++    capabilities = flashmd_model.capabilities()
+ 
+-    model_timestep = float(model.module.timestep)
++    model_timestep = float(flashmd_model.module.timestep)
+ 
+     dt = sim.syslist[0].motion.dt * 2.4188843e-17 * ase.units.s / ase.units.fs
+ 
+@@ -71,7 +81,13 @@ def get_flashmd_vv_step(
+ 
+     device = torch.device(device)
+     dtype = getattr(torch, capabilities.dtype)
+-    stepper = FlashMDStepper(model, device)
++    flashmd_stepper = FlashMDStepper(flashmd_model, device)
++    if symplectic_model is not None:
++        stepper = SymplecticStepper(
++            flashmd_stepper, symplectic_model, symplectic_config
++        )
++    else:
++        stepper = flashmd_stepper
+ 
+     def flashmd_vv(motion):
+         info("@flashmd: Starting VV", verbosity.debug)
+diff --git a/src/flashmd/models.py b/src/flashmd/models.py
+index e1f465a..e77753f 100644
+--- a/src/flashmd/models.py
++++ b/src/flashmd/models.py
+@@ -4,7 +4,7 @@
+ import time
+ 
+ from huggingface_hub import hf_hub_download
+-from metatomic.torch import AtomisticModel, load_atomistic_model
++from metatomic.torch import load_atomistic_model
+ 
+ 
+ AVAILABLE_MLIPS = ["pet-omatpes", "pet-omatpes-v2"]
+@@ -12,9 +12,14 @@
+     "pet-omatpes": [1, 2, 4, 8, 16, 32, 64, 128],
+     "pet-omatpes-v2": [1, 2, 4, 8, 16, 32, 64, 128],
+ }
++AVAILABLE_SYMPLECTIC_TIME_STEPS = {
++    "pet-omatpes": [2, 16],
++}
+ 
+ 
+-def get_pretrained(mlip: str = "pet-omatpes-v2", time_step: int = 16) -> AtomisticModel:
++def get_pretrained(
++    mlip: str = "pet-omatpes-v2", time_step: int = 16, symplectic: bool = False
++):
+     if mlip not in AVAILABLE_MLIPS:
+         raise ValueError(
+             f"MLIP '{mlip}' is not available. "
+@@ -27,6 +32,16 @@ def get_pretrained(mlip: str = "pet-omatpes-v2", time_step: int = 16) -> Atomist
+             f"for time steps of {', '.join(map(str, AVAILABLE_TIME_STEPS[mlip]))} fs."
+         )
+ 
++    if symplectic:
++        if mlip not in AVAILABLE_SYMPLECTIC_TIME_STEPS:
++            raise ValueError(
++                f"No symplectic FlashMD model is available for the {mlip} MLIP."
++            )
++        if time_step not in AVAILABLE_SYMPLECTIC_TIME_STEPS[mlip]:
++            raise ValueError(
++                f"Symplectic FlashMD models based on the {mlip} MLIP are only available "
++                f"for time steps of {', '.join(map(str, AVAILABLE_SYMPLECTIC_TIME_STEPS[mlip]))} fs."
++            )
+     # Get checkpoints corresponding to the selected MLIP and FlashMD models
+     mlip_path = hf_hub_download(
+         repo_id="lab-cosmo/flashmd",
+@@ -81,7 +96,44 @@ def get_pretrained(mlip: str = "pet-omatpes-v2", time_step: int = 16) -> Atomist
+         mlip_model = load_atomistic_model(exported_mlip_path)
+         flashmd_model = load_atomistic_model(exported_flashmd_path)
+ 
+-    return mlip_model, flashmd_model
++    if not symplectic:
++        return mlip_model, flashmd_model
++
++    symplectic_path = hf_hub_download(
++        repo_id="lab-cosmo/flashmd",
++        filename=f"flashmd-symplectic_{mlip}_{time_step}fs.ckpt",
++        cache_dir=None,
++        revision="main",
++    )
++    exported_symplectic_path = symplectic_path.replace(".ckpt", ".pt")
++    symplectic_reexport = False
++    if not os.path.exists(exported_symplectic_path):
++        symplectic_reexport = True
++    if time.time() - os.path.getmtime(symplectic_path) < 10:
++        symplectic_reexport = True
++    if symplectic_reexport:
++        result = subprocess.run(
++            ["mtt", "export", symplectic_path, "-o", exported_symplectic_path],
++            capture_output=True,
++        )
++        if result.returncode != 0:
++            raise RuntimeError(result.stderr.decode())
++
++    try:
++        symplectic_model = load_atomistic_model(exported_symplectic_path)
++    except Exception:
++        print(f"{symplectic_path=}")
++        print(f"{exported_symplectic_path=}")
++        result = subprocess.run(
++            ["mtt", "export", symplectic_path, "-o", exported_symplectic_path],
++            capture_output=True,
++        )
++        if result.returncode != 0:
++            raise RuntimeError(result.stderr.decode())
++        print(f"{result.stdout=}")
++        symplectic_model = load_atomistic_model(exported_symplectic_path)
++
++    return mlip_model, flashmd_model, symplectic_model
+ 
+ 
+ def save_checkpoint(mlip: str = "pet-omatpes-v2", time_step: int = 16):
+diff --git a/src/flashmd/symplectic_stepper.py b/src/flashmd/symplectic_stepper.py
+new file mode 100644
+index 0000000..73e4a45
+--- /dev/null
++++ b/src/flashmd/symplectic_stepper.py
+@@ -0,0 +1,189 @@
++from functools import partial
++
++import torch
++import vesin.metatomic
++from metatensor.torch import Labels, TensorBlock, TensorMap
++from metatomic.torch import AtomisticModel, ModelEvaluationOptions, ModelOutput, System
++
++from flashmd.fpi import anderson_solver
++
++
++class SymplecticStepper:
++    """Fixed-point iteration based symplectic integrator.
++
++    Uses a FlashMDStepper for the initial guess, then refines via Anderson
++    acceleration on the midpoint fixed-point problem.
++
++    The fixed-point problem is: find the midpoint ``x_bar`` in phase space such
++    that ``x_bar = x_init + 0.5 * delta(x_bar)``, where ``delta`` is the output
++    of the symplectic correction model evaluated at ``x_bar``. The converged
++    endpoint is then ``x_star = 2 * x_bar - x_init``.
++
++    Args:
++        flashmd_stepper: Pre-built FlashMDStepper used to generate the initial guess.
++        symplectic_model: AtomisticModel evaluated at the midpoint; must output
++            ``positions`` and ``momenta`` keys representing the full-step deltas.
++        config: Optional dict with keys:
++            - ``tol`` (float, default 1e-5): convergence tolerance for Anderson
++            - ``max_iter`` (int, default 50): maximum Anderson iterations
++            - ``m`` (int, default 5): Anderson history size
++            - ``beta`` (float, default 1.0): Anderson mixing parameter
++            - ``lambda_reg`` (float, default 1e-4): Anderson regularisation
++    """
++
++    def __init__(
++        self,
++        flashmd_stepper,
++        symplectic_model: AtomisticModel,
++        config: dict | None = None,
++    ):
++        if config is None:
++            config = {}
++        self.flashmd_stepper = flashmd_stepper
++        self.device = flashmd_stepper.device
++        self.symplectic_model = symplectic_model.to(self.device)
++
++        flashmd_timestep = float(flashmd_stepper.model.module.timestep)
++        symplectic_timestep = float(symplectic_model.module.timestep)
++        if symplectic_timestep != flashmd_timestep:
++            raise ValueError(
++                f"Mismatch between FlashMD model timestep ({flashmd_timestep} fs) "
++                f"and symplectic model timestep ({symplectic_timestep} fs)."
++            )
++
++        self.tol = config.get("tol", 1e-5)
++        self.max_iter = config.get("max_iter", 50)
++        self.m = config.get("m", 5)
++        self.beta = config.get("beta", 1.0)
++        self.lambda_reg = config.get("lambda_reg", 1e-4)
++
++        self.evaluation_options = ModelEvaluationOptions(
++            length_unit="Angstrom",
++            outputs={
++                "positions": ModelOutput(per_atom=True),
++                "momenta": ModelOutput(per_atom=True),
++            },
++        )
++        self.neighbor_list_calculators = vesin.metatomic.neighbor_lists_for_model(
++            "angstrom", self.symplectic_model
++        )
++        # vesin's CUDA brute_force algorithm is broken for triclinic cells
++        for nl in self.neighbor_list_calculators:
++            nl._nl.algorithm = "cell_list"
++
++    def _midpoint_step(
++        self, system: System, x_init: torch.Tensor, x_bar: torch.Tensor
++    ) -> torch.Tensor:
++        """Evaluate the fixed-point mapping at midpoint estimate ``x_bar``.
++
++        Returns the new midpoint estimate ``x_init + 0.5 * delta(x_bar)``.
++        """
++        n = system.positions.shape[0]
++        masses = system.get_data("masses").block().values
++
++        q_bar = x_bar[: n * 3].view(n, 3)
++        p_bar = x_bar[n * 3 :].view(n, 3, 1)
++
++        midpoint = _make_system(q_bar, p_bar, masses, system)
++        for calculator in self.neighbor_list_calculators:
++            calculator.add_neighbor_list(midpoint)
++
++        outputs = self.symplectic_model(
++            [midpoint], self.evaluation_options, check_consistency=False
++        )
++        delta_q = outputs["positions"].block().values.squeeze(-1)
++        delta_p = outputs["momenta"].block().values
++
++        delta = torch.cat([delta_q.flatten(), delta_p.flatten()])
++        return x_init + 0.5 * delta
++
++    def step(self, system: System) -> System:
++        n = system.positions.shape[0]
++        masses = system.get_data("masses").block().values
++
++        # flatten initial state to a phase-space vector
++        x_init = torch.cat(
++            [
++                system.positions.flatten(),
++                system.get_data("momenta").block().values.flatten(),
++            ]
++        )
++
++        # FlashMD initial guess → initial midpoint estimate
++        initial_guess = self.flashmd_stepper.step(system)
++        x_prime = torch.cat(
++            [
++                initial_guess.positions.flatten(),
++                initial_guess.get_data("momenta").block().values.flatten(),
++            ]
++        )
++        x_bar_init = 0.5 * (x_init + x_prime)
++
++        # Anderson acceleration on the midpoint fixed-point problem
++        f = partial(self._midpoint_step, system, x_init)
++        x_bar_star = anderson_solver(
++            f,
++            x_bar_init,
++            m=self.m,
++            max_iter=self.max_iter,
++            tol=self.tol,
++            beta=self.beta,
++            lambda_reg=self.lambda_reg,
++        )
++
++        # recover endpoint from converged midpoint
++        x_star = 2 * x_bar_star - x_init
++        q_star = x_star[: n * 3].view(n, 3)
++        p_star = x_star[n * 3 :].view(n, 3, 1)
++
++        return _make_system(q_star, p_star, masses, system)
++
++
++def _make_system(positions, momenta, masses, template: System) -> System:
++    """Build a System from updated positions/momenta, copying metadata from template."""
++    device = template.positions.device
++    n = positions.shape[0]
++    atom_samples = Labels(
++        names=["system", "atom"],
++        values=torch.tensor([[0, j] for j in range(n)], device=device),
++    )
++    xyz = [Labels(names="xyz", values=torch.tensor([[0], [1], [2]], device=device))]
++
++    system = System(
++        positions=positions,
++        types=template.types,
++        cell=template.cell,
++        pbc=template.pbc,
++    )
++    system.add_data(
++        "momenta",
++        TensorMap(
++            keys=Labels.single().to(device),
++            blocks=[
++                TensorBlock(
++                    values=momenta if momenta.dim() == 3 else momenta.unsqueeze(-1),
++                    samples=atom_samples,
++                    components=xyz,
++                    properties=Labels.single().to(device),
++                )
++            ],
++        ),
++    )
++    system.add_data(
++        "masses",
++        TensorMap(
++            keys=Labels.single().to(device),
++            blocks=[
++                TensorBlock(
++                    values=masses,
++                    samples=Labels(
++                        names=["system", "atom"],
++                        values=torch.tensor([[0, j] for j in range(n)], device=device),
++                    ),
++                    components=[],
++                    properties=Labels.single().to(device),
++                )
++            ],
++        ),
++    )
++    return system
+diff --git a/tests/test_edge_cases.py b/tests/test_edge_cases.py
+index 5d5e995..3607566 100644
+--- a/tests/test_edge_cases.py
++++ b/tests/test_edge_cases.py
+@@ -1,7 +1,7 @@
+ import ase.build
+ import ase.units
+ import torch
+-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
++from ase.md.velocitydistribution import thermalize_momenta
+ 
+ from flashmd import get_pretrained
+ from flashmd.ase import EnergyCalculator
+@@ -13,7 +13,7 @@ def test_isolated_atom(monkeypatch, tmp_path):
+     monkeypatch.chdir(tmp_path)
+ 
+     atoms = ase.Atoms("O", positions=[[0, 0, 0]])
+-    MaxwellBoltzmannDistribution(atoms, temperature_K=300)
++    thermalize_momenta(atoms, temperature_K=300)
+ 
+     time_step = 8
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+@@ -38,7 +38,7 @@ def test_slab_plus_isolated_atom(monkeypatch, tmp_path):
+     slab = ase.build.fcc111("Al", size=(2, 2, 3), vacuum=10)
+     isolated_atom = ase.Atoms("O", positions=[[0, 0, 24]])
+     atoms = slab + isolated_atom
+-    MaxwellBoltzmannDistribution(atoms, temperature_K=300)
++    thermalize_momenta(atoms, temperature_K=300)
+ 
+     time_step = 8
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+diff --git a/tests/test_symplectic.py b/tests/test_symplectic.py
+new file mode 100644
+index 0000000..9a13f87
+--- /dev/null
++++ b/tests/test_symplectic.py
+@@ -0,0 +1,66 @@
++import ase.build
++import ase.units
++import pytest
++import torch
++from ase.md.velocitydistribution import thermalize_momenta
++
++from flashmd import get_pretrained
++from flashmd.ase.velocity_verlet import VelocityVerlet
++
++
++@pytest.fixture(scope="module")
++def models():
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    _, flashmd_model, symplectic_model = get_pretrained(
++        "pet-omatpes", time_step=2, symplectic=True
++    )
++    return flashmd_model, symplectic_model, device
++
++
++@pytest.fixture
++def atoms():
++    atoms = ase.build.bulk("Al", "fcc", cubic=True)
++    thermalize_momenta(atoms, temperature_K=300)
++    return atoms
++
++
++def test_symplectic_without_config(atoms, models):
++    """(flashmd_model, symplectic_model) runs without config."""
++    flashmd_model, symplectic_model, device = models
++    dyn = VelocityVerlet(
++        atoms=atoms,
++        timestep=2 * ase.units.fs,
++        model=(flashmd_model, symplectic_model),
++        device=device,
++        rescale_energy=False,  # no energy calculator attached to atoms
++    )
++    dyn.run(3)
++
++
++def test_symplectic_timestep_mismatch(atoms, models):
++    """Pairing models with mismatched timesteps raises an error."""
++    flashmd_model, _, device = models  # 2 fs FlashMD model
++    _, _, symplectic_model_16fs = get_pretrained(
++        "pet-omatpes", time_step=16, symplectic=True
++    )
++    with pytest.raises(ValueError, match="timestep"):
++        VelocityVerlet(
++            atoms=atoms,
++            timestep=2 * ase.units.fs,
++            model=(flashmd_model, symplectic_model_16fs),
++            device=device,
++            rescale_energy=False,
++        )
++
++
++def test_symplectic_with_config(atoms, models):
++    """(flashmd_model, (symplectic_model, config)) runs with explicit config."""
++    flashmd_model, symplectic_model, device = models
++    dyn = VelocityVerlet(
++        atoms=atoms,
++        timestep=2 * ase.units.fs,
++        model=(flashmd_model, (symplectic_model, {"tol": 1e-4, "max_iter": 10})),
++        device=device,
++        rescale_energy=False,  # no energy calculator attached to atoms
++    )
++    dyn.run(3)

@@ -1,0 +1,614 @@
+diff --git a/README.md b/README.md
+index 659439baa..8c09d2020 100644
+--- a/README.md
++++ b/README.md
+@@ -109,6 +109,48 @@ In some cases using precomputed database can still be useful. For the following
+ 
+ If no index was created (`MMSEQS_NO_INDEX=1` was set), then `--db-load-mode` does not do anything and can be ignored.
+ 
++### Saving MSAs in AlphaFold3-compatible JSON format
++You can export MSAs into a json format compatible with AlphaFold3 input using the `--af3-json` option. 
++
++**With colabfold_search:**
++
++If you are using the local database setup with colabfold_search, you can add the `--af3-json` option to save the MSAs as AlphaFold3 input json:
++```shell
++colabfold_search --mmseqs /path/to/bin/mmseqs input_sequences.fasta /path/to/db_folder msas --af3-json
++```
++This will create a json file in the `msas` folder, using the same name as the a3m file.
++
++**With colabfold_batch:**
++
++If you are using the MSA server via colabfold_batch, you can also use the `--af3-json` option. However, structure prediction will be skipped, and only the json file will be generated. 
++```shell
++colabfold_batch input_sequences.fasta out_dir --af3-json
++```
++
++#### Including non-protein molecules in FASTA
++AlphaFold3 supports non-protein components such as ligands and nucleic acids in input complexes. To include these in the generated json file, you can specify them directly in your FASTA input using the following format, `molecule type|sequence|(copies)`. As molecue types, dna, rna, ccd, smiles are allowed.
++
++ > :exclamation: **Substitute aromatic bonds in SMILES**
++ > If your SMILES string contains aromatic bonds (`:`), please replace them with semicolons (`;`) to avoid internal parsing issues.
++
++- Examples
++  - For DNA: `dna|ATCG`
++  - For RNA: `rna|AUGC`
++  - For ligands: 
++    - SMILES string: `smiles|C1=NC(=C2C(=N1)N(C=N2)[C@H]3[C@@H]([C@@H]([C@H](O3)COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N`
++    - CCD code: `ccd|ATP`
++  - To specify multiple copies of a molecule, you can add a number after the sequence, e.g. `ccd|ATP|2` or `dna|ATCG|2`.
++
++Here is an example of biological complex with 2 proteins and 2 ATP ligands:
++```
++>Complex1|Prot1:Prot2:Lig
++FIRSTPROTEIN:SECONDPROTEIN:ccd|ATP|2
++>Complex2|Prot1:Prot2:Lig
++FIRSTPROTEIN:SECONDPROTEIN:ccd|ATP:ccd|ATP
++```
++As the `copies` is optional, the `Complex1` and `Complex2` will result in identical json input.
++
++ Note that MMseqs2-based MSAs are only generated for the protein sequences. RNA entries will not have unpaired MSAs in the json file. However, the field is marked as null so that AlphaFold3 can generate MSAs for them. 
+ 
+ ### GPU-accelerated search with ⁠`colabfold_search` ⁠
+ ColabFold supports GPU-accelerated MSA searches through [MMseqs2-GPU](https://www.biorxiv.org/content/10.1101/2024.11.13.623350v1).
+diff --git a/colabfold/batch.py b/colabfold/batch.py
+index 843664d95..1df5f05e3 100644
+--- a/colabfold/batch.py
++++ b/colabfold/batch.py
+@@ -62,6 +62,7 @@
+     get_commit,
+     setup_logging,
+     CFMMCIFIO,
++    AF3Utils,
+ )
+ from colabfold.input import (
+     pair_msa,
+@@ -1031,7 +1032,7 @@ def put_mmciffiles_into_resultdir(
+ 
+ 
+ def run(
+-    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]]]],
++    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]], Optional[List[Tuple[str, str,int]]]]],
+     result_dir: Union[str, Path],
+     num_models: int,
+     is_complex: bool,
+@@ -1145,7 +1146,7 @@ def run(
+     # get max length
+     max_len = 0
+     max_num = 0
+-    for _, query_sequence, _ in queries:
++    for _, query_sequence, _, _ in queries:
+         N = 1 if isinstance(query_sequence,str) else len(query_sequence)
+         L = len("".join(query_sequence))
+         if L > max_len: max_len = L
+@@ -1237,7 +1238,7 @@ def run(
+     ranks, metrics = [],[]
+     first_job = True
+     job_number = 0
+-    for job_number, (raw_jobname, query_sequence, a3m_lines) in enumerate(queries):
++    for job_number, (raw_jobname, query_sequence, a3m_lines, _) in enumerate(queries):
+         if jobname_prefix is not None:
+             # pad job number based on number of queries
+             fill = len(str(len(queries)))
+@@ -1505,6 +1506,64 @@ def set_model_type(is_complex: bool, model_type: str) -> str:
+             model_type = "alphafold2_ptm"
+     return model_type
+ 
++def generate_af3_input(
++    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]], Optional[List[Tuple[str, str, int]]]]],
++    result_dir: Union[str, Path],
++    msa_mode: str = "mmseqs2_uniref_env",
++    pair_mode: str = "unpaired_paired",
++    pairing_strategy: str = "greedy",
++    use_templates: bool = False,
++    custom_template_path: str = None,
++    jobname_prefix: Optional[str] = None,
++    host_url: str = DEFAULT_API_SERVER, #NOTE: what is this ?
++    user_agent: str = "", #NOTE: what is this ?
++    # is_complex: bool,
++    # model_type: str = "auto",
++):
++    result_dir = Path(result_dir) 
++    result_dir.mkdir(exist_ok=True)
++
++    job_number = 0
++
++    for job_number, (raw_jobname, query_sequences, a3m_lines, other_molecules) in enumerate(queries):
++        if jobname_prefix is not None:
++            # pad job number based on number of queries
++            fill = len(str(len(queries)))
++            jobname = safe_filename(jobname_prefix) + "_" + str(job_number).zfill(fill)
++            # job_number += 1 # Why add?
++        else:
++            jobname = safe_filename(raw_jobname)
++
++        ###########################################
++        # generate MSA (a3m_lines) and templates
++        ###########################################
++        try:
++            if a3m_lines is None:
++                (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features) \
++                = get_msa_and_templates(jobname, query_sequences, a3m_lines, result_dir, msa_mode, use_templates,
++                    custom_template_path, pair_mode, pairing_strategy, host_url, user_agent)
++
++            elif a3m_lines is not None:
++                (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features) \
++                = unserialize_msa(a3m_lines, query_sequences)
++                # if use_templates:
++                #     (_, _, _, _, template_features) \
++                #         = get_msa_and_templates(jobname, query_seqs_unique, unpaired_msa, result_dir, 'single_sequence', use_templates,
++                #             custom_template_path, pair_mode, pairing_strategy, host_url, user_agent)
++
++            # save json
++            af3 = AF3Utils(jobname, query_seqs_unique, query_seqs_cardinality, unpaired_msa, paired_msa, other_molecules)
++            with open(result_dir.joinpath(f"{jobname}.json"), "w") as f:
++                f.write(json.dumps(af3.content, indent = 4))
++                
++            # save a3m
++            msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
++            result_dir.joinpath(f"{jobname}.a3m").write_text(msa)
++
++        except Exception as e:
++            logger.exception(f"Failed to generate AF3 input json for {jobname}: Could not get MSA/templates. {e}")
++            continue
++
+ def main():
+     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+     parser.add_argument(
+@@ -1832,6 +1891,15 @@ def main():
+         "Set to 0 to disable.",
+     )
+ 
++    af3_group = parser.add_argument_group(
++        "AlphaFold3 arguments", ""
++    )
++    af3_group.add_argument(
++        "--af3-json",
++        help="Generate input JSON for AlphaFold3 from the provided FASTA/A3M file.",
++        action="store_true",
++    )
++    
+     args = parser.parse_args()
+ 
+     if (args.custom_template_path is not None) and (args.pdb_hit_file is not None):
+@@ -1853,6 +1921,7 @@ def main():
+     data_dir = Path(args.data or default_data_dir)
+ 
+     queries, is_complex = get_queries(args.input, args.sort_queries_by)
++
+     model_type = set_model_type(is_complex, args.model_type)
+ 
+     if args.msa_only:
+@@ -1878,6 +1947,23 @@ def main():
+     use_probs_extra = False if args.no_use_probs_extra else True
+ 
+     user_agent = f"colabfold/{version}"
++
++    if args.af3_json:
++        generate_af3_input(
++            queries=queries,
++            result_dir=args.results,
++            msa_mode=args.msa_mode,
++            pair_mode=args.pair_mode,
++            pairing_strategy=args.pair_strategy,
++            use_templates=args.templates,
++            custom_template_path=args.custom_template_path,
++            jobname_prefix=args.jobname_prefix,
++            host_url=args.host_url,
++            user_agent=user_agent,
++            # extra_molecules=extra_molecules,
++        )
++        return
++    
+     run(
+         queries=queries,
+         result_dir=args.results,
+diff --git a/colabfold/input.py b/colabfold/input.py
+index c18f06b06..5094c8098 100644
+--- a/colabfold/input.py
++++ b/colabfold/input.py
+@@ -2,6 +2,7 @@
+ from pathlib import Path
+ import random
+ import logging
++from colabfold.utils import MolType
+ logger = logging.getLogger(__name__)
+ 
+ def safe_filename(file: str) -> str:
+@@ -114,11 +115,38 @@ def parse_fasta(fasta_string: str) -> Tuple[List[str], List[str]]:
+ 
+     return sequences, descriptions
+ 
++def classify_molecules(query_sequence: str) -> Tuple[List[str], Optional[List[Tuple[MolType, str, int]]]]:
++    """Classifies the sequences in the query sequence string into protein and non-protein sequences.
++
++    Returns a tuple of two lists:
++    * A list of protein sequences.
++    * A list of tuples, each containing a molecule type, a sequence, and number of copies.
++    """
++    sequences = query_sequence.upper().split(":")
++    protein_queries = []
++    other_queries = []
++    for seq in sequences:
++        if seq.count("|") == 0:
++            protein_queries.append(seq)
++        else:
++            parts = seq.split("|")
++            moltype, sequence, *rest = parts
++            moltype = MolType.get_moltype(moltype)
++            if moltype == MolType.SMILES:
++                sequence = sequence.replace(";", ":")
++            copies = int(rest[0]) if rest else 1
++            other_queries.append((moltype, sequence, copies))  # (molecule type, sequence, copies)
++
++    if len(other_queries) == 0:
++        other_queries = None
++
++    return protein_queries, other_queries
++
+ def get_queries(
+     input_path: Union[str, Path], sort_queries_by: str = "length"
+-) -> Tuple[List[Tuple[str, str, Optional[List[str]]]], bool]:
++) -> Tuple[List[Tuple[str, str, Optional[List[str]], Optional[List[Tuple[MolType, str, int]]]]], bool]:
+     """Reads a directory of fasta files, a single fasta file or a csv file and returns a tuple
+-    of job name, sequence and the optional a3m lines"""
++    of job name, sequence, optional a3m lines, and the optional non-protein sequences."""
+ 
+     input_path = Path(input_path)
+     if not input_path.exists():
+@@ -131,12 +159,12 @@ def get_queries(
+             df = pandas.read_csv(input_path, sep=sep, dtype=str)
+             assert "id" in df.columns and "sequence" in df.columns
+             queries = [
+-                (seq_id, sequence.upper().split(":"), None)
++                (seq_id, sequence.upper().split(":"), None, None)
+                 for seq_id, sequence in df[["id", "sequence"]].itertuples(index=False)
+             ]
+             for i in range(len(queries)):
+                 if len(queries[i][1]) == 1:
+-                    queries[i] = (queries[i][0], queries[i][1][0], None)
++                    queries[i] = (queries[i][0], queries[i][1][0], None, None)
+         elif input_path.suffix == ".a3m":
+             (seqs, header) = parse_fasta(input_path.read_text())
+             if len(seqs) == 0:
+@@ -144,7 +172,7 @@ def get_queries(
+             query_sequence = seqs[0]
+             # Use a list so we can easily extend this to multiple msas later
+             a3m_lines = [input_path.read_text()]
+-            queries = [(input_path.stem, query_sequence, a3m_lines)]
++            queries = [(input_path.stem, query_sequence, a3m_lines, None)]
+         elif input_path.suffix in [".fasta", ".faa", ".fa"]:
+             (sequences, headers) = parse_fasta(input_path.read_text())
+             queries = []
+@@ -152,10 +180,11 @@ def get_queries(
+                 sequence = sequence.upper()
+                 if sequence.count(":") == 0:
+                     # Single sequence
+-                    queries.append((header, sequence, None))
++                    queries.append((header, sequence, None, None))
+                 else:
+                     # Complex mode
+-                    queries.append((header, sequence.upper().split(":"), None))
++                    protein_queries, other_queries = classify_molecules(sequence)
++                    queries.append((header, protein_queries, None, other_queries))
+         else:
+             raise ValueError(f"Unknown file format {input_path.suffix}")
+     else:
+@@ -179,14 +208,15 @@ def get_queries(
+ 
+             if file.suffix.lower() == ".a3m":
+                 a3m_lines = [file.read_text()]
+-                queries.append((file.stem, query_sequence.upper(), a3m_lines))
++                queries.append((file.stem, query_sequence.upper(), a3m_lines, None))
+             else:
+                 if query_sequence.count(":") == 0:
+                     # Single sequence
+-                    queries.append((file.stem, query_sequence, None))
++                    queries.append((file.stem, query_sequence, None, None))
+                 else:
+                     # Complex mode
+-                    queries.append((file.stem, query_sequence.upper().split(":"), None))
++                    protein_queries, other_queries = classify_molecules(query_sequence)
++                    queries.append((file.stem, protein_queries, None, other_queries))
+ 
+     # sort by seq. len
+     if sort_queries_by == "length":
+@@ -196,7 +226,7 @@ def get_queries(
+         random.shuffle(queries)
+ 
+     is_complex = False
+-    for job_number, (_, query_sequence, a3m_lines) in enumerate(queries):
++    for job_number, (_, query_sequence, a3m_lines, _) in enumerate(queries):
+         if isinstance(query_sequence, list):
+             is_complex = True
+             break
+diff --git a/colabfold/mmseqs/search.py b/colabfold/mmseqs/search.py
+index 652d6be61..aab4545be 100644
+--- a/colabfold/mmseqs/search.py
++++ b/colabfold/mmseqs/search.py
+@@ -7,11 +7,13 @@
+ import os
+ import shutil
+ import subprocess
++import json
+ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+ from pathlib import Path
+ from typing import List, Union
+ 
+ from colabfold.input import get_queries, msa_to_str, safe_filename
++from colabfold.utils import AF3Utils
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -392,6 +394,14 @@ def main():
+     parser.add_argument(
+         "--gpu-server", type=int, default=0, choices=[0, 1], help="Whether to use GPU server (1) or not (0)"
+     )
++
++    # AlphaFold3 relevant params
++    parser.add_argument(
++        "--af3-json", action="store_true", help="Generate input JSON for AlphaFold3 from the provided FASTA/A3M file."
++    )
++    parser.add_argument(
++        "--af3-msa-as-path", action="store_true", help="Save MSA as a file path instead of a string in the JSON."
++    )
+     args = parser.parse_args()
+ 
+     logging.basicConfig(level = logging.INFO)
+@@ -399,7 +409,7 @@ def main():
+     queries, is_complex = get_queries(args.query, None)
+ 
+     queries_unique = []
+-    for job_number, (raw_jobname, query_sequences, a3m_lines) in enumerate(queries):
++    for job_number, (raw_jobname, query_sequences, a3m_lines, other_molecules) in enumerate(queries):
+         # remove duplicates before searching
+         query_sequences = (
+             [query_sequences] if isinstance(query_sequences, str) else query_sequences
+@@ -413,7 +423,7 @@ def main():
+             seq_idx = query_seqs_unique.index(seq)
+             query_seqs_cardinality[seq_idx] += 1
+ 
+-        queries_unique.append([raw_jobname, query_seqs_unique, query_seqs_cardinality])
++        queries_unique.append([raw_jobname, query_seqs_unique, query_seqs_cardinality, other_molecules])
+ 
+     args.base.mkdir(exist_ok=True, parents=True)
+     query_file = args.base.joinpath("query.fas")
+@@ -422,6 +432,7 @@ def main():
+             raw_jobname,
+             query_sequences,
+             query_seqs_cardinality,
++            _
+         ) in enumerate(queries_unique):
+             for j, seq in enumerate(query_sequences):
+                 # The header of first sequence set as 101
+@@ -439,6 +450,7 @@ def main():
+             raw_jobname,
+             query_sequences,
+             query_seqs_cardinality,
++            _
+         ) in enumerate(queries_unique):
+             for seq in query_sequences:
+                 raw_jobname_first = raw_jobname.split()[0]
+@@ -503,12 +515,13 @@ def main():
+                 unpack=args.unpack,
+             )
+ 
+-        if args.unpack:
++        if args.unpack | args.af3_json:
+             id = 0
+             for job_number, (
+                 raw_jobname,
+                 query_sequences,
+                 query_seqs_cardinality,
++                other_molecules,
+             ) in enumerate(queries_unique):
+                 unpaired_msa = []
+                 paired_msa = None
+@@ -517,28 +530,44 @@ def main():
+                 for seq in query_sequences:
+                     with args.base.joinpath(f"{id}.a3m").open("r") as f:
+                         unpaired_msa.append(f.read())
+-                    args.base.joinpath(f"{id}.a3m").unlink()
++                    if args.af3_json:
++                        args.base.joinpath(f"{id}.a3m").unlink()
+ 
+                     if args.use_env_pairing:
+                         with open(args.base.joinpath(f"{id}.paired.a3m"), 'a') as file_pair:
+                             with open(args.base.joinpath(f"{id}.env.paired.a3m"), 'r') as file_pair_env:
+                                 while chunk := file_pair_env.read(10 * 1024 * 1024):
+                                     file_pair.write(chunk)
+-                        args.base.joinpath(f"{id}.env.paired.a3m").unlink()
++                        if args.unpack:
++                            args.base.joinpath(f"{id}.env.paired.a3m").unlink()
+ 
+                     if len(query_seqs_cardinality) > 1:
+                         with args.base.joinpath(f"{id}.paired.a3m").open("r") as f:
+                             paired_msa.append(f.read())
+-                    args.base.joinpath(f"{id}.paired.a3m").unlink()
++                    if args.unpack:
++                        args.base.joinpath(f"{id}.paired.a3m").unlink()
+                     id += 1
+-                msa = msa_to_str(
+-                    unpaired_msa, paired_msa, query_sequences, query_seqs_cardinality
+-                )
+-                args.base.joinpath(f"{job_number}.a3m").write_text(msa)
++
++                if args.af3_json:
++                    af3 = AF3Utils(raw_jobname, query_sequences, query_seqs_cardinality, unpaired_msa, paired_msa, other_molecules)
++                    with open(args.base.joinpath(f"{job_number}.json"), 'w') as f:
++                        f.write(json.dumps(af3.content, indent=4))
++
++                if args.unpack:   
++                    msa = msa_to_str(
++                        unpaired_msa, paired_msa, query_sequences, query_seqs_cardinality
++                    )
++                    args.base.joinpath(f"{job_number}.a3m").write_text(msa)
++    else:
++        if args.af3_json:
++            af3 = AF3Utils(raw_jobname, query_sequences, query_seqs_cardinality, unpaired_msa, None, other_molecules)
++            with open(args.base.joinpath(f"{job_number}.json"), 'w') as f:
++                f.write(json.dumps(af3.content, indent=4))
++            
+ 
+     if args.unpack:
+         # rename a3m files
+-        for job_number, (raw_jobname, query_sequences, query_seqs_cardinality) in enumerate(queries_unique):
++        for job_number, (raw_jobname, query_sequences, query_seqs_cardinality, other_molecules) in enumerate(queries_unique):
+             os.rename(
+                 args.base.joinpath(f"{job_number}.a3m"),
+                 args.base.joinpath(f"{safe_filename(raw_jobname)}.a3m"),
+@@ -559,6 +588,14 @@ def main():
+         run_mmseqs(args.mmseqs, ["rmdb", args.base.joinpath("qdb")])
+         run_mmseqs(args.mmseqs, ["rmdb", args.base.joinpath("qdb_h")])
+ 
++    if args.af3_json:
++        # rename json files
++        for job_number, (raw_jobname, query_sequences, query_seqs_cardinality, other_molecules) in enumerate(queries_unique):
++            os.rename(
++                args.base.joinpath(f"{job_number}.json"),
++                args.base.joinpath(f"{safe_filename(raw_jobname)}.json"),
++            )
++
+     query_file.unlink()
+ 
+ 
+diff --git a/colabfold/utils.py b/colabfold/utils.py
+index 16f9b4f64..1203c1b00 100644
+--- a/colabfold/utils.py
++++ b/colabfold/utils.py
+@@ -2,7 +2,8 @@
+ import logging
+ import warnings
+ from pathlib import Path
+-from typing import Optional
++from typing import Optional, Tuple, List
++from enum import Enum
+ 
+ from absl import logging as absl_logging
+ from importlib_metadata import distribution
+@@ -276,3 +277,125 @@ def _save_dict(self, out_file):
+             out_file.write("#\n")
+             ### end section copied from Bio.PDB
+             out_file.write(CIF_REVISION_DATE)
++
++class MolType(Enum):
++    RNA = ("sequence", "rna")
++    DNA = ("sequence", "dna")
++    CCD = ("ccdCodes", "ligand")
++    SMILES = ("smiles", "ligand")
++
++    def __init__(self, af3code, upperclass):
++        self.af3code = af3code
++        self.upperclass = upperclass
++
++    @classmethod
++    def get_moltype(cls, moltype: str):
++        if moltype == "RNA":
++            return cls.RNA
++        elif moltype == "DNA":
++            return cls.DNA
++        elif moltype == "SMILES":
++            return cls.SMILES
++        elif moltype == "CCD":
++            return cls.CCD
++        else:
++            raise ValueError(f"Only dna, rna, ccd, smiles are allowed as molecule types.")
++
++class AF3Utils:
++    def __init__(self, name: str, 
++                 query_seqs_unique: List[str], query_seqs_cardinality: List[int],
++                 unpairedmsa: List[str], pairedmsa: List[str],
++                 extra_molecules: List[Tuple[str,str,int]] = None,
++                 ) -> None:
++        content = self.make_af3_input(
++            name, query_seqs_unique, query_seqs_cardinality,
++            unpairedmsa, pairedmsa
++        )
++        if extra_molecules:
++            content = self.add_extra_molecules(content, extra_molecules)
++        self.content = content
++
++    def _int_id_to_str_id(self, i: int) -> str:
++        if i <= 0:
++            raise ValueError(f"int_id_to_str_id: Only positive integers allowed, got {i}")
++        i = i - 1 # 1-based indexing
++        output = []
++        while i >= 0:
++            output.append(chr(i % 26 + ord("A")))
++            i = i // 26 - 1
++        return "".join(output)
++
++    def make_af3_input(self, 
++        name: str, query_seqs_unique: List[str], query_seqs_cardinality: List[int],
++        unpairedmsa: List[str], pairedmsa: List[str],
++    ) -> dict:
++        sequences: list[dict] = []
++        chain_id_count = 0
++        for i in range(len(query_seqs_unique)): # NOTE: This will not work if there's no protein sequences
++            query_seq = query_seqs_unique[i]
++            chain_ids = [
++                self._int_id_to_str_id(chain_id_count + j + 1) for j in range(query_seqs_cardinality[i])
++            ]
++            chain_id_count += query_seqs_cardinality[i]
++            moldict = { "protein": {
++                "id": chain_ids,
++                "sequence": query_seq,
++                "modifications": [],
++                "templates": [],
++                }}
++            if unpairedmsa and unpairedmsa[i]:
++                moldict["protein"]["unpairedMsa"] = unpairedmsa[i]
++            else:
++                moldict["protein"]["unpairedMsa"] = "" # if "" unpairedMsa-free elif "null" AF3 generates MSA
++            if pairedmsa and pairedmsa[i]:
++                moldict["protein"]["pairedMsa"] = pairedmsa[i]
++            else:
++                moldict["protein"]["pairedMsa"] = "" # if "" pairedMsa-free elif "null" AF3 generates MSA
++            sequences.append(moldict)
++        content = {
++                "dialect": "alphafold3",
++                "version": 2, # 1: initial AF3 input format, 2: external MSA & Template
++                "name": f"{name}",
++                "sequences": sequences,
++                "modelSeeds": [1],
++                "bondedAtomPairs": None,
++                "userCCD": None,
++            }
++        return content
++    
++    def add_extra_molecules(self, content: dict, molecules: List[Tuple[MolType,str,int]]) -> dict:
++        chain_id_count = 0
++        for sequence in content["sequences"]:
++            chain_id_count += len(sequence["protein"]["id"])
++
++        unique_molecules = dict() # {moltype: {sequence: copies}}
++
++        for (moltype, sequence, copies) in molecules:
++            upperclass = moltype.upperclass
++            if upperclass not in unique_molecules:
++                unique_molecules[upperclass] = dict()
++            entity = (moltype, sequence)
++            if entity not in unique_molecules[upperclass]:
++                unique_molecules[upperclass][entity] = copies
++            else:
++                unique_molecules[upperclass][entity] += copies
++
++        if not unique_molecules:
++            return content
++        
++        for upperclass, entities in unique_molecules.items():
++            for (moltype, sequence), copies in entities.items():
++                chain_ids = [self._int_id_to_str_id(chain_id_count + j + 1) for j in range(copies)]
++                moldict= {upperclass: {"id": chain_ids}}
++                af3code = moltype.af3code
++
++                if moltype == MolType.CCD:
++                   moldict[upperclass][af3code] = [sequence]
++                else:
++                    moldict[upperclass][af3code] = sequence
++                    if moltype == MolType.RNA:
++                        moldict[upperclass]["unpairedMsa"] = None
++
++                content["sequences"].append(moldict)
++                chain_id_count += copies
++        return content

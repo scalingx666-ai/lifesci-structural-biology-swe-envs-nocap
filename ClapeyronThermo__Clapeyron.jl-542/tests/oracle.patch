@@ -1,0 +1,316 @@
+diff --git a/Project.toml b/Project.toml
+index c77e69beb..af532c827 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -10,6 +10,7 @@ DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+ Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+ FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
+ ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
++IFTDuals = "e48d2a1f-af84-496e-b4fe-d99c19dbdf31"
+ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+ LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+@@ -61,6 +62,7 @@ Downloads = "1"
+ EoSSuperancillaries = "1.2.3"
+ FillArrays = "^0.12, 0.13, 1"
+ ForwardDiff = "0.10.36,1"
++IFTDuals = "0.1.2"
+ JSON = "1"
+ JutulDarcy = "0.2, 0.3"
+ LinearAlgebra = "1"
+diff --git a/docs/src/implicit_differentiation.md b/docs/src/implicit_differentiation.md
+index f38fc52fa..e630edabd 100644
+--- a/docs/src/implicit_differentiation.md
++++ b/docs/src/implicit_differentiation.md
+@@ -7,9 +7,6 @@ Given an implicit variable $x$ defined through the root $F(x(\theta),\theta)=0$,
+ \frac{d F}{d \theta} = \frac{\partial F}{\partial x} \frac{d x}{d \theta} + \frac{\partial F}{\partial \theta} = 0 \implies \frac{d x}{d \theta} = - \left(\frac{\partial F}{\partial x}\right)^{-1} \frac{\partial F}{\partial \theta}
+ ```
+ 
+-To avoid the unrolling of iterations, computing the derivative at each iteration and hence populating the AD stack unnecessarily, `Clapeyron` currently implements the IFT using `ForwardDiff.jl` through the manual manipulation of Duals. Currently only first order AD is supported. Higher order derivatives through nested Duals or Duals with different tags will error. The current AD implementation is:
+-```@docs
+-Clapeyron.__gradients_for_root_finders
+-```
++To avoid the unrolling of iterations, computing the derivative at each iteration and hence populating the AD stack unnecessarily, `Clapeyron` uses [`IFTDual.jl`](https://github.com/Garren-H/IFTDuals.jl), which implements the IFT for dual numbers and is hence only limited to `ForwardDiff.jl`. `IFTDuals.jl` can and is used to obtain abitrary order derivatives.
+ 
+-`Clapeyron` previously implemented a final Newton step to propagate first order derivatives, which is also limited to first order AD. Although this method does produce numeric values for nested Duals, these higher order derivatives are incorrect as it neglects the indirect effects from lower order gradients. For a more complete explanation see [this discussion](https://github.com/ClapeyronThermo/Clapeyron.jl/issues/502).
+\ No newline at end of file
++`Clapeyron` previously implemented a final Newton step to propagate first order derivatives, which is also limited to first order AD. Although this method does produce numeric values for nested Duals, these higher order derivatives are incorrect as it neglects the indirect effects from lower order gradients. For a more complete explanation see [this discussion](https://github.com/ClapeyronThermo/Clapeyron.jl/issues/502).
+diff --git a/src/Clapeyron.jl b/src/Clapeyron.jl
+index 93ee84078..b9142315c 100755
+--- a/src/Clapeyron.jl
++++ b/src/Clapeyron.jl
+@@ -15,7 +15,7 @@ import SpecialFunctions
+ using StaticArrays
+ 
+ using DiffResults, ForwardDiff
+-import DifferentiationInterface # keep function local
++using IFTDuals
+ using Downloads #for bibtex
+ using StableTasks #for multithreaded volume
+ #compatibility and raw julia utilities
+diff --git a/src/base/errors.jl b/src/base/errors.jl
+index 61732026e..fc9fddff7 100644
+--- a/src/base/errors.jl
++++ b/src/base/errors.jl
+@@ -87,19 +87,3 @@ end
+ function moles_positivity(x::T) where T<:Real
+     @assert x >= 0 "Moles non-positive values! Contains values $x"
+ end
+-
+-struct NestedADError <: Exception
+-    msg::String
+-end
+-NestedADError() = NestedADError("")
+-function Base.showerror(io::IO, e::NestedADError)
+-    print(io, "NestedADError: ", e.msg)
+-end
+-
+-struct MultipleTagError <: Exception
+-    msg::String
+-end
+-MultipleTagError() = MultipleTagError("")
+-function Base.showerror(io::IO, e::MultipleTagError)
+-    print(io, "MultipleTagError: ", e.msg)
+-end
+diff --git a/src/methods/differentials.jl b/src/methods/differentials.jl
+index 029823ffc..ff1cfdb91 100755
+--- a/src/methods/differentials.jl
++++ b/src/methods/differentials.jl
+@@ -212,111 +212,18 @@ end
+ 
+ _primalval(model::EoSModel,::T) where T = model
+ 
++# use IFTDuals: ift for implicit differentiation
+ """
+     __gradients_for_root_finders(x::AbstractVector{T},tups::Tuple,tups_primal::Tuple,f::Function) where T<:Real
+ 
+ Computes the gradients of `x` with respect to the relevant parameters in `tups` under the condition that `x` is implicitly defined through the root finding problem `f(x,tups) = 0`. 
+-The function uses the implicit function theorem to compute the gradients efficiently through the reconstruction of Duals.
+-
+-!!! note 
+-    Currently only supports first order AD. Trying to differentiate nested Duals or Duals with different tags will throw an error.
++The function uses the implicit function theorem to compute the gradients efficiently through the reconstruction of Duals. We use the IFTDuals.jl package for this purpose, which has some restrictions, currently mixed nested Duals (i.e. different tags) are not supported. 
+ """
+-function __gradients_for_root_finders(x::AbstractVector{T},tups::T1,tups_primal::T2,f::F) where {T<:Real,T1,T2,F}
+-    # check and return primal of no duals
+-    !any(has_dual,tups) && return x
+-
+-    # Checks
+-    implicit_ad_check(tups)
+-
+-    # compute partials
+-    ∂f_∂θ_dual = f(x,tups)
+-
+-    #guard against NaN in input or output
+-    if any(isnan,x) || any(isnan,∂f_∂θ_dual)
+-        _0 = zero(eltype(∂f_∂θ_dual))
+-        nan = _0/_0
+-        return nan .* x
+-    end
+-
+-    return __gradients_for_root_finders_solver(f,x,tups_primal,∂f_∂θ_dual)
+-end
+-
+-function __gradients_for_root_finders(x::T,tups::T1,primal_tups::T2,f::F) where {T<:Real,T1,T2,F}
+-    x_vec = SVector(x)
+-    f_vec(x_vec,tupsx) = SVector(f(x_vec[1],tupsx))
+-    x_dual_vec = __gradients_for_root_finders(x_vec,tups,primal_tups,f_vec)
+-    return only(x_dual_vec)
+-end
+-
+-__gradients_for_root_finders(::Union{AbstractArray{T},T},_,_,_) where T<:ForwardDiff.Dual = error("Input `x` cannot be a dual")
+-
+-function __partial_to_svec(x::ForwardDiff.Dual{T,V,N}) where {T,V,N}
+-    return SVector{N,V}(ForwardDiff.partials(x))
+-end
+-
+-function __gradients_for_root_finders_solver(f::F,x::AbstractVector{V1},tups_primal,∂f_∂θ_dual::AbstractVector{ForwardDiff.Dual{TAG,V2,Npartials}}) where {F,V1,TAG,V2,Npartials}
+-
+-    ∂f_∂x = DifferentiationInterface.jacobian(f,DifferentiationInterface.AutoForwardDiff(),x,DifferentiationInterface.Constant(tups_primal))
+-    LinearAlgebra.checksquare(∂f_∂x)
+-    # get dual
+-    ∂f_∂θi = map(__partial_to_svec,∂f_∂θ_dual)
+-    ∂f_∂θ = transpose(reduce(hcat,∂f_∂θi))
+-
+-    # gradient through implicit function theorem
+-    dx_dθ = try
+-         - ∂f_∂x \ ∂f_∂θ
+-    catch
+-        _0 = zero(eltype(∂f_∂θ))
+-        nan = _0 / _0
+-        vec(∂f_∂θ) .* nan
++function __gradients_for_root_finders(x::Union{AbstractArray{T},T},tups,tups_primal,f::Function) where T<:Real # tups not restructed to Tuple
++    if any(isnan,x) # guard against NaN in input, do not need Dual types here?
++        return x 
+     end
+-
+-    to_dual(x1,x2) = ForwardDiff.Dual{TAG,V2,Npartials}(x1,ForwardDiff.Partials(NTuple{Npartials,V2}(x2)))
+-    x_dual2 = map(to_dual,x,eachrow(dx_dθ))
+-    return x_dual2
++    return ift(x,f,tups,tups_primal) # use IFTDuals package, returns primal if tups has no duals
+ end
+ 
+-function nested_ad_check(a::A) where A
+-    AT = eltype(a)
+-    if AT <: ForwardDiff.Dual
+-        V = ForwardDiff.valtype(AT)
+-        V <: ForwardDiff.Dual && throw(NestedADError("Found nested Duals of type $AT. This is currently not supported in implicit differentiation."))
+-    end
+-    return nothing
+-end
+-
+-nested_ad_check(a::Tuple) = foreach(nested_ad_check,a)
+-
+-function multiple_tag_ad_check(a::T) where T <: Tuple
+-    f(x) = eltype(x) <: ForwardDiff.Dual
+-    n_dual = count(f,a)
+-    if n_dual == 1
+-        return nothing
+-    end
+-
+-    #TODO write as @generated so it does not allocate
+-    tag(x) = ForwardDiff.tagtype(eltype(x))
+-    duals = findall(map(f,a))
+-    tags = map(tag,a)
+-    valid_tags = tags[duals]
+-    t1 = first(valid_tags)
+-    t = Base.tail(valid_tags)
+-    for ti in t
+-        if t1 != ti
+-            msg = "Found multiple Dual tags: $t1 and $ti. This is currently not supported in implicit differentiation."
+-            throw(MultipleTagError(msg))
+-        end
+-    end
+-    return nothing
+-end
+-
+-multiple_tag_ad_check(a) = nothing
+-
+-function implicit_ad_check(a)
+-    nested_ad_check(a)
+-end
+-
+-function implicit_ad_check(a::Tuple)
+-    nested_ad_check(a)
+-    multiple_tag_ad_check(a)
+-end
++IFTDuals.promote_my_type(m::EoSModel) = eltype(m)
+diff --git a/src/models/SAFT/association.jl b/src/models/SAFT/association.jl
+index 00f583238..961fbdf22 100755
+--- a/src/models/SAFT/association.jl
++++ b/src/models/SAFT/association.jl
+@@ -349,10 +349,10 @@ function X_and_Δ(model::EoSModel, V, T, z,data = nothing)
+ end
+ 
+ function assoc_matrix_solve(K::AbstractMatrix{T},options::AssocOptions = AssocOptions()) where T
+-    atol = T(options.atol)
+-    rtol = T(options.rtol)
++    atol = options.atol
++    rtol = options.rtol
+     max_iters = options.max_iters
+-    α = T(options.dampingfactor)
++    α = options.dampingfactor
+     return assoc_matrix_solve(K, α, atol ,rtol, max_iters)
+ end
+ 
+@@ -423,7 +423,7 @@ end
+ 
+ 
+ #this function destroys KK and XX0
+-function __assoc_matrix_solve_static(::Val{N},KK::AbstractMatrix{T1},XX0::AbstractVector{T2}, α::T1, atol ,rtol, max_iters) where {N,T1,T2}
++function __assoc_matrix_solve_static(::Val{N},KK::AbstractMatrix{T1},XX0::AbstractVector{T2}, α, atol ,rtol, max_iters) where {N,T1,T2}
+     X0 = SVector{N,T2}(XX0)
+     K = SMatrix{N,N,T1,N*N}(KK)
+     Xsol = X0
+@@ -486,7 +486,7 @@ function __assoc_matrix_solve_static(::Val{N},KK::AbstractMatrix{T1},XX0::Abstra
+     return XX0
+ end
+ 
+-function assoc_matrix_solve(K::AbstractMatrix{T}, α::T, atol ,rtol, max_iters) where T
++function assoc_matrix_solve(K::AbstractMatrix{T}, α, atol ,rtol, max_iters) where T
+     n = LinearAlgebra.checksquare(K) #size
+     #initialization procedure:
+     X0 = Vector{T}(undef,n)
+@@ -496,6 +496,12 @@ function assoc_matrix_solve(K::AbstractMatrix{T}, α::T, atol ,rtol, max_iters)
+     #length(X0) == 3 && return __assoc_matrix_solve_static(Val{3}(), K, X0, α, atol ,rtol, max_iters)
+     #length(X0) == 4 && return __assoc_matrix_solve_static(Val{4}(), K, X0, α, atol ,rtol, max_iters)
+     #length(X0) == 5 && return __assoc_matrix_solve_static(Val{5}(), K, X0, α, atol ,rtol, max_iters)
++    K_primal = nested_pvalue(K) # solve on primalval
++    Xsol = assoc_matrix_solve_general(K_primal, nested_pvalue.(X0), n, α, atol ,rtol, max_iters)
++    return assoc_matrix_solve_ad(Xsol, K, K_primal) # implicit AD
++end
++
++function assoc_matrix_solve_general(K::AbstractMatrix{T}, X0, n, α, atol ,rtol, max_iters) where T
+     Xsol = Vector{T}(undef,n)
+     Xsol .= X0
+     #=
+@@ -585,6 +591,28 @@ function assoc_matrix_solve(K::AbstractMatrix{T}, α::T, atol ,rtol, max_iters)
+     return Xsol
+ end
+ 
++function assoc_matrix_solve_ad(Xsol::X, K::KT, K_primal::KP)::Vector{V2} where {V1,V2,X<:AbstractVector{V1},KT<:AbstractMatrix{V2},KP<:AbstractMatrix{V1}}
++    N = Val(length(Xsol))
++    f(X_::XX_,tups_::Tuple{KK_,Val{N_}}) where {V1_,V2_,N_,XX_<:AbstractVector{V1_},KK_<:AbstractMatrix{V2_}} = begin 
++        TT = promote_type(V1_,V2_)
++        _1 = one(TT)
++        K_ = tups_[1]
++        #itt = (@inbounds begin
++        #            ki = @view K_[i,:]
++        #            dot(ki,X_) * X_[i] + X_[i] - _1
++        #        end
++        #        for i in 1:N_) # Generator for inefficient code below
++        #tmp = SVector{N_,TT}(itt)
++        tmp = K_ * X_ # K * X, allocates initial Vector{TT} buffer=#
++        tmp .*= X_ # (K * X) .* X
++        tmp .+= X_ # (K * X) .* X .+ X
++        tmp .-= _1 # (K * X) .* X .+ X .- 1
++        tmp
++    end# (1 + ∑_{jb} K⁽ⁱᵃʲᵇ⁾X⁽ⁱᵃʲᵇ⁾ )⁻¹ = Xⁱᵃ for all iₐ, but rearranged. 
++    # f wrt X has polynomial form, which is easier (and more efficient) to differentiate compared to 1 ./ X
++    return __gradients_for_root_finders(Xsol,(K,N),(K_primal,N),f) # implicit AD
++end
++
+ #exact calculation of site non-bonded fraction when there is only one site
+ 
+ function X_exact1(model,V,T,z,data = nothing)
+@@ -975,4 +1003,4 @@ end
+ #Mx = a + b(x,x)
+ #Axx + x - 1 = 0
+ #x = 1 - Axx
+-=#
+\ No newline at end of file
++=#
+diff --git a/test/test_differentials.jl b/test/test_differentials.jl
+index 61934db9f..ce6419e3f 100755
+--- a/test/test_differentials.jl
++++ b/test/test_differentials.jl
+@@ -82,29 +82,6 @@ end
+         @test all(ddp[2] .≈ dp)
+         @test all(ddp[1] .≈ d2p)
+     end
+-    
+-    @testset "AD Error Checks" begin
+-        import ForwardDiff
+-        import Clapeyron: MultipleTagError, NestedADError, __gradients_for_root_finders
+-        f_test(x,tups) = tups[1]*tups[2]*x # just a generic function to check error handling
+-        tag1 = ForwardDiff.Tag{:tag1,Float64}
+-        tag2 = ForwardDiff.Tag{:tag2,Float64}
+-        Tdual1 = ForwardDiff.Dual{tag1,Float64,1}
+-        Tdual2 = ForwardDiff.Dual{tag2,Float64,1}
+-        parts = ForwardDiff.Partials{1,Float64}((1.0,))
+-        theta1,theta2 = 0.5,2.0;
+-        x = 0.0
+-        x_dual = ForwardDiff.Dual{tag1,Float64,1}(x,parts)
+-        tups_primal = (theta1,theta2)
+-        tups_Dual2 = (Tdual1(theta1,parts),Tdual2(theta2,parts))
+-        tups_nestedDual = (ForwardDiff.Dual{tag2,Tdual1,1}(Tdual1(theta1,parts)),theta2)
+-        # Test multiple tag error
+-        @test_throws MultipleTagError __gradients_for_root_finders(x,tups_Dual2,tups_primal,f_test)
+-        # Test nested dual error
+-        @test_throws NestedADError __gradients_for_root_finders(x,tups_nestedDual,tups_primal,f_test)
+-        # Test dual as x error 
+-        @test_throws ErrorException __gradients_for_root_finders(x_dual,(theta1,theta2),tups_primal,f_test)
+-    end
+ end
+ 
+ 

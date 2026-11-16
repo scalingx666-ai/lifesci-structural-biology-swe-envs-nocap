@@ -1,0 +1,250 @@
+diff --git a/ColabFold2_preview.ipynb b/ColabFold2_preview.ipynb
+index 424f781c..c7e2eec3 100644
+--- a/ColabFold2_preview.ipynb
++++ b/ColabFold2_preview.ipynb
+@@ -413,7 +413,7 @@
+         "#@markdown After changing this form, rerun this cell and the prediction cell, or use **Run all**. Settings are\n",
+         "#@markdown saved in the notebook itself.\n",
+         "\n",
+-        "#@markdown **Model:** choose an RGI-supported model such as `boltz2` in Install dependencies. OpenBind-0 supports RGI. AF2, IntelliFold2 and BioEmu2 are vanilla only.\n",
++        "#@markdown **Model:** choose an RGI-supported model such as `boltz2` in Install dependencies. OpenBind-0 and BioEmu2 support RGI. AF2 and IntelliFold2 are vanilla only.\n",
+         "\n",
+         "# A raw field left empty is a SyntaxError in Colab, so this one is a string: empty means {}.\n",
+         "import ast as _ast\n",
+@@ -824,7 +824,7 @@
+         "| `esmfold2_fast` | [ESMFold2-Fast](https://huggingface.co/biohub/ESMFold2-Fast) (Chan Zuckerberg Biohub) | MIT | Yes | Half of ESMFold2's trunk, so faster. |\n",
+         "| `esmfold2_lm600m` | ESMFold2, 600M tower | MIT | Yes | No confidence head. |\n",
+         "| `esmfold2_lm300m` | ESMFold2, 300M tower | MIT | Yes | No confidence head. |\n",
+-        "| `bioemu2` | [BioEmu2](https://github.com/microsoft/bioemu2) (Microsoft Research) | MIT | No | No confidence head. Its ensemble sampling is a command-line option, not in this notebook. |\n",
++        "| `bioemu2` | [BioEmu2](https://github.com/microsoft/bioemu2) (Microsoft Research) | MIT | Yes | No confidence head. Its ensemble sampling is a command-line option, not in this notebook. |\n",
+         "| `af2_ptm` | AlphaFold 2 monomer pTM (DeepMind) | CC BY 4.0 | No | **Protein only** — a ligand or nucleotide raises rather than quietly folding the rest. Templates use the model_1/model_2 parameter sets. |\n",
+         "| `af2_multimer` | AlphaFold 2 multimer v3 (DeepMind) | CC BY 4.0 | No | Protein only, as above. |\n",
+         "| `alphafold3` | Google DeepMind's own parameters | [AF3 terms of use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md) | Yes | DeepMind's public release, downloaded on first use (~1 GB). Its terms govern the weights and the outputs; run_alphafold prints them at startup. |\n",
+diff --git a/colabfold/rgi/__init__.py b/colabfold/rgi/__init__.py
+index 6944b2a4..6160090b 100644
+--- a/colabfold/rgi/__init__.py
++++ b/colabfold/rgi/__init__.py
+@@ -16,6 +16,7 @@
+         "esmfold2_fast",
+         "esmfold2_lm600m",
+         "esmfold2_lm300m",
++        "bioemu2",
+     }
+ )
+ ALPHAFOLD3_COLABFOLD_VERSION = "3.1.11"
+diff --git a/colabfold/rgi/runtime.py b/colabfold/rgi/runtime.py
+index b893145e..7182d7f8 100644
+--- a/colabfold/rgi/runtime.py
++++ b/colabfold/rgi/runtime.py
+@@ -172,6 +172,8 @@ def predict(fold_input, model_runner, **kwargs):
+         from rgi_toolkit.combined import CombinedRestraints
+         from rgi_toolkit.notebook import distance_report, restraint_inventory
+ 
++        from colabfold.rgi.sampler import restraint_layout
++
+         config, opted = jobs.get(fold_input.name, (None, {}))
+         if config is None:
+             return original_predict(fold_input, model_runner, **kwargs)
+@@ -183,7 +185,10 @@ def predict(fold_input, model_runner, **kwargs):
+ 
+         def inference(example, rng_key):
+             restraints = CombinedRestraints()
+-            adapter = build_adapter(fold_input, example, opted)
++            restraint_example, gather = restraint_layout(
++                example, model_runner.model_name
++            )
++            adapter = build_adapter(fold_input, restraint_example, opted)
+             restraints.setup(adapter, config=config)
+             if not restraints.is_active():
+                 raise ValueError(
+@@ -204,19 +209,7 @@ def inference(example, rng_key):
+                 flush=True,
+             )
+             minimize = restraints.get_minimizer()
+-            gather = example.get("structbook/residue_atom_gather")
+             if gather is not None:
+-                gather = np.asarray(gather)
+-                mask = np.asarray(example["ref_mask"], bool)
+-                if gather.shape != mask.shape or np.any(mask & (gather < 0)):
+-                    raise ValueError(
+-                        "OpenDDE structural atom map does not cover the RGI atoms."
+-                    )
+-                valid = gather[gather >= 0]
+-                if len(np.unique(valid)) != len(valid):
+-                    raise ValueError(
+-                        "OpenDDE structural atom map contains duplicate atoms."
+-                    )
+                 gather = jnp.asarray(gather)
+             apply = model_runner._rgi_apply
+             had_model = "_model" in vars(model_runner)
+diff --git a/colabfold/rgi/sampler.py b/colabfold/rgi/sampler.py
+index e10121c6..707191f9 100644
+--- a/colabfold/rgi/sampler.py
++++ b/colabfold/rgi/sampler.py
+@@ -89,15 +89,50 @@ def make_guided_sampler(original, minimize):
+     return namespace[original.__name__]
+ 
+ 
++def restraint_layout(example, model):
++    """Match the restraint atom mask to the predictor's sampling coordinates."""
++    import numpy as np
++
++    bioemu = model == "bioemu2"
++    if bioemu and any(key.startswith("bioemu2steer/preset_") for key in example):
++        raise ValueError("BioEmu2 RGI requires BIOEMU2_SAMPLER=edm.")
++    key = "bioemu2/af3_index" if bioemu else "structbook/residue_atom_gather"
++    gather = example.get(key)
++    if gather is None:
++        if bioemu:
++            raise ValueError(
++                "BioEmu2 RGI needs its atom map from alphafold3-colabfold 3.1.18 or later."
++            )
++        return example, None
++    gather = np.asarray(gather)
++    mask = np.asarray(example["ref_mask"], bool)
++    if gather.shape != mask.shape or not np.issubdtype(gather.dtype, np.integer):
++        raise ValueError(
++            f"{model} atom map must be an integer array matching ref_mask."
++        )
++    valid = gather[gather >= 0]
++    if len(np.unique(valid)) != len(valid):
++        raise ValueError(f"{model} atom map contains duplicate atoms.")
++    if bioemu:
++        atom_mask = np.asarray(example["bioemu2/atom_mask"], bool)
++        if np.any(valid >= len(atom_mask)) or not np.all(atom_mask[valid]):
++            raise ValueError("BioEmu2 atom map points outside its predicted atoms.")
++        # BioEmu2 omits terminal OXT/OP3 and leaving atoms retained in ref_mask.
++        example = dict(example, ref_mask=mask & (gather >= 0))
++    elif np.any(mask & (gather < 0)):
++        raise ValueError("OpenDDE structural atom map does not cover the RGI atoms.")
++    return example, gather
++
++
+ def coordinate_minimizer(minimize, gather=None):
+-    """Bridge dense AF3 or OpenDDE structural-token coordinates to the engine."""
++    """Bridge AF3, OpenDDE, or BioEmu2 sampling coordinates to the engine."""
+     import jax.numpy as jnp
+ 
+     def apply(coords, sigma, step):
+         flat = coords.reshape(-1, 3)
+         if gather is None:
+             return minimize(flat, sigma, step).reshape(coords.shape)
+-        # OpenDDE diffuses structural subtokens; RGI retains per-residue numbering.
++        # RGI retains residue numbering across reordered sampling atom layouts.
+         # Invalid padded entries scatter out of bounds with mode='drop'.
+         indices = gather.reshape(-1)
+         valid = indices >= 0
+diff --git a/tests/test_notebook_vanilla.py b/tests/test_notebook_vanilla.py
+index 6554b1bd..454b73f5 100644
+--- a/tests/test_notebook_vanilla.py
++++ b/tests/test_notebook_vanilla.py
+@@ -17,6 +17,8 @@
+     ("notebook", "model", "extra_args"),
+     [
+         ("ColabFold2_preview.ipynb", "openbind0", []),
++        ("ColabFold2_preview.ipynb", "bioemu2", []),
++        ("ColabFold2_preview.ipynb", "protenix1", []),
+         ("ColabFold2_preview.ipynb", "af2_ptm", ["--model_dir=af2_weights"]),
+         ("ColabFold2_preview.ipynb", "chai1", ["--use_esm_embeddings"]),
+         ("ColabFold2_preview.ipynb", "esmfold2", ["--use_esm_embeddings"]),
+diff --git a/tests/test_rgi_notebook.py b/tests/test_rgi_notebook.py
+index ca0d40cd..294d50ec 100644
+--- a/tests/test_rgi_notebook.py
++++ b/tests/test_rgi_notebook.py
+@@ -185,7 +185,13 @@ def test_native_form_runs_without_widgets_and_reads_every_edit(
+     cells = json.loads((root / name).read_text())["cells"]
+     cell = next(c for c in cells if c.get("metadata", {}).get("id") == "rgi-restraints")
+     source = "".join(cell["source"])
+-    assert source.partition("\n")[2].startswith(COLAB_FORM.partition("\n")[2])
++    form_fields = set(re.findall(r"^(\w+)\s*=.*#@param", source, re.MULTILINE))
++    if "target_chains" in form_fields:
++        form_fields.remove("target_chains")
++        form_fields.add("conformer_chains")
++    assert form_fields == set(
++        re.findall(r"^(\w+)\s*=.*#@param", COLAB_FORM, re.MULTILINE)
++    )
+     assert "notebook_widgets" not in json.dumps(cells)
+     assert sum("use_rgi = False #@param" in "".join(c["source"]) for c in cells) == 1
+     namespace = {"model": model, "sys": sys, "_toolkit_source": "installed-in-test"}
+diff --git a/tests/test_rgi_sampler.py b/tests/test_rgi_sampler.py
+index 9d99247b..7e28e775 100644
+--- a/tests/test_rgi_sampler.py
++++ b/tests/test_rgi_sampler.py
+@@ -9,14 +9,64 @@
+ import numpy as np
+ import pytest
+ 
+-from colabfold.rgi.sampler import coordinate_minimizer, guided
++from colabfold.rgi.sampler import coordinate_minimizer, guided, restraint_layout
++
++
++def test_bioemu_atom_layout_excludes_missing_terminal_atoms_without_mutation():
++    example = {
++        "ref_mask": np.array([[1, 1, 1], [1, 0, 0]]),
++        "bioemu2/af3_index": np.array([[2, 0, -1], [1, -1, -1]]),
++        "bioemu2/atom_mask": np.array([1, 1, 1, 0]),
++    }
++    adapted, gather = restraint_layout(example, "bioemu2")
++    np.testing.assert_array_equal(adapted["ref_mask"], [[1, 1, 0], [1, 0, 0]])
++    assert example["ref_mask"][0, 2] == 1
++    np.testing.assert_array_equal(gather, example["bioemu2/af3_index"])
++
++
++@pytest.mark.parametrize("indices", [[[0, 0]], [[0, 3]], [[0, 2]], [[0.0, 1.0]]])
++def test_bioemu_rejects_invalid_atom_maps(indices):
++    example = {
++        "ref_mask": np.ones((1, 2)),
++        "bioemu2/af3_index": np.asarray(indices),
++        "bioemu2/atom_mask": np.array([1, 1, 0]),
++    }
++    with pytest.raises(ValueError, match="atom map"):
++        restraint_layout(example, "bioemu2")
++
++
++def test_bioemu_rejects_samplers_that_bypass_the_guidance_hook():
++    with pytest.raises(ValueError, match="BIOEMU2_SAMPLER=edm"):
++        restraint_layout({"bioemu2steer/preset_edm_gd": np.zeros(0)}, "bioemu2")
++    with pytest.raises(ValueError, match="3.1.18"):
++        restraint_layout({}, "bioemu2")
++
++
++def test_bioemu_coordinate_mapping_is_preserved_under_jit_and_vmap():
++    jax = pytest.importorskip("jax")
++    jnp = pytest.importorskip("jax.numpy")
++    coords = jnp.arange(24, dtype=jnp.float32).reshape(2, 4, 1, 3)
++    gather = jnp.array([[2, 0, -1], [1, -1, -1]])
++    offsets = jnp.arange(6, dtype=jnp.float32)[:, None]
++    apply = coordinate_minimizer(lambda x, sigma, step: x + offsets, gather)
++    actual = jax.jit(jax.vmap(lambda x: apply(x, 1.0, 0)))(coords)
++    expected = np.asarray(coords).copy()
++    expected[:, 0, 0] += 1
++    expected[:, 1, 0] += 3
++    np.testing.assert_array_equal(actual, expected)
+ 
+ 
+ def test_structural_token_coordinates_preserve_residue_mapping():
+     jax = pytest.importorskip("jax")
+     jnp = pytest.importorskip("jax.numpy")
+     coords = jnp.arange(18, dtype=jnp.float32).reshape(3, 2, 3)
+-    gather = jnp.array([[4, 1], [3, -1]])
++    example = {
++        "ref_mask": np.array([[1, 1], [1, 0]]),
++        "structbook/residue_atom_gather": np.array([[4, 1], [3, -1]]),
++    }
++    adapted, gather = restraint_layout(example, "opendde")
++    assert adapted is example
++    gather = jnp.asarray(gather)
+     apply = coordinate_minimizer(lambda x, sigma, step: x + 10, gather)
+     actual = jax.jit(apply)(coords, 1.0, 0).reshape(-1, 3)
+     expected = np.asarray(coords).reshape(-1, 3).copy()
+@@ -24,7 +74,9 @@ def test_structural_token_coordinates_preserve_residue_mapping():
+     np.testing.assert_array_equal(actual, expected)
+ 
+ 
+-@pytest.mark.parametrize("model", ["openbind0", "chai1", "esmfold2"])
++@pytest.mark.parametrize(
++    "model", ["openbind0", "chai1", "esmfold2", "bioemu2", "protenix1"]
++)
+ def test_identity_hook_preserves_upstream_sampling_paths(model):
+     dh = pytest.importorskip("alphafold3.model.network.diffusion_head")
+     import haiku as hk

@@ -1,0 +1,4156 @@
+diff --git a/docs/examples.rst b/docs/examples.rst
+index f48e4fdb..c036322f 100644
+--- a/docs/examples.rst
++++ b/docs/examples.rst
+@@ -11,3 +11,4 @@ Examples
+    examples/minimize
+    examples/fire_minimization
+    examples/reaxff_nve_simulation
++   examples/custom_nl
+diff --git a/docs/index.rst b/docs/index.rst
+index 0ec27e5c..f16b2d98 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -19,6 +19,7 @@ particular problem.
+ 
+    jax_md.space
+    jax_md.partition
++   jax_md.custom_partition
+    jax_md.energy
+    jax_md.minimize
+    jax_md.simulate
+@@ -27,6 +28,7 @@ particular problem.
+    jax_md.elasticity
+    jax_md.rigid_body
+    jax_md.smap
++   jax_md.custom_smap
+    jax_md.io
+    jax_md.interpolate
+    jax_md.dataclasses
+diff --git a/docs/jax_md.custom_partition.rst b/docs/jax_md.custom_partition.rst
+new file mode 100644
+index 00000000..bbec858f
+--- /dev/null
++++ b/docs/jax_md.custom_partition.rst
+@@ -0,0 +1,33 @@
++Multi-Image Neighbor Lists
++===========================
++
++.. default-role:: code
++.. automodule:: jax_md.custom_partition
++
++This module provides neighbor list construction for small periodic boxes where
++the cutoff radius exceeds half the box size (:math:`r_\text{cut} > L/2`). In such
++cases, the standard minimum image convention (MIC) fails, and particles may
++interact with multiple periodic images of their neighbors.
++
++Neighbor List Construction
++---------------------------
++.. autofunction:: neighbor_list_multi_image
++.. autofunction:: neighbor_list_multi_image_mask
++
++Data Structures
++----------------
++.. autoclass:: NeighborListMultiImage
++   :members:
++   :undoc-members:
++
++.. autoclass:: NeighborListMultiImageFns
++   :members:
++
++Capacity Estimation
++--------------------
++.. autofunction:: estimate_max_neighbors
++.. autofunction:: estimate_max_neighbors_from_box
++
++Graph Neural Network Support
++-----------------------------
++.. autofunction:: graph_featurizer
+diff --git a/docs/jax_md.custom_smap.rst b/docs/jax_md.custom_smap.rst
+new file mode 100644
+index 00000000..303979a8
+--- /dev/null
++++ b/docs/jax_md.custom_smap.rst
+@@ -0,0 +1,17 @@
++Multi-Image Structure Maps
++===========================
++
++.. default-role:: code
++.. automodule:: jax_md.custom_smap
++
++This module provides structure-mapped functions (analogous to :mod:`jax_md.smap`)
++that work with :class:`~jax_md.custom_partition.NeighborListMultiImage` to correctly
++handle small periodic boxes where :math:`r_\text{cut} > L/2`.
++
++The key difference from standard ``smap`` functions is that these use explicit
++lattice shifts stored in the neighbor list rather than relying on the minimum
++image convention.
++
++Pair Functions
++---------------
++.. autofunction:: pair_neighbor_list_multi_image
+diff --git a/examples/custom_nl.py b/examples/custom_nl.py
+new file mode 100644
+index 00000000..9f01374b
+--- /dev/null
++++ b/examples/custom_nl.py
+@@ -0,0 +1,508 @@
++# ---
++# jupyter:
++#   jupytext:
++#     formats: py:percent,ipynb
++#     text_representation:
++#       extension: .py
++#       format_name: percent
++#       format_version: '1.3'
++#       jupytext_version: 1.18.1
++#   kernelspec:
++#     display_name: Python 3
++#     language: python
++#     name: python3
++# ---
++
++# %% [markdown]
++# [![Download Notebook](https://img.shields.io/badge/Download-Notebook-blue?style=for-the-badge&logo=jupyter)](https://jax-md.readthedocs.io/en/main/notebooks/custom_nl.ipynb)
++# [![Download Python Script](https://img.shields.io/badge/Download-Python_Script-green?style=for-the-badge&logo=python)](https://raw.githubusercontent.com/google/jax-md/main/examples/custom_nl.py)
++
++# %% [markdown]
++# # Multi-Image Neighbor Lists for Small Periodic Boxes
++#
++# This tutorial demonstrates how to use **multi-image neighbor lists** in JAX-MD
++# for systems where the cutoff radius is larger than half the box length
++# ($r_\text{cut} > L/2$).
++#
++# ## The Problem with Standard Neighbor Lists
++#
++# Standard neighbor lists in JAX-MD use the **Minimum Image Convention (MIC)**,
++# which assumes each atom interacts with at most one periodic image of every
++# other atom. This works well when:
++#
++# $$r_\text{cut} < \frac{L}{2}$$
++#
++# However, for small periodic boxes (common in ab initio MD or machine learning
++# potentials with longer cutoffs), an atom may interact with **multiple periodic
++# images** of the same neighbor. The multi-image neighbor list explicitly
++# enumerates all images within the cutoff.
++
++# %% [markdown]
++# ## Imports & Setup
++
++# %%
++import os
++
++IN_COLAB = 'COLAB_RELEASE_TAG' in os.environ
++if IN_COLAB:
++  import subprocess
++  import sys
++
++  subprocess.run(
++    [
++      sys.executable,
++      '-m',
++      'pip',
++      'install',
++      '-q',
++      'git+https://github.com/jax-md/jax-md.git',
++    ]
++  )
++
++import numpy as onp
++
++from jax import config
++
++config.update('jax_enable_x64', True)
++
++import jax.numpy as jnp
++from jax import random, jit, lax
++
++import time
++import matplotlib.pyplot as plt
++import seaborn as sns
++
++from jax_md import space, energy, partition, quantity, simulate
++from jax_md.custom_partition import (
++  neighbor_list_multi_image,
++  estimate_max_neighbors_from_box,
++  estimate_max_neighbors,
++)
++from jax_md.custom_smap import pair_neighbor_list_multi_image
++
++SMOKE_TEST = os.environ.get('READTHEDOCS', False)
++
++sns.set_style(style='white')
++
++
++def format_plot(x, y):
++  plt.xlabel(x, fontsize=20)
++  plt.ylabel(y, fontsize=20)
++
++
++def finalize_plot(shape=(1, 1)):
++  plt.gcf().set_size_inches(
++    shape[0] * 1.5 * plt.gcf().get_size_inches()[1],
++    shape[1] * 1.5 * plt.gcf().get_size_inches()[1],
++  )
++  plt.tight_layout()
++
++
++# %% [markdown]
++# ## Helper: Create Crystal Structures
++
++
++# %%
++def make_fcc(n_cells, a=1.0):
++  """Create FCC crystal positions in fractional coordinates.
++
++  Args:
++    n_cells: Number of unit cells in each direction.
++    a: Lattice constant.
++
++  Returns:
++    R: Fractional positions of shape [N, 3] in [0, 1).
++    box: Box matrix of shape [3, 3] with columns as lattice vectors.
++  """
++  # FCC basis: 4 atoms per unit cell
++  basis = onp.array(
++    [
++      [0.0, 0.0, 0.0],
++      [0.5, 0.5, 0.0],
++      [0.5, 0.0, 0.5],
++      [0.0, 0.5, 0.5],
++    ]
++  )
++
++  positions = []
++  for i in range(n_cells):
++    for j in range(n_cells):
++      for k in range(n_cells):
++        for b in basis:
++          pos = (onp.array([i, j, k]) + b) / n_cells
++          positions.append(pos)
++
++  R = onp.array(positions)
++  L = n_cells * a
++  box = onp.eye(3) * L
++  return jnp.array(R), jnp.array(box)
++
++
++def make_diamond_cubic(n_cells, a=5.43):
++  """Create diamond cubic crystal using the 2-atom primitive cell.
++
++  Uses the FCC primitive cell with a 2-atom basis:
++  - Lattice vectors: a1=(0,1,1)a/2, a2=(1,0,1)a/2, a3=(1,1,0)a/2
++  - Basis: (0,0,0) and (1/4,1/4,1/4) in fractional coordinates
++
++  This is more efficient than the 8-atom conventional cell.
++  Used for silicon (a=5.43 Å) and germanium (a=5.66 Å).
++
++  Args:
++    n_cells: Number of primitive cells in each direction.
++    a: Conventional cubic lattice constant (default 5.43 Å for silicon).
++
++  Returns:
++    R: Fractional positions of shape [N, 3] in [0, 1).
++    box: Box matrix of shape [3, 3] with columns as FCC primitive vectors.
++  """
++  # 2-atom basis in fractional coordinates of primitive cell
++  basis = onp.array(
++    [
++      [0.0, 0.0, 0.0],
++      [0.25, 0.25, 0.25],
++    ]
++  )
++
++  positions = []
++  for i in range(n_cells):
++    for j in range(n_cells):
++      for k in range(n_cells):
++        for b in basis:
++          pos = (onp.array([i, j, k]) + b) / n_cells
++          positions.append(pos)
++
++  R = onp.array(positions)
++
++  # FCC primitive lattice vectors (columns of box matrix)
++  # a1 = (0, a/2, a/2), a2 = (a/2, 0, a/2), a3 = (a/2, a/2, 0)
++  box = (a / 2.0) * onp.array(
++    [
++      [0.0, 1.0, 1.0],
++      [1.0, 0.0, 1.0],
++      [1.0, 1.0, 0.0],
++    ]
++  )
++  # Scale by n_cells
++  box = box * n_cells
++
++  return jnp.array(R), jnp.array(box)
++
++
++# %% [markdown]
++# ## Example 1: Lennard-Jones with All Three neighbor list formats
++#
++# We compute LJ energy for a small FCC argon crystal using all three neighbor
++# list formats to verify they produce identical results:
++#
++# - **Dense**: Per-atom neighbor arrays `[N, max_neighbors]`
++# - **Sparse**: Edge list `[2, capacity]` with both directions
++# - **OrderedSparse**: Edge list with one direction per pair (most efficient)
++
++# %%
++# Argon LJ parameters (reduced units: sigma=1, epsilon=1)
++sigma = 1.0  # Length unit
++epsilon = 1.0  # Energy unit
++r_cutoff = 2.5 * sigma
++r_onset = 2.0 * sigma
++
++# Create small FCC argon crystal where r_cut > L/2
++# In reduced units, equilibrium nearest-neighbor distance ≈ 2^(1/6) * sigma ≈ 1.12
++# FCC lattice constant a = sqrt(2) * nearest_neighbor ≈ 1.58 in reduced units
++n_cells = 2
++a_reduced = 1.55  # Small box to test multi-image (r_cut/L > 0.5)
++R, box = make_fcc(n_cells, a=a_reduced)
++N = len(R)
++L = float(box[0, 0])
++
++print(f'System: {N} Ar atoms in {n_cells}x{n_cells}x{n_cells} FCC')
++print(f'Box size L = {L:.2f}sigma, r_cutoff = {r_cutoff:.2f}sigma')
++print(f'r_cutoff / L = {r_cutoff / L:.2f} (> 0.5: multi-image needed)')
++
++# Estimate max neighbors for capacity allocation
++max_nbrs = estimate_max_neighbors_from_box(box, r_cutoff, n_atoms=N)
++print(f'Estimated max neighbors: {max_nbrs}')
++
++# Setup displacement function
++displacement_fn, shift_fn = space.periodic_general(
++  box, fractional_coordinates=True
++)
++
++# Test all three formats
++formats = [
++  ('Dense', partition.Dense),
++  ('Sparse', partition.Sparse),
++  ('OrderedSparse', partition.OrderedSparse),
++]
++
++energies = {}
++for name, fmt in formats:
++  neighbor_fn, energy_fn = energy.lennard_jones_neighbor_list(
++    displacement_fn,
++    box,
++    sigma=sigma,
++    epsilon=epsilon,
++    r_onset=r_onset / sigma,
++    r_cutoff=r_cutoff / sigma,
++    fractional_coordinates=True,
++    neighbor_list_fn=neighbor_list_multi_image,
++    pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++    max_neighbors=max_nbrs,
++    format=fmt,
++  )
++
++  nbrs = neighbor_fn.allocate(R)
++  E = float(energy_fn(R, nbrs))
++  energies[name] = E
++
++  # Get neighbor count
++  if partition.is_sparse(fmt):
++    n_edges = int(jnp.sum(nbrs.idx[0] < N))
++  else:
++    n_edges = int(jnp.sum(nbrs.idx < N))
++
++  print(f'{name:15s}: E = {E:12.6f}, edges = {n_edges}')
++
++# Verify all formats give the same energy
++E_ref = energies['Dense']
++for name, E in energies.items():
++  assert abs(E - E_ref) < 1e-5, f'{name} energy mismatch: {E} vs {E_ref}'
++# %% [markdown]
++# ## Example 2: Stillinger-Weber (Three-Body Potential)
++#
++# Stillinger-Weber is a three-body potential for silicon that requires
++# **Dense** format for the angular terms. We use a 2x2x2 supercell of the
++# 2-atom primitive cell.
++#
++# **Note**: Stillinger-Weber internally uses `space.map_neighbor` for
++# displacement computation, which applies the minimum image convention (MIC).
++# For small boxes where `r_cut > L/2`, the multi-image neighbor list finds
++# the correct neighbors, but the energy computation would still use MIC
++# displacements. Therefore, we use a larger box where MIC is valid.
++
++# %%
++# Stillinger-Weber parameters for silicon
++sw_sigma = 2.0951  # Angstrom
++sw_cutoff = 1.8 * sw_sigma  # ~3.77 Angstrom
++r_cutoff_sw = 3.77118
++
++# Create 3x3x3 supercell so that MIC is valid
++# For SW, the box must be large enough that r_cut < L/2
++n_cells_sw = 3
++a_sw = 5.43  # Si lattice constant
++R_sw, box_sw = make_diamond_cubic(n_cells_sw, a=a_sw)
++N_sw = len(R_sw)
++
++# For non-cubic boxes, compute minimum perpendicular height
++inv_box_T = jnp.linalg.inv(box_sw).T
++heights_sw = 1.0 / jnp.linalg.norm(inv_box_T, axis=0)
++L_min_sw = float(jnp.min(heights_sw))
++
++print(f'System: {N_sw} Si atoms in {n_cells_sw}x{n_cells_sw}x{n_cells_sw} diamond cubic supercell')
++print(f'Min box height = {L_min_sw:.2f} Angstrom, SW cutoff = {sw_cutoff:.2f} Angstrom')
++print(f'cutoff / L_min = {sw_cutoff / L_min_sw:.2f} (< 0.5: MIC is valid)')
++
++displacement_sw, shift_sw = space.periodic_general(
++  box_sw, fractional_coordinates=True
++)
++
++# Stillinger-Weber only supports Dense format (three-body terms)
++# Note: SW uses MIC internally, so multi-image NL only helps with neighbor finding
++neighbor_fn_sw, energy_fn_sw = energy.stillinger_weber_neighbor_list(
++  displacement_sw,
++  box_sw,
++  neighbor_list_fn=neighbor_list_multi_image,
++  max_neighbors=estimate_max_neighbors(r_cutoff_sw, atomic_density=0.15, dim=3),
++  format=partition.Dense,
++  fractional_coordinates=True,
++)
++
++nbrs_sw = neighbor_fn_sw.allocate(R_sw)
++E_sw = float(energy_fn_sw(R_sw, nbrs_sw))
++n_edges_sw = int(jnp.sum(nbrs_sw.idx < N_sw))
++
++print(f'Stillinger-Weber energy: {E_sw:.6f} eV')
++print(f'Number of edges: {n_edges_sw}')
++print('Stillinger-Weber computes correctly (MIC valid for this box size).')
++
++# %% [markdown]
++# ## Example 3: NVE Molecular Dynamics
++#
++# We run NVE (constant energy) molecular dynamics with the multi-image neighbor
++# list. This demonstrates rebuild tracking and overflow handling following the
++# pattern recommended in `partition.neighbor_list` documentation.
++
++# %%
++
++# Simulation parameters
++N_md = 500
++dimension = 2
++box_size = 40.0 if SMOKE_TEST else 60.0
++
++# Create box matrix for 2D
++box_md = jnp.eye(dimension) * box_size
++
++# Random initial positions (fractional coordinates in [0, 1))
++key = random.PRNGKey(0)
++R_md = random.uniform(key, (N_md, dimension), minval=0.0, maxval=1.0)
++
++# 50:50 mixture of two species
++sigma_md = jnp.array([[1.0, 1.2], [1.2, 1.4]])
++N_half = N_md // 2
++species = jnp.where(jnp.arange(N_md) < N_half, 0, 1)
++
++# Cutoff
++r_cutoff_md = 2.5
++
++print(f'System: {N_md} atoms in {dimension}D box of size {box_size}')
++print(f'Cutoff: {r_cutoff_md}, cutoff/L = {r_cutoff_md / box_size:.3f}')
++
++# Setup displacement function for fractional coordinates
++displacement_md, shift_md = space.periodic_general(
++  box_md, fractional_coordinates=True
++)
++
++# For random positions, use generous capacity to avoid overflow
++# Random positions can cluster, requiring more capacity than uniform estimates
++max_nbrs_md = 50  # Conservative value for random systems
++print(f'Max neighbors: {max_nbrs_md}')
++
++# Use soft sphere potential with multi-image neighbor list
++neighbor_fn_md, energy_fn_md = energy.soft_sphere_neighbor_list(
++  displacement_md,
++  box_md,
++  species=species,
++  sigma=sigma_md,
++  fractional_coordinates=True,
++  neighbor_list_fn=neighbor_list_multi_image,
++  pair_neighbor_list_fn=pair_neighbor_list_multi_image,
++  max_neighbors=max_nbrs_md,
++  format=partition.Sparse,
++)
++
++# Initialize neighbor list
++nbrs_md = neighbor_fn_md.allocate(R_md)
++if nbrs_md.did_buffer_overflow:
++  raise RuntimeError('Neighbor list overflowed - increase max_neighbors')
++
++# Setup NVE integrator
++dt = 1e-2
++init_fn, apply_fn = simulate.nve(energy_fn_md, shift_md, dt)
++
++# Initialize state with zero temperature
++state = init_fn(key, R_md, neighbor=nbrs_md, kT=0.0)
++
++
++# JIT-compiled step function with neighbor list update
++@jit
++def step_fn(i, state_and_nbrs):
++  state, nbrs = state_and_nbrs
++  state = apply_fn(state, neighbor=nbrs)
++  nbrs = nbrs.update(state.position)
++  return state, nbrs
++
++
++# %%
++# Run simulation following JAX-MD's recommended pattern for overflow handling.
++# See partition.neighbor_list docstring for the canonical example.
++N_steps = 200 if SMOKE_TEST else 1000
++print_every = 20
++inner_steps = 10
++
++PE = []
++KE = []
++rebuild_count = 0
++realloc_count = 0
++
++print(f'{"Step":>4} {"KE":>5} {"PE":>6} {"Total":>6} {"dt":>6} {"rebuild":>7} {"realloc":>7}')
++old_time = time.time()
++
++for i in range(N_steps):
++  # Track reference position before inner loop
++  old_ref_pos = nbrs_md.reference_position
++
++  # Run inner_steps using fori_loop for efficiency
++  new_state, new_nbrs = lax.fori_loop(0, inner_steps, step_fn, (state, nbrs_md))
++
++  # Check for buffer overflow after the loop
++  # If overflow: discard new state, reallocate with extra capacity
++  # If no overflow: accept new state
++  if new_nbrs.did_buffer_overflow:
++    # Reallocate with extra capacity (10 more neighbors per atom)
++    nbrs_md = neighbor_fn_md.allocate(state.position, extra_capacity=10)
++    realloc_count += 1
++    print(f'  [Overflow at step {i * inner_steps}! Reallocating with extra capacity...]')
++    # Don't advance state - retry from last good state
++  else:
++    # Accept the new state
++    state = new_state
++    nbrs_md = new_nbrs
++
++    # Check if rebuild happened (reference position changed)
++    new_ref_pos = nbrs_md.reference_position
++    if not jnp.allclose(old_ref_pos, new_ref_pos):
++      rebuild_count += 1
++
++  pe = float(energy_fn_md(state.position, nbrs_md))
++  ke = float(quantity.kinetic_energy(momentum=state.momentum))
++  PE.append(pe)
++  KE.append(ke)
++
++  if i % print_every == 0 and i > 0:
++    new_time = time.time()
++    step_time = (new_time - old_time) / print_every / inner_steps
++    print(
++      f'{i * inner_steps:4d} {ke:5.1f} {pe:6.1f} {ke + pe:6.2f} '
++      f'{step_time:6.4f} {rebuild_count:7d} {realloc_count:7d}'
++    )
++    old_time = new_time
++
++PE = jnp.array(PE)
++KE = jnp.array(KE)
++
++print(f'Total energy drift: {abs(float(PE[-1] + KE[-1] - PE[0] - KE[0])):.2e}')
++print(f'Total rebuilds: {rebuild_count}, reallocs: {realloc_count}')
++
++# %% [markdown]
++# ## Plot Energy Evolution
++#
++# We verify energy conservation by plotting PE, KE, and total energy over time.
++
++# %%
++t = onp.arange(N_steps) * dt * inner_steps
++
++plt.figure(figsize=(10, 6))
++plt.plot(t, PE, label='PE', linewidth=2)
++plt.plot(t, KE, label='KE', linewidth=2)
++plt.plot(t, PE + KE, label='Total Energy', linewidth=2, linestyle='--')
++plt.legend(fontsize=12)
++format_plot('Time', 'Energy')
++plt.title('NVE Energy Conservation with Multi-Image Neighbor List', fontsize=14)
++finalize_plot()
++plt.savefig('nve_multi_image.png', dpi=150, bbox_inches='tight')
++plt.show()
++
++# %% [markdown]
++# ## Visualize Final Configuration
++
++# %%
++ms = 40 if SMOKE_TEST else 15
++R_final = onp.array(state.position)
++
++# Convert from fractional to Cartesian for plotting
++R_cart = R_final * box_size
++
++plt.figure(figsize=(8, 8))
++plt.plot(
++  R_cart[:N_half, 0], R_cart[:N_half, 1], 'o', markersize=ms * 0.5, alpha=0.7
++)
++plt.plot(
++  R_cart[N_half:, 0], R_cart[N_half:, 1], 'o', markersize=ms * 0.7, alpha=0.7
++)
++plt.xlim([0, box_size])
++plt.ylim([0, box_size])
++plt.axis('off')
++plt.title('Final Configuration', fontsize=14)
++finalize_plot((2, 2))
++plt.savefig('nve_final_config.png', dpi=150, bbox_inches='tight')
++plt.show()
+diff --git a/jax_md/custom_partition.py b/jax_md/custom_partition.py
+new file mode 100644
+index 00000000..8ff23a07
+--- /dev/null
++++ b/jax_md/custom_partition.py
+@@ -0,0 +1,1182 @@
++import jax
++import jax.numpy as jnp
++from jax_md import dataclasses, partition, space
++from jax_md.partition import NeighborListFormat
++from typing import Callable, Tuple, Union, Optional
++
++# Type aliases
++Array = jnp.ndarray
++f32 = jnp.float32
++i32 = jnp.int32
++
++
++@dataclasses.dataclass
++class NeighborListMultiImage:
++  """A struct containing the state of a multi-image neighbor list.
++
++  This data structure is compatible with `jax_md.partition.to_jraph` and
++  `jax_md.partition.neighbor_list_mask`. It stores edges between atoms,
++  including all periodic images within the cutoff (not just the nearest).
++
++  Supports two storage formats:
++
++  **Sparse/OrderedSparse**:
++    - idx: Tuple (receivers, senders), each shape (capacity,)
++    - shifts: Shape (capacity, dim)
++
++  **Dense**:
++    - idx: Shape (N, max_neighbors), neighbor indices for each atom
++    - shifts: Shape (N, max_neighbors, dim), shift for each neighbor
++
++  Attributes:
++    idx: For Sparse: tuple (receivers, senders). For Dense: array (N, max_neighbors).
++      Invalid entries are padded with index N (number of atoms).
++    shifts: Integer shift vectors. Sparse: (capacity, dim). Dense: (N, max_neighbors, dim).
++      The real-space shift is ``shifts @ box.T``.
++    reference_position: Positions when the list was built, shape (N, dim).
++    box: An affine transformation; see ``jax_md.space.periodic_general``.
++    format: NeighborListFormat.Sparse, OrderedSparse, or Dense.
++    max_occupancy: For Sparse: total capacity. For Dense: max_neighbors.
++    update_fn: Function to update the neighbor list.
++    did_buffer_overflow: True if more edges/neighbors were found than capacity allows.
++  """
++
++  # Sparse/OrderedSparse: Tuple[Array[capacity], Array[capacity]] = (receivers, senders)
++  # Dense: Array[N, max_neighbors]
++  idx: Union[Tuple[Array, Array], Array]
++  # Sparse/OrderedSparse: Array[capacity, dim]
++  # Dense: Array[N, max_neighbors, dim]
++  shifts: Array  # real-space shift = shifts @ box.T
++  reference_position: Array  # [N, dim]
++  box: Array  # [dim, dim]
++  format: NeighborListFormat = dataclasses.static_field()
++  max_occupancy: int = dataclasses.static_field()
++  update_fn: Callable[..., 'NeighborListMultiImage'] = (
++    dataclasses.static_field()
++  )
++  did_buffer_overflow: bool = False
++
++  def update(self, position: Array, **kwargs) -> 'NeighborListMultiImage':
++    """Update neighbor list with new positions."""
++    return self.update_fn(position, self, **kwargs)
++
++  @property
++  def senders(self) -> Array:
++    """Sender atom indices (Sparse format only)."""
++    if self.format is NeighborListFormat.Dense:
++      raise ValueError(
++        'senders property not available for Dense format. Use idx directly.'
++      )
++    return self.idx[1]
++
++  @property
++  def receivers(self) -> Array:
++    """Receiver atom indices (Sparse format only)."""
++    if self.format is NeighborListFormat.Dense:
++      raise ValueError(
++        'receivers property not available for Dense format. Use idx directly.'
++      )
++    return self.idx[0]
++
++  @property
++  def n_edges(self) -> int:
++    """Number of valid edges (excluding padding)."""
++    N = len(self.reference_position)
++    if self.format is NeighborListFormat.Dense:
++      # Count valid entries in Dense format
++      return int(jnp.sum(self.idx < N))
++    return int(jnp.sum(self.idx[0] < N))
++
++  @property
++  def max_neighbors(self) -> int:
++    """Maximum neighbors per atom (Dense format only)."""
++    if self.format is not NeighborListFormat.Dense:
++      raise ValueError(
++        'max_neighbors property only available for Dense format.'
++      )
++    return self.idx.shape[1]
++
++  @property
++  def n_node(self) -> int:
++    """Number of atoms (for to_jraph compatibility)."""
++    return len(self.reference_position)
++
++
++# Type alias for neighbor list functions
++# AllocateFn: (position: Array[N, dim], **kwargs) -> NeighborListMultiImage
++# UpdateFn: (position: Array[N, dim], neighbors: NeighborListMultiImage, **kwargs) -> NeighborListMultiImage
++AllocateFn = Callable[..., NeighborListMultiImage]
++UpdateFn = Callable[[Array, NeighborListMultiImage], NeighborListMultiImage]
++
++
++@dataclasses.dataclass
++class NeighborListMultiImageFns:
++  """A struct containing functions to allocate and update neighbor lists.
++
++  This mirrors the `jax_md.partition.NeighborListFns` interface.
++
++  Attributes:
++    allocate: A function to allocate a new neighbor list. This function cannot
++      be compiled, since it uses the values of positions to infer the shapes.
++      Signature: `(position: Array[N, dim], **kwargs) -> NeighborListMultiImage`
++    update: A function to update a neighbor list given a new set of positions
++      and a previously allocated neighbor list.
++      Signature: `(position: Array[N, dim], neighbors: NeighborListMultiImage, **kwargs) -> NeighborListMultiImage`
++  """
++
++  allocate: AllocateFn = dataclasses.static_field()
++  update: UpdateFn = dataclasses.static_field()
++
++  def __iter__(self):
++    """Allow unpacking: allocate_fn, update_fn = neighbor_fn."""
++    return iter((self.allocate, self.update))
++
++
++def _compute_shift_ranges(
++  box: Array,  # [dim, dim]
++  r_cutoff: float,
++  pbc: Array,  # [dim]
++) -> Array:  # [num_shifts, dim]
++  r"""Compute integer shift vectors for multi-image neighbor search.
++
++  For each lattice direction, determines how many periodic images are needed
++  to capture all neighbors within :math:`r_\text{cut}`. Uses the reciprocal
++  lattice to compute perpendicular box heights:
++
++  .. math::
++
++    h_i = \frac{1}{\|\mathbf{b}_i\|}
++
++  where :math:`\mathbf{b}_i` is the :math:`i`-th column of the inverse box
++  transpose (i.e., the :math:`i`-th reciprocal lattice vector). The number of
++  shifts along direction :math:`i` is :math:`n_i = \lceil r_\text{cut} / h_i \rceil`.
++
++  The total number of shift vectors is :math:`\prod_i (2 n_i + 1)` for periodic
++  directions. The real-space shift for a given integer shift vector
++  :math:`\mathbf{s}` is :math:`\mathbf{s} \cdot \mathbf{T}` where
++  :math:`\mathbf{T}` is the box matrix.
++
++  This is the same algorithm used by ASE and matscipy for neighbor list
++  construction with periodic boundary conditions.
++
++  Args:
++    box: Affine transformation (see ``periodic_general``). Shape ``[dim, dim]``.
++    r_cutoff: Interaction cutoff distance (scalar).
++    pbc: Boolean array indicating which directions are periodic.
++      Shape ``[dim]``. Non-periodic directions get zero shifts.
++
++  Returns:
++    Integer shift vectors spanning the required range. Shape
++    ``[num_shifts, dim]``. Each row is a shift vector :math:`(n_1, n_2, \ldots, n_d)`.
++  """
++  # Reciprocal lattice vectors (columns of inv_box.T)
++  inv_box_T = jnp.linalg.inv(box).T  # [dim, dim]
++  # Perpendicular heights of the box
++  heights = 1.0 / jnp.linalg.norm(inv_box_T, axis=0)  # [dim]
++  # Number of shifts needed per direction.
++  n_max = jnp.ceil(r_cutoff / heights).astype(i32)  # [dim]
++  n_max = jnp.where(pbc, n_max, 0)  # [dim], zero for non-periodic
++
++  # Build Cartesian product of shift ranges
++  dim = box.shape[0]
++  n_max_int = [int(n_max[i]) for i in range(dim)]
++  ranges = [jnp.arange(-n, n + 1) for n in n_max_int]  # List of [2*n+1]
++  grids = jnp.meshgrid(*ranges, indexing='ij')
++  return jnp.stack([g.ravel() for g in grids], axis=-1)  # [num_shifts, dim]
++
++
++def _compute_distances_sq(
++  position: Array,  # [N, dim]
++  box: Array,  # [dim, dim]
++  shifts_real: Array,  # [num_shifts, dim]
++  fractional_coordinates: bool,
++) -> Array:  # [num_shifts, N, N]
++  r"""Compute squared distances for all (shift, i, j) combinations.
++
++  For each shift :math:`\mathbf{s}` and atom pair :math:`(i, j)`:
++
++  .. math::
++
++    d_{ij}^{\mathbf{s}2} = \|\mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i\|^2
++
++  Args:
++    position: Atom positions. Shape ``[N, dim]``.
++    box: Box matrix. Shape ``[dim, dim]``.
++    shifts_real: Real-space shifts. Shape ``[num_shifts, dim]``.
++    fractional_coordinates: If True, positions are fractional.
++
++  Returns:
++    Squared distances. Shape ``[num_shifts, N, N]``.
++  """
++  if fractional_coordinates:
++    position_real = position @ box.T  # [N, dim]
++  else:
++    position_real = position
++
++  D_all = (
++    position_real[None, None, :, :]  # [1, 1, N, dim]
++    + shifts_real[:, None, None, :]  # [num_shifts, 1, 1, dim]
++    - position_real[None, :, None, :]  # [1, N, 1, dim]
++  )  # [num_shifts, N, N, dim]
++
++  return jnp.sum(D_all**2, axis=-1)  # [num_shifts, N, N]
++
++
++def _compute_pairwise_mask(
++  position: Array,  # [N, dim]
++  box: Array,  # [dim, dim]
++  shifts_real: Array,  # [num_shifts, dim]
++  zero_shift_idx: int,
++  r_cutoff: float,
++  fractional_coordinates: bool,
++) -> Array:  # [num_shifts, N, N]
++  r"""Compute boolean mask for pairs within cutoff across all shifts.
++
++  For each shift vector :math:`\mathbf{s}` and atom pair :math:`(i, j)`,
++  computes whether the distance is within the cutoff:
++
++  .. math::
++
++    \|\mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i\| < r_\text{cut}
++
++  Self-interactions (:math:`i = j` with zero shift) are excluded.
++
++  Uses ``vmap`` over shifts for better memory locality and fused computation.
++
++  Args:
++    position: Atom positions. Shape ``[N, dim]``.
++    box: Affine transformation (see ``periodic_general``). Shape ``[dim, dim]``.
++    shifts_real: Real-space shift vectors. Shape ``[num_shifts, dim]``.
++    zero_shift_idx: Index of the zero shift in ``shifts_real``.
++    r_cutoff: Cutoff distance (scalar).
++    fractional_coordinates: If True, positions are fractional.
++
++  Returns:
++    Boolean mask. Shape ``[num_shifts, N, N]``. Entry ``[s, i, j]`` is True
++    if atom ``j`` with shift ``s`` is a neighbor of atom ``i``.
++  """
++  N = position.shape[0]
++  num_shifts = shifts_real.shape[0]
++  cutoff_sq = r_cutoff**2
++
++  # Convert to real coordinates if needed
++  if fractional_coordinates:
++    position_real = position @ box.T  # [N, dim]
++  else:
++    position_real = position
++
++  # Fused distance and mask computation per shift using vmap
++  def mask_for_shift(shift):  # shift: [dim]
++    # D[i,j] = r_j + shift - r_i
++    D = (
++      position_real[None, :, :] + shift - position_real[:, None, :]
++    )  # [N, N, dim]
++    dist_sq = jnp.sum(D**2, axis=-1)  # [N, N]
++    return dist_sq < cutoff_sq
++
++  within_cutoff = jax.vmap(mask_for_shift)(shifts_real)  # [num_shifts, N, N]
++
++  # Exclude self-interactions (i == j with zero shift)
++  self_mask = jnp.eye(N, dtype=bool)  # [N, N]
++  zero_shift_mask = jnp.arange(num_shifts) == zero_shift_idx  # [num_shifts]
++  self_interaction = zero_shift_mask[:, None, None] & self_mask[None, :, :]
++  within_cutoff = within_cutoff & ~self_interaction  # [num_shifts, N, N]
++
++  return within_cutoff
++
++
++def _scatter_to_sparse(
++  valid_mask: Array,  # [num_shifts, N, N]
++  shifts: Array,  # [num_shifts, dim]
++  capacity: int,
++  N: int,
++) -> Tuple[Array, Array, Array, Array]:
++  r"""Scatter valid pairs into fixed-size sparse arrays.
++
++  Uses cumulative sum for compaction of valid entries.
++
++  Args:
++    valid_mask: Boolean mask indicating valid pairs. Shape ``[num_shifts, N, N]``.
++    shifts: Integer shift vectors. Shape ``[num_shifts, dim]``.
++    capacity: Maximum number of edges to store.
++    N: Number of atoms.
++
++  Returns:
++    Tuple ``(senders, receivers, edge_shifts, n_valid)``:
++
++    - ``senders``: Shape ``[capacity]``. Padded with ``N``.
++    - ``receivers``: Shape ``[capacity]``. Padded with ``N``.
++    - ``edge_shifts``: Shape ``[capacity, dim]``.
++    - ``n_valid``: Total number of valid pairs (scalar).
++  """
++  num_shifts = shifts.shape[0]
++  dim = shifts.shape[1]
++
++  valid_flat = valid_mask.ravel()  # [num_shifts * N * N]
++
++  # Create index grids
++  s_grid, i_grid, j_grid = jnp.meshgrid(
++    jnp.arange(num_shifts), jnp.arange(N), jnp.arange(N), indexing='ij'
++  )  # each [num_shifts, N, N]
++  s_flat, i_flat, j_flat = s_grid.ravel(), i_grid.ravel(), j_grid.ravel()
++
++  # Compact using cumsum
++  n_valid = jnp.sum(valid_flat)
++  cumsum = jnp.cumsum(valid_flat) - 1  # [num_shifts * N * N]
++
++  # Pre-allocate with padding index = N
++  senders = N * jnp.ones(capacity, dtype=i32)  # [capacity]
++  receivers = N * jnp.ones(capacity, dtype=i32)  # [capacity]
++  edge_shifts = jnp.zeros(
++    (capacity, dim), dtype=shifts.dtype
++  )  # [capacity, dim]
++
++  # Scatter valid entries
++  write_idx = jnp.where(valid_flat, cumsum, capacity)
++  write_mask = valid_flat & (cumsum < capacity)
++
++  senders = senders.at[write_idx].set(
++    jnp.where(write_mask, j_flat, N), mode='drop'
++  )
++  receivers = receivers.at[write_idx].set(
++    jnp.where(write_mask, i_flat, N), mode='drop'
++  )
++
++  shift_vals = shifts[s_flat]  # [num_shifts * N * N, dim]
++  shift_vals_masked = jnp.where(write_mask[:, None], shift_vals, 0)
++  edge_shifts = edge_shifts.at[write_idx].set(shift_vals_masked, mode='drop')
++
++  return senders, receivers, edge_shifts, n_valid
++
++
++def _build_neighbor_list_sparse(
++  position: Array,  # [N, dim]
++  box: Array,  # [dim, dim]
++  shifts: Array,  # [num_shifts, dim]
++  shifts_real: Array,  # [num_shifts, dim]
++  zero_shift_idx: int,
++  r_cutoff: float,
++  capacity: int,
++  fractional_coordinates: bool,
++  update_fn: Callable,
++) -> NeighborListMultiImage:
++  r"""Build neighbor list in Sparse format.
++
++  Stores **both directions** for each pair: if :math:`(i, j)` is a neighbor,
++  both :math:`i \to j` and :math:`j \to i` are stored. Required for GNNs
++  and asymmetric potentials.
++
++  Args:
++    position: Atom positions. Shape ``[N, dim]``.
++    box: Box matrix. Shape ``[dim, dim]``.
++    shifts: Integer shift vectors. Shape ``[num_shifts, dim]``.
++    shifts_real: Real-space shifts (``shifts @ box.T``). Shape ``[num_shifts, dim]``.
++    zero_shift_idx: Index of the zero shift vector.
++    r_cutoff: Cutoff distance.
++    capacity: Maximum edges to store.
++    fractional_coordinates: If True, positions are fractional.
++    update_fn: Function to update the neighbor list.
++
++  Returns:
++    NeighborListMultiImage with ``format=Sparse``:
++
++    - ``idx``: ``(receivers, senders)`` each shape ``[capacity]``.
++    - ``shifts``: Shape ``[capacity, dim]``.
++  """
++  within_cutoff = _compute_pairwise_mask(
++    position, box, shifts_real, zero_shift_idx, r_cutoff, fractional_coordinates
++  )  # [num_shifts, N, N]
++
++  N = position.shape[0]
++  senders, receivers, edge_shifts, n_valid = _scatter_to_sparse(
++    within_cutoff, shifts, capacity, N
++  )
++
++  return NeighborListMultiImage(
++    idx=(receivers, senders),
++    shifts=edge_shifts,
++    reference_position=position,
++    box=box,
++    format=NeighborListFormat.Sparse,
++    did_buffer_overflow=(n_valid > capacity),
++    max_occupancy=capacity,
++    update_fn=update_fn,
++  )
++
++
++def _build_neighbor_list_orderedsparse(
++  position: Array,  # [N, dim]
++  box: Array,  # [dim, dim]
++  shifts: Array,  # [num_shifts, dim]
++  shifts_real: Array,  # [num_shifts, dim]
++  zero_shift_idx: int,
++  r_cutoff: float,
++  capacity: int,
++  fractional_coordinates: bool,
++  update_fn: Callable,
++) -> NeighborListMultiImage:
++  r"""Build neighbor list in OrderedSparse format.
++
++  Stores **one direction** per pair to avoid double-counting. Uses 2x less
++  memory than Sparse format.
++
++  **Ordering rules:**
++
++  - **Zero shift** (:math:`\mathbf{s} = \mathbf{0}`): Store only :math:`i < j`.
++  - **Non-zero shift**: A shift is "canonical" if its first non-zero component
++    is positive. Only canonical shifts are stored.
++
++  Args:
++    position: Atom positions. Shape ``[N, dim]``.
++    box: Box matrix. Shape ``[dim, dim]``.
++    shifts: Integer shift vectors. Shape ``[num_shifts, dim]``.
++    shifts_real: Real-space shifts (``shifts @ box.T``). Shape ``[num_shifts, dim]``.
++    zero_shift_idx: Index of the zero shift vector.
++    r_cutoff: Cutoff distance.
++    capacity: Maximum edges to store.
++    fractional_coordinates: If True, positions are fractional.
++    update_fn: Function to update the neighbor list.
++
++  Returns:
++    NeighborListMultiImage with ``format=OrderedSparse``:
++
++    - ``idx``: ``(receivers, senders)`` each shape ``[capacity]``.
++    - ``shifts``: Shape ``[capacity, dim]``.
++  """
++  N = position.shape[0]
++  num_shifts = shifts.shape[0]
++
++  within_cutoff = _compute_pairwise_mask(
++    position, box, shifts_real, zero_shift_idx, r_cutoff, fractional_coordinates
++  )  # [num_shifts, N, N]
++
++  # Apply ordering to eliminate double-counting
++  i_idx = jnp.arange(N)[None, :, None]  # [1, N, 1]
++  j_idx = jnp.arange(N)[None, None, :]  # [1, 1, N]
++  zero_shift_mask = jnp.arange(num_shifts) == zero_shift_idx  # [num_shifts]
++
++  def is_shift_canonical(s):
++    """Check if shift is canonical (first non-zero component positive)."""
++    nonzero_mask = s != 0
++    first_nonzero_idx = jnp.argmax(nonzero_mask)
++    first_val = s[first_nonzero_idx]
++    is_zero = jnp.all(s == 0)
++    return jnp.where(is_zero, True, first_val > 0)
++
++  shift_is_canonical = jax.vmap(is_shift_canonical)(shifts)  # [num_shifts]
++
++  # Keep mask: zero shift -> i < j, non-zero -> canonical shifts only
++  keep_mask = jnp.where(
++    zero_shift_mask[:, None, None],
++    i_idx < j_idx,
++    shift_is_canonical[:, None, None],
++  )  # [num_shifts, N, N]
++
++  within_cutoff = within_cutoff & keep_mask
++
++  senders, receivers, edge_shifts, n_valid = _scatter_to_sparse(
++    within_cutoff, shifts, capacity, N
++  )
++
++  return NeighborListMultiImage(
++    idx=(receivers, senders),
++    shifts=edge_shifts,
++    reference_position=position,
++    box=box,
++    format=NeighborListFormat.OrderedSparse,
++    did_buffer_overflow=(n_valid > capacity),
++    max_occupancy=capacity,
++    update_fn=update_fn,
++  )
++
++
++def _build_neighbor_list_dense(
++  position: Array,  # [N, dim]
++  box: Array,  # [dim, dim]
++  shifts: Array,  # [num_shifts, dim]
++  shifts_real: Array,  # [num_shifts, dim]
++  zero_shift_idx: int,
++  r_cutoff: float,
++  max_neighbors: int,
++  fractional_coordinates: bool,
++  update_fn: Callable,
++) -> NeighborListMultiImage:
++  r"""Build neighbor list in Dense format.
++
++  Dense format stores neighbors per atom as a ``[N, max_neighbors]`` array,
++  enabling efficient three-body potential computation via vectorized operations.
++
++  For each atom :math:`i`, finds the closest ``max_neighbors`` atoms :math:`j`
++  (with shifts :math:`\mathbf{s}`) satisfying:
++
++  .. math::
++
++    \|\mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i\| < r_\text{cut}
++
++  Uses ``argsort`` to select top-k neighbors per atom.
++
++  Args:
++    position: Atom positions. Shape ``[N, dim]``.
++    box: Affine transformation (see ``periodic_general``). Shape ``[dim, dim]``.
++    shifts: Integer shift vectors. Shape ``[num_shifts, dim]``.
++    shifts_real: Real-space shifts (``shifts @ box.T``). Shape ``[num_shifts, dim]``.
++    zero_shift_idx: Index of the zero shift vector.
++    r_cutoff: Cutoff distance (scalar).
++    max_neighbors: Maximum neighbors per atom.
++    fractional_coordinates: If True, positions are fractional.
++    update_fn: Function to update the neighbor list.
++
++  Returns:
++    NeighborListMultiImage with ``format=Dense``:
++
++    - ``idx``: Neighbor indices. Shape ``[N, max_neighbors]``. Padded with ``N``.
++    - ``shifts``: Shift vectors. Shape ``[N, max_neighbors, dim]``.
++  """
++  N = position.shape[0]
++  num_shifts = shifts.shape[0]
++
++  # Compute squared distances for all (shift, i, j)
++  dist_sq = _compute_distances_sq(
++    position, box, shifts_real, fractional_coordinates
++  )  # [num_shifts, N, N]
++
++  # Valid neighbors: within cutoff, excluding self (i==j with zero shift)
++  within_cutoff = dist_sq < r_cutoff**2  # [num_shifts, N, N]
++  self_mask = jnp.eye(N, dtype=bool)  # [N, N]
++  zero_shift_mask = jnp.arange(num_shifts) == zero_shift_idx  # [num_shifts]
++  self_interaction = zero_shift_mask[:, None, None] & self_mask[None, :, :]
++  valid = within_cutoff & ~self_interaction  # [num_shifts, N, N]
++
++  # Reshape to per-atom view: [N, num_shifts * N]
++  # Transpose [num_shifts, N, N] -> [N, num_shifts, N] -> [N, num_shifts * N]
++  valid_per_atom = valid.transpose(1, 0, 2).reshape(N, num_shifts * N)
++  dist_sq_per_atom = dist_sq.transpose(1, 0, 2).reshape(N, num_shifts * N)
++
++  # Set invalid distances to inf for sorting
++  dist_for_sort = jnp.where(valid_per_atom, dist_sq_per_atom, jnp.inf)
++
++  # Select top-k closest neighbors per atom via argsort
++  top_k_flat_idx = jnp.argsort(dist_for_sort, axis=-1)[
++    :, :max_neighbors
++  ]  # [N, max_neighbors]
++
++  # Decode flat index -> (shift_idx, j)
++  neighbor_shift_idx = top_k_flat_idx // N  # [N, max_neighbors]
++  neighbor_j = top_k_flat_idx % N  # [N, max_neighbors]
++
++  # Gather shift vectors
++  neighbor_shifts = shifts[neighbor_shift_idx]  # [N, max_neighbors, dim]
++
++  # Check which entries are actually valid (not inf padding)
++  gathered_valid = jnp.take_along_axis(
++    valid_per_atom, top_k_flat_idx, axis=-1
++  )  # [N, max_neighbors]
++
++  # Replace invalid entries with padding sentinel N
++  neighbor_idx = jnp.where(gathered_valid, neighbor_j, N)  # [N, max_neighbors]
++  neighbor_shifts = jnp.where(
++    gathered_valid[:, :, None], neighbor_shifts, 0
++  )  # [N, max_neighbors, dim]
++
++  # Check for overflow
++  total_valid_per_atom = jnp.sum(valid_per_atom, axis=-1)  # [N]
++  did_overflow = jnp.any(total_valid_per_atom > max_neighbors)
++
++  return NeighborListMultiImage(
++    idx=neighbor_idx,
++    shifts=neighbor_shifts,
++    reference_position=position,
++    box=box,
++    format=NeighborListFormat.Dense,
++    did_buffer_overflow=did_overflow,
++    max_occupancy=max_neighbors,
++    update_fn=update_fn,
++  )
++
++
++def estimate_max_neighbors(
++  r_cutoff: float,
++  atomic_density: float = 0.1,
++  safety_factor: float = 2.0,
++  dim: int = 3,
++) -> int:
++  r"""Estimate maximum neighbors per atom from atomic density.
++
++  Quick estimation when you don't have box/n_atoms information. Uses:
++
++  .. math::
++
++    N_\text{neighbors} = \text{safety\_factor} \cdot \rho \cdot V_\text{sphere}
++
++  where :math:`\rho` is the atomic density and :math:`V_\text{sphere}` is the
++  volume of a sphere with radius ``r_cutoff``.
++
++  Args:
++    r_cutoff: Interaction cutoff distance (scalar).
++    atomic_density: Atomic density in atoms per unit volume. Default: 0.1.
++      Common values: ~0.03 for gases, ~0.1 for liquids, ~0.15 for solids.
++    safety_factor: Multiplier for safety margin. Default: 2.0.
++    dim: Spatial dimension. Default: 3.
++
++  Returns:
++    Estimated maximum neighbors per atom.
++
++  Example:
++
++    .. code-block:: python
++
++       from jax_md.custom_partition import (
++           neighbor_list_multi_image,
++           estimate_max_neighbors,
++       )
++
++       max_nbrs = estimate_max_neighbors(r_cutoff=2.5, atomic_density=0.1)
++       neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff, max_neighbors=max_nbrs)
++
++  See Also:
++    ``estimate_max_neighbors_from_box``: More accurate estimation when box and
++    n_atoms are known, accounts for multiple periodic images.
++  """
++  if r_cutoff <= 0:
++    return 0
++
++  if dim > 3:
++    raise ValueError(f'dim must be 1, 2, or 3, got {dim}')
++
++  # Compute sphere volume based on dimension
++  if dim == 3:
++    sphere_volume = 4.0 / 3.0 * jnp.pi * r_cutoff**3
++  elif dim == 2:
++    sphere_volume = jnp.pi * r_cutoff**2
++  else:  # dim == 1
++    sphere_volume = 2.0 * r_cutoff
++
++  expected_neighbors = safety_factor * atomic_density * sphere_volume
++  return max(int(jnp.ceil(expected_neighbors)), 1)
++
++
++def estimate_max_neighbors_from_box(
++  box: Array,  # [dim, dim]
++  r_cutoff: float,
++  n_atoms: int,
++  safety_factor: float = 2.0,
++  pbc: Optional[Array] = None,  # [dim]
++) -> int:
++  r"""Estimate maximum neighbors per atom from box and atom count.
++
++  Accurate estimation for multi-image neighbor lists, supporting both fully
++  periodic and mixed boundary conditions.
++
++  .. math::
++
++    N_\text{neighbors} = \text{safety\_factor} \cdot \rho \cdot V_\text{eff}
++
++  where :math:`\rho = N / V_\text{box}` is the number density and
++  :math:`V_\text{eff}` is the effective cutoff volume (sphere for fully
++  periodic, capped for non-periodic directions).
++
++  For non-periodic directions, the cutoff is capped at the box length since
++  atoms beyond the box boundary don't exist. This reduces the effective
++  cutoff volume and thus the expected neighbor count.
++
++  Args:
++    box: Affine transformation (see ``jax_md.space.periodic_general``).
++      Shape ``[dim, dim]``. Columns are lattice vectors.
++    r_cutoff: Interaction cutoff distance (scalar).
++    n_atoms: Number of atoms in the system.
++    safety_factor: Multiplier for safety margin. Default: 2.0.
++    pbc: Boolean array indicating periodic directions. Shape ``[dim]``.
++      Default: all True. For non-periodic directions, the cutoff is capped
++      at the box length in that direction.
++
++  Returns:
++    Estimated maximum neighbors per atom.
++
++  Raises:
++    ValueError: If spatial dimension is not 1, 2, or 3.
++
++  Example:
++
++    .. code-block:: python
++
++       from jax_md.custom_partition import (
++           neighbor_list_multi_image,
++           estimate_max_neighbors_from_box,
++       )
++
++       # Fully periodic
++       max_nbrs = estimate_max_neighbors_from_box(box, r_cutoff, n_atoms=N)
++
++       # Mixed: periodic in x,y but not z
++       max_nbrs = estimate_max_neighbors_from_box(
++           box, r_cutoff, n_atoms=N, pbc=[True, True, False]
++       )
++       neighbor_fn = neighbor_list_multi_image(
++           None, box, r_cutoff, max_neighbors=max_nbrs, pbc=[True, True, False]
++       )
++
++  See Also:
++    ``estimate_max_neighbors``: Quick estimation when box is not available.
++  """
++  if r_cutoff <= 0:
++    return 0
++
++  box = jnp.asarray(box)
++  dim = box.shape[0]
++
++  if dim > 3:
++    raise ValueError(f'dim must be 1, 2, or 3, got {dim}')
++
++  if pbc is None:
++    pbc = jnp.ones(dim, dtype=bool)
++  pbc = jnp.asarray(pbc)
++
++  # Compute density from box
++  box_volume = float(jnp.abs(jnp.linalg.det(box)))
++  density = n_atoms / box_volume
++
++  # For non-periodic directions, cap the effective cutoff at the box length.
++  # This is because atoms can only exist within the box in non-periodic directions.
++  # Compute box lengths along each axis (diagonal for orthorhombic, more complex otherwise)
++  box_lengths = jnp.linalg.norm(
++    box, axis=0
++  )  # [dim] - length of each lattice vector
++
++  # Effective cutoff per direction: r_cutoff if periodic, min(r_cutoff, L) if not
++  r_eff = jnp.where(pbc, r_cutoff, jnp.minimum(r_cutoff, box_lengths))
++
++  # For computing effective volume, use the minimum effective cutoff
++  # This is conservative (may overestimate slightly for anisotropic boxes)
++  r_eff_min = float(jnp.min(r_eff))
++
++  # Compute sphere/circle/line volume based on dimension using effective cutoff
++  if dim == 3:
++    sphere_volume = 4.0 / 3.0 * jnp.pi * r_eff_min**3
++  elif dim == 2:
++    sphere_volume = jnp.pi * r_eff_min**2
++  else:  # dim == 1
++    sphere_volume = 2.0 * r_eff_min
++
++  # For multi-image neighbor lists, when r_cutoff > L/2, the cutoff sphere
++  # extends into multiple periodic images. However, the atoms in those images
++  # are the same physical atoms, just translated. The expected neighbor count
++  # is still density * sphere_volume (the number of atoms within the sphere),
++  # regardless of how many images are involved.
++  expected_neighbors = safety_factor * density * sphere_volume
++  return max(int(jnp.ceil(expected_neighbors)), 1)
++
++
++def neighbor_list_multi_image(
++  displacement_or_metric,  # Ignored, for API compatibility
++  box: Array,  # [dim, dim]
++  r_cutoff: float,
++  dr_threshold: float = 0.0,
++  capacity_multiplier: float = 1.25,
++  pbc: Optional[Array] = None,  # [dim]
++  fractional_coordinates: bool = True,
++  ordered: bool = False,
++  format: NeighborListFormat = NeighborListFormat.Sparse,
++  max_neighbors: Optional[int] = None,
++  **kwargs,
++) -> NeighborListMultiImageFns:
++  r"""Returns functions to build neighbor lists for small periodic boxes.
++
++  This function mirrors the API of ``jax_md.partition.neighbor_list`` but
++  correctly handles small boxes where :math:`r_\text{cut} > L/2` by
++  explicitly enumerating periodic images. Works for any dimension.
++
++  **Algorithm:**
++
++  For each lattice direction :math:`i`, computes the number of shifts needed:
++
++  .. math::
++
++    n_i = \lceil r_\text{cut} / h_i \rceil
++
++  where :math:`h_i` is the perpendicular height of the box along direction
++  :math:`i`. Then enumerates all integer shift vectors
++  :math:`\mathbf{s} \in [-n_1, n_1] \times \ldots \times [-n_d, n_d]` and finds
++  pairs :math:`(i, j)` with:
++
++  .. math::
++
++    \|\mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i\| < r_\text{cut}
++
++  **Usage:**
++
++  .. code-block:: python
++
++     from jax_md.custom_partition import (
++         neighbor_list_multi_image,
++         estimate_max_neighbors,
++     )
++
++     # Basic usage: uses default max_neighbors=100
++     neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff)
++     nbrs = neighbor_fn.allocate(R)
++
++     # With explicit max_neighbors
++     neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff, max_neighbors=50)
++
++     # Use estimate_max_neighbors for density-based estimation
++     max_nbrs = estimate_max_neighbors(box, r_cutoff, n_atoms=N)
++     neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff, max_neighbors=max_nbrs)
++
++     nbrs = neighbor_fn.allocate(R)
++
++     for _ in range(steps):
++       nbrs = nbrs.update(state.position)
++       if nbrs.did_buffer_overflow:
++         nbrs = neighbor_fn.allocate(state.position)
++       state = apply_fn(state, nbrs)
++
++  Args:
++    displacement_or_metric: Ignored. Accepted for API compatibility with
++      ``partition.neighbor_list``. Multi-image computes displacements using
++      explicit lattice shifts.
++    box: Affine transformation (see ``jax_md.space.periodic_general``).
++      Shape ``[dim, dim]``. Columns are lattice vectors.
++    r_cutoff: Interaction cutoff distance (scalar).
++    dr_threshold: Maximum distance atoms can move before rebuilding.
++      Set to 0 to always rebuild. Uses :math:`d_\text{max} < d_\text{thresh}/2`
++      as the skip condition.
++    capacity_multiplier: Safety factor for neighbor list capacity.
++    pbc: Boolean array indicating periodic directions. Shape ``[dim]``.
++      Default: all True.
++    fractional_coordinates: If True, positions are in fractional coordinates.
++    ordered: If True, use OrderedSparse format (one direction per pair).
++      Uses 2x less memory. Ignored for Dense format.
++    format: Neighbor list format:
++
++      - ``Sparse``: Edge list ``(receivers, senders)``. Shape ``[capacity]``.
++      - ``OrderedSparse``: Like Sparse but only :math:`i < j` pairs.
++      - ``Dense``: Per-atom neighbors. Shape ``[N, max_neighbors]``.
++
++    max_neighbors: Maximum neighbors per atom. Default: 100. Use
++      ``estimate_max_neighbors()`` for density-based estimation.
++    **kwargs: Additional arguments (ignored, for API compatibility).
++
++  Returns:
++    ``NeighborListMultiImageFns`` with:
++
++    - ``allocate(position)``: Create new neighbor list from positions ``[N, dim]``.
++    - ``update(position, neighbors)``: Update existing neighbor list.
++  """
++  del displacement_or_metric  # Unused - multi-image uses explicit shifts
++
++  # Configuration constants
++  DEFAULT_MAX_NEIGHBORS = 256  # Default max neighbors per atom if not specified
++
++  box = jnp.asarray(box)  # [dim, dim]
++  dim = box.shape[0]
++  use_dense = format is NeighborListFormat.Dense
++  use_ordered = ordered or (format is NeighborListFormat.OrderedSparse)
++
++  if pbc is None:
++    pbc = jnp.ones(dim, dtype=bool)
++  pbc = jnp.asarray(pbc)  # [dim]
++
++  # Add dr_threshold as a "skin" buffer to the cutoff for neighbor search.
++  search_cutoff = r_cutoff + dr_threshold
++
++  # Pre-compute shift vectors using reciprocal lattice heights
++  shifts = _compute_shift_ranges(box, search_cutoff, pbc)  # [num_shifts, dim]
++  shifts_real = shifts @ box.T  # [num_shifts, dim]
++  zero_shift_idx = int(jnp.argmin(jnp.sum(shifts**2, axis=1)))
++
++  # Compute neighbors_per_atom from max_neighbors or default
++  if max_neighbors is not None:
++    neighbors_per_atom = int(max_neighbors * capacity_multiplier)
++  else:
++    neighbors_per_atom = int(DEFAULT_MAX_NEIGHBORS * capacity_multiplier)
++
++  # Displacement threshold for skipping rebuild
++  threshold_sq = (dr_threshold / 2.0) ** 2
++
++  # Placeholder for circular reference in NeighborListMultiImage.update
++  def update_fn_placeholder(position, neighbors, **kwargs):
++    raise NotImplementedError()
++
++  update_fn_ref = [update_fn_placeholder]
++
++  # Cache for JIT-compiled build functions per capacity
++  # This avoids recompilation when N stays constant across calls
++  build_fn_cache = {}
++
++  def compute_capacity(N: int) -> int:
++    """Compute capacity from number of atoms."""
++    if use_dense:
++      return neighbors_per_atom
++    else:
++      cap = N * neighbors_per_atom
++      if use_ordered:
++        cap = cap // 2 + N  # Ordered stores ~half the edges
++      return cap
++
++  def get_build_fn(capacity: int):
++    """Get or create JIT-compiled build function for given capacity."""
++    if capacity in build_fn_cache:
++      return build_fn_cache[capacity]
++
++    # Create build function for this capacity
++    if use_dense:
++
++      @jax.jit
++      def build_fn(pos):  # pos: [N, dim]
++        return _build_neighbor_list_dense(
++          pos,
++          box,
++          shifts,
++          shifts_real,
++          zero_shift_idx,
++          search_cutoff,
++          capacity,
++          fractional_coordinates,
++          update_fn_ref[0],
++        )
++
++    elif use_ordered:
++
++      @jax.jit
++      def build_fn(pos):  # pos: [N, dim]
++        return _build_neighbor_list_orderedsparse(
++          pos,
++          box,
++          shifts,
++          shifts_real,
++          zero_shift_idx,
++          search_cutoff,
++          capacity,
++          fractional_coordinates,
++          update_fn_ref[0],
++        )
++
++    else:
++
++      @jax.jit
++      def build_fn(pos):  # pos: [N, dim]
++        return _build_neighbor_list_sparse(
++          pos,
++          box,
++          shifts,
++          shifts_real,
++          zero_shift_idx,
++          search_cutoff,
++          capacity,
++          fractional_coordinates,
++          update_fn_ref[0],
++        )
++
++    build_fn_cache[capacity] = build_fn
++    return build_fn
++
++  @jax.jit
++  def check_needs_rebuild(
++    position: Array,  # [N, dim]
++    reference_position: Array,  # [N, dim]
++  ) -> Array:  # scalar bool
++    """Check if maximum displacement exceeds threshold."""
++    if fractional_coordinates:
++      pos_new = position @ box.T  # [N, dim]
++      pos_old = reference_position @ box.T
++    else:
++      pos_new = position
++      pos_old = reference_position
++    max_disp_sq = jnp.max(jnp.sum((pos_new - pos_old) ** 2, axis=-1))
++    return max_disp_sq >= threshold_sq
++
++  # Choose update strategy at function creation time (not trace time)
++  use_threshold = dr_threshold > 0
++
++  def allocate_fn(
++    position: Array, extra_capacity: int = 0, **kwargs
++  ) -> NeighborListMultiImage:
++    """Allocate a new neighbor list from positions [N, dim].
++
++    Computes capacity based on position.shape[0] and caches the JIT-compiled
++    build function for efficient reuse with the same N.
++
++    Args:
++      position: Atom positions. Shape ``[N, dim]``.
++      extra_capacity: Additional capacity to add (multiplied by N for Sparse).
++        Use this to recover from buffer overflow.
++
++    Returns:
++      New neighbor list.
++    """
++    position = jnp.asarray(position)
++    N = position.shape[0]
++    base_capacity = compute_capacity(N)
++    # For sparse formats, extra_capacity is per-atom; for dense it's absolute
++    if use_dense:
++      capacity = base_capacity + extra_capacity
++    else:
++      capacity = base_capacity + N * extra_capacity
++    build_fn = get_build_fn(capacity)
++    return build_fn(position)
++
++  def neighbor_list_fn(
++    position: Array,  # [N, dim]
++    neighbors: Optional[NeighborListMultiImage] = None,
++    **kwargs,
++  ) -> NeighborListMultiImage:
++    """Build or update neighbor list.
++
++    Args:
++      position: Atom positions. Shape ``[N, dim]``.
++      neighbors: Existing neighbor list, or None to allocate new.
++      **kwargs: Additional arguments (unused, for API compatibility).
++
++    Returns:
++      Updated neighbor list.
++    """
++    position = jnp.asarray(position)
++
++    if neighbors is None:
++      # First call: allocate with capacity computed from position
++      return allocate_fn(position, **kwargs)
++
++    # Update: reuse existing capacity from neighbor list
++    capacity = neighbors.max_occupancy
++    build_fn = get_build_fn(capacity)
++
++    # Check if rebuild needed based on displacement threshold
++    if use_threshold:
++      return jax.lax.cond(
++        check_needs_rebuild(position, neighbors.reference_position),
++        build_fn,  # True branch: rebuild
++        lambda pos: neighbors,  # False branch: return existing
++        position,
++      )
++
++    return build_fn(position)
++
++  # Close the circular reference
++  update_fn_ref[0] = neighbor_list_fn
++
++  return NeighborListMultiImageFns(allocate_fn, neighbor_list_fn)
++
++
++def neighbor_list_multi_image_mask(
++  neighbors: NeighborListMultiImage,
++) -> Array:  # [capacity]
++  r"""Compute a boolean mask for valid edges in a neighbor list.
++
++  This is equivalent to ``jax_md.partition.neighbor_list_mask``. An edge is
++  valid if its receiver index is less than ``N`` (invalid edges are padded
++  with index ``N``).
++
++  Args:
++    neighbors: A ``NeighborListMultiImage`` (Sparse or OrderedSparse format).
++
++  Returns:
++    Boolean mask. Shape ``[capacity]``. True indicates a valid edge.
++  """
++  N = len(neighbors.reference_position)
++  return neighbors.idx[0] < N  # [capacity]
++
++
++def graph_featurizer(displacement_fn):
++  """Create graph featurizer for multi-image neighbor lists.
++
++  Converts a NeighborListMultiImage to a jraph.GraphsTuple with displacement
++  vectors as edge features. Uses explicit lattice shifts instead of MIC.
++
++  This has the same signature as ``jax_md._nn.util.neighbor_list_featurizer``
++  so it can be used as a drop-in replacement for multi-image neighbor lists.
++
++  Args:
++    displacement_fn: Displacement function (ignored - uses neighbor.box instead).
++
++  Returns:
++    featurize(atoms, positions, neighbor) -> GraphsTuple
++
++  Example:
++    >>> from jax_md.custom_partition import neighbor_list_multi_image, graph_featurizer
++    >>> neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff)
++    >>> featurizer = graph_featurizer(displacement_fn)  # displacement_fn is ignored
++    >>> nbrs = neighbor_fn.allocate(positions)
++    >>> graph = featurizer(atoms, positions, nbrs)
++  """
++  del displacement_fn  # Not used - we use neighbor.box for multi-image
++
++  def featurize(atoms, positions: Array, neighbor: NeighborListMultiImage):
++    """Convert neighbor list to graph with displacement edges.
++
++    Args:
++      atoms: Node features dict (e.g., {'species': ..., 'positions': ...}).
++      positions: Atom positions (fractional), shape (N, dim).
++      neighbor: Multi-image neighbor list.
++
++    Returns:
++      GraphsTuple with displacement vectors as edges.
++    """
++    graph = partition.to_jraph(neighbor, nodes=atoms)
++    mask = neighbor_list_multi_image_mask(neighbor)
++
++    # Use box from neighbor list for consistency with shifts
++    box = neighbor.box
++
++    # Get positions and compute displacements with explicit shifts
++    pos_real = space.transform(box, positions)
++    Ra = pos_real[neighbor.receivers]
++    Rb = pos_real[neighbor.senders]
++    shifts_real = space.transform(box, neighbor.shifts)
++
++    # dR = R_j + shift - R_i
++    dR = Rb + shifts_real - Ra
++    dR = jnp.where(mask[:, None], dR, 1.0)  # Set masked edges to displacement 1
++
++    return graph._replace(edges=dR)
++
++  return featurize
++
++
++def _compute_displacements(
++  position: Array,  # [N, dim]
++  neighbors: NeighborListMultiImage,
++  fractional_coordinates: bool = True,
++) -> Array:  # [capacity, dim]
++  r"""Compute displacement vectors for all edges in a neighbor list.
++
++  For each edge from receiver :math:`i` to sender :math:`j` with shift
++  :math:`\mathbf{s}`, computes:
++
++  .. math::
++
++    \mathbf{d}_{ij}^{\mathbf{s}} = \mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i
++
++  where :math:`\mathbf{T}` is the box matrix.
++
++  Uses ``space.transform`` for coordinate conversion so that gradients w.r.t.
++  fractional inputs are real-space gradients (see ``space.transform_jvp``).
++
++  Args:
++    position: Atom positions. Shape ``[N, dim]``.
++    neighbors: A ``NeighborListMultiImage`` (Sparse or OrderedSparse format).
++    fractional_coordinates: If True, positions are in fractional coordinates.
++
++  Returns:
++    Displacement vectors in Cartesian coordinates. Shape ``[capacity, dim]``.
++    Invalid edges are set to zero. Use ``neighbor_list_mask(neighbors)`` to
++    filter valid edges.
++  """
++  box = neighbors.box  # [dim, dim]
++  N = position.shape[0]
++  mask = neighbor_list_multi_image_mask(neighbors)  # [capacity]
++
++  if fractional_coordinates:
++    position_real = space.transform(box, position)  # [N, dim]
++  else:
++    position_real = position
++
++  # Safe indexing for padding (clip to valid range)
++  i_safe = jnp.clip(neighbors.receivers, 0, N - 1)  # [capacity]
++  j_safe = jnp.clip(neighbors.senders, 0, N - 1)  # [capacity]
++  shifts_real = space.transform(box, neighbors.shifts)  # [capacity, dim]
++
++  # Displacement: r_j + shift - r_i
++  dR = (
++    position_real[j_safe] + shifts_real - position_real[i_safe]
++  )  # [capacity, dim]
++  return jnp.where(mask[:, None], dR, 0.0)
+diff --git a/jax_md/custom_smap.py b/jax_md/custom_smap.py
+new file mode 100644
+index 00000000..737126e6
+--- /dev/null
++++ b/jax_md/custom_smap.py
+@@ -0,0 +1,270 @@
++"""Structure-mapped functions for multi-image neighbor lists.
++
++This module provides analogues to ``jax_md.smap`` functions that work with
++``NeighborListMultiImage`` to correctly handle small periodic boxes where
++:math:`r_\\text{cut} > L/2`.
++
++The key difference from standard ``smap`` functions is that these use explicit
++lattice shifts stored in the neighbor list rather than relying on the minimum
++image convention.
++"""
++
++from typing import Callable, Tuple, Optional
++import jax.numpy as jnp
++from jax import ops
++from jax_md import partition, space, util
++from jax_md.custom_partition import (
++  NeighborListMultiImage,
++  NeighborListFormat,
++  neighbor_list_multi_image_mask,
++)
++
++# Type aliases
++Array = jnp.ndarray
++f32 = jnp.float32
++i32 = jnp.int32
++
++
++def pair_neighbor_list_multi_image(
++  pair_fn: Callable[..., Array],
++  displacement_or_metric=None,  # Ignored, for API compatibility with smap.pair_neighbor_list
++  species: Optional[Array] = None,  # [N] or None
++  reduce_axis: Optional[Tuple[int, ...]] = None,
++  ignore_unused_parameters: bool = False,  # For API compatibility
++  fractional_coordinates: bool = True,
++  **static_kwargs,
++) -> Callable[[Array, NeighborListMultiImage], Array]:
++  r"""Creates a function for pair potentials using multi-image neighbors.
++
++  This function is analogous to ``jax_md.smap.pair_neighbor_list`` but works
++  with ``NeighborListMultiImage`` to correctly handle small periodic boxes
++  where :math:`r_\text{cut} > L/2`.
++
++  **API Compatibility:**
++
++  The ``displacement_or_metric`` parameter is accepted but ignored (for
++  signature compatibility with ``smap.pair_neighbor_list``). Multi-image
++  neighbor lists compute displacements using the box stored in the neighbor
++  list, so no displacement function is needed.
++
++  For each edge :math:`(i, j)` with shift :math:`\mathbf{s}`, computes:
++
++  .. math::
++
++    E_{ij}^{\mathbf{s}} = f\left(\|\mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i\|\right)
++
++  where :math:`f` is the pair function and :math:`\mathbf{T}` is the box matrix.
++
++  The pair function should have the signature::
++
++    pair_fn(dr, **kwargs) -> energy
++
++  where ``dr`` is an array of scalar pairwise distances of shape ``[capacity]``.
++  This matches the signature expected by ``smap.pair_neighbor_list``, so the
++  same pair function (e.g., ``energy.lennard_jones``) works with both.
++
++  **Gradient handling:**
++
++  Uses ``space.transform`` for coordinate transformations, which has a custom
++  JVP that keeps gradients in the same coordinate system as inputs. When using
++  fractional coordinates, ``jax.grad(energy_fn)`` returns forces in fractional
++  coordinates (compatible with fractional-coordinate dynamics).
++
++  **Format handling:**
++
++  - ``Sparse``: Both :math:`i \\to j` and :math:`j \\to i` are stored, so
++    energies are divided by 2. Supports per-particle energies.
++  - ``OrderedSparse``: Only one direction per pair, no division needed.
++    Does **not** support per-particle energies (raises ``ValueError``).
++  - ``Dense``: Stores neighbors per atom as ``[N, max_neighbors]``. Both
++    directions are stored, so energies are divided by 2. Supports per-particle
++    energies via sum over axis 1.
++
++  Args:
++    pair_fn: A function that computes pairwise energies from distances.
++      Examples: ``energy.lennard_jones``, ``energy.morse``, ``energy.soft_sphere``.
++      Signature: ``(dr: Array[capacity], **kwargs) -> Array[capacity]``.
++    species: Optional species array. Shape ``[N]``. If provided, kwargs like
++      ``sigma`` and ``epsilon`` should have shape ``[max_species, max_species]``
++      and will be indexed per-pair.
++    fractional_coordinates: If True, positions are in fractional coordinates.
++    reduce_axis: Axis over which to reduce the energy. If ``None`` (default),
++      sums all pair energies to a scalar. If specified, returns per-atom
++      energies of shape ``[N]``. **Note:** Per-atom energies are not supported
++      with ``OrderedSparse`` format (raises ``ValueError``).
++    **static_kwargs: Static parameters passed to the pair function (e.g.,
++      ``sigma``, ``epsilon``). Can be overridden at call time.
++
++  Returns:
++    An energy function with signature:
++    ``energy_fn(R, neighbor, **kwargs) -> Array``
++
++    - Input ``R``: Positions. Shape ``[N, dim]``.
++    - Input ``neighbor``: A ``NeighborListMultiImage``.
++    - Output: Total energy (scalar) or per-atom energies (shape ``[N]``).
++
++  Example:
++
++    .. code-block:: python
++
++       from jax_md import energy
++       from jax_md.custom_partition import neighbor_list_multi_image
++       from jax_md.custom_smap import pair_neighbor_list_multi_image
++
++       # Create Lennard-Jones energy function for multi-image neighbors
++       lj_energy = pair_neighbor_list_multi_image(
++           energy.lennard_jones,
++           sigma=1.0,
++           epsilon=1.0,
++       )
++
++       # Use with multi-image neighbor list
++       neighbor_fn = neighbor_list_multi_image(None, box, r_cutoff, n_atoms=N)
++       nbrs = neighbor_fn.allocate(positions)
++       E = lj_energy(positions, nbrs)
++
++       # Compute forces via autodiff
++       force_fn = jax.grad(lambda R, nbrs: -lj_energy(R, nbrs))
++       F = force_fn(positions, nbrs)  # Shape: [N, dim]
++  """
++  # These parameters are accepted for API compatibility but not used.
++  # Multi-image uses the box from the neighbor list, not a displacement function.
++  del displacement_or_metric, ignore_unused_parameters
++
++  def energy_fn(
++    R: Array,  # [N, dim]
++    neighbor: NeighborListMultiImage,
++    **kwargs,
++  ) -> Array:  # scalar or [N]
++    """Compute total pair energy."""
++    merged_kwargs = {**static_kwargs, **kwargs}
++    _species = merged_kwargs.pop('species', species)
++
++    box = neighbor.box  # [dim, dim]
++    N = R.shape[0]
++
++    # Compute Cartesian positions using space.transform for correct gradients.
++    # Note: space.transform has a custom JVP that keeps gradients in the same
++    # coordinate system as inputs (fractional -> fractional forces).
++    if fractional_coordinates:
++      R_real = space.transform(box, R)  # [N, dim]
++    else:
++      R_real = R  # [N, dim]
++
++    # Handle Dense vs Sparse formats differently
++    if partition.is_sparse(neighbor.format):
++      # Sparse/OrderedSparse: edge-list format
++      # idx shape: [2, capacity], shifts shape: [capacity, dim]
++      mask = neighbor_list_multi_image_mask(neighbor)  # [capacity]
++
++      # Compute displacement vectors: r_j + shift - r_i
++      i_safe = jnp.clip(neighbor.receivers, 0, N - 1)  # [capacity]
++      j_safe = jnp.clip(neighbor.senders, 0, N - 1)  # [capacity]
++      shifts_real = space.transform(box, neighbor.shifts)  # [capacity, dim]
++      dR = R_real[j_safe] + shifts_real - R_real[i_safe]  # [capacity, dim]
++
++      # Compute scalar distances
++      dr = space.distance(dR)  # [capacity]
++
++      # Handle species-dependent parameters
++      if _species is not None:
++        species_i = _species[i_safe]  # [capacity]
++        species_j = _species[j_safe]  # [capacity]
++        processed_kwargs = {}
++        for key, val in merged_kwargs.items():
++          if jnp.ndim(val) == 2:
++            processed_kwargs[key] = val[species_i, species_j]  # [capacity]
++          else:
++            processed_kwargs[key] = val
++        merged_kwargs = processed_kwargs
++
++      # Compute pair energies
++      pair_energies = pair_fn(dr, **merged_kwargs)  # [capacity]
++      zero = jnp.zeros((), dtype=pair_energies.dtype)
++      pair_energies = jnp.where(mask, pair_energies, zero)  # [capacity]
++
++      # Normalization: OrderedSparse stores one direction, Sparse stores both
++      normalization = (
++        1.0 if neighbor.format is NeighborListFormat.OrderedSparse else 2.0
++      )
++
++      if reduce_axis is None:
++        return util.high_precision_sum(pair_energies) / normalization
++      else:
++        # Per-particle energy via segment_sum
++        if neighbor.format is NeighborListFormat.OrderedSparse:
++          raise ValueError(
++            'Cannot compute per-particle energies with OrderedSparse format. '
++            'OrderedSparse stores only one direction per pair, so segment_sum '
++            'would assign the full pair energy to the receiver atom only. '
++            'Use Sparse or Dense format for per-particle energies.'
++          )
++        particle_energies = ops.segment_sum(
++          pair_energies * mask, neighbor.receivers, N
++        )  # [N]
++        return particle_energies / normalization
++
++    else:
++      # Dense format: per-atom neighbor arrays
++      # idx shape: [N, max_neighbors], shifts shape: [N, max_neighbors, dim]
++      idx = neighbor.idx  # [N, max_neighbors]
++      shifts = neighbor.shifts  # [N, max_neighbors, dim]
++      mask = idx < N  # [N, max_neighbors]
++
++      # Get neighbor positions with safe indexing
++      j_safe = jnp.clip(idx, 0, N - 1)  # [N, max_neighbors]
++      R_neigh = R_real[j_safe]  # [N, max_neighbors, dim]
++
++      # Transform shifts to real space
++      # shifts has shape [N, max_neighbors, dim], need to reshape for transform
++      shifts_flat = shifts.reshape(
++        -1, shifts.shape[-1]
++      )  # [N*max_neighbors, dim]
++      shifts_real_flat = space.transform(
++        box, shifts_flat
++      )  # [N*max_neighbors, dim]
++      shifts_real = shifts_real_flat.reshape(
++        shifts.shape
++      )  # [N, max_neighbors, dim]
++
++      # Compute displacements: r_j + shift - r_i
++      # R_real[:, None, :] broadcasts to [N, 1, dim]
++      dR = R_neigh + shifts_real - R_real[:, None, :]  # [N, max_neighbors, dim]
++
++      # Compute scalar distances
++      dr = space.distance(dR)  # [N, max_neighbors]
++
++      # Handle species-dependent parameters
++      if _species is not None:
++        species_i = jnp.broadcast_to(
++          _species[:, None], idx.shape
++        )  # [N, max_neighbors]
++        species_j = _species[j_safe]  # [N, max_neighbors]
++        processed_kwargs = {}
++        for key, val in merged_kwargs.items():
++          if jnp.ndim(val) == 2:
++            processed_kwargs[key] = val[
++              species_i, species_j
++            ]  # [N, max_neighbors]
++          else:
++            processed_kwargs[key] = val
++        merged_kwargs = processed_kwargs
++
++      # Compute pair energies
++      pair_energies = pair_fn(dr, **merged_kwargs)  # [N, max_neighbors]
++      zero = jnp.zeros((), dtype=pair_energies.dtype)
++      pair_energies = jnp.where(mask, pair_energies, zero)  # [N, max_neighbors]
++
++      # Dense stores both directions, so divide by 2
++      normalization = 2.0
++
++      if reduce_axis is None:
++        return util.high_precision_sum(pair_energies) / normalization
++      else:
++        # Per-particle energy: sum over neighbors (axis 1)
++        particle_energies = util.high_precision_sum(
++          pair_energies, axis=1
++        )  # [N]
++        return particle_energies / normalization
++
++  return energy_fn
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index 048c300c..959072ba 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -179,6 +179,8 @@ def soft_sphere_neighbor_list(
+   per_particle: bool = False,
+   fractional_coordinates: bool = False,
+   format: NeighborListFormat = partition.OrderedSparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  pair_neighbor_list_fn: Callable = smap.pair_neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`soft spheres <soft-sphere>` using a neighbor list."""
+@@ -188,7 +190,7 @@ def soft_sphere_neighbor_list(
+   list_cutoff = jnp.max(sigma)
+   dr_threshold = maybe_downcast(dr_threshold)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_or_metric,
+     box_size,
+     list_cutoff,
+@@ -197,7 +199,7 @@ def soft_sphere_neighbor_list(
+     format=format,
+     **neighbor_kwargs,
+   )
+-  energy_fn = smap.pair_neighbor_list(
++  energy_fn = pair_neighbor_list_fn(
+     soft_sphere,
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
+     ignore_unused_parameters=True,
+@@ -206,6 +208,7 @@ def soft_sphere_neighbor_list(
+     epsilon=epsilon,
+     alpha=alpha,
+     reduce_axis=(1,) if per_particle else None,
++    fractional_coordinates=fractional_coordinates,
+   )
+ 
+   return neighbor_fn, energy_fn
+@@ -274,6 +277,8 @@ def lennard_jones_neighbor_list(
+   per_particle: bool = False,
+   fractional_coordinates: bool = False,
+   format: partition.NeighborListFormat = partition.OrderedSparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  pair_neighbor_list_fn: Callable = smap.pair_neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`Lennard-Jones <lj-pot>` using a neighbor list."""
+@@ -283,7 +288,7 @@ def lennard_jones_neighbor_list(
+   r_cutoff = maybe_downcast(r_cutoff) * jnp.max(sigma)
+   dr_threshold = maybe_downcast(dr_threshold)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_or_metric,
+     box_size,
+     r_cutoff,
+@@ -292,7 +297,7 @@ def lennard_jones_neighbor_list(
+     format=format,
+     **neighbor_kwargs,
+   )
+-  energy_fn = smap.pair_neighbor_list(
++  energy_fn = pair_neighbor_list_fn(
+     multiplicative_isotropic_cutoff(lennard_jones, r_onset, r_cutoff),
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
+     ignore_unused_parameters=True,
+@@ -300,6 +305,7 @@ def lennard_jones_neighbor_list(
+     sigma=sigma,
+     epsilon=epsilon,
+     reduce_axis=(1,) if per_particle else None,
++    fractional_coordinates=fractional_coordinates,
+   )
+ 
+   return neighbor_fn, energy_fn
+@@ -372,6 +378,8 @@ def morse_neighbor_list(
+   per_particle: bool = False,
+   fractional_coordinates: bool = False,
+   format: partition.NeighborListFormat = partition.OrderedSparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  pair_neighbor_list_fn: Callable = smap.pair_neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`Morse <morse-pot>` using a neighbor list."""
+@@ -382,7 +390,7 @@ def morse_neighbor_list(
+   r_cutoff = maybe_downcast(r_cutoff)
+   dr_threshold = maybe_downcast(dr_threshold)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_or_metric,
+     box_size,
+     r_cutoff,
+@@ -391,7 +399,7 @@ def morse_neighbor_list(
+     format=format,
+     **neighbor_kwargs,
+   )
+-  energy_fn = smap.pair_neighbor_list(
++  energy_fn = pair_neighbor_list_fn(
+     multiplicative_isotropic_cutoff(morse, r_onset, r_cutoff),
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
+     ignore_unused_parameters=True,
+@@ -400,6 +408,7 @@ def morse_neighbor_list(
+     epsilon=epsilon,
+     alpha=alpha,
+     reduce_axis=(1,) if per_particle else None,
++    fractional_coordinates=fractional_coordinates,
+   )
+ 
+   return neighbor_fn, energy_fn
+@@ -656,6 +665,8 @@ def bks_neighbor_list(
+   dr_threshold: float = 0.8,
+   fractional_coordinates: bool = False,
+   format: partition.NeighborListFormat = partition.OrderedSparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  pair_neighbor_list_fn: Callable = smap.pair_neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`BKS energy <bks-pot>` using a neighbor list."""
+@@ -666,7 +677,7 @@ def bks_neighbor_list(
+   repulsive_coeff = maybe_downcast(repulsive_coeff)
+   dr_threshold = maybe_downcast(dr_threshold)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_or_metric,
+     box_size,
+     cutoff,
+@@ -676,7 +687,7 @@ def bks_neighbor_list(
+     **neighbor_kwargs,
+   )
+ 
+-  energy_fn = smap.pair_neighbor_list(
++  energy_fn = pair_neighbor_list_fn(
+     bks,
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
+     species=species,
+@@ -688,6 +699,7 @@ def bks_neighbor_list(
+     repulsive_coeff=repulsive_coeff,
+     coulomb_alpha=coulomb_alpha,
+     cutoff=cutoff,
++    fractional_coordinates=fractional_coordinates,
+   )
+ 
+   return neighbor_fn, energy_fn
+@@ -757,6 +769,8 @@ def bks_silica_neighbor_list(
+   dr_threshold: float = 1.0,
+   fractional_coordinates: bool = False,
+   format: partition.NeighborListFormat = partition.OrderedSparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  pair_neighbor_list_fn: Callable = smap.pair_neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`BKS energy <bks-pot>` using neighbor lists."""
+@@ -769,6 +783,8 @@ def bks_silica_neighbor_list(
+     dr_threshold=dr_threshold,
+     fractional_coordinates=fractional_coordinates,
+     format=format,
++    neighbor_list_fn=neighbor_list_fn,
++    pair_neighbor_list_fn=pair_neighbor_list_fn,
+     **kwargs,
+   )
+   N_0 = jnp.sum(species == 0)
+@@ -923,6 +939,7 @@ def stillinger_weber_neighbor_list(
+   dr_threshold: float = 0.5,
+   fractional_coordinates: bool = False,
+   format: NeighborListFormat = partition.Dense,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`Stillinger-Weber <sw-pot>`
+@@ -931,7 +948,7 @@ def stillinger_weber_neighbor_list(
+   two_body_fn = partial(_sw_radial_interaction, sigma, B, cutoff)
+   three_body_fn = partial(_sw_angle_interaction, gamma, sigma, cutoff)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement,
+     box_size,
+     cutoff,
+@@ -1272,6 +1289,7 @@ def tersoff_neighbor_list(
+   disable_cell_list: bool = False,
+   fractional_coordinates: bool = True,
+   format: NeighborListFormat = partition.Dense,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Computes the Tersoff potential.
+@@ -1331,7 +1349,7 @@ def tersoff_neighbor_list(
+   # define a neighbor function.
+   # TODO: other neighbor list construction method will be implemented.
+   if format is partition.Dense:
+-    neighbor_fn = partition.neighbor_list(
++    neighbor_fn = neighbor_list_fn(
+       displacement,
+       box_size,
+       params['R'] + params['D'],
+@@ -1369,6 +1387,7 @@ def tersoff_from_lammps_parameters_neighbor_list(
+   f: TextIO,
+   dr_threshold: float = 0.5,
+   fractional_coordinates=True,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute Tersoff energy with LAMMPS parameters."""
+@@ -1378,6 +1397,7 @@ def tersoff_from_lammps_parameters_neighbor_list(
+     load_lammps_tersoff_parameters(f),
+     dr_threshold=dr_threshold,
+     fractional_coordinates=fractional_coordinates,
++    neighbor_list_fn=neighbor_list_fn,
+     **neighbor_kwargs,
+   )
+ 
+@@ -1565,6 +1585,7 @@ def edip_neighbor_list(
+   dr_threshold: f64 = 0.0,
+   fractional_coordinates: bool = True,
+   format: NeighborListFormat = partition.Dense,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   two_body_fn = partial(
+@@ -1586,7 +1607,7 @@ def edip_neighbor_list(
+     mu,
+   )
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement,
+     box_size,
+     cutoff,
+@@ -1795,12 +1816,13 @@ def eam_neighbor_list(
+   axis: Optional[Tuple[int, ...]] = None,
+   fractional_coordinates: bool = True,
+   format: partition.NeighborListFormat = partition.Sparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`EAM <eam-pot>` using a neighbor list."""
+   metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_or_metric,
+     box_size,
+     cutoff,
+@@ -1849,6 +1871,7 @@ def eam_from_lammps_parameters_neighbor_list(
+   axis=None,
+   dr_threshold: float = 0.5,
+   fractional_coordinates=True,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[NeighborFn, Callable[[Array, NeighborList], Array]]:
+   """Convenience wrapper to compute :ref:`EAM energy <eam-pot>`
+@@ -1858,6 +1881,7 @@ def eam_from_lammps_parameters_neighbor_list(
+     box_size,
+     *load_lammps_eam_parameters(f),
+     dr_threshold=dr_threshold,
++    neighbor_list_fn=neighbor_list_fn,
+     **neighbor_kwargs,
+   )
+ 
+@@ -1906,6 +1930,7 @@ def behler_parrinello_neighbor_list(
+   dr_threshold: float = 0.5,
+   fractional_coordinates: bool = False,
+   format: partition.NeighborListFormat = partition.Sparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[
+   NeighborFn, nn.InitFn, Callable[[PyTree, Array, NeighborList], Array]
+@@ -1919,7 +1944,7 @@ def behler_parrinello_neighbor_list(
+   if 'cutoff_distance' in sym_kwargs:
+     cutoff_distance = sym_kwargs['cutoff_distance']
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement,
+     box_size,
+     cutoff_distance,
+@@ -2078,6 +2103,7 @@ def graph_network_neighbor_list(
+   mlp_kwargs: Optional[Dict[str, Any]] = None,
+   fractional_coordinates: bool = False,
+   format: partition.NeighborListFormat = partition.Sparse,
++  neighbor_list_fn: Callable = partition.neighbor_list,
+   **neighbor_kwargs,
+ ) -> Tuple[
+   NeighborFn, nn.InitFn, Callable[[PyTree, Array, NeighborList], Array]
+@@ -2160,7 +2186,7 @@ def model(R, neighbor, **kwargs):
+     net = EnergyGraphNet(n_recurrences, mlp_sizes, mlp_kwargs, format)
+     return net(graph)  # pytype: disable=wrong-arg-count
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_fn,
+     box_size,
+     r_cutoff,
+@@ -2176,16 +2202,42 @@ def model(R, neighbor, **kwargs):
+ 
+ 
+ def nequip_neighbor_list(
+-  displacement_fn, box, cfg: ConfigDict = None, atoms=None, **nl_kwargs
++  displacement_fn,
++  box,
++  cfg: ConfigDict = None,
++  atoms=None,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  featurizer_fn: Callable = nn.util.neighbor_list_featurizer,
++  **nl_kwargs,
+ ):
++  """Convenience wrapper to compute NequIP energy using a neighbor list.
++
++  Args:
++    displacement_fn: Displacement function from `jax_md.space`.
++    box: Box matrix with columns as lattice vectors, shape (dim, dim).
++    cfg: NequIP configuration. If None, uses default config.
++    atoms: One-hot encoding of atom types.
++    neighbor_list_fn: Neighbor list constructor. Can be `partition.neighbor_list`
++      (default, uses MIC) or `custom_partition.neighbor_list_multi_image` for
++      small boxes where r_cut > L/2.
++    featurizer_fn: Function to create a featurizer. Signature:
++      `featurizer_fn(displacement_fn) -> featurize(atoms, position, neighbor)`.
++      Defaults to `nn.util.neighbor_list_featurizer` for standard MIC.
++      Use `custom_partition.graph_featurizer` with `neighbor_list_multi_image`
++      for correct multi-image displacement computation.
++    **nl_kwargs: Additional kwargs for neighbor list (e.g., `fractional_coordinates`).
++
++  Returns:
++    Tuple of (neighbor_fn, init_fn, energy_fn).
++  """
+   cfg = nequip.default_config() if cfg is None else cfg
+   model = nequip.model_from_config(cfg)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_fn, box, cfg.r_max, format=partition.Sparse, **nl_kwargs
+   )
+ 
+-  featurizer = nn.util.neighbor_list_featurizer(displacement_fn)
++  featurizer = featurizer_fn(displacement_fn)
+ 
+   def init_fn(key, position, neighbor, **kwargs):
+     _atoms = kwargs.pop('atoms', atoms)
+@@ -2207,16 +2259,46 @@ def energy_fn(params, position, neighbor, **kwargs):
+ 
+ 
+ def load_gnome_model_neighbor_list(
+-  displacement_fn, box, directory, atoms=None, **nl_kwargs
++  displacement_fn,
++  box,
++  directory,
++  atoms=None,
++  neighbor_list_fn: Callable = partition.neighbor_list,
++  featurizer_fn: Callable = nn.util.neighbor_list_featurizer,
++  **nl_kwargs,
+ ):
+-  """Load a gnome model from a checkpoint."""
++  """Load a gnome model from a checkpoint.
++
++  Args:
++    displacement_fn: Displacement function from `jax_md.space`.
++    box: Box matrix with columns as lattice vectors, shape (dim, dim).
++    directory: Directory containing the gnome model checkpoint.
++    atoms: One-hot encoding of atom types.
++    neighbor_list_fn: Neighbor list constructor. Can be `partition.neighbor_list`
++      (default, uses MIC) or `custom_partition.neighbor_list_multi_image` for
++      small boxes where r_cut > L/2.
++    featurizer_fn: Function to create a featurizer. Signature:
++      `featurizer_fn(displacement_fn) -> featurize(atoms, position, neighbor)`.
++      Defaults to `nn.util.neighbor_list_featurizer` for standard MIC.
++      Use `custom_partition.graph_featurizer` with `neighbor_list_multi_image`
++      for correct multi-image displacement computation.
++    **nl_kwargs: Additional kwargs for neighbor list (e.g., `fractional_coordinates`).
++
++  Returns:
++    Tuple of (neighbor_fn, energy_fn).
++
++  Note:
++    When using `neighbor_list_multi_image`, you must also use a compatible
++    featurizer (e.g., `custom_partition.graph_featurizer`) to correctly compute
++    displacements using the stored shifts instead of MIC.
++  """
+   cfg, model, params = gnome.load_model(directory)
+ 
+-  neighbor_fn = partition.neighbor_list(
++  neighbor_fn = neighbor_list_fn(
+     displacement_fn, box, cfg.r_max, format=partition.Sparse, **nl_kwargs
+   )
+ 
+-  featurizer = nn.util.neighbor_list_featurizer(displacement_fn)
++  featurizer = featurizer_fn(displacement_fn)
+ 
+   def energy_fn(position, neighbor, **kwargs):
+     _atoms = kwargs.pop('atoms', atoms)
+diff --git a/jax_md/space.py b/jax_md/space.py
+index deb4bf7d..79e23cd5 100644
+--- a/jax_md/space.py
++++ b/jax_md/space.py
+@@ -153,6 +153,17 @@ def transform(box: Box, R: Array) -> Array:
+ 
+ @transform.defjvp
+ def transform_jvp(primals, tangents):
++  """Custom JVP for transform that preserves gradient coordinate system.
++
++  This JVP causes gradients to flow through unchanged (dR passes through
++  without being multiplied by box). As a result:
++
++  - Forward: R_real = transform(box, R) = R @ box.T
++  - Backward: dE/dR = dE/dR_real (real-space gradient, not dE/dR_real @ box.T)
++
++  This means jax.grad(energy)(R_frac) returns real-space forces in energy/distance,
++  even when R_frac is in fractional coordinates.
++  """
+   box, R = primals
+   dbox, dR = tangents
+   return (transform(box, R), dR + transform(dbox, R))
+diff --git a/tests/custom_partition_test.py b/tests/custom_partition_test.py
+new file mode 100644
+index 00000000..8775341d
+--- /dev/null
++++ b/tests/custom_partition_test.py
+@@ -0,0 +1,1057 @@
++"""Tests for custom_partition module comparing against ASE neighbor lists."""
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++from absl.testing import absltest, parameterized
++from ase import Atoms
++from ase.build import bulk, molecule
++from ase.neighborlist import neighbor_list as ase_neighbor_list
++
++from jax_md import partition
++from jax_md.custom_partition import (
++  NeighborListFormat,
++  NeighborListMultiImage,
++  estimate_max_neighbors,
++  estimate_max_neighbors_from_box,
++  neighbor_list_multi_image,
++  neighbor_list_multi_image_mask,
++)
++
++# Triclinic structure from TorchSim tests
++CaCrP2O7_mvc_11955 = {
++  'positions': [
++    [3.68954016, 5.03568186, 4.64369552],
++    [5.12301681, 2.13482791, 2.66220405],
++    [1.99411973, 0.94691001, 1.25068234],
++    [6.81843724, 6.22359976, 6.05521724],
++    [2.63005662, 4.16863452, 0.86090529],
++    [6.18250036, 3.00187525, 6.44499428],
++    [2.11497733, 1.98032773, 4.53610884],
++    [6.69757964, 5.19018203, 2.76979073],
++    [1.39215545, 2.94386142, 5.60917746],
++    [7.42040152, 4.22664834, 1.69672212],
++    [2.43224207, 5.4571615, 6.70305327],
++    [6.3803149, 1.71334827, 0.6028463],
++    [1.11265639, 1.50166318, 3.48760997],
++    [7.69990058, 5.66884659, 3.8182896],
++    [3.56971588, 5.20836551, 1.43673437],
++    [5.2428411, 1.96214426, 5.8691652],
++    [3.12282634, 2.72812741, 1.05450432],
++    [5.68973063, 4.44238236, 6.25139525],
++    [3.24868468, 2.83997522, 3.99842386],
++    [5.56387229, 4.33053455, 3.30747571],
++    [2.60835346, 0.74421609, 5.3236629],
++    [6.20420351, 6.42629368, 1.98223667],
++  ],
++  'cell': [
++    [6.19330899, 0.0, 0.0],
++    [2.4074486111396207, 6.149627748674982, 0.0],
++    [0.2117993724186579, 1.0208820183960539, 7.305899571570074],
++  ],
++  'numbers': [*[20] * 2, *[24] * 2, *[15] * 4, *[8] * 14],
++  'pbc': [True, True, True],
++}
++
++
++def get_ase_distances(atoms: Atoms, cutoff: float) -> np.ndarray:
++  """Get sorted distances from ASE neighbor list."""
++  i, j, d = ase_neighbor_list('ijd', atoms, cutoff)
++  return np.sort(d)
++
++
++def get_mi_distances(atoms: Atoms, cutoff: float) -> np.ndarray:
++  """Get sorted distances from multi-image neighbor list."""
++  # ASE uses row vectors: R_real = R_frac @ cell
++  # JAX-MD uses column vectors: R_real = R_frac @ box.T
++  # So box = cell.T to get: R_frac @ (cell.T).T = R_frac @ cell
++  cell = np.array(atoms.cell.array, dtype=np.float64)
++  box = cell.T  # JAX-MD convention: columns are lattice vectors
++  pos = atoms.get_positions()
++  N = len(atoms)
++  pbc = np.array(atoms.pbc)
++
++  # Use ASE's scaled positions directly (already in [0, 1))
++  pos_frac = atoms.get_scaled_positions()
++
++  # Use higher safety factor for skewed cells
++  max_neighbors = estimate_max_neighbors_from_box(
++    box, cutoff, N, safety_factor=5.0, pbc=pbc
++  )
++  neighbor_fn = neighbor_list_multi_image(
++    None,
++    box,
++    cutoff,
++    max_neighbors=max_neighbors,
++    format=NeighborListFormat.Sparse,
++    pbc=pbc,
++  )
++  nbrs = neighbor_fn.allocate(pos_frac)
++
++  # Convert back to Cartesian: R_real = R_frac @ box.T = R_frac @ cell
++  pos_cart = pos_frac @ box.T
++
++  # Compute distances
++  mask = nbrs.idx[0] < N
++  i_idx = np.array(nbrs.idx[0])[mask]
++  j_idx = np.array(nbrs.idx[1])[mask]
++  shifts = np.array(nbrs.shifts)[mask]
++
++  # r_j + shift @ box.T - r_i
++  shifts_real = shifts @ box.T
++  dR = pos_cart[j_idx] + shifts_real - pos_cart[i_idx]
++  distances = np.linalg.norm(dR, axis=1)
++
++  return np.sort(distances)
++
++
++def get_mi_distances_molecule(atoms: Atoms, cutoff: float) -> np.ndarray:
++  """Get sorted distances for non-periodic (molecule) structures."""
++  pos = atoms.get_positions()
++  N = len(atoms)
++
++  # Create a large box that contains all atoms with padding
++  pos_min = pos.min(axis=0) - cutoff - 1.0
++  pos_max = pos.max(axis=0) + cutoff + 1.0
++  box_size = pos_max - pos_min
++
++  # Shift positions to be positive
++  pos_shifted = pos - pos_min
++
++  # Create diagonal box (JAX-MD convention: columns are lattice vectors)
++  box = np.diag(box_size)
++
++  # Convert to fractional coordinates
++  pos_frac = pos_shifted / box_size
++
++  # Use simple estimate for non-periodic
++  max_neighbors = estimate_max_neighbors(cutoff, safety_factor=5.0)
++  neighbor_fn = neighbor_list_multi_image(
++    None,
++    box,
++    cutoff,
++    max_neighbors=max_neighbors,
++    format=NeighborListFormat.Sparse,
++    pbc=np.array([False, False, False]),
++  )
++  nbrs = neighbor_fn.allocate(pos_frac)
++
++  # Compute distances
++  mask = nbrs.idx[0] < N
++  i_idx = np.array(nbrs.idx[0])[mask]
++  j_idx = np.array(nbrs.idx[1])[mask]
++
++  # For non-periodic, shifts should all be zero
++  dR = pos_shifted[j_idx] - pos_shifted[i_idx]
++  distances = np.linalg.norm(dR, axis=1)
++
++  return np.sort(distances)
++
++
++def get_ase_edges(atoms: Atoms, cutoff: float) -> set:
++  """Get edges as set of (i, j, shift_tuple) from ASE."""
++  i, j, S = ase_neighbor_list('ijS', atoms, cutoff)
++  return set(zip(i, j, map(tuple, S)))
++
++
++def get_mi_edges(
++  atoms: Atoms,
++  cutoff: float,
++  fmt: NeighborListFormat = NeighborListFormat.Sparse,
++) -> tuple:
++  """Get edges and neighbor list from multi-image NL."""
++  cell = np.array(atoms.cell.array, dtype=np.float64)
++  box = cell.T
++  N = len(atoms)
++  pbc = np.array(atoms.pbc)
++  pos_frac = atoms.get_scaled_positions()
++
++  max_neighbors = estimate_max_neighbors_from_box(
++    box, cutoff, N, safety_factor=5.0, pbc=pbc
++  )
++  neighbor_fn = neighbor_list_multi_image(
++    None, box, cutoff, max_neighbors=max_neighbors, format=fmt, pbc=pbc
++  )
++  nbrs = neighbor_fn.allocate(pos_frac)
++
++  if partition.is_sparse(fmt):
++    mask = nbrs.idx[0] < N
++    edges = set(
++      zip(
++        np.array(nbrs.idx[0])[mask],
++        np.array(nbrs.idx[1])[mask],
++        map(tuple, np.array(nbrs.shifts)[mask]),
++      )
++    )
++  else:
++    # Dense format
++    edges = set()
++    idx = np.array(nbrs.idx)
++    shifts = np.array(nbrs.shifts)
++    for i in range(N):
++      for k in range(idx.shape[1]):
++        j = idx[i, k]
++        if j < N:
++          edges.add((i, j, tuple(shifts[i, k])))
++
++  return edges, nbrs, neighbor_fn, pos_frac
++
++
++class CustomPartitionTest(parameterized.TestCase):
++  """Test multi-image neighbor list against ASE."""
++
++  @parameterized.parameters(
++    {'atoms': bulk('Si', 'diamond', a=5.43, cubic=True), 'cutoff': 3.0},
++    {'atoms': bulk('Cu', 'fcc', a=3.6), 'cutoff': 3.0},
++    {'atoms': bulk('Ti', 'hcp', a=2.94, c=4.64), 'cutoff': 3.5},
++    {'atoms': bulk('Bi', 'rhombohedral', a=6, alpha=20), 'cutoff': 4.0},
++    {'atoms': Atoms(**CaCrP2O7_mvc_11955), 'cutoff': 3.5},
++  )
++  def test_distances_match_ase(self, atoms: Atoms, cutoff: float):
++    """Check multi-image NL gives same distances as ASE."""
++    d_ase = get_ase_distances(atoms, cutoff)
++    d_mi = get_mi_distances(atoms, cutoff)
++
++    # Both should find same number of pairs
++    self.assertEqual(
++      len(d_ase), len(d_mi), f'Neighbor count mismatch for {atoms}'
++    )
++
++    # Distances should match
++    np.testing.assert_allclose(d_ase, d_mi, rtol=1e-7)
++
++  @parameterized.parameters(1.0, 3.0, 5.0, 7.0)
++  def test_varying_cutoffs(self, cutoff: float):
++    """Test with varying cutoffs on cubic Si."""
++    atoms = bulk('Si', 'diamond', a=5.43, cubic=True)
++    d_ase = get_ase_distances(atoms, cutoff)
++    d_mi = get_mi_distances(atoms, cutoff)
++
++    self.assertEqual(len(d_ase), len(d_mi))
++    if len(d_ase) > 0:
++      np.testing.assert_allclose(d_ase, d_mi, rtol=1e-7)
++
++  def test_small_box_more_neighbors(self):
++    """When r_cut > L/2, MI should find more neighbors than a single image."""
++    # Create small box where cutoff exceeds half box length
++    atoms = bulk('Cu', 'fcc', a=2.5)  # Small FCC
++    cutoff = 3.0  # Larger than L/2
++
++    d_ase = get_ase_distances(atoms, cutoff)
++    d_mi = get_mi_distances(atoms, cutoff)
++
++    # Should match ASE (which handles multi-image correctly)
++    self.assertEqual(len(d_ase), len(d_mi))
++    np.testing.assert_allclose(d_ase, d_mi, rtol=1e-7)
++
++  @parameterized.parameters(
++    {'mol_name': 'H2O', 'cutoff': 2.0},
++    {'mol_name': 'CH4', 'cutoff': 2.5},
++    {'mol_name': 'C2H6', 'cutoff': 3.0},
++    {'mol_name': 'CH3CH2NH2', 'cutoff': 3.0},
++  )
++  def test_molecule_non_periodic(self, mol_name: str, cutoff: float):
++    """Test non-periodic structures (molecules)."""
++    atoms = molecule(mol_name)
++    # Set a large cell for ASE (required for neighbor list)
++    atoms.center(vacuum=cutoff + 5.0)
++    atoms.pbc = False
++
++    d_ase = get_ase_distances(atoms, cutoff)
++    d_mi = get_mi_distances_molecule(atoms, cutoff)
++
++    self.assertEqual(
++      len(d_ase), len(d_mi), f'Neighbor count mismatch for {mol_name}'
++    )
++    if len(d_ase) > 0:
++      np.testing.assert_allclose(d_ase, d_mi, rtol=1e-7)
++
++  def test_mixed_pbc_slab(self):
++    """Test slab geometry: periodic in xy, non-periodic in z."""
++    # Create a slab (periodic in xy, vacuum in z)
++    atoms = bulk('Cu', 'fcc', a=3.6, cubic=True)
++    atoms = atoms.repeat((2, 2, 2))
++
++    # Add vacuum in z direction
++    atoms.center(vacuum=5.0, axis=2)
++
++    # Set mixed PBC
++    atoms.pbc = [True, True, False]
++    cutoff = 3.0
++
++    d_ase = get_ase_distances(atoms, cutoff)
++    d_mi = get_mi_distances(atoms, cutoff)
++
++    self.assertEqual(len(d_ase), len(d_mi), 'Neighbor count mismatch for slab')
++    np.testing.assert_allclose(d_ase, d_mi, rtol=1e-7)
++
++  def test_mixed_pbc_wire(self):
++    """Test wire geometry: periodic in z only."""
++    # Create a wire (periodic in z, vacuum in xy)
++    atoms = bulk('Cu', 'fcc', a=3.6, cubic=True)
++    atoms = atoms.repeat((1, 1, 3))
++
++    # Add vacuum in xy directions
++    atoms.center(vacuum=5.0, axis=0)
++    atoms.center(vacuum=5.0, axis=1)
++
++    # Set mixed PBC
++    atoms.pbc = [False, False, True]
++    cutoff = 3.0
++
++    d_ase = get_ase_distances(atoms, cutoff)
++    d_mi = get_mi_distances(atoms, cutoff)
++
++    self.assertEqual(len(d_ase), len(d_mi), 'Neighbor count mismatch for wire')
++    np.testing.assert_allclose(d_ase, d_mi, rtol=1e-7)
++
++  # =========================================================================
++  # Edge and Shift Verification (like nequip_jax_md.py)
++  # =========================================================================
++
++  def test_edges_match_ase_exactly(self):
++    """Verify (i, j, shift) tuples match ASE exactly."""
++    atoms = bulk('Si', 'diamond', a=5.43, cubic=True)
++    cutoff = 3.0
++
++    edges_ase = get_ase_edges(atoms, cutoff)
++    edges_mi, nbrs, _, _ = get_mi_edges(atoms, cutoff)
++
++    self.assertEqual(edges_ase, edges_mi, 'Edge sets do not match ASE')
++
++  def test_edges_match_ase_triclinic(self):
++    """Verify edges match ASE for triclinic cell."""
++    atoms = Atoms(**CaCrP2O7_mvc_11955)
++    cutoff = 3.5
++
++    edges_ase = get_ase_edges(atoms, cutoff)
++    edges_mi, nbrs, _, _ = get_mi_edges(atoms, cutoff)
++
++    self.assertEqual(
++      edges_ase, edges_mi, 'Edge sets do not match for triclinic'
++    )
++
++  # =========================================================================
++  # Format Tests
++  # =========================================================================
++
++  @parameterized.parameters(
++    NeighborListFormat.Sparse,
++    NeighborListFormat.OrderedSparse,
++    NeighborListFormat.Dense,
++  )
++  def test_all_formats_find_same_edges(self, fmt: NeighborListFormat):
++    """All formats should find the same neighbor pairs."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    edges_ase = get_ase_edges(atoms, cutoff)
++
++    if fmt is NeighborListFormat.OrderedSparse:
++      # OrderedSparse stores only one direction per pair
++      # Convert ASE edges to ordered (i < j for zero shift, canonical for others)
++      edges_mi, nbrs, _, _ = get_mi_edges(atoms, cutoff, fmt)
++      # Just check we have roughly half the edges
++      self.assertGreater(len(edges_mi), 0)
++      self.assertLessEqual(len(edges_mi), len(edges_ase))
++    else:
++      edges_mi, nbrs, _, _ = get_mi_edges(atoms, cutoff, fmt)
++      self.assertEqual(edges_ase, edges_mi)
++
++  def test_dense_format_shape(self):
++    """Dense format should have correct shapes."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Dense)
++
++    # Dense idx shape: (N, max_neighbors)
++    self.assertEqual(nbrs.idx.shape[0], N)
++    self.assertEqual(len(nbrs.idx.shape), 2)
++
++    # Dense shifts shape: (N, max_neighbors, dim)
++    self.assertEqual(nbrs.shifts.shape[0], N)
++    self.assertEqual(nbrs.shifts.shape[1], nbrs.idx.shape[1])
++    self.assertEqual(nbrs.shifts.shape[2], 3)
++
++  def test_sparse_format_shape(self):
++    """Sparse format should have correct shapes."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    # Sparse idx: tuple (receivers, senders), each shape (capacity,)
++    self.assertIsInstance(nbrs.idx, tuple)
++    self.assertEqual(len(nbrs.idx), 2)
++    self.assertEqual(nbrs.idx[0].shape, nbrs.idx[1].shape)
++
++    # Sparse shifts shape: (capacity, dim)
++    self.assertEqual(nbrs.shifts.shape[0], nbrs.idx[0].shape[0])
++    self.assertEqual(nbrs.shifts.shape[1], 3)
++
++  # =========================================================================
++  # Buffer Overflow Detection
++  # =========================================================================
++
++  def test_buffer_overflow_detection(self):
++    """Neighbor list should detect buffer overflow."""
++    atoms = bulk('Cu', 'fcc', a=3.6).repeat((3, 3, 3))
++    cutoff = 5.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = atoms.get_scaled_positions()
++
++    # Use intentionally small max_neighbors to trigger overflow
++    neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=2,  # Way too small
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    self.assertTrue(nbrs.did_buffer_overflow)
++
++  def test_no_buffer_overflow_with_sufficient_capacity(self):
++    """Neighbor list should not overflow with sufficient capacity."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff)
++
++    self.assertFalse(nbrs.did_buffer_overflow)
++
++  # =========================================================================
++  # Mask and Compatibility Tests
++  # =========================================================================
++
++  def test_neighbor_list_mask_sparse(self):
++    """Test neighbor_list_multi_image_mask for Sparse format."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    mask = neighbor_list_multi_image_mask(nbrs)
++    n_valid = int(jnp.sum(mask))
++
++    # Should have some valid edges
++    self.assertGreater(n_valid, 0)
++
++    # All valid indices should be < N
++    self.assertTrue(jnp.all(nbrs.idx[0][mask] < N))
++    self.assertTrue(jnp.all(nbrs.idx[1][mask] < N))
++
++  def test_partition_neighbor_list_mask_compatibility(self):
++    """Test compatibility with jax_md.partition.neighbor_list_mask."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    # Both mask functions should give the same result
++    mask_mi = neighbor_list_multi_image_mask(nbrs)
++    mask_jaxmd = partition.neighbor_list_mask(nbrs)
++
++    np.testing.assert_array_equal(mask_mi, mask_jaxmd)
++
++  def test_to_jraph_compatibility(self):
++    """Test compatibility with jax_md.partition.to_jraph."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    # Should be able to convert to jraph format
++    graph = partition.to_jraph(nbrs)
++
++    # Check graph structure
++    self.assertEqual(int(graph.n_node[0]), N)
++    self.assertGreater(int(graph.n_edge[0]), 0)
++
++  # =========================================================================
++  # Update Function Tests
++  # =========================================================================
++
++  def test_update_function(self):
++    """Test that update function works correctly."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    edges_ase = get_ase_edges(atoms, cutoff)
++    edges_mi, nbrs, neighbor_fn, pos_frac = get_mi_edges(atoms, cutoff)
++
++    # Update with same positions should give same result
++    nbrs_updated = nbrs.update(pos_frac)
++
++    mask = nbrs_updated.idx[0] < len(atoms)
++    edges_updated = set(
++      zip(
++        np.array(nbrs_updated.idx[0])[mask],
++        np.array(nbrs_updated.idx[1])[mask],
++        map(tuple, np.array(nbrs_updated.shifts)[mask]),
++      )
++    )
++
++    self.assertEqual(edges_ase, edges_updated)
++
++  def test_update_with_perturbed_positions(self):
++    """Test update with slightly perturbed positions."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    _, nbrs, neighbor_fn, pos_frac = get_mi_edges(atoms, cutoff)
++
++    # Small perturbation
++    pos_perturbed = pos_frac + 0.001 * np.random.randn(N, 3)
++
++    # Update should work without error
++    nbrs_updated = nbrs.update(pos_perturbed)
++
++    # Should still have valid edges
++    mask = nbrs_updated.idx[0] < N
++    n_valid = int(jnp.sum(mask))
++    self.assertGreater(n_valid, 0)
++
++  # =========================================================================
++  # Properties Tests
++  # =========================================================================
++
++  def test_n_edges_property(self):
++    """Test n_edges property counts valid edges."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    n_edges = nbrs.n_edges
++    mask = nbrs.idx[0] < N
++    expected = int(jnp.sum(mask))
++
++    self.assertEqual(n_edges, expected)
++
++  def test_senders_receivers_properties(self):
++    """Test senders and receivers properties for Sparse format."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    # Properties should work
++    senders = nbrs.senders
++    receivers = nbrs.receivers
++
++    # Should match idx tuple
++    np.testing.assert_array_equal(senders, nbrs.idx[1])
++    np.testing.assert_array_equal(receivers, nbrs.idx[0])
++
++  def test_senders_receivers_error_for_dense(self):
++    """Test that senders/receivers raise error for Dense format."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Dense)
++
++    with self.assertRaises(ValueError):
++      _ = nbrs.senders
++
++    with self.assertRaises(ValueError):
++      _ = nbrs.receivers
++
++  def test_max_neighbors_property_dense(self):
++    """Test max_neighbors property for Dense format."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Dense)
++
++    max_neighbors = nbrs.max_neighbors
++    self.assertEqual(max_neighbors, nbrs.idx.shape[1])
++
++  def test_max_neighbors_error_for_sparse(self):
++    """Test that max_neighbors raises error for Sparse format."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    _, nbrs, _, _ = get_mi_edges(atoms, cutoff, NeighborListFormat.Sparse)
++
++    with self.assertRaises(ValueError):
++      _ = nbrs.max_neighbors
++
++  # =========================================================================
++  # Estimation Functions Tests
++  # =========================================================================
++
++  def test_estimate_max_neighbors_positive(self):
++    """Test estimate_max_neighbors returns positive values."""
++    for cutoff in [1.0, 3.0, 5.0, 10.0]:
++      max_neighbors = estimate_max_neighbors(cutoff)
++      self.assertGreater(max_neighbors, 0)
++
++  def test_estimate_max_neighbors_zero_cutoff(self):
++    """Test estimate_max_neighbors with zero cutoff."""
++    max_neighbors = estimate_max_neighbors(0.0)
++    self.assertEqual(max_neighbors, 0)
++
++  def test_estimate_max_neighbors_from_box(self):
++    """Test estimate_max_neighbors_from_box gives reasonable values."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++
++    max_neighbors = estimate_max_neighbors_from_box(box, cutoff, N)
++
++    # Should be positive
++    self.assertGreater(max_neighbors, 0)
++
++    # Should be at least as many as actual neighbors
++    edges_ase = get_ase_edges(atoms, cutoff)
++    # Actual neighbors per atom (on average)
++    actual_avg = len(edges_ase) / N
++    self.assertGreater(max_neighbors, actual_avg * 0.5)
++
++  def test_estimate_max_neighbors_from_box_dim_error(self):
++    """Test estimate_max_neighbors_from_box raises error for dim > 3."""
++    box_4d = np.eye(4)
++
++    with self.assertRaises(ValueError):
++      estimate_max_neighbors_from_box(box_4d, 3.0, 10)
++
++  def test_estimate_max_neighbors_dim_error(self):
++    """Test estimate_max_neighbors raises error for dim > 3."""
++    with self.assertRaises(ValueError):
++      estimate_max_neighbors(3.0, dim=4)
++
++  # =========================================================================
++  # Non-periodic Shift Tests
++  # =========================================================================
++
++  def test_non_periodic_shifts_are_zero(self):
++    """For non-periodic systems, all shifts should be zero."""
++    atoms = molecule('H2O')
++    atoms.center(vacuum=10.0)
++    atoms.pbc = False
++    cutoff = 2.0
++
++    pos = atoms.get_positions()
++    N = len(atoms)
++    pos_min = pos.min(axis=0) - cutoff - 1.0
++    pos_max = pos.max(axis=0) + cutoff + 1.0
++    box_size = pos_max - pos_min
++    box = np.diag(box_size)
++    pos_frac = (pos - pos_min) / box_size
++
++    neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=50,
++      format=NeighborListFormat.Sparse,
++      pbc=np.array([False, False, False]),
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    mask = nbrs.idx[0] < N
++    shifts = np.array(nbrs.shifts)[mask]
++
++    # All shifts should be zero for non-periodic
++    np.testing.assert_array_equal(shifts, 0)
++
++  # =========================================================================
++  # 2D Tests
++  # =========================================================================
++
++  def test_2d_system(self):
++    """Test 2D system (graphene-like)."""
++    # Create simple 2D hexagonal lattice
++    a = 2.46  # graphene lattice constant
++    cell = np.array([[a, 0], [a / 2, a * np.sqrt(3) / 2]])
++    positions = np.array([[0, 0], [a / 2, a / (2 * np.sqrt(3))]])
++    cutoff = 2.0
++
++    N = len(positions)
++    box = cell.T  # JAX-MD convention
++
++    # Fractional coordinates
++    inv_cell = np.linalg.inv(cell)
++    pos_frac = positions @ inv_cell
++
++    max_neighbors = estimate_max_neighbors_from_box(box, cutoff, N)
++    neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=max_neighbors,
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # Should find some neighbors
++    n_edges = nbrs.n_edges
++    self.assertGreater(n_edges, 0)
++    self.assertFalse(nbrs.did_buffer_overflow)
++
++  # =========================================================================
++  # Tests inspired by jax_md/partition.py
++  # =========================================================================
++
++  def test_is_sparse_function(self):
++    """Test partition.is_sparse for all formats."""
++    self.assertTrue(partition.is_sparse(NeighborListFormat.Sparse))
++    self.assertTrue(partition.is_sparse(NeighborListFormat.OrderedSparse))
++    self.assertFalse(partition.is_sparse(NeighborListFormat.Dense))
++
++  def test_neighbor_list_fns_unpacking(self):
++    """Test that NeighborListFns can be unpacked like (allocate, update)."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = atoms.get_scaled_positions()
++
++    neighbor_fn = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=50, format=NeighborListFormat.Sparse
++    )
++
++    # Test unpacking
++    allocate_fn, update_fn = neighbor_fn
++
++    # Both should work
++    nbrs = allocate_fn(pos_frac)
++    self.assertGreater(nbrs.n_edges, 0)
++
++    nbrs_updated = update_fn(pos_frac, nbrs)
++    self.assertEqual(nbrs.n_edges, nbrs_updated.n_edges)
++
++  def test_dr_threshold_skips_rebuild(self):
++    """Test that dr_threshold skips rebuild when atoms haven't moved much."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = jnp.array(atoms.get_scaled_positions())
++
++    # Create neighbor list with dr_threshold
++    neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      dr_threshold=0.5,  # Large threshold
++      max_neighbors=50,
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++    ref_pos = nbrs.reference_position
++
++    # Small perturbation (well below threshold)
++    pos_perturbed = pos_frac + 0.001
++
++    # Update should return same neighbor list (skip rebuild)
++    nbrs_updated = nbrs.update(pos_perturbed)
++
++    # Reference position should be unchanged (rebuild was skipped)
++    np.testing.assert_array_equal(nbrs_updated.reference_position, ref_pos)
++
++  def test_dr_threshold_triggers_rebuild(self):
++    """Test that dr_threshold triggers rebuild when atoms move significantly."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = jnp.array(atoms.get_scaled_positions())
++
++    # Create neighbor list with small dr_threshold
++    neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      dr_threshold=0.01,  # Small threshold
++      max_neighbors=50,
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # Large perturbation (above threshold)
++    pos_perturbed = pos_frac + 0.1
++
++    # Update should trigger rebuild
++    nbrs_updated = nbrs.update(pos_perturbed)
++
++    # Reference position should be updated (rebuild was triggered)
++    np.testing.assert_array_equal(
++      nbrs_updated.reference_position, pos_perturbed
++    )
++
++  def test_fractional_vs_cartesian_coordinates(self):
++    """Test that fractional and Cartesian coordinates give same results."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = atoms.get_scaled_positions()
++    pos_cart = atoms.get_positions()
++
++    # Fractional coordinates
++    neighbor_fn_frac = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=50,
++      format=NeighborListFormat.Sparse,
++      fractional_coordinates=True,
++    )
++    nbrs_frac = neighbor_fn_frac.allocate(pos_frac)
++
++    # Cartesian coordinates
++    neighbor_fn_cart = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=50,
++      format=NeighborListFormat.Sparse,
++      fractional_coordinates=False,
++    )
++    nbrs_cart = neighbor_fn_cart.allocate(pos_cart)
++
++    # Should find same number of edges
++    self.assertEqual(nbrs_frac.n_edges, nbrs_cart.n_edges)
++
++    # Extract edges and compare
++    mask_frac = nbrs_frac.idx[0] < N
++    mask_cart = nbrs_cart.idx[0] < N
++
++    edges_frac = set(
++      zip(
++        np.array(nbrs_frac.idx[0])[mask_frac],
++        np.array(nbrs_frac.idx[1])[mask_frac],
++        map(tuple, np.array(nbrs_frac.shifts)[mask_frac]),
++      )
++    )
++    edges_cart = set(
++      zip(
++        np.array(nbrs_cart.idx[0])[mask_cart],
++        np.array(nbrs_cart.idx[1])[mask_cart],
++        map(tuple, np.array(nbrs_cart.shifts)[mask_cart]),
++      )
++    )
++
++    self.assertEqual(edges_frac, edges_cart)
++
++  def test_ordered_sparse_has_fewer_edges(self):
++    """OrderedSparse should have roughly half the edges of Sparse."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = atoms.get_scaled_positions()
++
++    # Sparse format
++    neighbor_fn_sparse = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=100, format=NeighborListFormat.Sparse
++    )
++    nbrs_sparse = neighbor_fn_sparse.allocate(pos_frac)
++
++    # OrderedSparse format
++    neighbor_fn_ordered = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=100,
++      format=NeighborListFormat.OrderedSparse,
++    )
++    nbrs_ordered = neighbor_fn_ordered.allocate(pos_frac)
++
++    # OrderedSparse should have roughly half the edges
++    ratio = nbrs_sparse.n_edges / max(nbrs_ordered.n_edges, 1)
++    self.assertGreater(ratio, 1.5)  # Should be close to 2
++    self.assertLess(ratio, 2.5)
++
++  def test_1d_system(self):
++    """Test 1D system (linear chain)."""
++    # Simple 1D chain
++    N = 5
++    box = np.array([[10.0]])  # 1D box
++    positions = np.linspace(0.1, 0.9, N).reshape(-1, 1)  # Fractional
++    cutoff = 3.0
++
++    max_neighbors = estimate_max_neighbors(cutoff, dim=1)
++    neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=max_neighbors,
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs = neighbor_fn.allocate(positions)
++
++    # Should find neighbors
++    self.assertGreater(nbrs.n_edges, 0)
++    self.assertFalse(nbrs.did_buffer_overflow)
++
++  def test_capacity_multiplier(self):
++    """Test that capacity_multiplier affects allocated capacity."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = atoms.get_scaled_positions()
++
++    # Small multiplier
++    neighbor_fn_small = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=20,
++      capacity_multiplier=1.0,
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs_small = neighbor_fn_small.allocate(pos_frac)
++
++    # Large multiplier
++    neighbor_fn_large = neighbor_list_multi_image(
++      None,
++      box,
++      cutoff,
++      max_neighbors=20,
++      capacity_multiplier=2.0,
++      format=NeighborListFormat.Sparse,
++    )
++    nbrs_large = neighbor_fn_large.allocate(pos_frac)
++
++    # Larger multiplier should give more capacity
++    self.assertGreater(nbrs_large.max_occupancy, nbrs_small.max_occupancy)
++
++  def test_reference_position_stored(self):
++    """Test that reference_position is correctly stored."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = jnp.array(atoms.get_scaled_positions())
++
++    neighbor_fn = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=50, format=NeighborListFormat.Sparse
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # Reference position should match input
++    np.testing.assert_array_equal(nbrs.reference_position, pos_frac)
++
++  def test_box_stored_in_neighbor_list(self):
++    """Test that box is correctly stored in neighbor list."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = jnp.array(cell.T)
++    pos_frac = atoms.get_scaled_positions()
++
++    neighbor_fn = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=50, format=NeighborListFormat.Sparse
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # Box should be stored
++    np.testing.assert_array_almost_equal(nbrs.box, box)
++
++  def test_dataclass_replace(self):
++    """Test that dataclasses.replace works on NeighborListMultiImage."""
++    from jax_md import dataclasses as jax_dataclasses
++
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = atoms.get_scaled_positions()
++
++    neighbor_fn = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=50, format=NeighborListFormat.Sparse
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # Replace a field
++    new_pos = pos_frac + 0.01
++    nbrs_replaced = jax_dataclasses.replace(nbrs, reference_position=new_pos)
++
++    # Original should be unchanged
++    np.testing.assert_array_equal(nbrs.reference_position, pos_frac)
++
++    # Replaced should have new value
++    np.testing.assert_array_almost_equal(
++      nbrs_replaced.reference_position, new_pos
++    )
++
++  def test_jit_compatible_update(self):
++    """Test that neighbor list update is JIT-compatible."""
++    atoms = bulk('Cu', 'fcc', a=3.6)
++    cutoff = 3.0
++    N = len(atoms)
++
++    cell = np.array(atoms.cell.array, dtype=np.float64)
++    box = cell.T
++    pos_frac = jnp.array(atoms.get_scaled_positions())
++
++    neighbor_fn = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=50, format=NeighborListFormat.Sparse
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # JIT the update function - use mask sum instead of n_edges property
++    # (n_edges uses int() which is not JIT-compatible)
++    @jax.jit
++    def update_and_count(pos, nbrs):
++      nbrs_new = nbrs.update(pos)
++      # Count valid edges (JIT-compatible)
++      mask = nbrs_new.idx[0] < N
++      return jnp.sum(mask)
++
++    # Should work without error
++    n_edges = update_and_count(pos_frac, nbrs)
++    self.assertGreater(int(n_edges), 0)
++
++    # Call again to ensure caching works
++    n_edges2 = update_and_count(pos_frac + 0.001, nbrs)
++    self.assertGreater(int(n_edges2), 0)
++
++  def test_empty_system(self):
++    """Test behavior with a single atom (no neighbors)."""
++    box = np.eye(3) * 10.0
++    pos_frac = np.array([[0.5, 0.5, 0.5]])
++    cutoff = 3.0
++
++    neighbor_fn = neighbor_list_multi_image(
++      None, box, cutoff, max_neighbors=50, format=NeighborListFormat.Sparse
++    )
++    nbrs = neighbor_fn.allocate(pos_frac)
++
++    # Single atom should have no neighbors
++    self.assertEqual(nbrs.n_edges, 0)
++    self.assertFalse(nbrs.did_buffer_overflow)
++
++
++if __name__ == '__main__':
++  absltest.main()
+diff --git a/tests/custom_smap_test.py b/tests/custom_smap_test.py
+new file mode 100644
+index 00000000..09a9db47
+--- /dev/null
++++ b/tests/custom_smap_test.py
+@@ -0,0 +1,605 @@
++"""Tests for jax_md.custom_smap (multi-image neighbor list smap functions).
++
++Note: custom_smap currently only supports pair potentials via
++`pair_neighbor_list_multi_image`. Three-body/triplet potentials are not yet
++implemented for multi-image neighbor lists.
++"""
++
++from absl.testing import absltest
++from absl.testing import parameterized
++
++import jax
++from jax import random
++import jax.numpy as np
++
++from jax_md import smap, space, partition, quantity
++from jax_md.custom_partition import (
++  neighbor_list_multi_image,
++  estimate_max_neighbors_from_box,
++  NeighborListFormat,
++)
++from jax_md.custom_smap import pair_neighbor_list_multi_image
++from jax_md.util import f32, f64, i32
++from jax_md import test_util
++
++jax.config.parse_flags_with_absl()
++
++test_util.update_test_tolerance(f32_tol=5e-5, f64_tol=1e-13)
++
++STOCHASTIC_SAMPLES = 3
++SPATIAL_DIMENSION = [2, 3]
++NEIGHBOR_LIST_FORMAT = [
++  NeighborListFormat.Dense,
++  NeighborListFormat.Sparse,
++  NeighborListFormat.OrderedSparse,
++]
++
++# Smaller particle count for multi-image tests (small boxes)
++PARTICLE_COUNT = 50
++
++if jax.config.jax_enable_x64:
++  POSITION_DTYPE = [f32, f64]
++else:
++  POSITION_DTYPE = [f32]
++
++
++class CustomSmapTest(test_util.JAXMDTestCase):
++  """Tests for pair_neighbor_list_multi_image."""
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      # Only test Sparse formats for comparison; Dense has different handling
++      for format in [
++        NeighborListFormat.Sparse,
++        NeighborListFormat.OrderedSparse,
++      ]
++    )
++  )
++  def test_pair_multi_image_matches_standard_large_box(
++    self, spatial_dimension, dtype, format
++  ):
++    """Test that multi-image matches standard smap for large boxes (r_cut < L/2)."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = PARTICLE_COUNT
++    # Large box so MIC is valid (r_cut < L/2)
++    box_size = 4.0 * N ** (1.0 / spatial_dimension)
++    sigma = 1.5
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++    metric = space.metric(disp)
++
++    # Standard smap
++    standard_energy = jax.jit(
++      smap.pair_neighbor_list(truncated_square, metric, sigma=sigma)
++    )
++
++    # Multi-image smap
++    multi_image_energy = jax.jit(
++      pair_neighbor_list_multi_image(
++        truncated_square, sigma=sigma, fractional_coordinates=True
++      )
++    )
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++      # Convert to fractional coordinates for multi-image
++      R_frac = R / box_size
++
++      # Standard neighbor list
++      neighbor_fn = partition.neighbor_list(
++        disp, box_size, sigma, 0.0, format=format
++      )
++      nbrs = neighbor_fn.allocate(R)
++
++      # Multi-image neighbor list
++      box = np.eye(spatial_dimension, dtype=dtype) * box_size
++      max_neighbors = estimate_max_neighbors_from_box(box, sigma, N)
++      mi_neighbor_fn = neighbor_list_multi_image(
++        None, box, sigma, max_neighbors=max_neighbors, format=format
++      )
++      mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++      E_standard = standard_energy(R, nbrs)
++      E_multi_image = multi_image_energy(R_frac, mi_nbrs)
++
++      # Check values match with appropriate tolerance for float32
++      self.assertAllClose(
++        E_standard, E_multi_image, check_dtypes=False, rtol=1e-5, atol=1e-5
++      )
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      for format in NEIGHBOR_LIST_FORMAT
++    )
++  )
++  def test_pair_multi_image_small_box(self, spatial_dimension, dtype, format):
++    """Test multi-image for small boxes where r_cut > L/2."""
++    key = random.PRNGKey(42)
++
++    def soft_pair(dr, sigma=1.0):
++      """Soft potential that doesn't diverge at short distances."""
++      return np.where(dr < sigma, (1.0 - dr / sigma) ** 2, f32(0.0))
++
++    # Small box: 4 atoms in a 2x2x2 (or 2x2 for 2D) box
++    N = 4
++    box_size = 2.0
++    sigma = 1.5
++    r_cutoff = 2.5  # > L/2 = 1.0, so MIC will miss images
++
++    key, split = random.split(key)
++    # Place atoms at corners of a small cube/square (well-separated)
++    if spatial_dimension == 3:
++      R_frac = np.array(
++        [
++          [0.25, 0.25, 0.25],
++          [0.75, 0.25, 0.25],
++          [0.25, 0.75, 0.25],
++          [0.25, 0.25, 0.75],
++        ],
++        dtype=dtype,
++      )
++    else:
++      R_frac = np.array(
++        [
++          [0.25, 0.25],
++          [0.75, 0.25],
++          [0.25, 0.75],
++          [0.75, 0.75],
++        ],
++        dtype=dtype,
++      )
++
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++
++    # Multi-image should find more neighbors than MIC for this setup
++    max_neighbors = estimate_max_neighbors_from_box(box, r_cutoff, N)
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None, box, r_cutoff, max_neighbors=max_neighbors, format=format
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    # Multi-image energy
++    multi_image_energy = pair_neighbor_list_multi_image(
++      soft_pair, sigma=sigma, fractional_coordinates=True
++    )
++    E_mi = multi_image_energy(R_frac, mi_nbrs)
++
++    # Verify we get a finite, positive energy
++    self.assertTrue(np.isfinite(E_mi))
++    self.assertGreater(float(E_mi), 0.0)
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      for format in [NeighborListFormat.Sparse, NeighborListFormat.Dense]
++    )
++  )
++  def test_pair_multi_image_species(self, spatial_dimension, dtype, format):
++    """Test species-dependent parameters."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = PARTICLE_COUNT
++    box_size = 4.0 * N ** (1.0 / spatial_dimension)
++
++    # Create species array (half type 0, half type 1)
++    species = np.zeros((N,), i32)
++    species = np.where(np.arange(N) >= N // 2, 1, species)
++
++    # Species-dependent sigma
++    sigma_matrix = np.array([[1.0, 1.5], [1.5, 2.0]], dtype=dtype)
++
++    key, split = random.split(key)
++    R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++    R_frac = R / box_size
++
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++    max_neighbors = estimate_max_neighbors_from_box(
++      box, float(np.max(sigma_matrix)), N
++    )
++
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      float(np.max(sigma_matrix)),
++      max_neighbors=max_neighbors,
++      format=format,
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    # Energy with species
++    energy_fn = pair_neighbor_list_multi_image(
++      truncated_square,
++      species=species,
++      sigma=sigma_matrix,
++      fractional_coordinates=True,
++    )
++    E = energy_fn(R_frac, mi_nbrs)
++
++    self.assertTrue(np.isfinite(E))
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      # OrderedSparse doesn't support per-particle energies
++      for format in [NeighborListFormat.Sparse, NeighborListFormat.Dense]
++    )
++  )
++  def test_pair_multi_image_per_particle(
++    self, spatial_dimension, dtype, format
++  ):
++    """Test per-particle energy reduction."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = PARTICLE_COUNT
++    box_size = 4.0 * N ** (1.0 / spatial_dimension)
++    sigma = 1.5
++
++    key, split = random.split(key)
++    R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++    R_frac = R / box_size
++
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++    max_neighbors = estimate_max_neighbors_from_box(box, sigma, N)
++
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None, box, sigma, max_neighbors=max_neighbors, format=format
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    # Total energy
++    total_energy_fn = pair_neighbor_list_multi_image(
++      truncated_square, sigma=sigma, fractional_coordinates=True
++    )
++    E_total = total_energy_fn(R_frac, mi_nbrs)
++
++    # Per-particle energy
++    per_particle_energy_fn = pair_neighbor_list_multi_image(
++      truncated_square,
++      sigma=sigma,
++      reduce_axis=(1,),
++      fractional_coordinates=True,
++    )
++    E_per_particle = per_particle_energy_fn(R_frac, mi_nbrs)
++
++    # Sum of per-particle should equal total
++    self.assertEqual(E_per_particle.shape, (N,))
++    self.assertAllClose(np.sum(E_per_particle), E_total)
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++    )
++  )
++  def test_pair_multi_image_ordered_sparse_per_particle_raises(
++    self, spatial_dimension, dtype
++  ):
++    """Test that OrderedSparse raises ValueError for per-particle energies."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = 10
++    box_size = 5.0
++    sigma = 1.5
++
++    R_frac = random.uniform(key, (N, spatial_dimension), dtype=dtype)
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      sigma,
++      max_neighbors=50,
++      format=NeighborListFormat.OrderedSparse,
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    per_particle_energy_fn = pair_neighbor_list_multi_image(
++      truncated_square,
++      sigma=sigma,
++      reduce_axis=(1,),
++      fractional_coordinates=True,
++    )
++
++    with self.assertRaises(ValueError):
++      per_particle_energy_fn(R_frac, mi_nbrs)
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      for format in NEIGHBOR_LIST_FORMAT
++    )
++  )
++  def test_pair_multi_image_forces(self, spatial_dimension, dtype, format):
++    """Test gradient computation (forces)."""
++    key = random.PRNGKey(0)
++
++    def lj_pair(dr, sigma=1.0, epsilon=1.0):
++      """Simple LJ potential."""
++      idr = sigma / dr
++      idr6 = idr**6
++      idr12 = idr6**2
++      return f32(4.0) * epsilon * (idr12 - idr6)
++
++    N = 20
++    box_size = 5.0
++    sigma = 1.0
++    r_cutoff = 2.5
++
++    key, split = random.split(key)
++    R_frac = random.uniform(split, (N, spatial_dimension), dtype=dtype)
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++
++    max_neighbors = estimate_max_neighbors_from_box(box, r_cutoff, N)
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None, box, r_cutoff, max_neighbors=max_neighbors, format=format
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    energy_fn = pair_neighbor_list_multi_image(
++      lj_pair, sigma=sigma, epsilon=1.0, fractional_coordinates=True
++    )
++
++    # Compute forces via autodiff
++    force_fn = quantity.force(energy_fn)
++    F = force_fn(R_frac, mi_nbrs)
++
++    # Forces should have correct shape
++    self.assertEqual(F.shape, (N, spatial_dimension))
++    # Forces should be finite
++    self.assertTrue(np.all(np.isfinite(F)))
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      for format in NEIGHBOR_LIST_FORMAT
++    )
++  )
++  def test_pair_multi_image_cartesian_coordinates(
++    self, spatial_dimension, dtype, format
++  ):
++    """Test with fractional_coordinates=False."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = PARTICLE_COUNT
++    box_size = 4.0 * N ** (1.0 / spatial_dimension)
++    sigma = 1.5
++
++    key, split = random.split(key)
++    R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++    max_neighbors = estimate_max_neighbors_from_box(box, sigma, N)
++
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      sigma,
++      max_neighbors=max_neighbors,
++      format=format,
++      fractional_coordinates=False,  # Use Cartesian
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R)
++
++    energy_fn = pair_neighbor_list_multi_image(
++      truncated_square, sigma=sigma, fractional_coordinates=False
++    )
++    E = energy_fn(R, mi_nbrs)
++
++    self.assertTrue(np.isfinite(E))
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}_format={format}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++        'format': format,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++      for format in NEIGHBOR_LIST_FORMAT
++    )
++  )
++  def test_pair_multi_image_dynamic_kwargs(
++    self, spatial_dimension, dtype, format
++  ):
++    """Test that kwargs can be overridden at call time."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = PARTICLE_COUNT
++    box_size = 4.0 * N ** (1.0 / spatial_dimension)
++    sigma_static = 1.5
++    sigma_dynamic = 2.0
++
++    key, split = random.split(key)
++    R_frac = random.uniform(split, (N, spatial_dimension), dtype=dtype)
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++
++    max_neighbors = estimate_max_neighbors_from_box(box, sigma_dynamic, N)
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None, box, sigma_dynamic, max_neighbors=max_neighbors, format=format
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    # Create with static sigma
++    energy_fn = pair_neighbor_list_multi_image(
++      truncated_square, sigma=sigma_static, fractional_coordinates=True
++    )
++
++    # Call with static sigma
++    E_static = energy_fn(R_frac, mi_nbrs)
++
++    # Call with dynamic sigma (should override)
++    E_dynamic = energy_fn(R_frac, mi_nbrs, sigma=sigma_dynamic)
++
++    # Energies should differ
++    self.assertFalse(np.allclose(E_static, E_dynamic))
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++    )
++  )
++  def test_pair_multi_image_dense_large_box(self, spatial_dimension, dtype):
++    """Test Dense format produces finite energies for large boxes."""
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr**2, f32(0.0))
++
++    N = PARTICLE_COUNT
++    box_size = 4.0 * N ** (1.0 / spatial_dimension)
++    sigma = 1.5
++
++    key, split = random.split(key)
++    R_frac = random.uniform(split, (N, spatial_dimension), dtype=dtype)
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++
++    max_neighbors = estimate_max_neighbors_from_box(box, sigma, N)
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      sigma,
++      max_neighbors=max_neighbors,
++      format=NeighborListFormat.Dense,
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++
++    energy_fn = pair_neighbor_list_multi_image(
++      truncated_square, sigma=sigma, fractional_coordinates=True
++    )
++    E = energy_fn(R_frac, mi_nbrs)
++
++    # Energy should be finite and positive (truncated_square is positive)
++    self.assertTrue(np.isfinite(E))
++    self.assertGreater(float(E), 0.0)
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dim={dim}_dtype={dtype.__name__}',
++        'spatial_dimension': dim,
++        'dtype': dtype,
++      }
++      for dim in SPATIAL_DIMENSION
++      for dtype in POSITION_DTYPE
++    )
++  )
++  def test_multi_image_finds_more_neighbors_small_box(
++    self, spatial_dimension, dtype
++  ):
++    """Verify multi-image finds more neighbors than MIC for small boxes."""
++    key = random.PRNGKey(123)
++
++    # Small box where r_cutoff > L/2
++    N = 8
++    box_size = 2.0
++    r_cutoff = 2.5  # > L/2 = 1.0
++
++    key, split = random.split(key)
++    R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++    R_frac = R / box_size
++
++    # Standard MIC neighbor list
++    disp, _ = space.periodic(box_size)
++    mic_neighbor_fn = partition.neighbor_list(
++      disp, box_size, r_cutoff, 0.0, format=partition.Sparse
++    )
++    mic_nbrs = mic_neighbor_fn.allocate(R)
++    mic_n_edges = int(np.sum(mic_nbrs.idx[0] < N))
++
++    # Multi-image neighbor list
++    box = np.eye(spatial_dimension, dtype=dtype) * box_size
++    max_neighbors = estimate_max_neighbors_from_box(box, r_cutoff, N)
++    mi_neighbor_fn = neighbor_list_multi_image(
++      None,
++      box,
++      r_cutoff,
++      max_neighbors=max_neighbors,
++      format=NeighborListFormat.Sparse,
++    )
++    mi_nbrs = mi_neighbor_fn.allocate(R_frac)
++    mi_n_edges = int(np.sum(mi_nbrs.idx[0] < N))
++
++    # Multi-image should find at least as many neighbors
++    self.assertGreaterEqual(mi_n_edges, mic_n_edges)
++
++
++if __name__ == '__main__':
++  absltest.main()

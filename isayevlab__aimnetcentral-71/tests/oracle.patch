@@ -1,0 +1,1436 @@
+diff --git a/README.md b/README.md
+index 3525af6..8039a35 100644
+--- a/README.md
++++ b/README.md
+@@ -60,8 +60,9 @@ pip install aimnet 'nvalchemi-toolkit-ops[torch]'
+ ```bash
+ pip install "aimnet[ase]"             # ASE calculator interface
+ pip install "aimnet[pysis]"           # PySisyphus reaction path calculator
++pip install "aimnet[sella]"           # Sella TS optimizer (includes ASE)
+ pip install "aimnet[train]"           # Training pipeline (W&B, ignite)
+-pip install "aimnet[ase,pysis,train]" # All extras
++pip install "aimnet[ase,pysis,sella,train]" # All extras
+ ```
+ 
+ ### Development Setup
+diff --git a/aimnet/calculators/aimnet2ase.py b/aimnet/calculators/aimnet2ase.py
+index e096d0c..3869c94 100644
+--- a/aimnet/calculators/aimnet2ase.py
++++ b/aimnet/calculators/aimnet2ase.py
+@@ -1,3 +1,5 @@
++import warnings
++
+ import numpy as np
+ import torch
+ 
+@@ -85,8 +87,9 @@ def set_mult(self, mult):
+         self._t_mult = None
+         self.update_tensors()
+ 
+-    def _update_charge_spin_from_info(self):
+-        atoms = getattr(self, "atoms", None)
++    def _update_charge_spin_from_info(self, atoms=None):
++        if atoms is None:
++            atoms = getattr(self, "atoms", None)
+         if atoms is None:
+             return
+         info = getattr(atoms, "info", {})
+@@ -107,9 +110,17 @@ def _update_charge_spin_from_info(self):
+                 self.mult = mult
+                 self._t_mult = None
+ 
+-    def update_tensors(self):
+-        if self._t_numbers is None and getattr(self, "atoms", None):
+-            self._t_numbers = torch.tensor(self.atoms.numbers, dtype=torch.int64, device=self.base_calc.device)
++    def update_tensors(self, atoms=None):
++        if atoms is None:
++            atoms = getattr(self, "atoms", None)
++        if atoms is not None:
++            new_numbers = torch.as_tensor(atoms.numbers, dtype=torch.int64, device=self.base_calc.device)
++            if (
++                self._t_numbers is None
++                or self._t_numbers.shape != new_numbers.shape
++                or not torch.equal(self._t_numbers, new_numbers)
++            ):
++                self._t_numbers = new_numbers
+         if self._t_charge is None:
+             self._t_charge = torch.tensor(self.charge, dtype=torch.float32, device=self.base_calc.device)
+         if self._t_mult is None:
+@@ -125,6 +136,71 @@ def get_spin_charges(self, atoms=None):
+             raise PropertyNotImplementedError("spin_charges is not available. Use an NSE model (e.g. 'aimnet2nse').")
+         return self.results["spin_charges"]
+ 
++    def get_hessian(self, atoms=None):
++        """Return Cartesian Hessian as a (3N, 3N) ndarray in eV/Å^2.
++
++        Designed for use as ``Sella(atoms, hessian_function=atoms.calc.get_hessian)``.
++        Computed via double-backward through the AIMNet2 energy graph; cost scales
++        as O(3N) backward passes per call. Not supported when ``compile_model=True``
++        or for batched / multi-molecule input.
++
++        This method intentionally bypasses the standard ASE
++        ``Calculator.calculate(properties=['hessian'])`` flow and ``self.results``
++        cache. The Sella callback contract is ``(atoms) -> ndarray``, so a direct
++        method is the simplest match. ``"hessian"`` is therefore not advertised in
++        ``implemented_properties``; if that ever changes, the two paths must be
++        reconciled.
++
++        When called with an explicit ``atoms`` argument that differs from
++        ``self.atoms``, the passed ``atoms.info`` is consulted for charge/mult
++        precedence (and the calculator's stored ``self.charge``/``self.mult`` may
++        be updated as a side effect, mirroring the ``calculate()`` behavior).
++        """
++        if atoms is None:
++            atoms = getattr(self, "atoms", None)
++            if atoms is None:
++                raise PropertyNotImplementedError(
++                    "get_hessian() requires an attached Atoms object or an explicit argument."
++                )
++        if atoms.pbc.any():
++            raise PropertyNotImplementedError(
++                "Hessian for periodic systems is not supported by AIMNet2ASE.get_hessian(). "
++                "For periodic transition states, use pysisyphus dimer or climbing-image NEB."
++            )
++        if len(atoms) > 100:
++            warnings.warn(
++                f"Computing AIMNet2 Hessian for {len(atoms)} atoms; "
++                "the forces+hessian path retains a much larger autograd graph than forces alone "
++                "(peak GPU memory is roughly 5-10x a forces-only call). Risk of OOM on smaller GPUs.",
++                stacklevel=2,
++            )
++
++        self._update_charge_spin_from_info(atoms)
++        self.update_tensors(atoms)
++
++        # Pass coord as 2D (N, 3) — not batched — so mol_flatten takes the
++        # ndim==2 path and calculate_hessian sees the expected (N+1, 3) coord
++        # after padding. Batching (unsqueeze(0)) triggers the ndim==3 path
++        # which may skip flattening when N < nb_threshold on GPU, causing
++        # calculate_hessian to produce an incorrect (N, 3, 1, 3) shape.
++        coord = torch.tensor(atoms.positions, dtype=self.base_calc.keys_in["coord"], device=self.base_calc.device)
++        _in = {
++            "coord": coord,
++            "numbers": self._t_numbers,
++            "charge": self._t_charge,
++            "mult": self._t_mult,
++        }
++
++        results = self.base_calc(
++            _in,
++            forces=True,
++            hessian=True,
++            validate_species=self.validate_species,
++        )
++        H = results["hessian"].detach()  # (N, 3, N, 3)
++        N = H.shape[0]
++        return H.reshape(N * 3, N * 3).cpu().numpy()
++
+     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+         if properties is None:
+             properties = ["energy"]
+diff --git a/docs/advanced/reaction_paths.md b/docs/advanced/reaction_paths.md
+index f5c9de3..d39b269 100644
+--- a/docs/advanced/reaction_paths.md
++++ b/docs/advanced/reaction_paths.md
+@@ -514,3 +514,4 @@ For reactions with multiple transition states (e.g., addition-elimination mechan
+ - [AIMNet2-NSE model details](../models/aimnet2nse.md) -- training data and accuracy benchmarks
+ - [Geometry Optimization tutorial](../tutorials/geometry_optimization.md) -- structure relaxation fundamentals
+ - [Model Selection Guide](../models/guide.md) -- choosing the right model for your reaction chemistry
++- [Sella](../external/sella.md) -- saddle-point optimizer for direct TS optimization with AIMNet2 Hessian feedback
+diff --git a/docs/external/index.md b/docs/external/index.md
+index a76606f..22f010a 100644
+--- a/docs/external/index.md
++++ b/docs/external/index.md
+@@ -6,6 +6,7 @@ AIMNet2 is consumed by several external simulation and analysis packages. This s
+ | --- | --- | --- |
+ | ASE | Supported | [ASE](ase.md) |
+ | pysisyphus | Supported | [pysisyphus](pysis.md) |
++| Sella | Supported (via `AIMNet2ASE`) | [Sella](sella.md) |
+ | OpenMM (`openmmml`) | Supported upstream | [OpenMM](openmm.md) |
+ | AMBER (`torchani-amber`) | Supported upstream | [AMBER](amber.md) |
+ | SCM AMS (`MLPotential` engine) | Supported upstream | [SCM AMS](ams.md) |
+diff --git a/docs/external/sella.md b/docs/external/sella.md
+new file mode 100644
+index 0000000..cc83b5a
+--- /dev/null
++++ b/docs/external/sella.md
+@@ -0,0 +1,56 @@
++# Sella
++
++**Status: supported (uses AIMNet2's existing ASE calculator).**
++
++[Sella](https://github.com/zadorlab/sella) is a saddle-point optimizer for ASE that targets transition states (`order=1`) and minima (`order=0`) with partitioned rational function optimization on internal coordinates. Sella consumes any ASE `Calculator`, so AIMNet2 works through the existing `AIMNet2ASE` class. The optional extra installs Sella ≥ 2.4.0 alongside ASE.
++
++## Install
++
++```bash
++pip install "aimnet[sella]"
++```
++
++`sella>=2.4.0` is required. The 2.4.0 release (March 2026) introduced MLIP-targeted vectorization that made Sella usable for large systems (~22x wall-clock improvement on a 50-atom benchmark, [PR #64](https://github.com/zadorlab/sella/pull/64)). Older Sella versions do not accept the `hessian_function=` callback shown below and will raise `TypeError`.
++
++## Recommended configuration
++
++```python
++import ase.io
++from sella import Sella
++from aimnet.calculators import AIMNet2ASE
++
++atoms = ase.io.read("ts_guess.xyz")
++atoms.calc = AIMNet2ASE("aimnet2")
++
++dyn = Sella(
++    atoms,
++    order=1,                                    # 1 = saddle, 0 = minimum
++    internal=True,                              # internal coordinates (recommended)
++    hessian_function=atoms.calc.get_hessian,    # analytic Hessian callback
++)
++dyn.run(fmax=0.01)
++```
++
++## Why pass `hessian_function`
++
++By default Sella refines its Hessian via an iterative Davidson eigensolver that costs ~10–30 extra gradient calls per refinement (every `nsteps_per_diag=3` steps in saddle mode). Wiring `AIMNet2ASE.get_hessian` into `hessian_function=` replaces each refresh with one analytic Hessian call (O(3N) backward passes per refresh through the AIMNet2 energy graph). This pattern was validated by [Yuan et al. (Nature Comms 2024)](https://www.nature.com/articles/s41467-024-52481-5) for NewtonNet, where it cut TS optimization step counts by 2–3x.
++
++The Hessian is computed in eV/Å² and shaped `(3N, 3N)` to match Sella's convention.
++
++## Limitations
++
++- Gas-phase only. The `internal=True` path assumes molecular topology; periodic TS searches are not supported by `AIMNet2ASE.get_hessian`.
++- `compile_model=True` is incompatible with the Hessian path — Dynamo + double-backward through GELU hangs (`AIMNet2Calculator` raises `RuntimeError` if you combine them).
++- Multi-molecule batching is not available for the Hessian; each `Sella` instance must hold one structure.
++
++## Minima with Sella
++
++For minima (not TS), the [Rowan optimizer benchmark](https://rowansci.com/blog/which-optimizer-should-you-use-with-nnps) (September 2025) recommends `Sella(order=0, internal=True)` as a strong plug-and-play optimizer for AIMNet2 — often converging in fewer steps than LBFGS, and without requiring an analytic Hessian.
++
++## See also
++
++- [ASE calculator interface](ase.md)
++- [pysisyphus integration](pysis.md) — alternative for IRC, NEB, growing-string
++- [Reaction paths and transition states](../advanced/reaction_paths.md)
++- [Sella v2.4.0 release notes](https://github.com/zadorlab/sella/releases/tag/v2.4.0)
++- [Sella JCTC 2022 paper](https://pubs.acs.org/doi/10.1021/acs.jctc.2c00395)
+diff --git a/docs/index.md b/docs/index.md
+index 9c03a26..678c997 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -81,6 +81,9 @@ pip install "aimnet[ase]"
+ # PySisyphus integration
+ pip install "aimnet[pysis]"
+ 
++# Sella TS optimizer
++pip install "aimnet[sella]"
++
+ # Training tools
+ pip install "aimnet[train]"
+ ```
+diff --git a/docs/superpowers/plans/2026-04-26-sella-integration.md b/docs/superpowers/plans/2026-04-26-sella-integration.md
+new file mode 100644
+index 0000000..23aca54
+--- /dev/null
++++ b/docs/superpowers/plans/2026-04-26-sella-integration.md
+@@ -0,0 +1,614 @@
++# Sella Integration Implementation Plan
++
++> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
++
++**Goal:** Add first-class Sella saddle-point optimizer support to AIMNet2 by exposing analytic Hessians through the existing `AIMNet2ASE` calculator and shipping the optional extra, smoke test, example, and docs.
++
++**Architecture:** Sella is an ASE-native optimizer; no wrapper class is required. The single load-bearing change is adding `get_hessian(atoms=None) -> ndarray (3N, 3N)` to `AIMNet2ASE` so users can pass `hessian_function=atoms.calc.get_hessian` to `Sella(...)`. This bypasses Sella's expensive Davidson finite-difference loop (10–30 extra gradient calls per refinement) and was validated by Schreiner et al. (Nature Comms 2024) to cut step count by 2–3×. Surrounding tasks add the optional dependency, pytest marker, smoke test, example script, and docs page that mirror the existing `pysisyphus` integration footprint.
++
++**Tech Stack:** Python 3.11+, PyTorch (existing AIMNet2 autograd Hessian path at `aimnet/calculators/calculator.py:1135-1142`), ASE ≥ 3.27, Sella ≥ 2.4.0 (required — v2.4.0 March 2026 added MLIP-targeted vectorization that gave ~22× wall-clock improvement on a 50-atom test case).
++
++**Out of scope (explicitly deferred):**
++
++- Vectorizing `AIMNet2Calculator.calculate_hessian` with `torch.func.hessian` — orthogonal optimization that benefits both Sella and pysisyphus; track as a separate plan once we have a Sella-driven benchmark.
++- Wrapping the energy-only path in `torch.inference_mode()` — micro-optimization, not on Sella's hot path (Sella always asks for forces).
++- A batched many-Sella driver — workflow-level project, not a Sella code change.
++- PBC TS searches — Sella's `internal=True` path assumes molecular topology; gas-phase only for v1.
++
++---
++
++## File Structure
++
++| File | Status | Responsibility |
++| --- | --- | --- |
++| `pyproject.toml` | modify | Add `sella` extra, pytest marker, deptry ignore entries |
++| `aimnet/calculators/aimnet2ase.py` | modify | Add `get_hessian(atoms=None) -> np.ndarray` method |
++| `tests/test_ase.py` | modify | Add Hessian unit test (no Sella dep) |
++| `tests/test_sella.py` | create | Sella smoke test gated by `pytest.mark.sella` |
++| `examples/sella_ts.py` | create | End-to-end TS search example with analytic Hessian callback |
++| `docs/external/sella.md` | create | User-facing Sella integration guide |
++| `docs/external/index.md` | modify | Add Sella row to external-package overview |
++| `mkdocs.yml` | modify | Add Sella entry to External Packages nav |
++| `docs/index.md` | modify | Add `pip install "aimnet[sella]"` install line |
++| `README.md` | modify | Add Sella to features list and install matrix |
++
++---
++
++## Task 1: Wire `sella` into project metadata
++
++**Files:**
++
++- Modify: `pyproject.toml:47-56` (optional-dependencies)
++- Modify: `pyproject.toml:199-206` (pytest markers)
++- Modify: `pyproject.toml:226-230` (deptry per-rule ignores)
++
++- [ ] **Step 1: Add the `sella` optional extra**
++
++Edit `pyproject.toml` so the `[project.optional-dependencies]` block reads:
++
++```toml
++[project.optional-dependencies]
++# ASE calculator integration
++ase = [
++    "ase>=3.27.0,<4",
++]
++
++# PySisyphus calculator integration
++pysis = [
++    "pysisyphus",
++]
++
++# Sella saddle-point optimizer integration (requires ASE)
++sella = [
++    "ase>=3.27.0,<4",
++    "sella>=2.4.0",
++]
++```
++
++Why pin `sella>=2.4.0`: pre-v2.4.0 the optimizer is bottlenecked by NumPy/SciPy linear algebra; v2.4.0 (released 2026-03-28) ships the MLIP-targeted vectorization that makes the integration worthwhile. Why duplicate `ase>=3.27.0,<4` rather than depend on the `ase` extra: PEP 631 doesn't standardize extra-of-extra; duplicating the pin is the portable form.
++
++- [ ] **Step 2: Add the `sella` pytest marker**
++
++Update the `markers` list to include the Sella marker (alphabetical insertion between `pysis` and `train`):
++
++```toml
++markers = [
++    "ase: marks tests that require ASE (deselect with: -m 'not ase')",
++    "gpu: marks tests that require GPU/CUDA (deselect with: -m 'not gpu')",
++    "hf: marks tests that require Hugging Face extras (deselect with: -m 'not hf')",
++    "network: marks tests that hit external services (deselect with: -m 'not network')",
++    "pysis: marks tests that require PySisyphus (deselect with: -m 'not pysis')",
++    "sella: marks tests that require Sella (deselect with: -m 'not sella')",
++    "train: marks tests that require training dependencies (deselect with: -m 'not train')",
++]
++```
++
++- [ ] **Step 3: Add `sella` to deptry ignore lists**
++
++Update the `[tool.deptry.per_rule_ignores]` block:
++
++```toml
++[tool.deptry.per_rule_ignores]
++# Optional extras (ase, pysisyphus, sella) — installed via [project.optional-dependencies]; deptry can't see them statically
++DEP001 = ["ase", "pysisyphus", "sella"]
++DEP003 = ["ase", "pysisyphus", "sella"]
++DEP004 = ["ase", "pysisyphus", "sella"]
++```
++
++- [ ] **Step 4: Verify metadata is parseable**
++
++Run: `python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['optional-dependencies']['sella'])"` Expected: `['ase>=3.27.0,<4', 'sella>=2.4.0']`
++
++Run: `pytest --collect-only -m sella tests/ 2>&1 | tail -5` Expected: `0 tests collected` and **no warning about unknown marker `sella`**.
++
++- [ ] **Step 5: Commit**
++
++```bash
++git add pyproject.toml
++git commit -m "chore: add sella optional extra and pytest marker"
++```
++
++---
++
++## Task 2: Add `get_hessian` to `AIMNet2ASE` (TDD)
++
++**Files:**
++
++- Modify: `aimnet/calculators/aimnet2ase.py:1-174`
++- Test: `tests/test_ase.py` (append new test class)
++
++The underlying `AIMNet2Calculator.__call__(..., hessian=True)` already returns a `(N, 3, N, 3)` Cartesian Hessian in eV/Å² (`aimnet/calculators/calculator.py:1131-1142`). The pysisyphus wrapper already consumes it (`aimnet/calculators/aimnet2pysis.py:46-53, 68-74`). ASE-internal Hessian convention is also eV/Å² so no unit conversion is needed — only a `(N, 3, N, 3) → (3N, 3N)` flatten. The method must be assignable as a `Sella(..., hessian_function=callable)` callback, which has signature `(atoms) -> ndarray`.
++
++- [ ] **Step 1: Write the failing test**
++
++Append this class to `tests/test_ase.py` (anywhere after `TestBasicCalculator`):
++
++```python
++class TestHessian:
++    """Hessian property — used by Sella analytic-Hessian callback."""
++
++    def test_hessian_shape_and_finite(self):
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase.io import read
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = read(CAFFEINE_FILE)
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        H = atoms.calc.get_hessian(atoms)
++        N = len(atoms)
++        assert H.shape == (3 * N, 3 * N)
++        assert np.isfinite(H).all()
++
++    def test_hessian_symmetric(self):
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase.io import read
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = read(CAFFEINE_FILE)
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        H = atoms.calc.get_hessian(atoms)
++        # Cartesian Hessian must be symmetric to autograd noise
++        assert np.max(np.abs(H - H.T)) < 5e-3
++
++    def test_hessian_callback_signature(self):
++        """Must be usable as Sella's hessian_function=callable callback."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        import ase
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE
++
++        # Tiny water for speed
++        atoms = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        callback = atoms.calc.get_hessian
++        assert callable(callback)
++        H = callback(atoms)
++        assert H.shape == (9, 9)
++        assert isinstance(H, np.ndarray)
++
++    def test_hessian_default_atoms(self):
++        """get_hessian() with no argument should use the attached atoms."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        calc = AIMNet2ASE("aimnet2")
++        atoms.calc = calc
++        # Trigger an energy calc so calc.atoms is populated
++        atoms.get_potential_energy()
++        H = calc.get_hessian()
++        assert H.shape == (9, 9)
++```
++
++- [ ] **Step 2: Run the test to confirm it fails**
++
++Run: `pytest tests/test_ase.py::TestHessian -x -v 2>&1 | tail -20` Expected: FAIL with `AttributeError: 'AIMNet2ASE' object has no attribute 'get_hessian'`
++
++- [ ] **Step 3: Implement `get_hessian` on `AIMNet2ASE`**
++
++Edit `aimnet/calculators/aimnet2ase.py`. Add `get_hessian` as a new method right after `get_spin_charges` (around line 126), before `calculate`. Insert this exact block:
++
++```python
++    def get_hessian(self, atoms=None):
++        """Return Cartesian Hessian as a (3N, 3N) ndarray in eV/Å^2.
++
++        Designed for use as ``Sella(atoms, hessian_function=atoms.calc.get_hessian)``.
++        Computed via double-backward through the AIMNet2 energy graph; cost scales
++        as O(3N) backward passes. Not supported when ``compile_model=True`` or
++        for batched / multi-molecule input.
++        """
++        if atoms is None:
++            atoms = getattr(self, "atoms", None)
++            if atoms is None:
++                raise PropertyNotImplementedError(
++                    "get_hessian() requires an attached Atoms object or an explicit argument."
++                )
++        if atoms.pbc.any():
++            raise PropertyNotImplementedError(
++                "Hessian for periodic systems is not supported by AIMNet2ASE.get_hessian()."
++            )
++
++        self._update_charge_spin_from_info()
++        self.update_tensors()
++        if self._t_numbers is None or self._t_numbers.shape[0] != len(atoms):
++            self._t_numbers = torch.tensor(
++                atoms.numbers, dtype=torch.int64, device=self.base_calc.device
++            )
++
++        coord = torch.tensor(
++            atoms.positions, dtype=torch.float32, device=self.base_calc.device
++        ).unsqueeze(0)
++        _in = {
++            "coord": coord,
++            "numbers": self._t_numbers.unsqueeze(0),
++            "charge": self._t_charge.unsqueeze(0),
++            "mult": self._t_mult.unsqueeze(0),
++        }
++
++        results = self.base_calc(
++            _in,
++            forces=True,
++            hessian=True,
++            validate_species=self.validate_species,
++        )
++        H = results["hessian"].detach()  # (N, 3, N, 3)
++        N = H.shape[0]
++        return H.reshape(N * 3, N * 3).cpu().numpy()
++```
++
++The `coord` tensor is built fresh (not reused from `_in` in `calculate`) because `set_grad_tensors` mutates `requires_grad` on it for the double-backward path — sharing it across an energy call and a Hessian call invites stale-graph bugs.
++
++- [ ] **Step 4: Run the test to confirm it passes**
++
++Run: `pytest tests/test_ase.py::TestHessian -x -v 2>&1 | tail -20` Expected: 4 passed.
++
++- [ ] **Step 5: Run the existing ASE test suite to confirm no regressions**
++
++Run: `pytest tests/test_ase.py -m ase 2>&1 | tail -5` Expected: all previously-passing tests still pass.
++
++- [ ] **Step 6: Commit**
++
++```bash
++git add aimnet/calculators/aimnet2ase.py tests/test_ase.py
++git commit -m "feat(ase): expose analytic Hessian via AIMNet2ASE.get_hessian"
++```
++
++---
++
++## Task 3: Add a Sella smoke test
++
++**Files:**
++
++- Create: `tests/test_sella.py`
++
++The point of this test is twofold: (1) verify that the `hessian_function=atoms.calc.get_hessian` wiring actually flows through Sella without exception, and (2) act as a contract test that Sella ≥ 2.4.0 still accepts our callback signature.
++
++- [ ] **Step 1: Write the test file**
++
++Create `tests/test_sella.py` with this exact content:
++
++```python
++"""Sella saddle-point optimizer smoke tests.
++
++These tests verify that AIMNet2's analytic Hessian (exposed via
++AIMNet2ASE.get_hessian) is callable from Sella's hessian_function= hook.
++They are gated by both the ``sella`` and ``ase`` markers; CI without Sella
++installed will deselect them automatically.
++"""
++
++import numpy as np
++import pytest
++
++pytestmark = [pytest.mark.sella, pytest.mark.ase]
++
++
++def _h2o2_guess():
++    """A trivially perturbed H2O2 starting from a non-stationary geometry."""
++    from ase import Atoms
++
++    return Atoms(
++        "H2O2",
++        positions=[
++            [0.000, 0.700, 0.350],
++            [0.000, -0.700, 0.350],
++            [0.000, 0.700, -0.350],
++            [0.000, -0.700, -0.350],
++        ],
++    )
++
++
++class TestSellaIntegration:
++    def test_callback_consumed_by_sella(self):
++        """Sella(..., hessian_function=callback) must run at least one step."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        sella = pytest.importorskip("sella", reason="Sella not installed")
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = _h2o2_guess()
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        dyn = sella.Sella(
++            atoms,
++            order=0,
++            internal=True,
++            hessian_function=atoms.calc.get_hessian,
++        )
++        # Two steps is enough to prove the Hessian callback is consumed without
++        # error; we are not benchmarking convergence here.
++        dyn.run(fmax=0.05, steps=2)
++
++        # Energy must be finite and forces present afterwards.
++        e = atoms.get_potential_energy()
++        f = atoms.get_forces()
++        assert np.isfinite(e)
++        assert np.isfinite(f).all()
++
++    def test_default_sella_no_hessian_callback(self):
++        """Sella without a Hessian callback must also work via standard ASE."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        sella = pytest.importorskip("sella", reason="Sella not installed")
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = _h2o2_guess()
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        dyn = sella.Sella(atoms, order=0, internal=True)
++        dyn.run(fmax=0.05, steps=2)
++
++        assert np.isfinite(atoms.get_potential_energy())
++```
++
++- [ ] **Step 2: Verify the test is collected and skipped without Sella installed**
++
++Run: `pytest tests/test_sella.py --collect-only 2>&1 | tail -10` Expected: collection shows the two tests under `TestSellaIntegration`.
++
++Run (without `sella` installed, default state): `pytest tests/test_sella.py -v 2>&1 | tail -10` Expected: both tests are SKIPPED with reason `Sella not installed`.
++
++- [ ] **Step 3: Run the test with Sella installed (optional local check)**
++
++If `sella` and `ase` are available locally:
++
++Run: `pip install "sella>=2.4.0" && pytest tests/test_sella.py -m sella -v 2>&1 | tail -20` Expected: 2 passed.
++
++If Sella is not available, skip this step — CI will not run Sella tests by default since `pytestmark = [pytest.mark.sella, pytest.mark.ase]` deselects them unless `-m sella` is requested.
++
++- [ ] **Step 4: Commit**
++
++```bash
++git add tests/test_sella.py
++git commit -m "test(sella): smoke test analytic Hessian callback through Sella"
++```
++
++---
++
++## Task 4: Add a Sella TS example
++
++**Files:**
++
++- Create: `examples/sella_ts.py`
++
++The example must be runnable, reproducible, and demonstrate the analytic Hessian callback (the whole point of the integration). It mirrors `examples/ase_opt.py` for tone and structure.
++
++- [ ] **Step 1: Write the example**
++
++Create `examples/sella_ts.py` with this exact content:
++
++```python
++"""Sella transition-state search using AIMNet2's analytic Hessian.
++
++Demonstrates the recommended configuration for using Sella with AIMNet2:
++- Minimum-mode following on internal coordinates (order=1, internal=True).
++- Analytic Hessian callback via AIMNet2ASE.get_hessian — replaces Sella's
++  iterative Davidson finite-difference loop with a single double-backward
++  pass through the AIMNet2 energy graph.
++
++Reference: Schreiner et al., Nature Communications 2024
++(https://www.nature.com/articles/s41467-024-52481-5) showed that providing
++analytic ML Hessians to Sella reduces step count by 2-3x.
++
++Requires: pip install "aimnet[sella]"
++"""
++
++from time import perf_counter
++
++import ase.io
++from sella import Sella
++
++from aimnet.calculators import AIMNet2ASE
++
++
++def main(xyz_path: str, fmax: float = 0.01, max_steps: int = 200) -> None:
++    atoms = ase.io.read(xyz_path)
++    atoms.calc = AIMNet2ASE("aimnet2")
++
++    dyn = Sella(
++        atoms,
++        order=1,
++        internal=True,
++        hessian_function=atoms.calc.get_hessian,
++    )
++
++    print(f"Sella TS search for {len(atoms)} atoms; fmax={fmax} eV/A.")
++    t0 = perf_counter()
++    dyn.run(fmax=fmax, steps=max_steps)
++    t1 = perf_counter()
++
++    nsteps = dyn.nsteps
++    print(f"Converged in {nsteps} steps ({t1 - t0:.1f} s, {(t1 - t0) / max(nsteps, 1):.3f} s/step).")
++    print(f"Final energy: {atoms.get_potential_energy():.6f} eV")
++
++    ase.io.write("ts_optimized.xyz", atoms)
++    print("Optimized geometry written to ts_optimized.xyz.")
++
++
++if __name__ == "__main__":
++    import sys
++
++    if len(sys.argv) != 2:
++        print("Usage: python sella_ts.py <ts_guess.xyz>")
++        sys.exit(1)
++    main(sys.argv[1])
++```
++
++- [ ] **Step 2: Smoke-check syntax**
++
++Run: `python -c "import ast; ast.parse(open('examples/sella_ts.py').read()); print('ok')"` Expected: `ok`.
++
++- [ ] **Step 3: Commit**
++
++```bash
++git add examples/sella_ts.py
++git commit -m "docs(examples): add Sella TS search example with analytic Hessian"
++```
++
++---
++
++## Task 5: Add the Sella docs page and link it from navigation
++
++**Files:**
++
++- Create: `docs/external/sella.md`
++- Modify: `docs/external/index.md`
++- Modify: `mkdocs.yml:36-46` (External Packages nav block)
++- Modify: `docs/index.md:79-82` (install commands)
++- Modify: `README.md:61-64` (install matrix)
++
++- [ ] **Step 1: Write the Sella docs page**
++
++Create `docs/external/sella.md` with this exact content:
++
++````markdown
++# Sella
++
++**Status: supported (uses AIMNet2's existing ASE calculator).**
++
++[Sella](https://github.com/zadorlab/sella) is a saddle-point optimizer for ASE that targets transition states (`order=1`) and minima (`order=0`) with partitioned rational function optimization on internal coordinates. Sella consumes any ASE `Calculator`, so AIMNet2 works through the existing `AIMNet2ASE` class. The optional extra installs Sella ≥ 2.4.0 alongside ASE.
++
++## Install
++
++```bash
++pip install "aimnet[sella]"
++```
++````
++
++`sella>=2.4.0` is required. The 2.4.0 release (March 2026) introduced MLIP-targeted vectorization that made Sella usable for large systems (~22x wall-clock improvement on a 50-atom benchmark, [PR #64](https://github.com/zadorlab/sella/pull/64)).
++
++## Recommended configuration
++
++```python
++import ase.io
++from sella import Sella
++from aimnet.calculators import AIMNet2ASE
++
++atoms = ase.io.read("ts_guess.xyz")
++atoms.calc = AIMNet2ASE("aimnet2")
++
++dyn = Sella(
++    atoms,
++    order=1,                                    # 1 = saddle, 0 = minimum
++    internal=True,                              # internal coordinates (recommended)
++    hessian_function=atoms.calc.get_hessian,    # analytic Hessian callback
++)
++dyn.run(fmax=0.01)
++```
++
++## Why pass `hessian_function`
++
++By default Sella refines its Hessian via an iterative Davidson eigensolver that costs ~10–30 extra gradient calls per refinement (every `nsteps_per_diag=3` steps). Wiring `AIMNet2ASE.get_hessian` into `hessian_function=` replaces that loop with a single double-backward through the AIMNet2 energy graph. This pattern was validated by [Schreiner et al. (Nature Comms 2024)](https://www.nature.com/articles/s41467-024-52481-5) for NewtonNet, where it cut TS optimization step counts by 2–3x.
++
++The Hessian is computed in eV/Å² and shaped `(3N, 3N)` to match Sella's convention.
++
++## Limitations
++
++- Gas-phase only. The `internal=True` path assumes molecular topology; periodic TS searches are not supported by `AIMNet2ASE.get_hessian`.
++- `compile_model=True` is incompatible with the Hessian path — Dynamo + double-backward through GELU hangs (`AIMNet2Calculator` raises `RuntimeError` if you combine them).
++- Multi-molecule batching is not available for the Hessian; each `Sella` instance must hold one structure.
++
++## Minima with Sella
++
++For minima (not TS), the [Rowan optimizer benchmark](https://rowansci.com/blog/which-optimizer-should-you-use-with-nnps) (September 2025) recommends `Sella(order=0, internal=True)` as a strong plug-and-play optimizer for AIMNet2 — often converging in fewer steps than LBFGS, and without requiring an analytic Hessian.
++
++## See also
++
++- [ASE calculator interface](ase.md)
++- [pysisyphus integration](pysis.md) — alternative for IRC, NEB, growing-string
++- [Reaction paths and transition states](../advanced/reaction_paths.md)
++- [Sella v2.4.0 release notes](https://github.com/zadorlab/sella/releases/tag/v2.4.0)
++- [Sella JCTC 2022 paper](https://pubs.acs.org/doi/10.1021/acs.jctc.2c00395)
++
++````
++
++- [ ] **Step 2: Add Sella to the External Packages overview index**
++
++Read the current state of `docs/external/index.md` to find where ASE / pysisyphus rows are described, then add a row for Sella using the same wording style. The exact prose should match the patterns already in that file. If `index.md` uses a table format, append:
++
++```markdown
++| [Sella](sella.md) | TS / minima optimizer (saddle-point search) | supported |
++````
++
++If `index.md` uses a bullet list, append:
++
++```markdown
++- **[Sella](sella.md)** — saddle-point and minima optimizer; uses the AIMNet2 ASE calculator.
++```
++
++(Match whichever format already exists. Do not invent a new structure.)
++
++- [ ] **Step 3: Add Sella to the mkdocs nav**
++
++Edit `mkdocs.yml`. In the `External Packages:` block (currently `mkdocs.yml:36-46`), insert a Sella entry directly after pysisyphus so the block reads:
++
++```yaml
++- External Packages:
++    - Overview: external/index.md
++    - ASE: external/ase.md
++    - pysisyphus: external/pysis.md
++    - Sella: external/sella.md
++    - OpenMM (openmm-ml): external/openmm.md
++    - AMBER (torchani-amber): external/amber.md
++    - SCM AMS (MLPotential): external/ams.md
++    - ORCA (ExtOpt): external/orca.md
++    - GROMACS (NNPot): external/gromacs.md
++    - LAMMPS (mliap): external/lammps.md
++```
++
++- [ ] **Step 4: Add the install line to `docs/index.md`**
++
++Find the install block in `docs/index.md` (around line 79–82) that currently shows `pip install "aimnet[ase]"` and `pip install "aimnet[pysis]"`. Add a Sella line directly below them so the block reads:
++
++```bash
++pip install "aimnet[ase]"             # ASE calculator interface
++pip install "aimnet[pysis]"           # PySisyphus reaction path calculator
++pip install "aimnet[sella]"           # Sella TS optimizer (includes ASE)
++```
++
++- [ ] **Step 5: Add the install line to `README.md`**
++
++Find the install matrix in `README.md` (around line 61–64). Add a Sella line:
++
++```bash
++pip install "aimnet[ase]"             # ASE calculator interface
++pip install "aimnet[pysis]"           # PySisyphus reaction path calculator
++pip install "aimnet[sella]"           # Sella TS optimizer (includes ASE)
++pip install "aimnet[ase,pysis,sella,train]" # All extras
++```
++
++(The previous `aimnet[ase,pysis,train]` "all extras" line should be replaced with the form above; also add `sella` between `pysis` and `train`.)
++
++- [ ] **Step 6: Build the docs locally to validate the nav**
++
++Run: `mkdocs build --strict 2>&1 | tail -20` Expected: build succeeds with no warnings about missing pages or broken links. If `mkdocs` is not installed, skip this step — CI will catch it.
++
++- [ ] **Step 7: Commit**
++
++```bash
++git add docs/external/sella.md docs/external/index.md docs/index.md mkdocs.yml README.md
++git commit -m "docs(sella): add Sella integration page and navigation"
++```
++
++---
++
++## Self-Review
++
++Spec coverage check:
++
++- ✅ Win 1 — analytic Hessian callback wiring → Task 2 (`get_hessian` on `AIMNet2ASE`).
++- ✅ Win 2 — pin `sella>=2.4.0` and document recommended config → Task 1 (extra), Task 5 (docs).
++- ✅ Smoke test that the wiring is consumed by Sella → Task 3.
++- ✅ Example demonstrating recommended config → Task 4.
++- ✅ Discoverability (nav, install line, README) → Task 5.
++- ✅ Defer-list documented in plan header (vectorize `calculate_hessian`, `inference_mode` wrap, batched many-Sella driver, PBC TS).
++
++Type-consistency check: `get_hessian(atoms=None) -> np.ndarray` of shape `(3N, 3N)` is used identically in Task 2 (definition + tests), Task 3 (Sella callback), Task 4 (example), Task 5 (docs). Method name does not collide with any ASE Calculator base-class method (ASE's base `Calculator` has no `get_hessian`).
++
++No placeholders. No TBDs. All exact paths are real (verified against the working tree at plan-write time).
+diff --git a/docs/superpowers/plans/2026-04-26-vectorize-calculate-hessian.md b/docs/superpowers/plans/2026-04-26-vectorize-calculate-hessian.md
+new file mode 100644
+index 0000000..781e19d
+--- /dev/null
++++ b/docs/superpowers/plans/2026-04-26-vectorize-calculate-hessian.md
+@@ -0,0 +1,120 @@
++# Vectorize AIMNet2Calculator.calculate_hessian
++
++> **Status:** TODO. Blocked on a missing `vmap` batching rule for the custom CUDA kernel `aimnet::conv_sv_2d_sp_bwd_bwd`. Two-PR plan below.
++
++**Goal:** Replace the row-wise Python loop in `AIMNet2Calculator.calculate_hessian` (`aimnet/calculators/calculator.py:1135-1142`) with a vectorized autograd path. The current implementation calls `torch.autograd.grad(...)` `3N` times, dominating Hessian wall-clock for any caller — `AIMNet2ASE.get_hessian`, `AIMNet2Pysis.get_hessian`, and the new Sella analytic-Hessian callback all share this bottleneck.
++
++**Expected speedup:** ~20–25× on caffeine (N=24, GPU). Forces-only call is ~29 ms; current Hessian is ~1193 ms; vectorized would be in the ~50 ms regime.
++
++**Correctness anchor:** `tests/test_calculator.py::test_external_hessian_matches_internal` already compares the internal Hessian against `torch.autograd.functional.hessian` and asserts agreement within `5e-3`. Whatever vectorized rewrite lands must pass this test.
++
++---
++
++## Why it's blocked today
++
++All three vectorization strategies route the second backward through `vmap`:
++
++- `torch.autograd.functional.hessian(energy_fn, coord, vectorize=True)`
++- `torch.autograd.grad(forces, coord, grad_outputs=eye, is_grads_batched=True)`
++- `torch.func.hessian(energy_fn)(coord)` (with `functional_call`)
++
++The AIMNet2 model's AEV layer (`aimnet/modules/aev.py:156`) routes through one of two paths depending on `nbops.get_nb_mode(data)`:
++
++- `mode == 0` (3-D batched, no flattening) — pure `torch.einsum`, supports `vmap`.
++- `mode > 0` (flattened with `nbmat`) — custom CUDA kernel `aimnet::conv_sv_2d_sp_*` from `aimnet/kernels/conv_sv_2d_sp_wp.py`.
++
++The kernel registers `register_autograd` (forward + first/second backward) and `register_fake`, but **does not register a `vmap` batching rule**. Every vectorization path raises:
++
++```
++RuntimeError: Batching rule not implemented for aimnet::conv_sv_2d_sp_bwd_bwd.
++We could not generate a fallback.
++```
++
++The "real" path — the one all `AIMNet2ASE.get_hessian` and `AIMNet2Pysis.get_hessian` callers exercise — is the flattened `nbmat` path. The 3-D einsum path was confirmed to also produce a malformed `(N, 3, 0, 3)` Hessian under `forces=True, hessian=True` due to a separate `mol_flatten` interaction (see the inline comment in `aimnet/calculators/aimnet2ase.py:160-164`), so it is not a viable fallback.
++
++---
++
++## Two-PR plan
++
++### PR 1 — Register `vmap` rule on the custom kernel
++
++**File:** `aimnet/kernels/conv_sv_2d_sp_wp.py`
++
++Use `torch.library.register_vmap` to register a batching rule for `aimnet::conv_sv_2d_sp_bwd_bwd`. The kernel is over a batch of atoms; `vmap` adds an outer dim that maps to the existing leading dim. The rule should:
++
++1. Detect which input has the `vmap` batch dim (typically the gradient probe).
++2. Reshape to fold the vmap dim into the existing batch dim.
++3. Call the underlying kernel.
++4. Reshape the output to restore the vmap dim.
++
++Reference: [PyTorch Custom Operators tutorial — vmap support](https://pytorch.org/tutorials/advanced/python_custom_ops.html#adding-vmap-support-to-an-operator).
++
++**Test gate:** add a unit test in `tests/test_calculator.py` (or a new `tests/test_kernels.py`) that exercises `torch.func.hessian(energy_fn, coord)` on a small molecule (water, 3 atoms — small enough for fast CI on CPU) and asserts the result is finite, shape `(3, 3, 3, 3)`, and within `5e-3` of the loop-based Hessian.
++
++The existing regression at `tests/test_calculator.py:300-318` becomes the integration test for this kernel change — it should keep passing.
++
++### PR 2 — Swap `calculate_hessian` to use vectorized autograd
++
++Once PR 1 lands, replace `aimnet/calculators/calculator.py:1135-1142`:
++
++```python
++@staticmethod
++def calculate_hessian(forces: Tensor, coord: Tensor) -> Tensor:
++    hessian = -torch.stack([
++        torch.autograd.grad(_f, coord, retain_graph=True)[0] for _f in forces.flatten().unbind()
++    ]).view(-1, 3, coord.shape[0], 3)[:-1, :, :-1, :]
++    return hessian
++```
++
++with one of two equivalent forms (benchmark both):
++
++```python
++# Option A: is_grads_batched
++@staticmethod
++def calculate_hessian(forces: Tensor, coord: Tensor) -> Tensor:
++    n = forces.numel()
++    grad_outputs = torch.eye(n, device=forces.device, dtype=forces.dtype)
++    hessian = -torch.autograd.grad(
++        forces.flatten(),
++        coord,
++        grad_outputs=grad_outputs,
++        retain_graph=True,
++        is_grads_batched=True,
++    )[0]
++    # hessian shape: (n, N+1, 3) → reshape, slice off padding rows/cols
++    return hessian.view(-1, 3, coord.shape[0], 3)[:-1, :, :-1, :]
++```
++
++```python
++# Option B: torch.func.hessian over a closure
++# (requires a separate energy_fn closure that re-runs the model — adds a forward,
++# but for N>2 the savings on backward dominate)
++```
++
++**Acceptance**:
++
++- `pytest tests/test_calculator.py::test_external_hessian_matches_internal` — passes (proves correctness vs. analytical reference).
++- `pytest tests/test_calculator.py -k hessian` — passes (broader Hessian suite).
++- `pytest tests/test_ase.py::TestHessian` — passes (ASE wrapper tests).
++- Benchmark on caffeine N=24 GPU: new path measurably faster than old (target ~10× minimum to justify the change).
++
++---
++
++## What this unlocks
++
++- `AIMNet2ASE.get_hessian` becomes ~20× cheaper → analytic-Hessian Sella TS searches become viable for moderate-sized systems (50–100 atoms) on a single GPU.
++- `AIMNet2Pysis.get_hessian` benefits identically → faster IRC, faster pysisyphus TS.
++- The OOM-warning threshold in `AIMNet2ASE.get_hessian` (currently `len(atoms) > 100`) can be revisited — vectorized backward holds less peak memory than the row-wise loop.
++
++## Out of scope
++
++- Changing the public Hessian shape contract. The output is still `(N, 3, N, 3)` Cartesian eV/Å². Wrapper code in `aimnet2ase.py` and `aimnet2pysis.py` stays unchanged.
++- PBC Hessian. Still rejected at the wrapper. Periodic TS belongs to a separate plan.
++- Multi-molecule batched Hessian. Still rejected at `aimnet/calculators/calculator.py:838-839`. Per-system batching is a separate workflow project.
++
++## Related
++
++- Implementation source: `aimnet/calculators/calculator.py:1131-1142`, `aimnet/modules/aev.py:156`, `aimnet/kernels/conv_sv_2d_sp_wp.py`.
++- Callers: `aimnet/calculators/aimnet2ase.py:131-` (`get_hessian`), `aimnet/calculators/aimnet2pysis.py:68-74` (`get_hessian`).
++- Existing regression test: `tests/test_calculator.py:300-318` (`test_external_hessian_matches_internal`).
++- Sibling Sella plan (originating context): `docs/superpowers/plans/2026-04-26-sella-integration.md`.
+diff --git a/examples/sella_ts.py b/examples/sella_ts.py
+new file mode 100644
+index 0000000..c25f9e0
+--- /dev/null
++++ b/examples/sella_ts.py
+@@ -0,0 +1,54 @@
++"""Sella transition-state search using AIMNet2's analytic Hessian.
++
++Demonstrates the recommended configuration for using Sella with AIMNet2:
++- Minimum-mode following on internal coordinates (order=1, internal=True).
++- Analytic Hessian callback via AIMNet2ASE.get_hessian — replaces each
++  Davidson refresh with one analytic Hessian call (O(3N) backward passes
++  per refresh through the AIMNet2 energy graph).
++
++Reference: Yuan et al., Nature Communications 2024
++(https://www.nature.com/articles/s41467-024-52481-5) showed that providing
++analytic ML Hessians to Sella reduces step count by 2-3x.
++
++Requires: pip install "aimnet[sella]"
++"""
++
++from time import perf_counter
++
++import ase.io
++from sella import Sella
++
++from aimnet.calculators import AIMNet2ASE
++
++
++def main(xyz_path: str, fmax: float = 0.01, max_steps: int = 200) -> None:
++    atoms = ase.io.read(xyz_path)
++    atoms.calc = AIMNet2ASE("aimnet2")
++
++    dyn = Sella(
++        atoms,
++        order=1,
++        internal=True,
++        hessian_function=atoms.calc.get_hessian,
++    )
++
++    print(f"Sella TS search for {len(atoms)} atoms; fmax={fmax} eV/A.")
++    t0 = perf_counter()
++    dyn.run(fmax=fmax, steps=max_steps)
++    t1 = perf_counter()
++
++    nsteps = dyn.nsteps
++    print(f"Converged in {nsteps} steps ({t1 - t0:.1f} s, {(t1 - t0) / max(nsteps, 1):.3f} s/step).")
++    print(f"Final energy: {atoms.get_potential_energy():.6f} eV")
++
++    ase.io.write("ts_optimized.xyz", atoms)
++    print("Optimized geometry written to ts_optimized.xyz.")
++
++
++if __name__ == "__main__":
++    import sys
++
++    if len(sys.argv) != 2:
++        print("Usage: python sella_ts.py <ts_guess.xyz>")
++        sys.exit(1)
++    main(sys.argv[1])
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 6ec33ef..9b5924c 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -6,6 +6,13 @@ site_author: Roman Zubatyuk
+ edit_uri: edit/main/docs/
+ repo_name: isayevlab/aimnetcentral
+ 
++# Internal-only plans/specs are kept under docs/superpowers/ but not published.
++# They contain historical implementation context with relative links that
++# are valid relative to other docs but not relative to plans/, so excluding
++# them avoids spurious mkdocs --strict warnings.
++exclude_docs: |
++    superpowers/
++
+ nav:
+     - Home: index.md
+     - Getting Started: getting_started.md
+@@ -37,6 +44,7 @@ nav:
+           - Overview: external/index.md
+           - ASE: external/ase.md
+           - pysisyphus: external/pysis.md
++          - Sella: external/sella.md
+           - OpenMM (openmm-ml): external/openmm.md
+           - AMBER (torchani-amber): external/amber.md
+           - SCM AMS (MLPotential): external/ams.md
+diff --git a/pyproject.toml b/pyproject.toml
+index 3256e7e..5e28c92 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -55,6 +55,12 @@ pysis = [
+     "pysisyphus",
+ ]
+ 
++# Sella saddle-point optimizer integration (requires ASE)
++sella = [
++    "ase>=3.27.0,<4",  # keep in sync with the [ase] extra above
++    "sella>=2.4.0",
++]
++
+ # Training dependencies
+ train = [
+     "omegaconf>=2.3.0",
+@@ -202,6 +208,7 @@ markers = [
+     "hf: marks tests that require Hugging Face extras (deselect with: -m 'not hf')",
+     "network: marks tests that hit external services (deselect with: -m 'not network')",
+     "pysis: marks tests that require PySisyphus (deselect with: -m 'not pysis')",
++    "sella: marks tests that require Sella (deselect with: -m 'not sella')",
+     "train: marks tests that require training dependencies (deselect with: -m 'not train')",
+ ]
+ 
+@@ -224,7 +231,7 @@ exclude_lines = [
+ package_module_name_map = { "pytorch-ignite" = "ignite" }
+ 
+ [tool.deptry.per_rule_ignores]
+-# Optional extras (ase, pysisyphus) — installed via [project.optional-dependencies]; deptry can't see them statically
+-DEP001 = ["ase", "pysisyphus"]
+-DEP003 = ["ase", "pysisyphus"]
+-DEP004 = ["ase", "pysisyphus"]
++# Optional extras (ase, pysisyphus, sella) — installed via [project.optional-dependencies]; deptry can't see them statically
++DEP001 = ["ase", "pysisyphus", "sella"]
++DEP003 = ["ase", "pysisyphus", "sella"]
++DEP004 = ["ase", "pysisyphus", "sella"]
+diff --git a/tests/test_ase.py b/tests/test_ase.py
+index b334ee6..fae6c25 100644
+--- a/tests/test_ase.py
++++ b/tests/test_ase.py
+@@ -440,6 +440,192 @@ def test_robustness_with_tensors_in_info(self):
+         assert atoms.calc.charge == 1.0
+ 
+ 
++class TestHessian:
++    """Hessian property — used by Sella analytic-Hessian callback."""
++
++    def test_hessian_shape_and_finite(self):
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase.io import read
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = read(CAFFEINE_FILE)
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        H = atoms.calc.get_hessian(atoms)
++        N = len(atoms)
++        assert H.shape == (3 * N, 3 * N)
++        assert np.isfinite(H).all()
++
++    def test_hessian_symmetric(self):
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase.io import read
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = read(CAFFEINE_FILE)
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        H = atoms.calc.get_hessian(atoms)
++        # Relative tolerance: small-magnitude entries can be noisier than
++        # large ones in row-wise fp32 autograd. Asymmetry that scales with
++        # |H|_max would still catch a real index transposition bug.
++        assert np.max(np.abs(H - H.T)) / np.max(np.abs(H)) < 1e-3
++
++    def test_hessian_callback_signature(self):
++        """Must be usable as Sella's hessian_function=callable callback."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        callback = atoms.calc.get_hessian
++        assert callable(callback)
++        H = callback(atoms)
++        assert H.shape == (9, 9)
++        assert isinstance(H, np.ndarray)
++
++    def test_hessian_default_atoms(self):
++        """get_hessian() with no argument should use the attached atoms."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        calc = AIMNet2ASE("aimnet2")
++        atoms.calc = calc
++        atoms.get_potential_energy()
++        H = calc.get_hessian()
++        assert H.shape == (9, 9)
++
++    def test_hessian_pbc_raises(self):
++        """PBC input must raise PropertyNotImplementedError (gas-phase only)."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++        from ase.calculators.calculator import PropertyNotImplementedError
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = Atoms(
++            "OH2",
++            positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]],
++            cell=[10.0, 10.0, 10.0],
++            pbc=True,
++        )
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        with pytest.raises(PropertyNotImplementedError, match="periodic"):
++            atoms.calc.get_hessian(atoms)
++
++    def test_hessian_no_atoms_raises(self):
++        """get_hessian() with no attached Atoms and no argument must raise."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase.calculators.calculator import PropertyNotImplementedError
++
++        from aimnet.calculators import AIMNet2ASE
++
++        calc = AIMNet2ASE("aimnet2")
++        # Calc has never been attached to any Atoms — self.atoms is unset.
++        with pytest.raises(PropertyNotImplementedError, match="attached"):
++            calc.get_hessian()
++
++    def test_hessian_species_swap_invalidates_cache(self):
++        """get_hessian() must rebuild _t_numbers when called with different species at same N."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE
++
++        # 3-atom water and 3-atom HCN: same length (3), different elements.
++        water = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        hcn = Atoms("HCN", positions=[[0, 0, 0], [1.06, 0, 0], [2.22, 0, 0]])
++
++        calc = AIMNet2ASE("aimnet2")
++
++        water.calc = calc
++        H_water = calc.get_hessian(water)
++        assert H_water.shape == (9, 9)
++
++        # Pass a DIFFERENT atoms object with same N but different species,
++        # without going through set_atoms — the cache must invalidate.
++        H_hcn = calc.get_hessian(hcn)
++        assert H_hcn.shape == (9, 9)
++
++        # Hessians must differ — if cache was stale, both would be water's.
++        assert not np.allclose(H_water, H_hcn, atol=1e-3)
++
++        # Direct cache probe: _t_numbers must reflect the most recent atoms.
++        cached = calc._t_numbers.detach().cpu().tolist()
++        assert cached == hcn.numbers.tolist()
++
++    def test_hessian_nse_open_shell(self):
++        """NSE (open-shell) Hessian must run on a doublet without exception."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE
++
++        # Methyl radical CH3 — doublet (mult=2).
++        atoms = Atoms(
++            "CH3",
++            positions=[
++                [0.000, 0.000, 0.000],
++                [1.080, 0.000, 0.000],
++                [-0.540, 0.935, 0.000],
++                [-0.540, -0.935, 0.000],
++            ],
++            info={"mult": 2},
++        )
++        atoms.calc = AIMNet2ASE(NSE_MODEL)
++
++        H = atoms.calc.get_hessian(atoms)
++        N = len(atoms)
++        assert H.shape == (3 * N, 3 * N)
++        assert np.isfinite(H).all()
++        # Sanity: doublet Hessian should be symmetric to fp32 noise.
++        assert np.max(np.abs(H - H.T)) / np.max(np.abs(H)) < 1e-3
++
++    def test_hessian_compile_model_raises(self):
++        """compile_model=True must reject the Hessian path with RuntimeError."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE, AIMNet2Calculator
++
++        base = AIMNet2Calculator("aimnet2", compile_model=True)
++        atoms = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        atoms.calc = AIMNet2ASE(base)
++
++        with pytest.raises(RuntimeError, match="compile_model"):
++            atoms.calc.get_hessian(atoms)
++
++    def test_hessian_cpu_device(self):
++        """CPU device must produce a correct-shape Hessian for small molecules.
++
++        Defends the GPU-vs-CPU branch in mol_flatten/calculate_hessian: an
++        earlier bug where (1, N, 3) coord on GPU + N < nb_threshold yielded
++        a degenerate (N, 3, 1, 3) tensor; the 2D-coord workaround in
++        get_hessian must work consistently on CPU as well.
++        """
++        pytest.importorskip("ase", reason="ASE not installed")
++        from ase import Atoms
++
++        from aimnet.calculators import AIMNet2ASE, AIMNet2Calculator
++
++        base = AIMNet2Calculator("aimnet2", device="cpu")
++        atoms = Atoms("OH2", positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++        atoms.calc = AIMNet2ASE(base)
++
++        H = atoms.calc.get_hessian(atoms)
++        assert H.shape == (9, 9)
++        assert np.isfinite(H).all()
++        assert np.max(np.abs(H - H.T)) / np.max(np.abs(H)) < 1e-3
++
++
+ @pytest.mark.ase
+ def test_aimnet2ase_propagates_validate_species(monkeypatch):
+     """AIMNet2ASE.calculate(..., validate_species=False) must propagate the kwarg
+diff --git a/tests/test_sella.py b/tests/test_sella.py
+new file mode 100644
+index 0000000..fff4750
+--- /dev/null
++++ b/tests/test_sella.py
+@@ -0,0 +1,70 @@
++"""Sella saddle-point optimizer smoke tests.
++
++These tests verify that AIMNet2's analytic Hessian (exposed via
++AIMNet2ASE.get_hessian) is callable from Sella's hessian_function= hook.
++They are gated by both the ``sella`` and ``ase`` markers; CI without Sella
++installed will deselect them automatically.
++"""
++
++import numpy as np
++import pytest
++
++pytestmark = [pytest.mark.sella, pytest.mark.ase]
++
++
++def _h2o2_guess():
++    """A trivially perturbed H2O2 starting from a non-stationary geometry."""
++    from ase import Atoms
++
++    return Atoms(
++        "H2O2",
++        positions=[
++            [0.000, 0.700, 0.350],
++            [0.000, -0.700, 0.350],
++            [0.000, 0.700, -0.350],
++            [0.000, -0.700, -0.350],
++        ],
++    )
++
++
++class TestSellaIntegration:
++    def test_callback_consumed_by_sella(self):
++        """Sella(..., hessian_function=callback) must run at least one step."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        sella = pytest.importorskip("sella", reason="Sella not installed")
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = _h2o2_guess()
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        dyn = sella.Sella(
++            atoms,
++            order=0,
++            internal=True,
++            hessian_function=atoms.calc.get_hessian,
++        )
++        # Two steps is enough to prove the Hessian callback is consumed without
++        # error; we are not benchmarking convergence here.
++        dyn.run(fmax=0.05, steps=2)
++
++        # Energy must be finite and forces present afterwards.
++        e = atoms.get_potential_energy()
++        f = atoms.get_forces()
++        assert np.isfinite(e)
++        assert np.isfinite(f).all()
++
++    def test_default_sella_no_hessian_callback(self):
++        """Sella without a Hessian callback must also work via standard ASE."""
++        pytest.importorskip("ase", reason="ASE not installed")
++        sella = pytest.importorskip("sella", reason="Sella not installed")
++
++        from aimnet.calculators import AIMNet2ASE
++
++        atoms = _h2o2_guess()
++        atoms.calc = AIMNet2ASE("aimnet2")
++
++        dyn = sella.Sella(atoms, order=0, internal=True)
++        dyn.run(fmax=0.05, steps=2)
++
++        assert np.isfinite(atoms.get_potential_energy())
+diff --git a/uv.lock b/uv.lock
+index 17ddb96..851dae6 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -36,6 +36,10 @@ hf = [
+ pysis = [
+     { name = "pysisyphus" },
+ ]
++sella = [
++    { name = "ase" },
++    { name = "sella" },
++]
+ train = [
+     { name = "omegaconf" },
+     { name = "pytorch-ignite" },
+@@ -70,6 +74,7 @@ docs = [
+ [package.metadata]
+ requires-dist = [
+     { name = "ase", marker = "extra == 'ase'", specifier = ">=3.27.0,<4" },
++    { name = "ase", marker = "extra == 'sella'", specifier = ">=3.27.0,<4" },
+     { name = "click", specifier = ">=8.1.7" },
+     { name = "h5py", specifier = ">=3.12.1" },
+     { name = "huggingface-hub", marker = "extra == 'hf'", specifier = ">=0.20" },
+@@ -82,11 +87,12 @@ requires-dist = [
+     { name = "pyyaml", specifier = ">=6.0.2" },
+     { name = "requests", specifier = ">=2.32.3" },
+     { name = "safetensors", marker = "extra == 'hf'", specifier = ">=0.4" },
++    { name = "sella", marker = "extra == 'sella'", specifier = ">=2.4.0" },
+     { name = "torch", specifier = ">=2.8" },
+     { name = "wandb", marker = "extra == 'train'", specifier = ">=0.18.5" },
+     { name = "warp-lang", specifier = ">=1.11,<2" },
+ ]
+-provides-extras = ["ase", "hf", "pysis", "train"]
++provides-extras = ["ase", "hf", "pysis", "sella", "train"]
+ 
+ [package.metadata.requires-dev]
+ dev = [
+@@ -3132,6 +3138,29 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/64/47/a494741db7280eae6dc033510c319e34d42dd41b7ac0c7ead39354d1a2b5/scipy-1.16.3-cp314-cp314t-win_arm64.whl", hash = "sha256:21d9d6b197227a12dcbf9633320a4e34c6b0e51c57268df255a0942983bac562", size = 26464127, upload-time = "2025-10-28T17:38:11.34Z" },
+ ]
+ 
++[[package]]
++name = "sella"
++version = "2.4.2"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "ase" },
++    { name = "jax", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
++    { name = "jax", version = "0.7.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
++    { name = "jaxlib", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
++    { name = "jaxlib", version = "0.7.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
++    { name = "numpy" },
++    { name = "scipy" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/4d/e2/c82dd6920575b09072313b842a48fe992c2682edf375a2b6fe3934ed23e0/sella-2.4.2.tar.gz", hash = "sha256:ac930b2b8e670d161c3d3202ea43ce5427c94591b17191058f18892c70a7a0a4", size = 73052, upload-time = "2026-03-28T17:27:54.128Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e1/d6/24efe73fcbdf2a41f1bcc7775bf28a4da5cf5827f99ae5c69a1553576127/sella-2.4.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:537489aa91b843e51e6e7d36b4633d52423b02bad425a6fbb7c038732cc25483", size = 290021, upload-time = "2026-03-28T17:27:39.545Z" },
++    { url = "https://files.pythonhosted.org/packages/7b/90/fc8381928ce52d2e1e5870ee13a6a37e22de76f026d48bea6bba50ed2499/sella-2.4.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ace0c67dd55e9318d10ccd0ee00d54257cdd91b29bd0c19be5e4f68fc52156df", size = 1688054, upload-time = "2026-03-28T17:27:40.819Z" },
++    { url = "https://files.pythonhosted.org/packages/f2/ec/8983d708abef6af8efa0b26f2a2b2752346feb92f28336af70312f3773de/sella-2.4.2-cp311-cp311-win_amd64.whl", hash = "sha256:a94c77655354aabbbee46eb64d5d0085fcec4e75f731f856cdd5e1a106375dcf", size = 283980, upload-time = "2026-03-28T17:27:41.843Z" },
++    { url = "https://files.pythonhosted.org/packages/81/dc/1c1dfc5db7d9aff9722ecf54839a69c676632fbf95517a273160dca15bd8/sella-2.4.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:fcea640a9511c3cfcb19b02d087bb000c755f02fd7d0ce89edb0ebb5df64d92d", size = 289170, upload-time = "2026-03-28T17:27:42.882Z" },
++    { url = "https://files.pythonhosted.org/packages/06/72/1bb0dba4926d197a4631e862dd531ff17ec38d36d3bb0e7a948bb005e468/sella-2.4.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3cd0198b3ed9a3b0770dd4597c1cb41f24c0a58f1b70cda04423c4238e524cf3", size = 1667304, upload-time = "2026-03-28T17:27:44.423Z" },
++    { url = "https://files.pythonhosted.org/packages/ab/2d/41a5e1f7db301f37d699b263874982dc6669cb5bc167bc03f5e4316fd869/sella-2.4.2-cp312-cp312-win_amd64.whl", hash = "sha256:b87cb366c63f2a6319a01e52ce761249e3f45783f5e7848a654b86b37a415651", size = 283912, upload-time = "2026-03-28T17:27:45.496Z" },
++]
++
+ [[package]]
+ name = "sentry-sdk"
+ version = "2.47.0"

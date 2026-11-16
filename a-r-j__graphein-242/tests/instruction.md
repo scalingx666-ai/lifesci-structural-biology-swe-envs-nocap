@@ -1,0 +1,40 @@
+# Issue
+
+**Title:** control protein graph construction verbosity
+
+## Description
+
+#### Reference Issues/PRs
+<!--
+
+-->
+
+#### What does this implement/fix? Explain your changes
+
+Adds verbosity control to the protein graph construction. The drawback is that this solution still involves the creation of a Progress context even if no progress is shown. However, this overhead is minimal and obviates the need for try/catch/finally if using Progress non-contextually or shallow wrappers in construct_graph.
+
+#### What testing did you do to verify the changes in this PR?
+Passes the included tests. 
+
+#### Pull Request Checklist
+
+<!--
+Please fill out the following checklist if applicable. For more more information and help, please see the Contributor Documentation avaialable at https://graphein.ai/contributing/contributing.html.
+-->
+
+- [x] Added a note about the modification or contribution to the `./CHANGELOG.md` file (if applicable)
+- [x] Added appropriate unit test functions in the `./graphein/tests/*` directories (if applicable)
+- [x] Modify documentation in the corresponding Jupyter Notebook under `./notebooks/` (if applicable)
+- [x] Ran `python -m py.test tests/` and make sure that all unit tests pass (for small modifications, it might be sufficient to only run the specific test file, e.g., `python -m py.test tests/protein/test_graphs.py`)
+- [x ] Checked for style issues by running `black .` and `isort .`
+
+
+<!--
+We value all user contributions, no matter how minor they are.
+
+Thanks for contributing!
+-->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `5118331c8b70`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,463 @@
+diff --git a/mdagent/mainagent/agent.py b/mdagent/mainagent/agent.py
+index 07884769..0e20df8c 100644
+--- a/mdagent/mainagent/agent.py
++++ b/mdagent/mainagent/agent.py
+@@ -1,49 +1,45 @@
+ from dotenv import load_dotenv
+-from langchain.agents import AgentExecutor, AgentType, initialize_agent
+-from langchain.agents.format_scratchpad import format_to_openai_function_messages
+-from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
+-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+-from langchain.tools.render import format_tool_to_openai_function
++from langchain.agents import AgentExecutor, OpenAIFunctionsAgent
++from langchain.agents.structured_chat.base import StructuredChatAgent
++from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
++from langchain.chat_models import ChatOpenAI
+ 
+ from mdagent.subagents import SubAgentSettings
+ from mdagent.utils import PathRegistry, _make_llm
+ 
+ from ..tools import make_all_tools
+-from .prompt import (
+-    FORMAT_INSTRUCTIONS,
+-    FORMAT_INSTRUCTIONS_FUNC,
+-    PREFIX,
+-    QUESTION_PROMPT,
+-    QUESTION_PROMPT_FUNC,
+-    SUFFIX,
+-)
++from .prompt import openaifxn_prompt, structured_prompt
+ 
+ load_dotenv()
+ 
+ 
+-main_prompt = PromptTemplate(
+-    input_variables=["input"],
+-    template="""
+-    You are an expert molecular dynamics scientist and your
+-    task is to respond to the question or
+-    solve the problem to the best of your ability using
+-    the provided tools. Once you map a path to a short name,
+-    you may only use that short name in future actions.
+-    Here is the input:
+-    input: {input}
+-    """,
+-)
++class AgentType:
++    valid_models = {
++        "Structured": StructuredChatAgent,
++        "OpenAIFunctionsAgent": OpenAIFunctionsAgent,
++    }
++
++    @classmethod
++    def get_agent(cls, model_name: str = "OpenAIFunctionsAgent"):
++        try:
++            agent = cls.valid_models[model_name]
++            return agent
++        except KeyError:
++            raise ValueError(
++                f"""Invalid agent type: {model_name}
++                Please choose from {cls.valid_models.keys()}"""
++            )
+ 
+ 
+ class MDAgent:
+     def __init__(
+         self,
+         tools=None,
++        agent_type="OpenAIFunctionsAgent",  # this can also be strucured_chat
+         model="gpt-4-1106-preview",  # current name for gpt-4 turbo
+         tools_model="gpt-4-1106-preview",
+         temp=0.1,
+         max_iterations=40,
+-        api_key=None,
+         verbose=True,
+         path_registry=None,
+         subagents_model="gpt-4-1106-preview",
+@@ -51,95 +47,42 @@ def __init__(
+         resume=False,
+         top_k_tools=10,
+         use_human_tool=False,
+-        type="functions",
+     ):
+-        self.type = type
++        if path_registry is None:
++            path_registry = PathRegistry.get_instance()
+         if tools is None:
+             tools_llm = _make_llm(tools_model, temp, verbose)
+-            tools = make_all_tools(tools_llm)
++            tools = make_all_tools(tools_llm, human=use_human_tool)
+ 
+-        if self.type == "functions":
+-            self.llm = _make_llm("gpt-4-1106-preview", temp, verbose)
+-            prompt = ChatPromptTemplate.from_messages(
+-                [
+-                    ("system", "\n\n".join([PREFIX, FORMAT_INSTRUCTIONS_FUNC])),
+-                    ("user", QUESTION_PROMPT_FUNC),
+-                    MessagesPlaceholder(variable_name="agent_scratchpad"),
+-                ]
+-            )
+-            llm_with_tools = self.llm.bind(
+-                functions=[format_tool_to_openai_function(t) for t in tools]
+-            )
+-            agent = (
+-                {
+-                    "input": lambda x: x["input"],
+-                    "agent_scratchpad": lambda x: format_to_openai_function_messages(
+-                        x["intermediate_steps"]
+-                    ),
+-                }
+-                | prompt
+-                | llm_with_tools
+-                | OpenAIFunctionsAgentOutputParser()
+-            )
+-
+-            self.agent_executor = AgentExecutor(
+-                agent=agent,
+-                tools=tools,
+-                handle_parsing_errors=True,
+-                max_iterations=40,
+-                return_intermediate_steps=True,
+-                verbose=True,
+-            )
+-        elif type == "structured" or type == "mrkl":
+-            # Initialize agent
+-            self.llm = _make_llm(model, temp, verbose)
+-            self.agent_executor = initialize_agent(
+-                tools,
+-                self.llm,
+-                agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+-                suffix=SUFFIX,
+-                format_instructions=FORMAT_INSTRUCTIONS,
+-                question_prompt=QUESTION_PROMPT,
+-                return_intermediate_steps=True,
+-                max_iterations=max_iterations,
+-                handle_parsing_errors=True,
+-            )
++        self.llm = ChatOpenAI(
++            temperature=temp,
++            model=model,
++            client=None,
++            streaming=True,
++            callbacks=[StreamingStdOutCallbackHandler()],
++        )
++        self.agent = AgentExecutor.from_agent_and_tools(
++            tools=tools,
++            agent=AgentType.get_agent(agent_type).from_llm_and_tools(self.llm, tools),
++            handle_parsing_errors=True,
++        )
++        # assign prompt
++        if agent_type == "Structured":
++            self.prompt = structured_prompt
++        elif agent_type == "OpenAIFunctionsAgent":
++            self.prompt = openaifxn_prompt
+ 
+-        self.llm = _make_llm(model, temp, verbose)
+-        self.tools_llm = _make_llm(tools_model, temp, verbose)
+-        self.tools = tools
+-        self.top_k_tools = top_k_tools
+-        self.ckpt_dir = ckpt_dir
+-        self.human = use_human_tool
+-        if path_registry is None:
+-            path_registry = PathRegistry.get_instance()
+         self.subagents_settings = SubAgentSettings(
+             path_registry=path_registry,
+             subagents_model=subagents_model,
+             temp=temp,
+             max_iterations=max_iterations,
+-            api_key=api_key,
+             verbose=verbose,
+             ckpt_dir=ckpt_dir,
+             resume=resume,
+             retrieval_top_k=top_k_tools,
+         )
+ 
+-    def run(self, prompt):
+-        outputs = self.agent_executor({"input": prompt})
+-        # Parse long output (with intermediate steps)
+-        intermed = outputs["intermediate_steps"]
+-
+-        final = ""
+-        if self.type == "mrkl":
+-            for step in intermed:
+-                final += f"Thought: {step[0].log}\n" f"Observation: {step[1]}\n"
+-            final += f"Final Answer: {outputs['output']}"
+-
+-            return final
+-        if self.type == "functions":
+-            for step in intermed:
+-                final += f"{step[0].log}\n" + f"Observation: {step[1]}\n"
+-            final += f"Final Answer: {outputs['output']}"
+-
+-            return final
++    def run(self, user_input, callbacks=None):
++        # todo: check this for both agent types
++        return self.agent.run(self.prompt.format(input=user_input), callbacks=callbacks)
+diff --git a/mdagent/mainagent/prompt.py b/mdagent/mainagent/prompt.py
+index e0e03631..5cdbc107 100644
+--- a/mdagent/mainagent/prompt.py
++++ b/mdagent/mainagent/prompt.py
+@@ -1,72 +1,51 @@
+-# flake8: noqa
+-PREFIX = """
+-You are an expert molecular dynamics scientist and your task is to respond to the question or
+-solve the problem to the best of your ability using the provided tools.
+-"""
+-
+-
+-FORMAT_INSTRUCTIONS = """
+-You can only respond with a single complete
+-"Thought, Action, Action Input" format
+-OR a single "Final Answer" format.
+-
+-Complete format:
+-
+-Thought: (reflect on your progress and decide what to do next)
+-Action: (the action name, should be one of [{tool_names}])
+-Action Input: (the input string to the action)
+-
+-OR
+-
+-Final Answer: (the final answer to the original input question)
+-"""
+-
+-QUESTION_PROMPT = """
+-Answer the question below using the following tools:
+-
+-{tool_strings}
+-
+-Use the tools provided, using the most specific tool available for each action.
+-Once you map a path to a short name, you may only use that short name in future actions.
+-Your final answer should contain all information necessary to answer the question and subquestions.
+-Your thought process should be clean and clear, and you must explicitly state the actions you are taking.
+-Question: {input}
+-"""
+-
+-SUFFIX = """
+-Thought: {agent_scratchpad}
+-"""
+-FINAL_ANSWER_ACTION = "Final Answer:"
+-
+-###################==============OpenAIFunctions Prompts================####################
+-
+-FORMAT_INSTRUCTIONS_FUNC = """
+-You can only act with an action, final answer or a
+-reflexive thought that will help you make move towards the final answer.
+-Complete format:
+-
+-Action: (the action name, should be one of tools available)
+-Action Input: (the input string to the action)
+-
+-OR
+-Thought:
+-
+-OR
+-
+-Final Answer: (the final answer to the original input question)
+-"""
+-
+-QUESTION_PROMPT_FUNC = """
+-Answer the question below.
+-
+-Use the tools provided, using the most specific tool available for each action.
+-Once you map a path to a short name, you may only use that short name in future actions.
+-Your final answer should contain all information necessary to answer the question and subquestions.
+-
+-Question: {input}
+-"""
+-
+-
+-SUFFIX = """
+-Thought: {agent_scratchpad}
+-"""
++from langchain.prompts import PromptTemplate
++
++structured_prompt = PromptTemplate(
++    input_variables=["input"],
++    template="""
++    You are an expert molecular dynamics scientist and
++    your task is to respond to the question or
++    solve the problem to the best of your ability using
++    the provided tools.
++
++    You can only respond with a single complete
++    "Thought, Action, Action Input" format
++    OR a single "Final Answer" format.
++
++    Complete format:
++
++    Thought: (reflect on your progress and decide what
++    to do next)
++    Action: (the action name, should be the name of a tool)
++    Action Input: (the input string to the action)
++
++    OR
++
++    Final Answer: (the final answer to the original input
++    question)
++
++    Use the tools provided, using the most specific tool
++    available for each action.
++    Once you map a path to a short name, you may only use
++    that short name in future actions.
++    Your final answer should contain all information
++    necessary to answer the question and subquestions.
++    Your thought process should be clean and clear,
++    and you must explicitly state the actions you are taking.
++    Question: {input}
++    """,
++)
++
++
++openaifxn_prompt = PromptTemplate(
++    input_variables=["input"],
++    template="""
++    You are an expert molecular dynamics scientist and your
++    task is to respond to the question or
++    solve the problem to the best of your ability using
++    the provided tools. Once you map a path to a short name,
++    you may only use that short name in future actions.
++    Here is the input:
++    input: {input}
++    """,
++)
+diff --git a/mdagent/subagents/subagent_setup.py b/mdagent/subagents/subagent_setup.py
+index 1760a532..1da9ebeb 100644
+--- a/mdagent/subagents/subagent_setup.py
++++ b/mdagent/subagents/subagent_setup.py
+@@ -11,7 +11,6 @@ def __init__(
+         subagents_model="gpt-3.5-turbo",
+         temp=0.1,
+         max_iterations=40,
+-        api_key=None,
+         verbose=True,
+         ckpt_dir="ckpt",
+         resume=False,
+@@ -21,7 +20,6 @@ def __init__(
+         self.subagents_model = subagents_model
+         self.temp = temp
+         self.max_iterations = max_iterations
+-        self.api_key = api_key
+         self.verbose = verbose
+         self.ckpt_dir = ckpt_dir
+         self.resume = resume
+@@ -38,7 +36,6 @@ def __init__(self, settings: Optional[SubAgentSettings] = None):
+         self.subagents_model = settings.subagents_model
+         self.temp = settings.temp
+         self.max_iterations = settings.max_iterations
+-        self.api_key = settings.api_key
+         self.verbose = settings.verbose
+         self.ckpt_dir = settings.ckpt_dir
+         self.resume = settings.resume
+diff --git a/mypy.ini b/mypy.ini
+deleted file mode 100644
+index 4dbad4e8..00000000
+--- a/mypy.ini
++++ /dev/null
+@@ -1,106 +0,0 @@
+-# mypy.ini
+-# This configuration file is for mypy, a static type checker for Python.
+-
+-[mypy]
+-python_version = 3.10
+-
+-# The following sections tell mypy to ignore missing imports for certain libraries.
+-# If a library doesn't have type hints (or "stub files"), mypy can't check the types
+-# of any objects that come from that library. By ignoring missing imports, we can
+-# prevent mypy from raising an error in this case.
+-
+-# Note that this means mypy won't be able to check the types of any objects that come
+-# from these libraries, so we're losing some of the benefits of static typing for those
+-# parts of our code. We should only add these settings for libraries that we're certain
+-# don't have type hints or stub files.
+-
+-[mypy-ast.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from chromadb
+-[mypy-Chroma.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from dotenv
+-[mypy-dotenv.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from langchain
+-[mypy-langchain.*]
+-ignore_missing_imports = True
+-[mypy-langchain_experimental.*]
+-ignore_missing_imports = True
+-
+-# ignore missing imports from matplotlib
+-[mypy-matplotlib.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from mdanalysis
+-[mypy-MDAnalysis.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from nbformat
+-[mypy-nbformat.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from numpy
+-[mypy-numpy.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from openmm
+-[mypy-openmm.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from paperqa & pqapi
+-[mypy-paperqa.*]
+-ignore_missing_imports = True
+-[mypy-pqapi.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from paperscraper
+-[mypy-paperscraper.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from pdbfixer
+-[mypy-pdbfixer.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from pypdf.errors
+-[mypy-pypdf.*]
+-ignore_missing_imports = True
+-
+-#Ignore missing imports from pydantic
+-[mypy-pydantic.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from pytest
+-[mypy-pytest.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from requests
+-[mypy-requests.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from rmrkl
+-[mypy-rmrkl.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from serpapi
+-[mypy-serpapi.*]
+-ignore_missing_imports = True
+-
+-# Ignore missing imports from setuptools
+-[mypy-setuptools.*]
+-ignore_missing_imports = True
+-
+-#Ignore missing imports from subprocess
+-[mypy-subprocess.*]
+-ignore_missing_imports = True
+-
+- # Ignore missing imports from tiktoken
+-[mypy-tiktoken.*]
+-ignore_missing_imports = True
+-
+-#Ignore missing imports from typing
+-[mypy-typing.*]
+-ignore_missing_imports = True

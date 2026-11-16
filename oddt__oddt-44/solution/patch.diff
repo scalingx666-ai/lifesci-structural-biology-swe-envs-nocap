@@ -1,0 +1,939 @@
+diff --git a/oddt/docking/AutodockVina.py b/oddt/docking/AutodockVina.py
+index 84f059f3..5291d15c 100644
+--- a/oddt/docking/AutodockVina.py
++++ b/oddt/docking/AutodockVina.py
+@@ -1,11 +1,14 @@
+ from tempfile import mkdtemp
+ from shutil import rmtree
+ import sys
+-import six
++from six import next
+ import subprocess
+ import numpy as np
+ import re
+-from oddt import toolkit
++import os
++
++import oddt
++from oddt.spatial import rmsd
+ 
+ 
+ class autodock_vina(object):
+@@ -77,7 +80,7 @@ def __init__(self,
+         if auto_ligand:
+             if type(auto_ligand) is str:
+                 extension = auto_ligand.split('.')[-1]
+-                auto_ligand = six.next(toolkit.readfile(extension, auto_ligand))
++                auto_ligand = next(oddt.toolkit.readfile(extension, auto_ligand))
+             self.center = tuple(np.array([atom.coords for atom in auto_ligand],
+                                          dtype=np.float32).mean(axis=0))
+         # autodetect Vina executable
+@@ -145,38 +148,22 @@ def set_protein(self, protein):
+         # generate new directory
+         self._tmp_dir = None
+         if protein:
+-            self.protein = protein
+             if type(protein) is str:
+                 extension = protein.split('.')[-1]
+                 if extension == 'pdbqt':
+                     self.protein_file = protein
+-                    self.protein = six.next(toolkit.readfile(extension, protein))
++                    self.protein = next(oddt.toolkit.readfile(extension, protein))
+                     self.protein.protein = True
+                 else:
+-                    self.protein = six.next(toolkit.readfile(extension, protein))
++                    self.protein = next(oddt.toolkit.readfile(extension, protein))
+                     self.protein.protein = True
+-                    self.protein_file = self.tmp_dir + '/protein.pdbqt'
+-                    # remove OB 2.3 ROOT/ENDROOT tags
+-                    with open(self.protein_file, 'w') as f:
+-                        for line in self.protein.write('pdbqt', opt={'r': None, 'c': None}, overwrite=True).split('\n'):
+-                            if line in ['ROOT', 'ENDROOT']:
+-                                continue
+-                            elif line[:7] == 'TORSDOF':
+-                                f.write('TER\n')
+-                            else:
+-                                f.write(line + '\n')
+             else:
+-                # write protein to file
+-                self.protein_file = self.tmp_dir + '/protein.pdbqt'
+-                # remove OB 2.3 ROOT/ENDROOT tags
+-                with open(self.protein_file, 'w') as f:
+-                    for line in self.protein.write('pdbqt', opt={'r': None, 'c': None}, overwrite=True).split('\n'):
+-                        if line in ['ROOT', 'ENDROOT']:
+-                            continue
+-                        elif line[:7] == 'TORSDOF':
+-                            f.write('TER\n')
+-                        else:
+-                            f.write(line + '\n')
++                self.protein = protein
++
++            # skip writing if we have PDBQT protein
++            if self.protein_file is None:
++                self.protein_file = write_vina_pdbqt(self.protein, self.tmp_dir,
++                                                     flexible=False)
+ 
+     def score(self, ligands, protein=None, single=False):
+         """Automated scoring procedure.
+@@ -208,23 +195,20 @@ def score(self, ligands, protein=None, single=False):
+         ligand_dir = mkdtemp(dir=self.tmp_dir, prefix='ligands_')
+         output_array = []
+         for n, ligand in enumerate(ligands):
+-            # write ligand to file
+-            ligand_file = ligand_dir + '/' + str(n) + '_' + re.sub('[^A-Za-z0-9]+', '_', ligand.title) + '.pdbqt'
+-            ligand.write('pdbqt', ligand_file, overwrite=True, opt={'b': None})
++            ligand_file = write_vina_pdbqt(ligand, ligand_dir, name_id=n)
+             try:
+-                scores = parse_vina_scoring_output(subprocess.check_output([self.executable,
+-                                                                            '--score_only',
+-                                                                            '--receptor',
+-                                                                            self.protein_file,
+-                                                                            '--ligand',
+-                                                                            ligand_file] + self.params,
+-                                                                           stderr=subprocess.STDOUT))
++                scores = parse_vina_scoring_output(
++                    subprocess.check_output([self.executable, '--score_only',
++                                             '--receptor', self.protein_file,
++                                             '--ligand', ligand_file] + self.params,
++                                            stderr=subprocess.STDOUT))
+             except subprocess.CalledProcessError as e:
+-                sys.stderr.write(e.output)
++                sys.stderr.write(e.output.decode('ascii'))
+                 if self.skip_bad_mols:
+                     continue
+                 else:
+-                    raise Exception('Autodock Vina failed. Command: "%s"' % ' '.join(e.cmd))
++                    raise Exception('Autodock Vina failed. Command: "%s"' %
++                                    ' '.join(e.cmd))
+             ligand.data.update(scores)
+             output_array.append(ligand)
+         rmtree(ligand_dir)
+@@ -260,31 +244,61 @@ def dock(self, ligands, protein=None, single=False):
+         ligand_dir = mkdtemp(dir=self.tmp_dir, prefix='ligands_')
+         output_array = []
+         for n, ligand in enumerate(ligands):
+-            # write ligand to file
+-            ligand_file = ligand_dir + '/' + str(n) + '_' + re.sub('[^A-Za-z0-9]+', '_', ligand.title) + '.pdbqt'
+-            ligand_outfile = ligand_dir + '/' + str(n) + '_' + re.sub('[^A-Za-z0-9]+', '_', ligand.title) + '_out.pdbqt'
+-            ligand.write('pdbqt', ligand_file, overwrite=True, opt={'b': None})
++            ligand_file = write_vina_pdbqt(ligand, ligand_dir, name_id=n)
++            ligand_outfile = ligand_file[:-6] + '_out.pdbqt'
+             try:
+-                vina = parse_vina_docking_output(subprocess.check_output([self.executable,
+-                                                                          '--receptor',
+-                                                                          self.protein_file,
+-                                                                          '--ligand', ligand_file,
+-                                                                          '--out', ligand_outfile] + self.params,
+-                                                                         stderr=subprocess.STDOUT))
++                scores = parse_vina_docking_output(
++                    subprocess.check_output([self.executable, '--receptor',
++                                             self.protein_file,
++                                             '--ligand', ligand_file,
++                                             '--out', ligand_outfile] + self.params,
++                                            stderr=subprocess.STDOUT))
+             except subprocess.CalledProcessError as e:
+                 sys.stderr.write(e.output.decode('ascii'))
+                 if self.skip_bad_mols:
+-                    continue
++                    continue  # TODO: print some warning message
++                else:
++                    raise Exception('Autodock Vina failed. Command: "%s"' %
++                                    ' '.join(e.cmd))
++
++            # docked conformations may have wrong connectivity - use source ligand
++            if (hasattr(oddt.toolkits, 'ob') and
++                    isinstance(ligand, oddt.toolkits.ob.Molecule)):
++                if oddt.toolkits.ob.__version__ >= '2.4.0':
++                    # find the order of PDBQT atoms assigned by OpenBabel
++                    with open(ligand_file) as f:
++                        write_order = [int(line[7:12].strip())
++                                       for line in f
++                                       if line[:4] == 'ATOM']
++                    new_order = sorted(range(len(write_order)),
++                                       key=write_order.__getitem__)
++                    new_order = [i + 1 for i in new_order]  # OBMol has 1 based idx
++
++                    assert len(new_order) == len(ligand.atoms)
+                 else:
+-                    raise Exception('Autodock Vina failed. Command: "%s"' % ' '.join(e.cmd))
+-            # HACK # overcome connectivity problems in obabel
+-            source_ligand = six.next(toolkit.readfile('pdbqt', ligand_file))
+-            del source_ligand.data['REMARK']
+-            for lig, scores in zip([lig for lig in toolkit.readfile('pdbqt', ligand_outfile, opt={'b': None})], vina):
+-                # HACK # copy data from source
+-                clone = source_ligand.clone
+-                clone.clone_coords(lig)
+-                clone.data.update(scores)
++                    # Openbabel 2.3.2 does not support perserving atom order.
++                    # We read back the PDBQT ligand to get "correct" bonding.
++                    ligand = next(oddt.toolkit.readfile('pdbqt', ligand_file))
++                    if 'REMARK' in ligand.data:
++                        del ligand.data['REMARK']
++
++            docked_ligands = oddt.toolkit.readfile('pdbqt', ligand_outfile)
++            for docked_ligand, score in zip(docked_ligands, scores):
++                # Renumber atoms to match the input ligand
++                if (hasattr(oddt.toolkits, 'ob') and
++                        isinstance(docked_ligand, oddt.toolkits.ob.Molecule) and
++                        oddt.toolkits.ob.__version__ >= '2.4.0'):
++                    docked_ligand.OBMol.RenumberAtoms(new_order)
++                # HACK: copy docked coordinates onto source ligand
++                # We assume that the order of atoms match between ligands
++                clone = ligand.clone
++                clone.clone_coords(docked_ligand)
++                clone.data.update(score)
++
++                # Calculate RMSD to the input pose
++                clone.data['vina_rmsd_input'] = rmsd(ligand, clone)
++                clone.data['vina_rmsd_input_min'] = rmsd(ligand, clone,
++                                                         method='min_symmetry')
+                 output_array.append(clone)
+         rmtree(ligand_dir)
+         return output_array
+@@ -324,6 +338,52 @@ def predict_ligands(self, ligands):
+         return self.score(ligands)
+ 
+ 
++def write_vina_pdbqt(mol, directory, flexible=True, name_id=None):
++    """Write single PDBQT molecule to a given directory. For proteins use
++    `flexible=False` to avoid encoding torsions. Additionally an name ID can
++    be appended to a name to avoid conflicts.
++    """
++    if name_id is None:
++        name_id = ''
++
++    # We expect name such as 0_ZINC123456.pdbqt or simply ZINC123456.pdbqt if no
++    # name_id is specified. All non alpha-numeric signs are replaced with underscore.
++    mol_file = ('_'.join(filter(None, [str(name_id),
++                                       re.sub('[^A-Za-z0-9]+', '_', mol.title)]
++                                )) + '.pdbqt')
++    # prepend path to filename
++    mol_file = os.path.join(directory, mol_file)
++
++    if (hasattr(oddt.toolkits, 'ob') and
++            isinstance(mol, oddt.toolkits.ob.Molecule)):
++        if flexible:
++            # auto bonding (b), perserve atom names (n) indices (p) and Hs (h)
++            kwargs = {'opt': {'b': None, 'p': None, 'h': None, 'n': None}}
++        else:
++            # for proteins write rigid mol (r) and combine all frags in one (c)
++            kwargs = {'opt': {'r': None, 'c': None, 'h': None}}
++
++    else:
++        kwargs = {'flexible': flexible}
++
++    # HACK: fix OB 2.3.2 PDBQT bugs
++    if (not flexible and hasattr(oddt.toolkits, 'ob') and
++            oddt.toolkits.ob.__version__ < '2.4.0' and
++            isinstance(mol, oddt.toolkits.ob.Molecule)):
++        with open(mol_file, 'w') as f:
++            for line in mol.write('pdbqt', overwrite=True, **kwargs).split('\n'):
++                # remove OB 2.3 ROOT/ENDROOT tags
++                if line in ['ROOT', 'ENDROOT']:
++                    continue
++                elif line[:7] == 'TORSDOF':
++                    f.write('TER\n')
++                else:
++                    f.write(line + '\n')
++    else:
++        mol.write('pdbqt', mol_file, overwrite=True, **kwargs)
++    return mol_file
++
++
+ def parse_vina_scoring_output(output):
+     """Function parsing Autodock Vina scoring output to a dictionary
+ 
+diff --git a/oddt/toolkits/extras/rdkit.py b/oddt/toolkits/extras/rdkit.py
+index 616a1134..236bdc51 100644
+--- a/oddt/toolkits/extras/rdkit.py
++++ b/oddt/toolkits/extras/rdkit.py
+@@ -1,5 +1,8 @@
+ from __future__ import absolute_import, print_function
++from math import isnan, isinf
++
+ from rdkit import Chem
++from rdkit.Chem import AllChem
+ 
+ _metals = (3, 4, 11, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+            30, 31, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+@@ -156,10 +159,310 @@ def _atom_matches_smarts(atom, smarts):
+ def _amide_bond(bond):
+     a1 = bond.GetBeginAtom()
+     a2 = bond.GetEndAtom()
+-    if a1.GetAtomicNum() == 6 and a2.GetAtomicNum() == 7 or a2.GetAtomicNum() == 6 and a1.GetAtomicNum() == 7:
++    if (a1.GetAtomicNum() == 6 and a2.GetAtomicNum() == 7 or
++            a2.GetAtomicNum() == 6 and a1.GetAtomicNum() == 7):
+         # https://github.com/rdkit/rdkit/blob/master/Data/FragmentDescriptors.csv
+         patt = Chem.MolFromSmarts('C(=O)-N')
+         for m in bond.GetOwningMol().GetSubstructMatches(patt):
+             if a1.GetIdx() in m and a2.GetIdx() in m:
+                 return True
+     return False
++
++
++def MolFromPDBQTBlock(block, sanitize=True, removeHs=True):
++    """Read PDBQT block to a RDKit Molecule
++
++    Parameters
++    ----------
++        block: string
++            Residue name which explicitly pint to a ligand(s).
++        sanitize: bool (default=True)
++            Should the sanitization be performed
++        removeHs: bool (default=True)
++            Should hydrogens be removed when reading molecule.
++
++    Returns
++    -------
++        mol: rdkit.Chem.rdchem.Mol
++            Molecule read from PDBQT
++    """
++    pdb_lines = []
++    name = ''
++    data = {}
++    for line in block.split('\n'):
++        # Get all know data from REMARK section
++        if line[:12] == 'REMARK  Name':
++            name = line[15:].strip()
++        elif line[:18] == 'REMARK VINA RESULT':
++            tmp = line[19:].split()
++            data['vina_affinity'] = tmp[0]
++            data['vina_rmsd_lb'] = tmp[1]
++            data['vina_rmsd_ub'] = tmp[2]
++
++        # no more data to collect
++        if line[:4] != 'ATOM':
++            continue
++
++        pdb_line = line[:56]
++        pdb_line += '1.00  0.00           '
++
++        # Do proper atom type lookup
++        atom_type = line[71:].split()[1]
++        if atom_type == 'A':
++            atom_type = 'C'
++        elif atom_type[:1] == 'O':
++            atom_type = 'O'
++        elif atom_type[:1] == 'H':
++            atom_type = 'H'
++            if removeHs:
++                continue
++        elif atom_type == 'NA':
++            atom_type = 'N'
++
++        pdb_lines.append(pdb_line + atom_type)
++    mol = Chem.MolFromPDBBlock('\n'.join(pdb_lines), sanitize=False)
++    mol.SetProp('_Name', name)
++    for k, v in data.items():
++        mol.SetProp(str(k), str(v))
++    if sanitize:
++        Chem.SanitizeMol(mol)
++
++    # reorder atoms using serial
++    if not sanitize:
++        Chem.GetSSSR(mol)
++    new_order = sorted(range(mol.GetNumAtoms()),
++                       key=lambda i: (mol.GetAtomWithIdx(i)
++                                      .GetPDBResidueInfo()
++                                      .GetSerialNumber()))
++    mol = Chem.RenumberAtoms(mol, new_order)
++
++    return mol
++
++
++def PDBQTAtomLines(mol, donors, acceptors):
++    """Create a list with PDBQT atom lines for each atom in molecule. Donors
++    and acceptors are given as a list of atom indices.
++    """
++
++    atom_lines = [line.replace('HETATM', 'ATOM  ')
++                  for line in Chem.MolToPDBBlock(mol).split('\n')
++                  if line.startswith('HETATM') or line.startswith('ATOM')]
++
++    pdbqt_lines = []
++    for idx, atom in enumerate(mol.GetAtoms()):
++        pdbqt_line = atom_lines[idx][:56]
++
++        pdbqt_line += '0.00  0.00    '  # append empty vdW and ele
++        # Get charge
++        charge = 0.
++        if atom.HasProp('_GasteigerCharge'):
++            charge = float(atom.GetProp('_GasteigerCharge'))
++        if atom.HasProp('_TriposPartialCharge'):
++            charge = float(atom.GetProp('_TriposPartialCharge'))
++        elif atom.GetAtomicNum() == 1:
++            root_atom = atom.GetNeighbors()[0]
++            if root_atom.HasProp('_GasteigerHCharge'):
++                charge = float(root_atom.GetProp('_GasteigerHCharge'))
++        # FIXME: this should not happen, blame RDKit
++        if isnan(charge) or isinf(charge):
++            charge = 0.
++        pdbqt_line += ('%.3f' % charge).rjust(6)
++
++        # Get atom type
++        pdbqt_line += ' '
++        atomicnum = atom.GetAtomicNum()
++        if atomicnum == 6 and atom.GetIsAromatic():
++            pdbqt_line += 'A'
++        elif atomicnum == 7 and idx in acceptors:
++            pdbqt_line += 'NA'
++        elif atomicnum == 8 and idx in acceptors:
++            pdbqt_line += 'OA'
++        elif atomicnum == 1 and atom.GetNeighbors()[0].GetIdx() in donors:
++            pdbqt_line += 'HD'
++        else:
++            pdbqt_line += atom.GetSymbol()
++        pdbqt_lines.append(pdbqt_line)
++    return pdbqt_lines
++
++
++def MolToPDBQTBlock(mol, flexible=True, addHs=False, computeCharges=False):
++    """Write RDKit Molecule to a PDBQT block
++
++    Parameters
++    ----------
++        mol: rdkit.Chem.rdchem.Mol
++            Molecule with a protein ligand complex
++        flexible: bool (default=True)
++            Should the molecule encode torsions. Ligands should be flexible,
++            proteins in turn can be rigid.
++        addHs: bool (default=False)
++            The PDBQT format requires at least polar Hs on donors. By default Hs
++            are added.
++        computeCharges: bool (default=False)
++            Should the partial charges be automatically computed. If the Hs are
++            added the charges must and will be recomputed. If there are no
++            partial charge information, they are set to 0.0.
++
++    Returns
++    -------
++        block: str
++            String wit PDBQT encoded molecule
++    """
++    # make a copy of molecule
++    mol = Chem.Mol(mol)
++
++    # if flexible molecule contains multiple fragments write them separately
++    if flexible and len(Chem.GetMolFrags(mol)) > 1:
++        return ''.join(MolToPDBQTBlock(frag, flexible=flexible, addHs=addHs,
++                                       computeCharges=computeCharges)
++                       for frag in Chem.GetMolFrags(mol, asMols=True))
++
++    # Identify donors and acceptors for atom typing
++    # Acceptors
++    patt = Chem.MolFromSmarts('[$([O;H1;v2]),'
++                              '$([O;H0;v2;!$(O=N-*),'
++                              '$([O;-;!$(*-N=O)]),'
++                              '$([o;+0])]),'
++                              '$([n;+0;!X3;!$([n;H1](cc)cc),'
++                              '$([$([N;H0]#[C&v4])]),'
++                              '$([N&v3;H0;$(Nc)])]),'
++                              '$([F;$(F-[#6]);!$(FC[F,Cl,Br,I])])]')
++    acceptors = list(map(lambda x: x[0],
++                         mol.GetSubstructMatches(patt, maxMatches=mol.GetNumAtoms())))
++    # Donors
++    patt = Chem.MolFromSmarts('[$([N&!H0&v3,N&!H0&+1&v4,n&H1&+0,$([$([Nv3](-C)(-C)-C)]),'
++                              '$([$(n[n;H1]),'
++                              '$(nc[n;H1])])]),'
++                              # Guanidine can be tautormeic - e.g. Arginine
++                              '$([NX3,NX2]([!O,!S])!@C(!@[NX3,NX2]([!O,!S]))!@[NX3,NX2]([!O,!S])),'
++                              '$([O,S;H1;+0])]')
++    donors = list(map(lambda x: x[0],
++                      mol.GetSubstructMatches(patt, maxMatches=mol.GetNumAtoms())))
++    if addHs:
++        mol = Chem.AddHs(mol, addCoords=True, onlyOnAtoms=donors, )
++    if addHs or computeCharges:
++        AllChem.ComputeGasteigerCharges(mol)
++
++    atom_lines = PDBQTAtomLines(mol, donors, acceptors)
++    assert len(atom_lines) == mol.GetNumAtoms()
++
++    pdbqt_lines = []
++
++    # vina scores
++    if (mol.HasProp('vina_affinity') and mol.HasProp('vina_rmsd_lb') and
++            mol.HasProp('vina_rmsd_lb')):
++        pdbqt_lines.append('REMARK VINA RESULT:  ' +
++                           ('%.1f' % float(mol.GetProp('vina_affinity'))).rjust(8) +
++                           ('%.3f' % float(mol.GetProp('vina_rmsd_lb'))).rjust(11) +
++                           ('%.3f' % float(mol.GetProp('vina_rmsd_ub'))).rjust(11))
++
++    pdbqt_lines.append('REMARK  Name = ' +
++                       (mol.GetProp('_Name') if mol.HasProp('_Name') else ''))
++    if flexible:
++        # Find rotatable bonds
++        rot_bond = Chem.MolFromSmarts('[!$(*#*)&!D1&!$(C(F)(F)F)&'
++                                      '!$(C(Cl)(Cl)Cl)&'
++                                      '!$(C(Br)(Br)Br)&'
++                                      '!$(C([CH3])([CH3])[CH3])&'
++                                      '!$([CD3](=[N,O,S])-!@[#7,O,S!D1])&'
++                                      '!$([#7,O,S!D1]-!@[CD3]=[N,O,S])&'
++                                      '!$([CD3](=[N+])-!@[#7!D1])&'
++                                      '!$([#7!D1]-!@[CD3]=[N+])]-!@[!$(*#*)&'
++                                      '!D1&!$(C(F)(F)F)&'
++                                      '!$(C(Cl)(Cl)Cl)&'
++                                      '!$(C(Br)(Br)Br)&'
++                                      '!$(C([CH3])([CH3])[CH3])]')
++        bond_atoms = list(mol.GetSubstructMatches(rot_bond))
++        num_torsions = len(bond_atoms)
++
++        # Active torsions header
++        pdbqt_lines.append('REMARK  %i active torsions:' % num_torsions)
++        pdbqt_lines.append('REMARK  status: (\'A\' for Active; \'I\' for Inactive)')
++        for i, (a1, a2) in enumerate(bond_atoms):
++            pdbqt_lines.append('REMARK%5.0i  A    between atoms: _%i  and  _%i'
++                               % (i + 1, a1 + 1, a2 + 1))
++
++        # Fragment molecule on bonds to ge rigid fragments
++        bond_ids = [mol.GetBondBetweenAtoms(a1, a2).GetIdx()
++                    for a1, a2 in bond_atoms]
++        if bond_ids:
++            mol_rigid_frags = Chem.FragmentOnBonds(mol, bond_ids, addDummies=False)
++        else:
++            mol_rigid_frags = mol
++        frags = list(Chem.GetMolFrags(mol_rigid_frags))
++
++        def weigh_frags(frag):
++            """sort by the fragment size and the number of bonds (secondary)"""
++            num_bonds = 0
++            # bond_weight = 0
++            for a1, a2 in bond_atoms:
++                if a1 in frag or a2 in frag:
++                    num_bonds += 1
++                    # for frag2 in frags:
++                    #     if a1 in frag2 or a2 in frag2:
++                    #         bond_weight += len(frag2)
++
++            # changed signs are fixing mixed sorting type (ascending/descending)
++            return -len(frag), -num_bonds,  # bond_weight
++        frags = sorted(frags, key=weigh_frags)
++
++        # Start writting the lines with ROOT
++        pdbqt_lines.append('ROOT')
++        frag = frags.pop(0)
++        for idx in frag:
++            pdbqt_lines.append(atom_lines[idx])
++        pdbqt_lines.append('ENDROOT')
++
++        # Now build the tree of torsions usign DFS algorithm. Keep track of last
++        # route with following variables to move down the tree and close branches
++        branch_queue = []
++        current_root = frag
++        old_roots = [frag]
++
++        visited_frags = []
++        visited_bonds = []
++        while len(frags) > len(visited_frags):
++            end_branch = True
++            for frag_num, frag in enumerate(frags):
++                for bond_num, (a1, a2) in enumerate(bond_atoms):
++                    if (frag_num not in visited_frags and
++                        bond_num not in visited_bonds and
++                        (a1 in current_root and a2 in frag or
++                         a2 in current_root and a1 in frag)):
++                        # direction of bonds is important
++                        if a1 in current_root:
++                            bond_dir = '%i %i' % (a1 + 1, a2 + 1)
++                        else:
++                            bond_dir = '%i %i' % (a2 + 1, a1 + 1)
++                        pdbqt_lines.append('BRANCH %s' % bond_dir)
++                        for idx in frag:
++                            pdbqt_lines.append(atom_lines[idx])
++                        branch_queue.append('ENDBRANCH %s' % bond_dir)
++
++                        # Overwrite current root and stash previous one in queue
++                        old_roots.append(current_root)
++                        current_root = frag
++
++                        # remove used elements from stack
++                        visited_frags.append(frag_num)
++                        visited_bonds.append(bond_num)
++
++                        # mark that we dont want to end branch yet
++                        end_branch = False
++                        break
++                    else:
++                        continue
++                    break  # break the outer loop as well
++
++            if end_branch:
++                pdbqt_lines.append(branch_queue.pop())
++                if old_roots:
++                    current_root = old_roots.pop()
++        # close opened branches if any is open
++        while len(branch_queue):
++            pdbqt_lines.append(branch_queue.pop())
++        pdbqt_lines.append('TORSDOF %i' % num_torsions)
++    else:
++        pdbqt_lines.extend(atom_lines)
++
++    return '\n'.join(pdbqt_lines)
+diff --git a/oddt/toolkits/rdk.py b/oddt/toolkits/rdk.py
+index 00d60b91..c05366dc 100644
+--- a/oddt/toolkits/rdk.py
++++ b/oddt/toolkits/rdk.py
+@@ -20,14 +20,12 @@
+ 
+ from __future__ import print_function
+ import os
+-from copy import copy
+ import gzip
+ from base64 import b64encode
+-from itertools import combinations, chain
+-from collections import OrderedDict
++from itertools import combinations
+ import warnings
+ 
+-from six import next, BytesIO, PY3, string_types
++from six import next, BytesIO, PY3
+ import numpy as np
+ from sklearn.utils.deprecation import deprecated
+ 
+@@ -51,7 +49,10 @@
+ from rdkit.Chem.Pharm2D import Gobbi_Pharm2D, Generate
+ 
+ from oddt.toolkits.common import detect_secondary_structure
+-from oddt.toolkits.extras.rdkit import _sybyl_atom_type, MolFromPDBBlock
++from oddt.toolkits.extras.rdkit import (_sybyl_atom_type,
++                                        MolFromPDBBlock,
++                                        MolToPDBQTBlock,
++                                        MolFromPDBQTBlock)
+ 
+ _descDict = dict(Descriptors.descList)
+ 
+@@ -184,7 +185,7 @@ def _filereader_pdb(filename, opt=None):
+         for line in f:
+             line = line.decode('ascii')
+             block += line
+-            if line[:4] == 'ENDMDL':
++            if line[:6] == 'ENDMDL':
+                 yield Molecule(source={'fmt': 'pdb', 'string': block, 'opt': opt})
+                 n += 1
+                 block = ''
+@@ -192,7 +193,22 @@ def _filereader_pdb(filename, opt=None):
+             yield Molecule(source={'fmt': 'pdb', 'string': block, 'opt': opt})
+ 
+ 
+-def readfile(format, filename, lazy=False, opt=None, *args, **kwargs):
++def _filereader_pdbqt(filename, opt=None):
++    block = ''
++    n = 0
++    with gzip.open(filename, 'rb') if filename.split('.')[-1] == 'gz' else open(filename, 'rb') as f:
++        for line in f:
++            line = line.decode('ascii')
++            block += line
++            if line[:6] == 'ENDMDL':
++                yield Molecule(source={'fmt': 'pdbqt', 'string': block, 'opt': opt})
++                n += 1
++                block = ''
++        if block:  # open last molecule if any
++            yield Molecule(source={'fmt': 'pdbqt', 'string': block, 'opt': opt})
++
++
++def readfile(format, filename, lazy=False, opt=None, **kwargs):
+     """Iterate over the molecules in a file.
+ 
+     Required parameters:
+@@ -229,15 +245,14 @@ def readfile(format, filename, lazy=False, opt=None, *args, **kwargs):
+             filename_handle = gzip.open(filename, 'rb') if filename.split('.')[-1] == 'gz' else open(filename, 'rb')
+             return (Molecule(Mol) for Mol in Chem.ForwardSDMolSupplier(filename_handle, **kwargs))
+     elif format == "pdb":
+-        def mol_reader():
+-            with open(filename) as f:
+-                yield Molecule(MolFromPDBBlock(f.read(), *args, **kwargs))
+-        return mol_reader()
++        return _filereader_pdb(filename)
++    elif format == "pdbqt":
++        return _filereader_pdbqt(filename)
+     elif format == "mol2":
+         return _filereader_mol2(filename)
+     elif format == "smi":
+         iterator = Chem.SmilesMolSupplier(filename, delimiter=" \t",
+-                                          titleLine=False, *args, **kwargs)
++                                          titleLine=False, **kwargs)
+ 
+         def smi_reader():
+             for mol in iterator:
+@@ -246,7 +261,7 @@ def smi_reader():
+     elif format == 'inchi' and Chem.INCHI_AVAILABLE:
+         def inchi_reader():
+             for line in open(filename):
+-                mol = Chem.inchi.MolFromInchi(line.strip(), *args, **kwargs)
++                mol = Chem.inchi.MolFromInchi(line.strip(), **kwargs)
+                 yield Molecule(mol)
+         return inchi_reader()
+     else:
+@@ -278,6 +293,8 @@ def readstring(format, string, **kwargs):
+         mol = Chem.MolFromMol2Block(string, **kwargs)
+     elif format == "pdb":
+         mol = MolFromPDBBlock(string, **kwargs)
++    elif format == 'pdbqt':
++        mol = MolFromPDBQTBlock(string, **kwargs)
+     elif format == "smi":
+         s = string.strip().split('\n')[0].strip().split()
+         mol = Chem.MolFromSmiles(s[0], **kwargs)
+@@ -317,7 +334,7 @@ def __init__(self, format, filename, overwrite=False):
+             self._writer = Chem.SmilesWriter(self.filename, isomericSmiles=True, includeHeader=False)
+         elif format in ('inchi', 'inchikey') and Chem.INCHI_AVAILABLE:
+             self._writer = open(filename, 'w')
+-        elif format in ('mol2'):
++        elif format in ('mol2', 'pdbqt'):
+             self._writer = gzip.open(filename, 'w') if filename.split('.')[-1] == 'gz' else open(filename, 'w')
+         elif format == "pdb":
+             self._writer = Chem.PDBWriter(self.filename)
+@@ -335,6 +352,9 @@ def write(self, molecule):
+             raise IOError("Outputfile instance is closed.")
+         if self.format in ('inchi', 'inchikey', 'mol2'):
+             self._writer.write(molecule.write(self.format) + '\n')
++        if self.format == 'pdbqt':
++            self._writer.write('MODEL %i\n' % (self.total + 1) +
++                               molecule.write(self.format) + '\nENDMDL\n')
+         else:
+             self._writer.write(molecule.Mol)
+         self.total += 1
+@@ -507,7 +527,8 @@ def residues(self):
+             res_idx_unique = np.unique(res_idx)
+             if len(res_idx_unique) > 1:
+                 idx_sorted = np.argsort(res_idx, kind='mergesort')
+-                self._residues = np.split(idx_sorted,
++                self._residues = np.split(
++                    idx_sorted,
+                     np.where(np.diff(np.searchsorted(res_idx_unique,
+                                      res_idx[idx_sorted])) > 0)[0] + 1)
+             else:
+@@ -931,10 +952,12 @@ def write(self, format="smi", filename=None, overwrite=False, size=None, **kwarg
+             result = '%s\t%s\n' % (Chem.MolToSmiles(self.Mol, **kwargs), self.title)
+         elif format in ["mol", "sdf"]:
+             result = Chem.MolToMolBlock(self.Mol, **kwargs)
+-        elif format == "mol2":
+-            result = Chem.MolToMol2Block(self.Mol, **kwargs)
++        # elif format == "mol2":
++        #     result = MolToMol2Block(self.Mol, **kwargs)
+         elif format == "pdb":
+             result = Chem.MolToPDBBlock(self.Mol, **kwargs)
++        elif format == "pdbqt":
++            result = MolToPDBQTBlock(self.Mol, **kwargs)
+         elif format in ('inchi', 'inchikey') and Chem.INCHI_AVAILABLE:
+             result = Chem.inchi.MolToInchi(self.Mol, **kwargs)
+             if format == 'inchikey':
+diff --git a/setup.cfg b/setup.cfg
+index 8a131b3f..05e196ad 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -2,4 +2,4 @@
+ universal = 1
+ 
+ [nosetests]
+-process-timeout=60
++process-timeout=120
+diff --git a/tests/test_toolkit.py b/tests/test_toolkit.py
+index 5da010df..e8e0c3ce 100644
+--- a/tests/test_toolkit.py
++++ b/tests/test_toolkit.py
+@@ -1,11 +1,11 @@
+ import os
+-from tempfile import NamedTemporaryFile
++from collections import OrderedDict
+ 
+ from six.moves.cPickle import loads, dumps
+ import numpy as np
+ import pandas as pd
+ 
+-from nose.tools import nottest, assert_in, assert_not_in, assert_equal
++from nose.tools import assert_equal
+ from sklearn.utils.testing import (assert_true,
+                                    assert_false,
+                                    assert_dict_equal,
+@@ -31,7 +31,8 @@ def test_mol():
+     assert_equal(len(mol.atoms), 7)
+ 
+     # Hydrogen manipulation in proteins
+-    protein = next(oddt.toolkit.readfile('pdb', os.path.join(test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb')))
++    protein = next(oddt.toolkit.readfile(
++        'pdb', os.path.join(test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb')))
+     protein.protein = True
+ 
+     res_atoms_n = [6, 10, 8, 8, 7, 11, 8, 7, 6, 8, 5, 8, 12, 9, 5, 11, 8,
+@@ -345,3 +346,51 @@ def test_ss():
+     assert_equal(protein.res_dict['isbeta'].sum(), 9)
+     assert_equal((protein.res_dict['isalpha'] & protein.res_dict['isbeta']).sum(), 0)  # Must be zero!
+     assert_equal((~protein.res_dict['isalpha'] & ~protein.res_dict['isbeta']).sum(), 84)
++
++
++def test_pdbqt():
++    """RDKit PDBQT writer and reader"""
++    # test loop breaks in DFS algorithm
++    mol = oddt.toolkit.readstring('smi', 'CCc1cc(C)c(C)cc1-c1ccc(-c2cccc(C)c2)cc1')
++    mol.make3D()
++
++    # roundtrip molecule with template
++    mol2 = oddt.toolkit.readstring('pdbqt', mol.write('pdbqt'))
++    mol.removeh()
++
++    assert_equal(len(mol.atoms), len(mol2.atoms))
++
++    def nodes_size(block):
++        out = OrderedDict()
++        current_key = None
++        for line in block.split('\n'):
++            if line[:4] == 'ROOT' or line[:6] == 'BRANCH':
++                current_key = line.strip()
++                out[current_key] = 0
++            elif line[:4] == 'ATOM':
++                out[current_key] += 1
++        return list(out.values())
++
++    # check the branch order and size
++    if oddt.toolkit.backend == 'ob':
++        assert_array_equal(nodes_size(mol.write('pdbqt')),
++                           [6, 8, 2, 7])
++    else:
++        assert_array_equal(nodes_size(mol.write('pdbqt')),
++                           [8, 6, 7, 2])
++    mol = next(oddt.toolkit.readfile('sdf', os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf')))
++    assert_array_equal(nodes_size(mol.write('pdbqt')),
++                       [8, 3, 6, 6, 1, 6, 3, 2, 2])
++
++    # roundtrip a disconnected fragments
++    mol = oddt.toolkit.readstring('smi', 'c1ccccc1.c1ccccc1C')
++    if oddt.toolkit.backend == 'ob':
++        kwargs = {'opt': {'r': None}}
++    else:
++        kwargs = {'flexible': False}
++
++    mol2 = oddt.toolkit.readstring('pdbqt', mol.write('pdbqt', **kwargs))
++    assert_equal(len(mol.atoms), len(mol2.atoms))
++
++    mol2 = oddt.toolkit.readstring('pdbqt', mol.write('pdbqt'))
++    assert_equal(len(mol.atoms), len(mol2.atoms))
+diff --git a/tests/test_virtualscreening.py b/tests/test_virtualscreening.py
+index 7dc69d45..9406a78e 100644
+--- a/tests/test_virtualscreening.py
++++ b/tests/test_virtualscreening.py
+@@ -1,58 +1,81 @@
+ import os
+-from tempfile import NamedTemporaryFile
+ 
+-import numpy as np
+-import pandas as pd
+-
+-from nose.tools import nottest, assert_in, assert_not_in, assert_equal
+-from sklearn.utils.testing import (assert_true,
+-                                   assert_array_equal,
++from nose.tools import assert_in, assert_equal
++from sklearn.utils.testing import (assert_array_equal,
+                                    assert_array_almost_equal)
+ 
+ import oddt
++from oddt.spatial import rmsd
+ from oddt.virtualscreening import virtualscreening
+ 
+ test_data_dir = os.path.dirname(os.path.abspath(__file__))
+ 
+ 
+-if oddt.toolkit.backend == 'ob':  # RDKit doesn't write PDBQT
+-    def test_vs_scoring_vina():
+-        """VS scoring (Vina) tests"""
+-        vs = virtualscreening(n_cpu=1)
+-        vs.load_ligands('sdf', os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf'))
+-        vs.score(function='autodock_vina',
+-                 protein=os.path.join(test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb'))
+-        mols = list(vs.fetch())
+-        assert_equal(len(mols), 1)
+-        mol_data = mols[0].data
+-        assert_in('vina_affinity', mol_data)
+-        assert_in('vina_gauss1', mol_data)
+-        assert_in('vina_gauss2', mol_data)
+-        assert_in('vina_hydrogen', mol_data)
+-        assert_in('vina_hydrophobic', mol_data)
+-        assert_in('vina_repulsion', mol_data)
+-
+-
+-if oddt.toolkit.backend == 'ob':  # RDKit doesn't write PDBQT
+-    def test_vs_docking():
+-        """VS docking (Vina) tests"""
+-        vs = virtualscreening(n_cpu=1)
+-        vs.load_ligands('sdf', os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf'))
+-        vs.dock(engine='autodock_vina',
+-                protein=os.path.join(test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb'),
+-                auto_ligand=os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf'),
+-                exhaustiveness=1,
+-                num_modes=9,
+-                size=(20, 20, 20),
+-                seed=0)
+-        mols = list(vs.fetch())
+-        assert_equal(len(mols), 9)
+-        mol_data = mols[0].data
+-        assert_in('vina_affinity', mol_data)
+-        assert_in('vina_rmsd_lb', mol_data)
+-        assert_in('vina_rmsd_ub', mol_data)
+-        assert_array_equal([float(m.data['vina_affinity']) for m in mols],
+-                           [-6.3, -6., -6., -5.9, -5.9, -5.8, -5.2, -4.2, -3.9])
++def test_vs_scoring_vina():
++    """VS scoring (Vina) tests"""
++    vs = virtualscreening(n_cpu=1)
++    vs.load_ligands('sdf', os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf'))
++    vs.score(function='autodock_vina',
++             protein=os.path.join(test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb'))
++    mols = list(vs.fetch())
++    assert_equal(len(mols), 1)
++    mol_data = mols[0].data
++    assert_in('vina_affinity', mol_data)
++    assert_in('vina_gauss1', mol_data)
++    assert_in('vina_gauss2', mol_data)
++    assert_in('vina_hydrogen', mol_data)
++    assert_in('vina_hydrophobic', mol_data)
++    assert_in('vina_repulsion', mol_data)
++    assert_equal(mol_data['vina_affinity'], '-3.57594')
++    assert_equal(mol_data['vina_gauss1'], '63.01213')
++    assert_equal(mol_data['vina_gauss2'], '999.07625')
++    assert_equal(mol_data['vina_hydrogen'], '0.0')
++    assert_equal(mol_data['vina_hydrophobic'], '26.12648')
++    assert_equal(mol_data['vina_repulsion'], '3.63178')
++
++
++def test_vs_docking():
++    """VS docking (Vina) tests"""
++    vs = virtualscreening(n_cpu=1)
++    vs.load_ligands('sdf', os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf'))
++    vs.dock(engine='autodock_vina',
++            protein=os.path.join(test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb'),
++            auto_ligand=os.path.join(test_data_dir, 'data/dude/xiap/crystal_ligand.sdf'),
++            exhaustiveness=1,
++            energy_range=5,
++            num_modes=9,
++            size=(20, 20, 20),
++            seed=0)
++    mols = list(vs.fetch())
++    assert_equal(len(mols), 9)
++    mol_data = mols[0].data
++    assert_in('vina_affinity', mol_data)
++    assert_in('vina_rmsd_lb', mol_data)
++    assert_in('vina_rmsd_ub', mol_data)
++    if oddt.toolkit.backend == 'ob' and oddt.toolkit.__version__ < '2.4.0':
++        vina_scores = [-6.3, -6.0, -6.0, -5.9, -5.9, -5.8, -5.2, -4.2, -3.9]
++    else:
++        vina_scores = [-6.3, -6.0, -5.1, -3.9, -3.5, -3.5, -3.5, -3.3, -2.5]
++    assert_array_equal([float(m.data['vina_affinity']) for m in mols], vina_scores)
++
++    # verify the SMILES of molecules
++    ref_mol = next(
++        oddt.toolkit.readfile('sdf',
++                              os.path.join(test_data_dir,
++                                           'data/dude/xiap/crystal_ligand.sdf')))
++
++    if oddt.toolkit.backend == 'ob' and oddt.toolkit.__version__ < '2.4.0':
++        # OB 2.3.2 will fail the following, since Hs are removed, etc.
++        pass
++    else:
++        vina_rmsd = [8.247347, 5.316951, 7.964107, 7.445350, 8.127984, 7.465065,
++                     8.486132, 7.943340, 7.762220]
++        assert_array_equal([mol.smiles for mol in mols],
++                           [ref_mol.smiles] * len(mols))
++
++        assert_array_almost_equal([rmsd(ref_mol, mol, method='min_symmetry')
++                                   for mol in mols], vina_rmsd)
++
+ 
+ if oddt.toolkit.backend == 'ob':  # RDKit rewrite needed
+     def test_vs_filtering():

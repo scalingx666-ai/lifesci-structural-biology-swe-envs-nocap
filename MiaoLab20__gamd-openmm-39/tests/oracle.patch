@@ -1,0 +1,251 @@
+diff --git a/gamd/langevin/base_integrator.py b/gamd/langevin/base_integrator.py
+index 4f94a4d..6a1ca68 100644
+--- a/gamd/langevin/base_integrator.py
++++ b/gamd/langevin/base_integrator.py
+@@ -3,7 +3,7 @@
+ 
+ Portions copyright (c) 2020 University of Kansas
+ Authors: Matthew Copeland, Yinglong Miao
+-Contributors: Lane Votapka
++Contributors: Lane Votapka, Alex Brueckner
+ 
+ """
+ 
+@@ -217,7 +217,9 @@ def __init__(self, group_dict, boost_type, boost_method,
+             "oldVavg": 0, "sigmaV": 0, "M2": 0, "wVavg": 0,
+             "k": 0.0, "k0prime": 0, "k0doubleprime": 0, "k0doubleprime_window": 0,
+             "boosted_energy": 0, "check_boost": 0,
+-            "threshold_energy": -1E99}
++            "threshold_energy": -1E99, "energy_scale": 1.0,
++            "sigma_threshold": 0.001, "energy_diff_threshold": 0.001,
++            "boost_threshold": 0.001}
+         #
+         # These variables are always kept for reporting, regardless of boost 
+         # type
+@@ -278,8 +280,13 @@ def _update_potential_state_values_with_window_potential_state_values(
+             compute_type):
+         # Update window variables
+         self.add_compute_global_by_name("Vavg", "{0}", ["wVavg"], compute_type)
++        
++        # Calculate sigmaV, handling the case when windowCount < 2 to avoid division by zero
++        # When windowCount is 1, we have only one sample, so variance is undefined
++        # We use a conditional to set sigmaV to 0 when windowCount < 2
+         self.add_compute_global_by_name(
+-            "sigmaV", "sqrt({0}/(windowCount-1))", ["M2"], compute_type)
++            "sigmaV", "select(step(windowCount-1.5), sqrt({0}/max(1, windowCount-1)), 0)", 
++            ["M2"], compute_type)
+         
+         # Reset variables
+         self.set_global_by_name_to_value("M2", "0", compute_type)
+@@ -314,7 +321,10 @@ def _calculate_secondary_boost_statistics(
+         
+         self.add_compute_global_by_name("oldVavg", "{0}", ["wVavg"],
+                                         compute_type)
+-        self.add_compute_global_by_name("wVavg", "{0} + ({1}-{0})/windowCount",
++        
++        # Handle division by zero when windowCount is 0
++        self.add_compute_global_by_name("wVavg", 
++                                        "select(step(windowCount-0.5), {0} + ({1}-{0})/windowCount, {1})",
+                                         ["wVavg", "StartingPotentialEnergy"],
+                                         compute_type)
+ 
+@@ -340,10 +350,22 @@ def _add_gamd_pre_calc_step(self, compute_type):
+         # energy is read only.
+         #
+         
++        # Calculate dynamic threshold based on energy scale
++        self.add_compute_global_by_name(
++            "energy_scale", "max(max(abs({0}), abs({1})), 1.0)", 
++            ["threshold_energy", "StartingPotentialEnergy"], compute_type)
++        
++        self.add_compute_global_by_name(
++            "boost_threshold", "0.001 * {0}", ["energy_scale"], 
++            compute_type)
++        
++        # Handle division by zero when Vmax = Vmin (no energy variation)
+         self.add_compute_global_by_name(
+-            "BoostPotential", "0.5 * {0} * ({1} - {2})^2 / ({3} - {4})", 
++            "BoostPotential", 
++            "select(step(abs({3} - {4}) - {5}), "
++            "0.5 * {0} * ({1} - {2})^2 / ({3} - {4}), 0)", 
+             ["k0", "threshold_energy", "StartingPotentialEnergy", "Vmax", 
+-             "Vmin"], compute_type)
++             "Vmin", "boost_threshold"], compute_type)
+ 
+         #
+         # "BoostPotential*step(threshold_energy-boosted_energy)")
+@@ -488,6 +510,7 @@ def get_values(self, name):
+         not for use with DOF names.)
+         """
+         names = self.get_names(name)
++        results = {}
+         for name in names:
+             results[name] = self.getGlobalVariableByName(name)
+         return results
+@@ -586,9 +609,26 @@ def calculate_common_threshold_energy_and_effective_harmonic_constant(
+         self.add_compute_global_by_name("threshold_energy", "{0}", ["Vmax"],
+                                         compute_type, group_id)
+ 
++        # Calculate dynamic thresholds based on energy scale
++        self.add_compute_global_by_name(
++            "energy_scale", "max(max(abs({0}), abs({1})), max(abs({2}), 1.0))", 
++            ["Vmax", "Vmin", "Vavg"], compute_type, group_id)
++        
+         self.add_compute_global_by_name(
+-            "k0prime", "({0}/{1}) * ({2} - {3}) / ({2} - {4})",
+-            ["sigma0", "sigmaV", "Vmax", "Vmin", "Vavg"],
++            "sigma_threshold", "0.001 * {0}", ["energy_scale"], 
++            compute_type, group_id)
++        
++        self.add_compute_global_by_name(
++            "energy_diff_threshold", "0.001 * {0}", ["energy_scale"], 
++            compute_type, group_id)
++
++        # Handle the case when sigmaV is 0 (insufficient statistics) or when Vmax = Vmin (no energy variation)
++        # In these cases, we don't apply any boost (k0prime = 0)
++        self.add_compute_global_by_name(
++            "k0prime", 
++            "select(step({1} - {5}) * step(abs({2} - {3}) - {6}) * step(abs({2} - {4}) - {6}), "
++            "({0}/{1}) * ({2} - {3}) / ({2} - {4}), 0)",
++            ["sigma0", "sigmaV", "Vmax", "Vmin", "Vavg", "sigma_threshold", "energy_diff_threshold"],
+             compute_type, group_id)
+ 
+         self.add_compute_global_by_name("k0", "min(1.0, {0})", ["k0prime"],
+@@ -600,9 +640,26 @@ def _upper_bound_calculate_threshold_energy_and_effective_harmonic_constant(
+             self, compute_type):
+         self.set_global_by_name_to_value("k0", "1.0", compute_type)
+ 
++        # Calculate dynamic thresholds based on energy scale
++        self.add_compute_global_by_name(
++            "energy_scale", "max(max(abs({0}), abs({1})), max(abs({2}), 1.0))", 
++            ["Vmax", "Vmin", "Vavg"], compute_type)
++        
++        self.add_compute_global_by_name(
++            "sigma_threshold", "0.001 * {0}", ["energy_scale"], 
++            compute_type)
++        
++        self.add_compute_global_by_name(
++            "energy_diff_threshold", "0.001 * {0}", ["energy_scale"], 
++            compute_type)
++
++        # Handle the case when sigmaV is 0 (insufficient statistics) or when Vmax = Vmin (no energy variation)
++        # In these cases, we don't apply any boost (k0doubleprime = 0)
+         self.add_compute_global_by_name(
+-            "k0doubleprime", "(1 - {0}/{1}) * ({2} - {3})/({4} - {3})",
+-            ["sigma0", "sigmaV", "Vmax", "Vmin", "Vavg"], compute_type)
++            "k0doubleprime", 
++            "select(step({1} - {5}) * step(abs({2} - {3}) - {6}) * step(abs({4} - {3}) - {6}), "
++            "(1 - {0}/{1}) * ({2} - {3})/({4} - {3}), 0)",
++            ["sigma0", "sigmaV", "Vmax", "Vmin", "Vavg", "sigma_threshold", "energy_diff_threshold"], compute_type)
+ 
+         self.add_compute_global_by_name("k0", "{0}", ["k0doubleprime"],
+                                         compute_type)
+diff --git a/gamd/tests/test_nan_fix.py b/gamd/tests/test_nan_fix.py
+new file mode 100644
+index 0000000..5c70207
+--- /dev/null
++++ b/gamd/tests/test_nan_fix.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++"""
++Test script to validate that the NaN bug fix works correctly in GaMD boost calculations.
++
++This test specifically checks for the NaN errors that occurred when:
++1. windowCount = 1 (insufficient statistics for variance calculation)
++2. Vmax = Vmin (no energy variation)
++3. sigmaV = 0 (zero variance)
++
++The test creates a minimal system and runs integration steps to trigger these edge cases.
++"""
++import sys
++import os
++
++# Add the parent directory to the path to import gamd
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
++
++import openmm.app as app
++import openmm.unit as unit
++import openmm
++from gamd.integrator_factory import create_lower_total_boost_integrator
++
++def test_nan_fix():
++    """
++    Test that GaMD boost calculations don't produce NaN values in edge cases.
++    
++    This test specifically targets the scenarios that previously caused NaN errors:
++    - windowCount = 1 (insufficient statistics)
++    - Vmax = Vmin (no energy variation)  
++    - sigmaV = 0 (zero variance)
++    """
++    
++    # Create a simple system
++    topology = app.Topology()
++    positions = []
++    system = openmm.System()
++
++    # Add a single particle
++    chain = topology.addChain()
++    residue = topology.addResidue('TES', chain)
++    atom = topology.addAtom('T', app.Element.getBySymbol('C'), residue)
++    positions.append([0.0, 0.0, 0.0] * unit.nanometers)
++    system.addParticle(1.0)
++
++    # Add a harmonic force to prevent trivial potential
++    force = openmm.HarmonicBondForce()
++    system.addForce(force)
++
++    # Set up the integrator with parameters that will trigger the issue
++    temperature = 300.0 * unit.kelvin
++    dt = 2.0 * unit.femtoseconds
++    
++    # Use parameters that will trigger the windowCount=1 scenario
++    ntcmdprep = 10
++    ntcmd = 100  # Must be multiple of ntave
++    ntebprep = 10
++    nteb = 100   # Must be multiple of ntave
++    nstlim = 300
++    ntave = 20
++    
++    result = create_lower_total_boost_integrator(
++        system, temperature, dt, ntcmdprep, ntcmd, ntebprep, nteb, nstlim, ntave
++    )
++    
++    integrator = result[2]
++    
++    # Create a simple context
++    context = openmm.Context(system, integrator)
++    context.setPositions(positions)
++    
++    # Test the scenario: run integration steps to trigger edge cases
++    print("Testing GaMD boost calculations for NaN stability...")
++    
++    for i in range(250):  # Run sufficient steps to trigger all edge cases
++        integrator.step(1)
++        
++        # Check for NaN values in key variables
++        sigmaV = integrator.getGlobalVariableByName('sigmaV_Total')
++        k0 = integrator.getGlobalVariableByName('k0_Total')
++        k0prime = integrator.getGlobalVariableByName('k0prime_Total')
++        
++        # Check if any values are NaN
++        assert str(sigmaV) != 'nan', f"NaN detected in sigmaV at step {i}"
++        assert str(k0) != 'nan', f"NaN detected in k0 at step {i}"
++        assert str(k0prime) != 'nan', f"NaN detected in k0prime at step {i}"
++    
++    print("SUCCESS: No NaN values detected during integration!")
++    
++    # Final validation of all key variables
++    sigmaV = integrator.getGlobalVariableByName('sigmaV_Total')
++    k0 = integrator.getGlobalVariableByName('k0_Total')
++    k0prime = integrator.getGlobalVariableByName('k0prime_Total')
++    windowCount = integrator.getGlobalVariableByName('windowCount')
++    
++    print(f"Final values:")
++    print(f"  windowCount: {windowCount}")
++    print(f"  sigmaV_Total: {sigmaV}")
++    print(f"  k0_Total: {k0}")
++    print(f"  k0prime_Total: {k0prime}")
++
++if __name__ == "__main__":
++    test_nan_fix()
++    print("\nTest PASSED: NaN bug fix is working correctly!")

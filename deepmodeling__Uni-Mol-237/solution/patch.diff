@@ -1,0 +1,387 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index 7755d5a..dcfa5c3 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -25,9 +25,58 @@ jobs:
+           username: ${{ secrets.DOCKERHUB_USERNAME }}
+           password: ${{ secrets.DOCKERHUB_TOKEN }}
+       -
+-        name: Build and push
++        name: Free Disk Space (Ubuntu)
++        uses: jlumbroso/free-disk-space@main
++        with:
++          # this might remove tools that are actually needed,
++          # if set to "true" but frees about 6 GB
++          tool-cache: false
++
++          # all of these default to true, but feel free to set to
++          # "false" if necessary for your workflow
++          android: true
++          dotnet: true
++          haskell: true
++          large-packages: true
++          docker-images: false
++          swap-storage: false
++      -
++        name: Set up swap space
++        uses: pierotofy/set-swap-space@v1.0
++        with:
++          swap-size-gb: 10
++      -
++        name: Build and push with rdma
+         uses: docker/build-push-action@v3
+         with:
+           context: ./unimol/docker/
+           push: true
+           tags: dptechnology/unimol:latest-pytorch1.11.0-cuda11.3
++
++  publish_package:
++    name: Publish package
++    needs: [docker]
++
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v3
++
++      - uses: actions/setup-python@v4
++        with:
++          python-version: '3.10'
++
++      - name: Build core package
++        env:
++          FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
++        run: |
++          pip install setuptools wheel twine
++          cd unimol_tools
++          python setup.py sdist --dist-dir=dist
++
++      - name: Deploy
++        env:
++          TWINE_USERNAME: "__token__"
++          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
++        run: |
++          cd unimol_tools
++          python -m twine upload dist/*
+\ No newline at end of file
+diff --git a/unimol/docker/Dockerfile b/unimol/docker/Dockerfile
+index 99bab0a..4afe485 100644
+--- a/unimol/docker/Dockerfile
++++ b/unimol/docker/Dockerfile
+@@ -1,9 +1,11 @@
+ FROM dptechnology/unicore:0.0.1-pytorch1.11.0-cuda11.3
+ 
+-RUN conda install -y -c conda-forge rdkit==2021.09.5 && conda clean -ya
++RUN pip install setuptools wheel twine
++
++RUN pip install rdkit-pypi==2021.9.5.1
+ 
+ RUN ldconfig && \
+     apt-get clean && \
+     apt-get autoremove && \
+     rm -rf /var/lib/apt/lists/* /tmp/* && \
+-    conda clean -ya
++    pip cache purge
+diff --git a/unimol_tools/setup.py b/unimol_tools/setup.py
+index 5f8a207..1610eba 100644
+--- a/unimol_tools/setup.py
++++ b/unimol_tools/setup.py
+@@ -5,7 +5,7 @@
+ 
+ setup(
+     name="unimol_tools",
+-    version="0.1.0",
++    version="0.1.0.post1",
+     description=("unimol_tools is a Python package for property prediciton with Uni-Mol in molecule, materials and protein."),
+     author="DP Technology",
+     author_email="unimol@dp.tech",
+diff --git a/unimol_tools/unimol_tools/data/conformer.py b/unimol_tools/unimol_tools/data/conformer.py
+index a223aad..d186532 100644
+--- a/unimol_tools/unimol_tools/data/conformer.py
++++ b/unimol_tools/unimol_tools/data/conformer.py
+@@ -16,11 +16,10 @@
+ from .dictionary import Dictionary
+ from multiprocessing import Pool
+ from tqdm import tqdm
+-import pathlib
++
+ from ..utils import logger
+ from ..config import MODEL_CONFIG
+-
+-WEIGHT_DIR = os.path.join(pathlib.Path(__file__).resolve().parents[1], 'weights')
++from ..weights import weight_download, WEIGHT_DIR
+ 
+ 
+ class ConformerGen(object):
+@@ -59,6 +58,8 @@ def _init_features(self, **params):
+             self.dict_name = MODEL_CONFIG['dict'][name]
+         else:
+             self.dict_name = MODEL_CONFIG['dict'][self.data_type]
++        if not os.path.exists(os.path.join(WEIGHT_DIR, self.dict_name)):
++            weight_download(self.dict_name, WEIGHT_DIR)
+         self.dictionary = Dictionary.load(os.path.join(WEIGHT_DIR, self.dict_name))
+         self.dictionary.add_symbol("[MASK]", is_special=True)
+ 
+diff --git a/unimol_tools/unimol_tools/data/datareader.py b/unimol_tools/unimol_tools/data/datareader.py
+index c56b39e..0745b2c 100644
+--- a/unimol_tools/unimol_tools/data/datareader.py
++++ b/unimol_tools/unimol_tools/data/datareader.py
+@@ -11,7 +11,6 @@
+ from ..utils import logger
+ import pathlib
+ from rdkit.Chem.Scaffolds import MurckoScaffold
+-WEIGHT_DIR = os.path.join(pathlib.Path(__file__).resolve().parents[1], 'weights')
+ 
+ class MolDataReader(object):
+     '''A class to read Mol Data.'''
+@@ -60,7 +59,7 @@ def read_data(self, data=None, is_train=True, **params):
+             _ = data.pop('target', None)
+             data = pd.DataFrame(data).rename(columns={smiles_col: 'SMILES'})
+         
+-        elif isinstance(data, list):
++        elif isinstance(data, list) or isinstance(data, np.ndarray):
+             # load from smiles list
+             data = pd.DataFrame(data, columns=['SMILES'])
+         else:
+diff --git a/unimol_tools/unimol_tools/models/unimol.py b/unimol_tools/unimol_tools/models/unimol.py
+index 83a132e..6617a35 100644
+--- a/unimol_tools/unimol_tools/models/unimol.py
++++ b/unimol_tools/unimol_tools/models/unimol.py
+@@ -16,13 +16,12 @@
+ from ..utils import logger
+ from ..config import MODEL_CONFIG
+ from ..data import Dictionary
++from ..weights import weight_download, WEIGHT_DIR
+ 
+ BACKBONE = {
+     'transformer': TransformerEncoderWithPair,
+ }
+ 
+-WEIGHT_DIR = os.path.join(pathlib.Path(__file__).resolve().parents[1], 'weights')
+-
+ class UniMolModel(nn.Module):
+     """
+     UniMolModel is a specialized model for molecular, protein, crystal, or MOF (Metal-Organic Frameworks) data. 
+@@ -67,11 +66,14 @@ def __init__(self, output_dim=2, data_type='molecule', **params):
+         if data_type == 'molecule':
+             name = "no_h" if self.remove_hs else "all_h" 
+             name = data_type + '_' + name
+-            self.pretrain_path = os.path.join(WEIGHT_DIR, MODEL_CONFIG['weight'][name])
+-            self.dictionary = Dictionary.load(os.path.join(WEIGHT_DIR, MODEL_CONFIG['dict'][name]))
+         else:
+-            self.pretrain_path = os.path.join(WEIGHT_DIR, MODEL_CONFIG['weight'][data_type])
+-            self.dictionary = Dictionary.load(os.path.join(WEIGHT_DIR, MODEL_CONFIG['dict'][data_type]))
++            name = data_type
++        if not os.path.exists(os.path.join(WEIGHT_DIR, MODEL_CONFIG['weight'][name])):
++            weight_download(MODEL_CONFIG['weight'][name], WEIGHT_DIR)
++        if not os.path.exists(os.path.join(WEIGHT_DIR, MODEL_CONFIG['dict'][name])):
++            weight_download(MODEL_CONFIG['dict'][name], WEIGHT_DIR)
++        self.pretrain_path = os.path.join(WEIGHT_DIR, MODEL_CONFIG['weight'][name])
++        self.dictionary = Dictionary.load(os.path.join(WEIGHT_DIR, MODEL_CONFIG['dict'][name]))
+         self.mask_idx = self.dictionary.add_symbol("[MASK]", is_special=True)
+         self.padding_idx = self.dictionary.pad()
+         self.embed_tokens = nn.Embedding(
+diff --git a/unimol_tools/unimol_tools/utils/base_logger.py b/unimol_tools/unimol_tools/utils/base_logger.py
+index 87b13dd..5ba18e4 100644
+--- a/unimol_tools/unimol_tools/utils/base_logger.py
++++ b/unimol_tools/unimol_tools/utils/base_logger.py
+@@ -83,5 +83,5 @@ def get_logger(self):
+             self.logger.addHandler(file_handler)
+         return self.logger
+ 
+-logger = Logger('Uni-Mol(QSAR)').get_logger()
++logger = Logger('Uni-Mol Tools').get_logger()
+ logger.setLevel(logging.INFO)
+\ No newline at end of file
+diff --git a/unimol_tools/unimol_tools/weights/__init__.py b/unimol_tools/unimol_tools/weights/__init__.py
+index e69de29..d54a3e6 100644
+--- a/unimol_tools/unimol_tools/weights/__init__.py
++++ b/unimol_tools/unimol_tools/weights/__init__.py
+@@ -0,0 +1 @@
++from .weighthub import weight_download, WEIGHT_DIR
+\ No newline at end of file
+diff --git a/unimol_tools/unimol_tools/weights/mol.dict.txt b/unimol_tools/unimol_tools/weights/mol.dict.txt
+deleted file mode 100644
+index 4130c25..0000000
+--- a/unimol_tools/unimol_tools/weights/mol.dict.txt
++++ /dev/null
+@@ -1,30 +0,0 @@
+-[PAD]
+-[CLS]
+-[SEP]
+-[UNK]
+-C
+-N
+-O
+-S
+-H
+-Cl
+-F
+-Br
+-I
+-Si
+-P
+-B
+-Na
+-K
+-Al
+-Ca
+-Sn
+-As
+-Hg
+-Fe
+-Zn
+-Cr
+-Se
+-Gd
+-Au
+-Li
+\ No newline at end of file
+diff --git a/unimol_tools/unimol_tools/weights/oled.dict.txt b/unimol_tools/unimol_tools/weights/oled.dict.txt
+deleted file mode 100644
+index 2775ae8..0000000
+--- a/unimol_tools/unimol_tools/weights/oled.dict.txt
++++ /dev/null
+@@ -1,93 +0,0 @@
+-[PAD]
+-[CLS]
+-[SEP]
+-[UNK]
+-O
+-H
+-F
+-S
+-Li
+-P
+-N
+-Mg
+-C
+-Si
+-Cl
+-Fe
+-Mn
+-B
+-Se
+-Al
+-Co
+-Na
+-V
+-Ni
+-Cu
+-K
+-Ca
+-Ba
+-Ti
+-Zn
+-Ge
+-Sr
+-I
+-Br
+-Te
+-Cr
+-Mo
+-Sb
+-Ga
+-Sn
+-Bi
+-La
+-As
+-Nb
+-Rb
+-W
+-Y
+-In
+-Cs
+-Ag
+-Zr
+-Cd
+-Pb
+-Nd
+-Ta
+-Ce
+-Pd
+-Pr
+-Sm
+-Rh
+-Hg
+-Tl
+-Pt
+-Er
+-Tb
+-Ru
+-Sc
+-U
+-Dy
+-Ho
+-Au
+-Hf
+-Yb
+-Ir
+-Be
+-Eu
+-Tm
+-Re
+-Lu
+-Gd
+-Os
+-Th
+-Tc
+-Pu
+-Np
+-Pm
+-Xe
+-Ac
+-Pa
+-Kr
+-He
+-Ne
+-Ar
+\ No newline at end of file
+diff --git a/unimol_tools/unimol_tools/weights/weighthub.py b/unimol_tools/unimol_tools/weights/weighthub.py
+new file mode 100644
+index 0000000..6444210
+--- /dev/null
++++ b/unimol_tools/unimol_tools/weights/weighthub.py
+@@ -0,0 +1,42 @@
++import os
++
++from ..utils import logger
++
++try:
++    from huggingface_hub import snapshot_download
++except:
++    huggingface_hub_installed = False
++    def snapshot_download(*args, **kwargs):
++        raise ImportError('huggingface_hub is not installed. If weights are not avaliable, please install it by running: pip install huggingface_hub. Otherwise, please download the weights manually from https://huggingface.co/dptech/Uni-Mol-Models')
++
++WEIGHT_DIR = os.path.dirname(os.path.abspath(__file__))
++
++os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # use mirror to download weights
++
++def weight_download(pretrain, save_path, local_dir_use_symlinks=True):
++    if os.path.exists(os.path.join(save_path, pretrain)):
++        logger.info(f'{pretrain} exists in {save_path}')
++        return
++    
++    logger.info(f'Downloading {pretrain}')
++    snapshot_download(
++        repo_id="dptech/Uni-Mol-Models",
++        local_dir=save_path,
++        allow_patterns=pretrain,
++        local_dir_use_symlinks=local_dir_use_symlinks,
++        #max_workers=8
++    )
++
++# Download all the weights when this script is run
++def download_all_weights(local_dir_use_symlinks=False):
++    logger.info(f'Downloading all weights to {WEIGHT_DIR}')
++    snapshot_download(
++        repo_id="dptech/Uni-Mol-Models",
++        local_dir=WEIGHT_DIR,
++        allow_patterns='*',
++        local_dir_use_symlinks=local_dir_use_symlinks,
++        #max_workers=8
++    )
++
++if '__main__' == __name__:
++    download_all_weights()
+\ No newline at end of file

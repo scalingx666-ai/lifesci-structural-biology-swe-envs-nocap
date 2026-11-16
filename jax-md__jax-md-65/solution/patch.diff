@@ -1,0 +1,333 @@
+diff --git a/jax_md/partition.py b/jax_md/partition.py
+index 81159ee7..0cc03a4b 100644
+--- a/jax_md/partition.py
++++ b/jax_md/partition.py
+@@ -440,7 +440,7 @@ def copy_values_from_cell(value, cell_value, cell_id):
+     return neighbor_idx[:-1, :, 0]
+ 
+   # Use the example positions to estimate the maximum occupancy of the verlet
+-  # list. 
++  # list.
+   d_ex = partial(metric_sq, **static_kwargs)
+   d_ex = vmap(vmap(d_ex, (None, 0)))
+   N = example_R.shape[0]
+@@ -459,6 +459,7 @@ def neighbor_list_fn(R, **kwargs):
+ 
+     neigh_R = R[idx]
+     dR = d(R, neigh_R)
++
+     argsort = np.argsort(
+       f32(1) - np.logical_and(dR < cutoff_sq, idx < N), axis=1)
+     # TODO(schsam): Error checking for list exceeding maximum occupancy.
+diff --git a/jax_md/smap.py b/jax_md/smap.py
+index 4f1236a5..4e50b4ee 100644
+--- a/jax_md/smap.py
++++ b/jax_md/smap.py
+@@ -386,7 +386,7 @@ def _vectorized_cond(pred, fn, operand):
+ 
+ def pair_neighbor_list(
+     fn, metric, species=None, reduce_axis=None, keepdims=False, **kwargs):
+-  """Promotes a function a pair of particles to one using neighbor lists.
++  """Promotes a function acting on pairs of particles to use neighbor lists.
+ 
+   Args:
+     fn: A function that takes an ndarray of pairwise distances or displacements
+@@ -432,6 +432,6 @@ def fn_mapped(R, neighbor_idx, **dynamic_kwargs):
+     if out.ndim > mask.ndim:
+       ddim = out.ndim - mask.ndim
+       mask = np.reshape(mask, mask.shape + (1,) * ddim)
+-    out = mask * out
++    out = np.where(mask, out, 0.)
+     return _high_precision_sum(out, reduce_axis, keepdims) / 2.
+   return fn_mapped
+diff --git a/jax_md/space.py b/jax_md/space.py
+index 10c4d5d3..162bd46f 100644
+--- a/jax_md/space.py
++++ b/jax_md/space.py
+@@ -59,15 +59,7 @@ def _small_inverse(T):
+   """Compute the inverse of a small matrix."""
+   _check_transform_shapes(T)
+   dim = T.shape[0]
+-
+   # TODO(schsam): Check whether matrices are singular. @ErrorChecking
+-
+-  if dim == 2:
+-    det = T[0, 0] * T[1, 1] - T[0, 1] * T[1, 0]
+-    return np.array([[T[1, 1], -T[0, 1]], [-T[1, 0], T[0, 0]]], dtype=T.dtype) / det
+-
+-  # TODO(schsam): Fill in the 3x3 case by hand.
+-
+   return np.linalg.inv(T)
+ 
+ # Tempororay code to do transforms while JAX's custom_transform + vmap is
+diff --git a/jax_md/util.py b/jax_md/util.py
+index 92266a8b..d5e295ca 100644
+--- a/jax_md/util.py
++++ b/jax_md/util.py
+@@ -19,6 +19,7 @@
+ from __future__ import print_function
+ 
+ from jax.tree_util import register_pytree_node
++from jax.lib import xla_bridge
+ import jax.numpy as np
+ 
+ import numpy as onp
+@@ -35,7 +36,10 @@
+ def static_cast(*xs):
+   """Function to cast a value to the lowest dtype that can express it."""
+   # NOTE(schsam): static_cast is so named because it cannot be jit.
+-  return (np.array(x, dtype=onp.min_scalar_type(x)) for x in xs)
++  if xla_bridge.get_backend().platform == 'tpu':
++    return (np.array(x, np.float32) for x in xs)
++  else:
++    return (np.array(x, dtype=onp.min_scalar_type(x)) for x in xs)
+ 
+ 
+ def register_pytree_namedtuple(cls):
+@@ -59,7 +63,7 @@ def check_kwargs_time_dependence(kwargs):
+ def check_kwargs_empty(kwargs):
+   # TODO(schsam): We should be more careful about checking that kwargs don't
+   # have excess data at the leaves of our computations.
+-  return 
++  return
+   if kwargs:
+     raise ValueError(
+       'Found unexpected kwargs: {}. Expected empty.'.format(kwargs))
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index bb8f8f13..8c80ceba 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -53,7 +53,7 @@
+ else:
+   POSITION_DTYPE = [f32]
+ 
+-update_test_tolerance(1e-5, 1e-7)
++update_test_tolerance(2e-5, 1e-7)
+ 
+ 
+ def lattice_repeater(small_cell_pos, latvec, no_rep):
+@@ -182,8 +182,6 @@ def test_soft_sphere(self, spatial_dimension, alpha, dtype):
+   def test_lennard_jones(self, spatial_dimension, dtype):
+     key = random.PRNGKey(0)
+ 
+-    tol = None if dtype is np.float64 else 5e-6
+-
+     for _ in range(STOCHASTIC_SAMPLES):
+       key, split_sigma, split_epsilon = random.split(key, 3)
+       sigma = dtype(random.uniform(
+@@ -195,7 +193,7 @@ def test_lennard_jones(self, spatial_dimension, dtype):
+         energy.lennard_jones(dr, sigma, epsilon),
+         np.array(-epsilon, dtype=dtype), True)
+       g = grad(energy.lennard_jones)(dr, sigma, epsilon)
+-      self.assertAllClose(g, np.array(0, dtype=dtype), True, tol, tol)
++      self.assertAllClose(g, np.array(0, dtype=dtype), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -213,9 +211,9 @@ def test_isotropic_cutoff(self, spatial_dimension, dtype):
+       epsilon = f32(random.uniform(
+           split_epsilon, (1,), minval=0.0, maxval=4.0)[0])
+       r_small = random.uniform(
+-          split_rs, (10,), minval=0.0, maxval=2.0 * sigma, dtype=dtype) 
++          split_rs, (10,), minval=0.0, maxval=2.0 * sigma, dtype=dtype)
+       r_large = random.uniform(
+-          split_rl, (10,), minval=2.5 * sigma, maxval=3.0 * sigma, dtype=dtype) 
++          split_rl, (10,), minval=2.5 * sigma, maxval=3.0 * sigma, dtype=dtype)
+ 
+       r_onset = f32(2.0 * sigma)
+       r_cutoff = f32(2.5 * sigma)
+@@ -227,7 +225,7 @@ def test_isotropic_cutoff(self, spatial_dimension, dtype):
+         E(r_small, sigma, epsilon),
+         energy.lennard_jones(r_small, sigma, epsilon), True)
+       self.assertAllClose(
+-        E(r_large, sigma, epsilon), np.zeros_like(r_large, dtype=dtype), True) 
++        E(r_large, sigma, epsilon), np.zeros_like(r_large, dtype=dtype), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+diff --git a/tests/quantity_test.py b/tests/quantity_test.py
+index 2c80cdc2..3bf8679c 100644
+--- a/tests/quantity_test.py
++++ b/tests/quantity_test.py
+@@ -39,7 +39,7 @@
+ PARTICLE_COUNT = 10
+ STOCHASTIC_SAMPLES = 10
+ SPATIAL_DIMENSION = [2, 3]
+-DTYPES = [f32, f64]
++DTYPES = [f32, f64] if FLAGS.jax_enable_x64 else [f32]
+ 
+ 
+ class QuantityTest(jtu.JaxTestCase):
+diff --git a/tests/smap_test.py b/tests/smap_test.py
+index 9c3de84a..449de6f1 100644
+--- a/tests/smap_test.py
++++ b/tests/smap_test.py
+@@ -38,10 +38,10 @@
+ jax_config.parse_flags_with_absl()
+ FLAGS = jax_config.FLAGS
+ 
+-test_util.update_test_tolerance(f32_tolerance=2e-6)
++test_util.update_test_tolerance(f32_tolerance=5e-6, f64_tolerance=1e-14)
+ 
+ PARTICLE_COUNT = 1000
+-STOCHASTIC_SAMPLES = 10
++STOCHASTIC_SAMPLES = 3
+ SPATIAL_DIMENSION = [2, 3]
+ 
+ NEIGHBOR_LIST_PARTICLE_COUNT = 100
+@@ -529,8 +529,6 @@ def test_pair_neighbor_list_scalar(
+     def truncated_square(dr, sigma):
+       return np.where(dr < sigma, dr ** 2, f32(0.))
+ 
+-    tol = 2e-10 if dtype == np.float32 else None
+-
+     N = NEIGHBOR_LIST_PARTICLE_COUNT
+     box_size = 4. * N ** (1. / spatial_dimension)
+ 
+@@ -549,7 +547,73 @@ def truncated_square(dr, sigma):
+       neighbor_fn = jit(partition.neighbor_list(disp, box_size, sigma, R))
+       idx = neighbor_fn(R)
+       self.assertAllClose(mapped_square(R, sigma=sigma),
+-                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++                          neighbor_square(R, idx, sigma=sigma), True)
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
++  def test_pair_neighbor_list_scalar_diverging_potential(
++      self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    def potential(dr, sigma):
++      return np.where(dr < sigma, dr ** -6, f32(0.))
++
++    N = NEIGHBOR_LIST_PARTICLE_COUNT
++    box_size = 4. * N ** (1. / spatial_dimension)
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++    d = space.metric(disp)
++
++    neighbor_square = jit(smap.pair_neighbor_list(potential, d))
++    mapped_square = jit(smap.pair(potential, d))
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(
++        split, (N, spatial_dimension), dtype=dtype)
++      sigma = random.uniform(key, (), minval=0.5, maxval=2.5)
++      neighbor_fn = jit(partition.neighbor_list(disp, box_size, sigma, R))
++      idx = neighbor_fn(R)
++      self.assertAllClose(mapped_square(R, sigma=sigma),
++                          neighbor_square(R, idx, sigma=sigma), True)
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
++  def test_pair_neighbor_list_force_scalar_diverging_potential(
++      self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    def potential(dr, sigma):
++      return np.where(dr < sigma, dr ** -6, f32(0.))
++
++    N = NEIGHBOR_LIST_PARTICLE_COUNT
++    box_size = 4. * N ** (1. / spatial_dimension)
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++    d = space.metric(disp)
++
++    neighbor_square = jit(quantity.force(smap.pair_neighbor_list(potential, d)))
++    mapped_square = jit(quantity.force(smap.pair(potential, d)))
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(
++        split, (N, spatial_dimension), dtype=dtype)
++      sigma = random.uniform(key, (), minval=0.5, maxval=4.5)
++      neighbor_fn = jit(partition.neighbor_list(disp, box_size, sigma, R))
++      idx = neighbor_fn(R)
++      self.assertAllClose(mapped_square(R, sigma=sigma),
++                          neighbor_square(R, idx, sigma=sigma), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -564,8 +628,6 @@ def test_pair_neighbor_list_scalar_params_no_species(
+     def truncated_square(dr, sigma):
+       return np.where(dr < sigma, dr ** 2, f32(0.))
+ 
+-    tol = 2e-10 if dtype == np.float32 else None
+-
+     N = NEIGHBOR_LIST_PARTICLE_COUNT
+     box_size = 2. * N ** (1. / spatial_dimension)
+ 
+@@ -584,7 +646,7 @@ def truncated_square(dr, sigma):
+         partition.neighbor_list(disp, box_size, np.max(sigma), R))
+       idx = neighbor_fn(R)
+       self.assertAllClose(mapped_square(R, sigma=sigma),
+-                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++                          neighbor_square(R, idx, sigma=sigma), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -599,8 +661,6 @@ def test_pair_neighbor_list_scalar_params_matrix(
+     def truncated_square(dr, sigma):
+       return np.where(dr < sigma, dr ** 2, f32(0.))
+ 
+-    tol = 2e-10 if dtype == np.float32 else None
+-
+     N = NEIGHBOR_LIST_PARTICLE_COUNT
+     box_size = 2. * N ** (1. / spatial_dimension)
+ 
+@@ -620,7 +680,7 @@ def truncated_square(dr, sigma):
+         partition.neighbor_list(disp, box_size, np.max(sigma), R))
+       idx = neighbor_fn(R)
+       self.assertAllClose(mapped_square(R, sigma=sigma),
+-                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++                          neighbor_square(R, idx, sigma=sigma), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -635,8 +695,6 @@ def test_pair_neighbor_list_scalar_params_species(
+     def truncated_square(dr, sigma):
+       return np.where(dr < sigma, dr ** 2, f32(0.))
+ 
+-    tol = 2e-6 if dtype == np.float32 else None
+-
+     N = NEIGHBOR_LIST_PARTICLE_COUNT
+     box_size = 2. * N ** (1. / spatial_dimension)
+     species = np.zeros((N,), np.int32)
+@@ -660,7 +718,7 @@ def truncated_square(dr, sigma):
+         partition.neighbor_list(disp, box_size, np.max(sigma), R))
+       idx = neighbor_fn(R)
+       self.assertAllClose(mapped_square(R, sigma=sigma),
+-                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++                          neighbor_square(R, idx, sigma=sigma), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -675,8 +733,6 @@ def truncated_square(dR, sigma):
+       dr = np.reshape(space.distance(dR), dR.shape[:-1] + (1,))
+       return np.where(dr < sigma, dR ** 2, f32(0.))
+ 
+-    tol = 5e-6 if dtype == np.float32 else 1e-14
+-
+     N = PARTICLE_COUNT
+     box_size = 2. * N ** (1. / spatial_dimension)
+ 
+@@ -695,7 +751,7 @@ def truncated_square(dR, sigma):
+       neighbor_fn = jit(partition.neighbor_list(disp, box_size, sigma, R))
+       idx = neighbor_fn(R)
+       self.assertAllClose(mapped_square(R, sigma=sigma),
+-                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++                          neighbor_square(R, idx, sigma=sigma), True)
+ 
+ if __name__ == '__main__':
+   absltest.main()

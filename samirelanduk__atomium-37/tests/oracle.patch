@@ -1,0 +1,212 @@
+diff --git a/atomium/data.py b/atomium/data.py
+index b37fd6d..ab003b7 100644
+--- a/atomium/data.py
++++ b/atomium/data.py
+@@ -257,12 +257,17 @@ def create_chains(model_dict):
+         res_by_id = {r.id: r for r in res}
+         for res1, res2 in zip(res[:-1], res[1:]):
+             res1._next, res2._previous = res2, res1
+-        chains.append(Chain(
+-         *res, id=chain_id,
+-         helices=[[res_by_id[r] for r in h] for h in chain["helices"]],
+-         strands=[[res_by_id[r] for r in s] for s in chain["strands"]],
+-         internal_id=chain["internal_id"], sequence=chain["sequence"]
+-        ))
++        chains.append(
++            Chain(
++                *res,
++                id=chain_id,
++                helices=[[res_by_id[r] for r in h] for h in chain["helices"]],
++                strands=[[res_by_id[r] for r in s] for s in chain["strands"]],
++                information=chain["information"] if "information" in chain else [],
++                internal_id=chain["internal_id"],
++                sequence=chain["sequence"],
++            )
++        )
+     return chains
+ 
+ 
+diff --git a/atomium/pdb.py b/atomium/pdb.py
+index 12e4295..d6a5566 100644
+--- a/atomium/pdb.py
++++ b/atomium/pdb.py
+@@ -134,6 +134,59 @@ def update_geometry_dict(pdb_dict, data_dict):
+     extract_crystallography(pdb_dict, data_dict["geometry"])
+ 
+ 
++def add_annotation_to_polymers(model, pdb_dict):
++    """Parses COMPND and SOURCE records present in a .pdb dictionary and
++    updates the polymers present in the model with the retrieved
++    information.
++
++    :param dict model: The model dictionary to update.
++    :param dict pdb_dict: The .pdb dictionary to parse."""
++
++    compounds = []
++    compound = {}
++    if "COMPND" in pdb_dict:
++        for key, value in [
++            s.strip().replace(": ", ":").split(":")
++            for s in "".join([line[10:] for line in pdb_dict["COMPND"]]).split(";")
++        ]:
++            # New molecule described?
++            if key.lower() == "mol_id":
++                if compound:
++                    compounds.append(compound)
++                compound = {}
++            compound[key.lower()] = value
++
++        if compound:
++            compounds.append(compound)
++    else:
++        return
++
++    # All compounds should have a mol_id associated with them
++    if not all("mol_id" in compound for compound in compounds):
++        return
++
++    if "SOURCE" in pdb_dict:
++        for key, value in [
++            s.strip().replace(": ", ":").split(":")
++            for s in "".join([line[10:] for line in pdb_dict["SOURCE"]]).split(";")
++        ]:
++            # New molecule described?
++            if key.lower() == "mol_id":
++                compound = [
++                    compound for compound in compounds if compound["mol_id"] == value
++                ][0]
++
++            compound[key.lower()] = value
++
++    # Update polymers
++    for compound in compounds:
++        if "chain" in compound:
++            chain_ids = [chain_id.strip() for chain_id in compound["chain"].split(",")]
++            for chain_id in chain_ids:
++                if chain_id in model["polymer"]:
++                    model["polymer"][chain_id]["information"] = compound
++
++
+ def update_models_list(pdb_dict, data_dict):
+     """Creates model dictionaries in a data dictionary.
+ 
+@@ -160,6 +213,7 @@ def update_models_list(pdb_dict, data_dict):
+             for chain_id, chain in model["polymer"].items():
+                 chain["sequence"] = sequences.get(chain_id, "")
+         add_secondary_structure_to_polymers(model, secondary_structure)
++        add_annotation_to_polymers(model, pdb_dict)
+         data_dict["models"].append(model)
+ 
+ 
+diff --git a/atomium/structures.py b/atomium/structures.py
+index cea5726..1397ce2 100644
+--- a/atomium/structures.py
++++ b/atomium/structures.py
+@@ -618,7 +618,7 @@ class Chain(Molecule, metaclass=StructureClass):
+     :param list helices: the alpha helices within the chain.
+     :param list strands: the beta strands within the chain."""
+ 
+-    def __init__(self, *residues, sequence="", helices=None, strands=None, **kwargs):
++    def __init__(self, *residues, sequence="", helices=None, strands=None, information=None, **kwargs):
+         Molecule.__init__(
+          self, kwargs.get("id"), kwargs.get("name"), kwargs.get("internal_id")
+         )
+@@ -628,7 +628,7 @@ def __init__(self, *residues, sequence="", helices=None, strands=None, **kwargs)
+         self._model = None
+         self._helices = helices or []
+         self._strands = strands or []
+-
++        self._information = information or {}
+ 
+     def __repr__(self):
+         return "<Chain {} ({} residues)>".format(self._id, len(self._residues))
+@@ -683,6 +683,13 @@ def strands(self):
+ 
+         return tuple(self._strands)
+ 
++    @property
++    def information(self):
++        """The source organism and other information related to the chain
++
++        :rtype: ``dict``"""
++
++        return self._information
+ 
+     @property
+     def length(self):
+diff --git a/tests/integration/test_file_structure_reading.py b/tests/integration/test_file_structure_reading.py
+index 40370a8..05b5e4e 100644
+--- a/tests/integration/test_file_structure_reading.py
++++ b/tests/integration/test_file_structure_reading.py
+@@ -546,6 +546,22 @@ def test_1lol(self):
+             self.assertIs(res.next, chaina[5])
+             self.assertIn(chaina.residue(name="GLN"), [chaina.residue("A.136"), chaina.residue("A.173")])
+ 
++            # Source information
++            if e == "pdb":
++                for chain in (chaina, chainb):
++                    self.assertEqual(
++                        chain.information["organism_scientific"],
++                        "METHANOTHERMOBACTER THERMAUTOTROPHICUS STR. DELTA H",
++                    )
++                    self.assertEqual(
++                        chain.information["molecule"],
++                        "OROTIDINE 5'-MONOPHOSPHATE DECARBOXYLASE",
++                    )
++                    self.assertEqual(
++                        chain.information["engineered"],
++                        "YES",
++                    )
++
+             lig = model.ligand(name="XMP")
+             self.assertIs(lig.model, model)
+             self.assertEqual(len(lig.atoms()), 24)
+@@ -641,6 +657,21 @@ def test_5xme(self):
+                 self.assertEqual(atom.location[0], x)
+             self.assertEqual(len(all_atoms), 18270)
+ 
++            # Source information
++            if e == "pdb":
++                chain = models[0].chain("A")
++                self.assertEqual(
++                    chain.information["organism_scientific"],
++                    "HOMO SAPIENS",
++                )
++                self.assertEqual(
++                    chain.information["molecule"],
++                    "TUMOR NECROSIS FACTOR RECEPTOR TYPE 1-ASSOCIATED DEATH DOMAIN PROTEIN",
++                )
++                self.assertEqual(
++                    chain.information["engineered"],
++                    "YES",
++                )
+ 
+     def test_1cbn(self):
+         for e in ["cif", "mmtf", "pdb"]:
+@@ -717,6 +748,26 @@ def test_4opj(self):
+                  "(2R,3AS,4AR,5AR,5BS)-2-(6-AMINO-9H-PURIN-9-YL)-3A-HYDROXYHEXAHYDROCYCLOPROPA[4,5]CYCLOPENTA[1,2-B]FURAN-5A(4H)-YL DIHYDROGEN PHOSPHATE"
+                 )
+ 
++            if e == "pdb":
++                self.assertEqual(
++                    f.model.chain("A").information["molecule"], "RIBONUCLEASE H"
++                )
++                self.assertEqual(
++                    f.model.chain("C").information["molecule"], "RIBONUCLEASE H"
++                )
++                self.assertEqual(
++                    f.model.chain("B").information["molecule"],
++                    "5'-D(*CP*GP*CP*GP*AP*(TCY)P*TP*TP*CP*GP*CP*G)-3'",
++                )
++                self.assertEqual(
++                    f.model.chain("D").information["molecule"],
++                    "5'-D(*CP*GP*CP*GP*AP*(TCY)P*TP*TP*CP*GP*CP*G)-3'",
++                )
++                self.assertEqual(
++                    f.model.chain("A").information["organism_scientific"],
++                    "BACILLUS HALODURANS",
++                )
++                self.assertNotIn("organism_scientific", f.model.chain("B").information)
+ 
+     def test_6xlu(self):
+         # Branched chains

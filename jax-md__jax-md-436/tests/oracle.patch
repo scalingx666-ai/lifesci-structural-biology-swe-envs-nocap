@@ -1,0 +1,188 @@
+diff --git a/jax_md/minimize.py b/jax_md/minimize.py
+index 38b66bcc..ba2cb9e2 100644
+--- a/jax_md/minimize.py
++++ b/jax_md/minimize.py
+@@ -196,30 +196,28 @@ def apply_fn(state: FireDescentState, **kwargs) -> FireDescentState:
+       tree_reduce(lambda accum, p: accum + jnp.sum(p**2), P, 0.0)
+     )
+ 
+-    # NOTE: In the original FIRE algorithm, the quantity that determines when
+-    # to reset the momenta is F.V rather than F.P. However, all of the JAX MD
+-    # simulations are in momentum space for easier agreement with prior work /
+-    # rigid body physics. We only use the sign of F.P here, which shouldn't
+-    # differ from F.V, however if there are regressions then we should
+-    # reconsider this choice.
+-    F_dot_P = tree_reduce(
+-      lambda accum, f_dot_p: accum + f_dot_p,
+-      tree_map(lambda f, p: jnp.sum(f * p), F, P),
+-    )
++    # Rigid body masses do not broadcast against their momenta, so they use F.P.
++    if util.is_array(R):
++      F_dot_V = jnp.sum(F * P / M)
++    else:
++      F_dot_V = tree_reduce(
++        lambda accum, f_dot_p: accum + f_dot_p,
++        tree_map(lambda f, p: jnp.sum(f * p), F, P),
++      )
+     P = tree_map(lambda p, f: p + alpha * (f * P_norm / F_norm - p), P, F)
+ 
+     # NOTE(schsam): Can we clean this up at all?
+-    n_pos = jnp.where(F_dot_P >= 0, n_pos + 1, 0)
++    n_pos = jnp.where(F_dot_V >= 0, n_pos + 1, 0)
+     dt_choice = jnp.array([dt * f_inc, dt_max])
+     dt = jnp.where(
+-      F_dot_P > 0, jnp.where(n_pos > n_min, jnp.min(dt_choice), dt), dt
++      F_dot_V > 0, jnp.where(n_pos > n_min, jnp.min(dt_choice), dt), dt
+     )
+-    dt = jnp.where(F_dot_P < 0, dt * f_dec, dt)
++    dt = jnp.where(F_dot_V < 0, dt * f_dec, dt)
+     alpha = jnp.where(
+-      F_dot_P > 0, jnp.where(n_pos > n_min, alpha * f_alpha, alpha), alpha
++      F_dot_V > 0, jnp.where(n_pos > n_min, alpha * f_alpha, alpha), alpha
+     )
+-    alpha = jnp.where(F_dot_P < 0, alpha_start, alpha)
+-    P = tree_map(lambda p: (F_dot_P >= 0) * p, P)
++    alpha = jnp.where(F_dot_V < 0, alpha_start, alpha)
++    P = tree_map(lambda p: (F_dot_V >= 0) * p, P)
+ 
+     return FireDescentState(
+       R, P, F, M, dt, alpha, n_pos
+@@ -983,7 +981,7 @@ def apply_fn(
+     P_b = P_b + dt_2 * F_b
+ 
+     # FIRE: combined power check
+-    F_dot_P = jnp.sum(F * P) + jnp.sum(F_b * P_b)
++    F_dot_V = jnp.sum(F * P / M) + jnp.sum(F_b * P_b / M_b)
+ 
+     F_norm = jnp.sqrt(jnp.sum(F**2) + jnp.sum(F_b**2) + 1e-6)
+     P_norm = jnp.sqrt(jnp.sum(P**2) + jnp.sum(P_b**2))
+@@ -993,23 +991,23 @@ def apply_fn(
+     P_b = P_b + alpha * (F_b * P_norm / F_norm - P_b)
+ 
+     # FIRE: adaptive dt / alpha
+-    n_pos = jnp.where(F_dot_P >= 0, n_pos + 1, 0)
++    n_pos = jnp.where(F_dot_V >= 0, n_pos + 1, 0)
+     dt_choice = jnp.array([dt * f_inc, dt_max])
+     dt = jnp.where(
+-      F_dot_P > 0,
++      F_dot_V > 0,
+       jnp.where(n_pos > n_min, jnp.min(dt_choice), dt),
+       dt,
+     )
+-    dt = jnp.where(F_dot_P < 0, dt * f_dec, dt)
++    dt = jnp.where(F_dot_V < 0, dt * f_dec, dt)
+     alpha = jnp.where(
+-      F_dot_P > 0,
++      F_dot_V > 0,
+       jnp.where(n_pos > n_min, alpha * f_alpha, alpha),
+       alpha,
+     )
+-    alpha = jnp.where(F_dot_P < 0, alpha_start, alpha)
++    alpha = jnp.where(F_dot_V < 0, alpha_start, alpha)
+ 
+     # reset momenta on overshoot
+-    keep = f32(F_dot_P >= 0)
++    keep = f32(F_dot_V >= 0)
+     P = keep * P
+     P_b = keep * P_b
+ 
+diff --git a/jax_md/partition.py b/jax_md/partition.py
+index 79f6bd0c..5d49c8be 100644
+--- a/jax_md/partition.py
++++ b/jax_md/partition.py
+@@ -859,7 +859,8 @@ def body_fn(i, state):
+     box: Either a float specifying the size of the box, an array of
+       shape `[spatial_dim]` specifying the box size for a cubic box in each
+       spatial dimension, or a matrix of shape `[spatial_dim, spatial_dim]` that
+-      is upper triangular and specifies the lattice vectors of the box.
++      is upper triangular and whose columns are the lattice vectors of the box,
++      i.e. the transpose of ASE's `cell`.
+     r_cutoff: A scalar specifying the neighborhood radius.
+     dr_threshold: A scalar specifying the maximum distance particles can move
+       before rebuilding the neighbor list.
+@@ -1046,7 +1047,9 @@ def neighbor_fn(position_and_error, max_occupancy=None):
+           _box = kwargs.get('box', box)
+           cell_size = cutoff
+           if fractional_coordinates:
+-            err = err.update(PEC.MALFORMED_BOX, is_box_valid(_box))
++            err = err.update(
++              PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(_box))
++            )
+             cell_size = _fractional_cell_size(_box, cutoff)
+             _box = 1.0
+           if jnp.all(jnp.asarray(cell_size) < _box / 3.0):
+@@ -1135,7 +1138,9 @@ def neighbor_fn(position_and_error, max_occupancy=None):
+           1.0, _fractional_cell_size(kwargs['box'], cutoff)
+         )
+         err = err.update(PEC.CELL_SIZE_TOO_SMALL, new_cell_size > cur_cell_size)
+-      err = err.update(PEC.MALFORMED_BOX, is_box_valid(kwargs['box']))
++      err = err.update(
++        PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(kwargs['box']))
++      )
+       nbrs = dataclasses.replace(nbrs, error=err)
+ 
+     if _always_rebuild:
+diff --git a/jax_md/space.py b/jax_md/space.py
+index c4783785..fe72e585 100644
+--- a/jax_md/space.py
++++ b/jax_md/space.py
+@@ -48,8 +48,12 @@
+   neighbors such that if `Ra` has shape `[n, spatial_dim]` and `Rb` has shape
+   `[n, neighbors, spatial_dim]` then the output has shape
+   `[n, neighbors, spatial_dim]`.
++
++Keyword arguments to the mapped functions, such as `box`, are passed unchanged
++to every call rather than being mapped over.
+ """
+ 
++from functools import partial
+ from typing import Callable, Union, Tuple, Any, Optional, Protocol
+ 
+ from jax.core import ShapedArray
+@@ -345,7 +349,8 @@ def periodic_general(
+   ways. For a parallelepiped that is: 1) a cube of side length :math:`L`, the affine
+   transformation can simply be a scalar; 2) an orthorhombic unit cell can be
+   specified by a vector `[Lx, Ly, Lz]` of lengths for each axis; 3) a general
+-  triclinic cell can be specified by an upper triangular matrix.
++  triclinic cell can be specified by an upper triangular matrix whose columns
++  are the lattice vectors, i.e. the transpose of ASE's `cell`.
+ 
+   There are a number of ways to parameterize a simulation on :math:`X`.
+   `periodic_general` supports two parametrizations of :math:`X` that can be selected
+@@ -481,14 +486,24 @@ def map_product(
+   metric_or_displacement: DisplacementOrMetricFn | Callable[..., Array],
+ ) -> DisplacementOrMetricFn:
+   """Vectorizes a metric or displacement function over all pairs."""
+-  return vmap(vmap(metric_or_displacement, (0, None), 0), (None, 0), 0)
++
++  def wrapped_fn(Ra, Rb, **kwargs):
++    fn = partial(metric_or_displacement, **kwargs)
++    return vmap(vmap(fn, (0, None), 0), (None, 0), 0)(Ra, Rb)
++
++  return wrapped_fn
+ 
+ 
+ def map_bond(
+   metric_or_displacement: DisplacementOrMetricFn | Callable[..., Array],
+ ) -> DisplacementOrMetricFn:
+   """Vectorizes a metric or displacement function over bonds."""
+-  return vmap(metric_or_displacement, (0, 0), 0)
++
++  def wrapped_fn(Ra, Rb, **kwargs):
++    fn = partial(metric_or_displacement, **kwargs)
++    return vmap(fn, (0, 0), 0)(Ra, Rb)
++
++  return wrapped_fn
+ 
+ 
+ def map_neighbor(
+@@ -497,7 +512,8 @@ def map_neighbor(
+   """Vectorizes a metric or displacement function over neighborhoods."""
+ 
+   def wrapped_fn(Ra, Rb, **kwargs):
+-    return vmap(vmap(metric_or_displacement, (0, None)))(Rb, Ra, **kwargs)
++    fn = partial(metric_or_displacement, **kwargs)
++    return vmap(vmap(fn, (0, None)))(Rb, Ra)
+ 
+   return wrapped_fn
+ 

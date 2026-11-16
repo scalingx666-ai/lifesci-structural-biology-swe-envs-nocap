@@ -1,0 +1,352 @@
+diff --git a/moleculekit/distance_utils/distance_utils.pyx b/moleculekit/distance_utils/distance_utils.pyx
+index 39649d8e..b630be5b 100644
+--- a/moleculekit/distance_utils/distance_utils.pyx
++++ b/moleculekit/distance_utils/distance_utils.pyx
+@@ -86,56 +86,6 @@ def dist_trajectory(
+                 idx += 1
+ 
+ 
+-@cython.boundscheck(False) # turn off bounds-checking for entire function
+-@cython.wraparound(False)  # turn off negative index wrapping for entire function
+-def mindist_trajectory(
+-        FLOAT32_t[:,:,:] coords,
+-        FLOAT32_t[:,:] box,
+-        INT32_t[:,:] groups1,
+-        INT32_t[:,:] groups2,
+-        UINT32_t[:] digitized_chains,
+-        bool selfdist,
+-        bool pbc,
+-        FLOAT32_t[:,:] results,
+-    ):
+-    cdef int f, g1, g2, i, j, g1atm, g2atm, g2start, idx
+-    cdef int n_atoms = coords.shape[0]
+-    cdef int n_frames = coords.shape[2]
+-    cdef int n_groups1 = groups1.shape[0]
+-    cdef int n_groups2 = groups2.shape[0]
+-    cdef FLOAT32_t dist2, mindist
+-
+-    for f in range(n_frames):
+-        idx = 0
+-        for g1 in range(n_groups1):
+-            g2start = 0
+-            if selfdist:
+-                g2start = g1 + 1
+-
+-            for g2 in range(g2start, n_groups2):
+-                mindist = -1
+-
+-                for i in range(n_atoms):
+-                    g1atm = groups1[g1, i]
+-                    if g1atm == -1:
+-                        break
+-
+-                    for j in range(n_atoms):
+-                        g2atm = groups2[g2, j]
+-                        if g2atm == -1:
+-                            break
+-
+-                        dist2 = _dist(coords, box, digitized_chains, g1atm, g2atm, f, pbc)
+-
+-                        if dist2 < mindist or mindist < 0:
+-                            mindist = dist2
+-
+-                results[f, idx] = sqrt(mindist)
+-                idx += 1
+-
+-    return results
+-
+-
+ @cython.boundscheck(False) # turn off bounds-checking for entire function
+ @cython.wraparound(False)  # turn off negative index wrapping for entire function
+ cdef FLOAT32_t _calc_com(
+@@ -259,4 +209,73 @@ def dist_trajectory_reduction(
+                 results[f, idx] = sqrt(mindist)
+                 idx += 1
+ 
++    return results
++
++
++@cython.boundscheck(False) # turn off bounds-checking for entire function
++@cython.wraparound(False)  # turn off negative index wrapping for entire function
++def dist_trajectory_reduction_pairs(
++        FLOAT32_t[:,:,:] coords,
++        FLOAT32_t[:,:] box,
++        vector[vector[int]] &groups1,
++        vector[vector[int]] &groups2,
++        UINT32_t[:] digitized_chains1,
++        UINT32_t[:] digitized_chains2,
++        bool pbc,
++        FLOAT32_t[:] masses,
++        int reduction1,
++        int reduction2,
++        FLOAT32_t[:,:] results,
++    ):
++    # Iterates over group pairs instead of doing all-vs-all groups
++    cdef int f, g1, g2, i, j, k, g1atm, g2atm, g2start, idx
++    cdef int n_atoms = coords.shape[0]
++    cdef int n_frames = coords.shape[2]
++    cdef int n_groups = groups1.size()
++    cdef FLOAT32_t[:,:] com = np.zeros((2, 3), dtype=FLOAT32)
++    cdef FLOAT32_t dist2, mindist
++    cdef FLOAT32_t[:] curr_box
++    cdef UINT32_t chain1, chain2
++    cdef bool diff_chain
++    cdef FLOAT32_t[:] coor1, coor2
++    cdef vector[int] group1, group2
++    cdef vector[int] trash
++    trash.push_back(0)
++
++    for f in range(n_frames):
++        idx = 0
++        curr_box = box[:, f]
++
++        for g in range(n_groups):
++            group1 = groups1[g]
++            group2 = groups2[g]
++
++            if reduction1 == 1: # COM
++                _calc_com(coords, f, group1, masses, com, 0)
++                group1 = trash # Assign this so it loops once over the "group"
++            if reduction2 == 1: # COM
++                _calc_com(coords, f, group2, masses, com, 1)
++                group2 = trash  # Assign this so it loops once over the "group"
++
++            mindist = -1
++            diff_chain = digitized_chains1[g1] != digitized_chains2[g2]
++
++            for g1atm in group1:
++                coor1 = coords[g1atm, :, f]
++                if reduction1 == 1:
++                    coor1 = com[0, :]
++
++                for g2atm in group2:
++                    coor2 = coords[g2atm, :, f]
++                    if reduction2 == 1:
++                        coor2 = com[1, :]
++
++                    dist2 = _dist2(coor1, coor2, curr_box, diff_chain, pbc)
++
++                    if dist2 < mindist or mindist < 0:
++                        mindist = dist2
++
++            results[f, idx] = sqrt(mindist)
++            idx += 1
++
+     return results
+\ No newline at end of file
+diff --git a/moleculekit/projections/metricdistance.py b/moleculekit/projections/metricdistance.py
+index f01dd655..5760d44d 100644
+--- a/moleculekit/projections/metricdistance.py
++++ b/moleculekit/projections/metricdistance.py
+@@ -44,6 +44,9 @@ class MetricDistance(Projection):
+         group 1 to selection 2. `com` will calculate the distance of the center of mass of group 1 to selection 2.
+     groupreduce2 : ['closest', 'com'], optional
+         Same as `groupreduce1` but for group 2 if `groupsel2` is used.
++    pairs : bool
++        If set to True it will match atoms in sel1 to atoms in sel2 in their given order and only calculate
++        distances of those pairs of atoms instead of all-against-all distances
+ 
+     Returns
+     -------
+@@ -83,6 +86,7 @@ def __init__(
+         truncate=None,
+         groupreduce1="closest",
+         groupreduce2="closest",
++        pairs=False,
+     ):
+         super().__init__()
+ 
+@@ -101,6 +105,7 @@ def __init__(
+         self.truncate = truncate
+         self.groupreduce1 = groupreduce1
+         self.groupreduce2 = groupreduce2
++        self.pairs = pairs
+ 
+     def _checkChains(self, mol, sel1, sel2):
+         if np.array_equal(sel1, sel2):
+@@ -133,10 +138,7 @@ def project(self, mol):
+         data : np.ndarray
+             An array containing the projected data.
+         """
+-        from moleculekit.projections.util import (
+-            pp_calcDistances,
+-            get_reduced_distances,
+-        )
++        from moleculekit.projections.util import pp_calcDistances, get_reduced_distances
+ 
+         getMolProp = lambda prop: self._getMolProp(mol, prop)
+         sel1 = getMolProp("sel1")
+@@ -145,6 +147,8 @@ def project(self, mol):
+             self._checkChains(mol, sel1, sel2)
+ 
+         if np.ndim(sel1) == 1 and np.ndim(sel2) == 1:  # normal distances
++            if self.pairs:
++                raise RuntimeError("Pairs calculation not implemented without groups")
+             metric = pp_calcDistances(
+                 mol,
+                 sel1,
+@@ -165,6 +169,7 @@ def project(self, mol):
+                 truncate=self.truncate,
+                 reduction1=self.groupreduce1,
+                 reduction2=self.groupreduce2,
++                pairs=self.pairs,
+             )
+ 
+         return metric
+@@ -287,11 +292,20 @@ def getMapping(self, mol):
+             lig_labels = [
+                 f"{mol.resname[i]} {mol.resid[i]} {mol.name[i]}" for i in ligatoms
+             ]
+-            for i in range(numatoms1):
+-                atm1 = protatoms[i]
+-                for j in range(numatoms2):
+-                    atm2 = ligatoms[j]
+-                    desc = f"{self.metric[:-1]} between {prot_labels[i]} and {lig_labels[j]}"
++            if not self.pairs:
++                for i in range(numatoms1):
++                    atm1 = protatoms[i]
++                    for j in range(numatoms2):
++                        atm2 = ligatoms[j]
++                        desc = f"{self.metric[:-1]} between {prot_labels[i]} and {lig_labels[j]}"
++                        types += [self.metric[:-1]]
++                        indexes += [[atm1, atm2]]
++                        description += [desc]
++            else:
++                for i in range(numatoms1):
++                    atm1 = protatoms[i]
++                    atm2 = ligatoms[i]
++                    desc = f"{self.metric[:-1]} between {prot_labels[i]} and {lig_labels[i]}"
+                     types += [self.metric[:-1]]
+                     indexes += [[atm1, atm2]]
+                     description += [desc]
+@@ -974,6 +988,33 @@ def test_com_distances(self):
+         ).project(mol)
+         assert np.abs(dist[0][0] - 2.8153415) < 1e-5
+ 
++    def test_pair_distances(self):
++        from moleculekit.molecule import Molecule
++
++        sel1 = np.array([0, 1, 2]).reshape(-1, 1)
++        sel2 = np.array([1, 2, 3]).reshape(-1, 1)
++        mol = Molecule("3ptb")
++        res = MetricDistance(sel1, sel2, None, pairs=True).project(mol)
++        ref = np.linalg.norm(
++            mol.coords[sel1.flatten(), :, 0] - mol.coords[sel2.flatten(), :, 0], axis=1
++        )
++        assert np.allclose(res, ref)
++        mmp = MetricDistance(sel1, sel2, None, pairs=True).getMapping(mol)
++        assert mmp.shape == (3, 3)
++
++        res = MetricDistance(
++            "residue 1 2",
++            "residue 3 4",
++            None,
++            pairs=True,
++            groupsel1="residue",
++            groupsel2="residue",
++        ).project(mol)
++        res1 = MetricDistance("residue 1", "residue 3", None).project(mol)
++        res2 = MetricDistance("residue 2", "residue 4", None).project(mol)
++
++        assert np.allclose(res, [[res1.min(), res2.min()]])
++
+ 
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
+diff --git a/moleculekit/projections/util.py b/moleculekit/projections/util.py
+index 40f971a6..57f7d35e 100644
+--- a/moleculekit/projections/util.py
++++ b/moleculekit/projections/util.py
+@@ -88,8 +88,12 @@ def get_reduced_distances(
+     truncate=None,
+     reduction1="closest",
+     reduction2="closest",
++    pairs=False,
+ ):
+-    from moleculekit.distance_utils import dist_trajectory_reduction
++    from moleculekit.distance_utils import (
++        dist_trajectory_reduction,
++        dist_trajectory_reduction_pairs,
++    )
+     from moleculekit.periodictable import periodictable
+ 
+     # Converting non-grouped boolean atomselection to group-style atomselections
+@@ -136,14 +140,25 @@ def get_reduced_distances(
+     groups1 = [np.where(sel1[i, :])[0].tolist() for i in range(sel1.shape[0])]
+     groups2 = [np.where(sel2[i, :])[0].tolist() for i in range(sel2.shape[0])]
+ 
+-    mindist = np.zeros(
+-        (mol.numFrames, len(groups1) * len(groups2)), dtype=np.float32
+-    )  # Preparing the return array
++    if pairs and len(groups1) != len(groups2):
++        raise RuntimeError(
++            "If `pairs=True` mode is used, the number of groups in sel1 should match the number of groups in sel2."
++        )
++
+     if selfdist:
+         mindist = np.zeros(
+             (mol.numFrames, int((len(groups1) * (len(groups2) - 1)) / 2)),
+             dtype=np.float32,
+         )
++    else:
++        if not pairs:
++            mindist = np.zeros(
++                (mol.numFrames, len(groups1) * len(groups2)), dtype=np.float32
++            )  # Preparing the return array
++        else:
++            mindist = np.zeros(
++                (mol.numFrames, len(groups1)), dtype=np.float32
++            )  # Preparing the return array
+ 
+     # import time
+     # t = time.time()
+@@ -156,20 +171,35 @@ def get_reduced_distances(
+         [digitized_chains[gg[0]] for gg in groups2], dtype=np.uint32
+     )
+     masses = np.array([periodictable[el].mass for el in mol.element], dtype=np.float32)
+-    dist_trajectory_reduction(
+-        coords,
+-        box,
+-        groups1,
+-        groups2,
+-        digitized_chains1,
+-        digitized_chains2,
+-        selfdist,
+-        periodic is not None,
+-        masses,
+-        reduction_map[reduction1.lower()],
+-        reduction_map[reduction2.lower()],
+-        mindist,
+-    )
++    if not pairs:
++        dist_trajectory_reduction(
++            coords,
++            box,
++            groups1,
++            groups2,
++            digitized_chains1,
++            digitized_chains2,
++            selfdist,
++            periodic is not None,
++            masses,
++            reduction_map[reduction1.lower()],
++            reduction_map[reduction2.lower()],
++            mindist,
++        )
++    else:
++        dist_trajectory_reduction_pairs(
++            coords,
++            box,
++            groups1,
++            groups2,
++            digitized_chains1,
++            digitized_chains2,
++            periodic is not None,
++            masses,
++            reduction_map[reduction1.lower()],
++            reduction_map[reduction2.lower()],
++            mindist,
++        )
+     # print(time.time() - t)
+ 
+     if truncate is not None:

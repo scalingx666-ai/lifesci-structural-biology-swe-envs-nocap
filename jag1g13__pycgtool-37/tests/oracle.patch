@@ -1,0 +1,301 @@
+diff --git a/.github/workflows/python-package.yml b/.github/workflows/python-package.yml
+index e915b6f..37cf4a2 100644
+--- a/.github/workflows/python-package.yml
++++ b/.github/workflows/python-package.yml
+@@ -11,11 +11,13 @@ on:
+ 
+ jobs:
+   build:
+-
+-    runs-on: ubuntu-latest
+     strategy:
++      fail-fast: false
+       matrix:
+         python-version: [3.6, 3.7, 3.8]
++        os: [ubuntu-latest, macos-11.0]
++
++    runs-on: ${{ matrix.os }}
+ 
+     steps:
+     - uses: actions/checkout@v2
+@@ -25,23 +27,20 @@ jobs:
+       with:
+         python-version: ${{ matrix.python-version }}
+ 
+-    - name: Get pip cache dir
+-      id: pip-cache
++    - name: Install pre-install dependencies
+       run: |
+-        echo "::set-output name=dir::$(pip cache dir)"
++        python -m pip install --upgrade pip
++        pip install poetry wheel
++        poetry config virtualenvs.in-project true
+ 
+-    - name: pip cache
++    - name: Cache venv
+       uses: actions/cache@v2
+       with:
+-        path: ${{ steps.pip-cache.outputs.dir }}
+-        key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+-        restore-keys: |
+-          ${{ runner.os }}-pip-
++        path: .venv
++        key: ${{ matrix.os }}-${{ matrix.python-version }}-venv-${{ hashFiles('poetry.lock') }}
+ 
+-    - name: Install dependencies
++    - name: Install project dependencies
+       run: |
+-        python -m pip install --upgrade pip
+-        pip install poetry wheel
+         poetry install --no-root --extras docs --extras test
+ 
+     - name: Test with pytest
+@@ -59,3 +58,7 @@ jobs:
+     - name: Check that test coverage is above 80%
+       run: |
+         poetry run coverage report --fail-under=80
++
++    - name: Test that distributable package builds
++      run: |
++        poetry build
+diff --git a/.gitignore b/.gitignore
+index 5ad6c26..6f36e7c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,6 +15,7 @@
+ # Development and Testing
+ .cache
+ .coverage
++.python-version
+ /cover/
+ /dist/
+ /docs/build/
+diff --git a/README.md b/README.md
+index 978c28a..774ca17 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,13 @@ PyCGTOOL requires Python 3.6 or higher and may be installed using pip:
+ pip install pycgtool
+ ```
+ 
++### MDTraj on macOS
++
++On some versions macOS, with some versions of the Clang compiler, MDTraj may fail to load GROMACS XTC simulation trajectories.
++If you encounter this issue, make sure you have the latest version of MDTraj.
++
++For more information see [MDTraj/#1572](https://github.com/mdtraj/mdtraj/issues/1572).
++
+ ## Usage
+ 
+ Input to PyCGTOOL is GROMACS GRO and XTC files, along with two custom files: MAP and BND.  These files provide the atomistic-to-CG mapping and bonded topology respectively.  Example files are present in the [test/data](https://github.com/jag1g13/pycgtool/tree/master/test/data) directory.  The format of these files is described in the [full documentation](https://pycgtool.readthedocs.io/en/master/index.html).
+diff --git a/pycgtool/frame.py b/pycgtool/frame.py
+index 6af7f2e..d3bfe79 100644
+--- a/pycgtool/frame.py
++++ b/pycgtool/frame.py
+@@ -5,6 +5,7 @@
+ """
+ 
+ import logging
++import pathlib
+ import typing
+ 
+ import mdtraj
+@@ -34,8 +35,10 @@ def __init__(self, msg=None):
+ class Frame:
+     """Load and store data from a simulation trajectory."""
+     def __init__(self,
+-                 topology_file: typing.Optional[str] = None,
+-                 trajectory_file: typing.Optional[str] = None,
++                 topology_file: typing.Optional[typing.Union[pathlib.Path,
++                                                             str]] = None,
++                 trajectory_file: typing.Optional[typing.Union[pathlib.Path,
++                                                               str]] = None,
+                  frame_start: int = 0,
+                  frame_end: typing.Optional[int] = None):
+         """Load a simulation trajectory.
+@@ -45,16 +48,15 @@ def __init__(self,
+         :param frame_start: First frame of trajectory to use
+         :param frame_end: Last frame of trajectory to use
+         """
+-        if topology_file:
++        if topology_file is not None:
+             try:
+-                self._trajectory = mdtraj.load(topology_file)
++                self._trajectory = mdtraj.load(str(topology_file))
+                 self._topology = self._trajectory.topology
+ 
+-                if trajectory_file:
++                if trajectory_file is not None:
+                     try:
+-                        self._trajectory = mdtraj.load(
+-                            trajectory_file,
+-                            top=self._topology)
++                        self._trajectory = mdtraj.load(str(trajectory_file),
++                                                       top=self._topology)
+ 
+                         self._slice_trajectory(frame_start, frame_end)
+ 
+diff --git a/test/test_bondset.py b/test/test_bondset.py
+index 430559f..aa34785 100644
+--- a/test/test_bondset.py
++++ b/test/test_bondset.py
+@@ -2,6 +2,8 @@
+ 
+ import math
+ import os
++import pathlib
++import tempfile
+ 
+ from pycgtool.bondset import BondSet
+ from pycgtool.frame import Frame
+@@ -31,6 +33,9 @@ def __iter__(self):
+ 
+ # TODO add setup and teardown to put all files in a tmp directory
+ class BondSetTest(unittest.TestCase):
++    base_dir = pathlib.Path(__file__).absolute().parent
++    data_dir = base_dir.joinpath('data')
++
+     # Columns are: eqm value, standard fc, MARTINI defaults fc
+     invert_test_ref_data = [
+         ( 0.220474419132,  72658.18163, 1250),
+@@ -179,10 +184,18 @@ def test_full_itp_sugar(self):
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+-        measure.write_itp('sugar_out.itp', mapping)
+ 
+-        self.assertTrue(cmp_file_whitespace_float('sugar_out.itp', 'test/data/sugar_out.itp',
+-                                                  rtol=0.005, verbose=True))
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp_path = pathlib.Path(tmpdir)
++
++            measure.write_itp(tmp_path.joinpath('sugar_out.itp'), mapping)
++
++            self.assertTrue(
++                cmp_file_whitespace_float(
++                    tmp_path.joinpath('sugar_out.itp'),
++                    self.data_dir.joinpath('sugar_out.itp'),
++                    rtol=0.005,
++                    verbose=True))
+ 
+     def test_full_itp_vsites(self):
+         """Test full operation to output of .itp file for molecule with vsites."""
+@@ -197,13 +210,18 @@ def test_full_itp_vsites(self):
+ 
+         measure.apply(cg_frame)
+         measure.boltzmann_invert()
+-        measure.write_itp('naphthalene_out.itp', mapping)
+ 
+-        self.assertTrue(
+-            cmp_file_whitespace_float('naphthalene_out.itp',
+-                                      'test/data/martini3/naphthalene_out.itp',
+-                                      rtol=0.005,
+-                                      verbose=True))
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp_path = pathlib.Path(tmpdir)
++            measure.write_itp(tmp_path.joinpath('naphthalene_out.itp'),
++                              mapping)
++
++            self.assertTrue(
++                cmp_file_whitespace_float(
++                    tmp_path.joinpath('naphthalene_out.itp'),
++                    self.data_dir.joinpath('martini3/naphthalene_out.itp'),
++                    rtol=0.005,
++                    verbose=True))
+ 
+     def test_duplicate_atoms_in_bond(self):
+         with self.assertRaises(ValueError):
+@@ -220,10 +238,14 @@ def test_dump_bonds(self):
+         measure.boltzmann_invert()
+         measure.dump_values()
+ 
++        data_dir = pathlib.Path('test/data')
+         filenames = ('ALLA_length.dat', 'ALLA_angle.dat', 'ALLA_dihedral.dat')
+         for filename in filenames:
+-            self.assertTrue(cmp_file_whitespace_float(os.path.join('test/data', filename), filename,
+-                                                      rtol=0.008, verbose=True))
++            self.assertTrue(
++                cmp_file_whitespace_float(data_dir.joinpath(filename),
++                                          filename,
++                                          rtol=0.008,
++                                          verbose=True))
+             os.remove(filename)
+ 
+     def test_get_lines_for_bond_dump(self):
+diff --git a/test/test_frame.py b/test/test_frame.py
+index 9cc64a9..0b07366 100644
+--- a/test/test_frame.py
++++ b/test/test_frame.py
+@@ -1,11 +1,14 @@
+ import filecmp
+ import os
++import pathlib
+ import unittest
++import tempfile
+ 
+ import numpy as np
+ 
+ from pycgtool.frame import NonMatchingSystemError, UnsupportedFormatException
+ from pycgtool.frame import Frame
++from pycgtool import util
+ 
+ 
+ def try_remove(filename) -> None:
+@@ -18,6 +21,9 @@ def try_remove(filename) -> None:
+ 
+ # TODO add ITP parsing tests
+ class FrameTest(unittest.TestCase):
++    base_dir = pathlib.Path(__file__).absolute().parent
++    data_dir = base_dir.joinpath('data')
++
+     def check_reference_topology(self, frame, skip_names=True):
+         self.assertEqual(663, frame.natoms)
+ 
+@@ -105,10 +111,14 @@ def test_frame_any_read_unsupported(self):
+ 
+     def test_frame_output_gro(self):
+         frame = Frame('test/data/water.gro')
+-        frame.save('water-out.gro')
+-        self.assertTrue(filecmp.cmp('test/data/water.gro', 'water-out.gro'))
+ 
+-        try_remove('water-out.gro')
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp_path = pathlib.Path(tmpdir)
++
++            frame.save(tmp_path.joinpath('water-out.gro'))
++            self.assertTrue(
++                filecmp.cmp(self.data_dir.joinpath('water.gro'),
++                            tmp_path.joinpath('water-out.gro')))
+ 
+     def test_frame_read_xtc_numframes(self):
+         frame = Frame('test/data/water.gro', 'test/data/water.xtc')
+@@ -119,11 +129,25 @@ def test_frame_read_xtc(self):
+ 
+         self.check_reference_trajectory(frame)
+ 
+-    def test_frame_write_xtc(self):
+-        try_remove('water_test2.xtc')
++    def test_frame_accept_path(self):
++        """Test that Frame accepts :class:`pathlib.Path` arguments."""
++        _ = Frame(self.data_dir.joinpath('water.gro'),
++                  self.data_dir.joinpath('water.xtc'))
+ 
+-        frame = Frame('test/data/water.gro', 'test/data/water.xtc')
+-        frame.save('water_test2.xtc')
++    def test_frame_write_xtc(self):
++        """Test that :class:`Frame` can save a trajectory file."""
++        frame = Frame(self.data_dir.joinpath('water.gro'),
++                      self.data_dir.joinpath('water.xtc'))
++
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp_path = pathlib.Path(tmpdir)
++
++            frame.save(tmp_path.joinpath('water.xtc'))
++            self.assertTrue(
++                util.compare_trajectories(
++                    self.data_dir.joinpath('water.xtc'),
++                    tmp_path.joinpath('water.xtc'),
++                    topology_file=self.data_dir.joinpath('water.gro')))
+ 
+     def test_raise_nonmatching_system_mdtraj(self):
+         with self.assertRaises(NonMatchingSystemError):

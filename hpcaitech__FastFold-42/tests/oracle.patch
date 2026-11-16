@@ -1,0 +1,319 @@
+diff --git a/.github/workflows/build_fastfold_wheel.py b/.github/workflows/build_fastfold_wheel.py
+new file mode 100644
+index 00000000..b585dd0a
+--- /dev/null
++++ b/.github/workflows/build_fastfold_wheel.py
+@@ -0,0 +1,97 @@
++import requests
++from bs4 import BeautifulSoup
++import argparse
++import os
++import subprocess
++from packaging import version
++from functools import cmp_to_key
++
++
++WHEEL_TEXT_ROOT_URL = 'https://github.com/hpcaitech/public_assets/tree/main/colossalai/torch_build/torch_wheels'
++RAW_TEXT_FILE_PREFIX = 'https://raw.githubusercontent.com/hpcaitech/public_assets/main/colossalai/torch_build/torch_wheels'
++CUDA_HOME = os.environ['CUDA_HOME']
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--torch_version', type=str)
++    return parser.parse_args()
++
++def get_cuda_bare_metal_version():
++    raw_output = subprocess.check_output([CUDA_HOME + "/bin/nvcc", "-V"], universal_newlines=True)
++    output = raw_output.split()
++    release_idx = output.index("release") + 1
++    release = output[release_idx].split(".")
++    bare_metal_major = release[0]
++    bare_metal_minor = release[1][0]
++
++    return bare_metal_major, bare_metal_minor
++
++def all_wheel_info():
++    page_text = requests.get(WHEEL_TEXT_ROOT_URL).text
++    soup = BeautifulSoup(page_text)
++
++    all_a_links = soup.find_all('a')
++
++    wheel_info = dict()
++
++    for a_link in all_a_links:
++        if 'cuda' in a_link.text and '.txt' in a_link.text:
++            filename = a_link.text
++            torch_version, cuda_version = filename.rstrip('.txt').split('-')
++            cuda_version = cuda_version.lstrip('cuda')
++            if float(cuda_version) < 11.1:
++                continue
++            if torch_version not in wheel_info:
++                wheel_info[torch_version] = dict()
++            wheel_info[torch_version][cuda_version] = dict()
++
++            file_text = requests.get(f'{RAW_TEXT_FILE_PREFIX}/{filename}').text
++            lines = file_text.strip().split('\n')
++
++            for line in lines:
++                parts = line.split('\t')
++                method, url, python_version = parts[:3]
++                if float(python_version) < 3.8 or method == "conda":
++                    continue
++                wheel_info[torch_version][cuda_version][python_version] = dict(url=url)
++    return wheel_info
++
++def build_colossalai(wheel_info):
++    cuda_version_major, cuda_version_minor = get_cuda_bare_metal_version()
++    cuda_version_on_host = f'{cuda_version_major}.{cuda_version_minor}'
++
++    for torch_version, cuda_versioned_wheel_info in wheel_info.items():
++        for cuda_version, python_versioned_wheel_info in cuda_versioned_wheel_info.items():
++            if cuda_version_on_host == cuda_version:
++                for python_version, wheel_info in python_versioned_wheel_info.items():
++                    url = wheel_info['url']
++                    filename = url.split('/')[-1].replace('%2B', '+')
++                    cmd = f'bash ./build_fastfold_wheel.sh {url} {filename} {cuda_version} {python_version}'
++                    os.system(cmd)
++
++def main():
++    args = parse_args()
++    wheel_info = all_wheel_info()
++
++    # filter wheels on condition
++    all_torch_versions = list(wheel_info.keys())
++    def _compare_version(a, b):
++        if version.parse(a) > version.parse(b):
++            return 1
++        else:
++            return -1
++
++    all_torch_versions.sort(key=cmp_to_key(_compare_version))
++
++    if args.torch_version != 'all':
++        torch_versions = args.torch_version.split(',')
++        # only keep the torch versions specified
++        for key in all_torch_versions:
++            if key not in torch_versions:
++                wheel_info.pop(key)
++
++    build_colossalai(wheel_info)
++
++if __name__ == '__main__':
++    main()
+diff --git a/.github/workflows/build_fastfold_wheel.sh b/.github/workflows/build_fastfold_wheel.sh
+new file mode 100644
+index 00000000..8317da6f
+--- /dev/null
++++ b/.github/workflows/build_fastfold_wheel.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++url=${1}
++filename=${2}
++cuda_version=${3}
++python_version=${4}
++
++git reset --hard HEAD
++mkdir -p ./all_dist
++source activate base
++conda create -n $python_version -y python=$python_version
++source activate $python_version
++
++wget -nc -q -O ./$filename $url
++pip install ./$filename
++pip install numpy
++
++python setup.py bdist_wheel
++mv ./dist/* ./all_dist
++python setup.py clean
++conda deactivate
++conda env remove -n $python_version
+\ No newline at end of file
+diff --git a/.github/workflows/release_bdist.yml b/.github/workflows/release_bdist.yml
+new file mode 100644
+index 00000000..d5ca298b
+--- /dev/null
++++ b/.github/workflows/release_bdist.yml
+@@ -0,0 +1,80 @@
++name: Release bdist wheel
++
++on:
++  workflow_dispatch:
++    inputs:
++      torch_version:
++        type: string
++        description: torch version, separated by comma
++        required: true
++        default: "all"
++      cuda_version:
++        type: string
++        description: cuda version, separated by comma
++        required: true
++      github_ref:
++        type: string
++        description: Branch or Tag
++        default: 'main'
++        required: true
++
++jobs:
++  matrix_preparation:
++    name: Prepare Container List
++    runs-on: ubuntu-latest
++    outputs:
++      matrix: ${{ steps.set-matrix.outputs.matrix }}
++    steps:
++    - id: set-matrix
++      env:
++        TORCH_VERSIONS: ${{ inputs.torch_version }}
++        CUDA_VERSIONS: ${{ inputs.cuda_version }}
++      run: |
++        echo $TORCH_VERSIONS
++        echo $CUDA_VERSIONS
++        IFS=','
++        DOCKER_IMAGE=()
++        for cv in $CUDA_VERSIONS
++        do
++            DOCKER_IMAGE+=("\"hpcaitech/cuda-conda:${cv}\"")
++        done
++        container=$( IFS=',' ; echo "${DOCKER_IMAGE[*]}" )
++        container="[${container}]"
++        echo "$container"
++        echo "::set-output name=matrix::{\"container\":$(echo "$container")}"
++  build:
++    name: Release bdist wheels
++    needs: matrix_preparation
++    if: github.repository == 'hpcaitech/FastFold' && contains(fromJson('["FrankLeeeee", "feifeibear", "Shenggan", "Gy-Lu"]'), github.actor)
++    runs-on: [self-hosted, gpu]
++    strategy:
++      fail-fast: false
++      matrix: ${{fromJson(needs.matrix_preparation.outputs.matrix)}}
++    container:
++      image: ${{ matrix.container }}
++      options: --gpus all --rm
++    steps:
++      - uses: actions/checkout@v2
++        with:
++          fetch-depth: 0
++      - name: Copy scripts and checkout
++        run: |
++          cp -r ./.github/workflows/* ./
++          ln -s /github/home/pip_wheels ./pip_wheels
++          git checkout $git_ref
++        env:
++          git_ref: ${{ github.event.inputs.github_ref }}
++      - name: Build bdist wheel
++        run: |
++          pip install beautifulsoup4 requests packaging
++          python ./build_fastfold_wheel.py --torch_version $TORCH_VERSIONS
++        env:
++          TORCH_VERSIONS: ${{ inputs.torch_version }}
++      - name: 🚀 Deploy
++        uses: garygrossgarten/github-action-scp@release
++        with:
++          local: all_dist
++          remote: ${{ secrets.PRIVATE_PYPI_DIR }}
++          host: ${{ secrets.PRIVATE_PYPI_HOST }}
++          username: ${{ secrets.PRIVATE_PYPI_USER }}
++          password: ${{ secrets.PRIVATE_PYPI_PASSWD }}
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index cc8e617b..5cf3623b 100644
+--- a/README.md
++++ b/README.md
+@@ -21,24 +21,48 @@ FastFold provides a **high-performance implementation of Evoformer** with the fo
+ 
+ ## Installation
+ 
+-You will need Python 3.8 or later and [NVIDIA CUDA](https://developer.nvidia.com/cuda-downloads) 11.1 or above when you are installing from source. 
++To install and use FastFold, you will need:
+++ Python 3.8 or later
+++ [NVIDIA CUDA](https://developer.nvidia.com/cuda-downloads) 11.1 or above
+++ PyTorch 1.10 or above 
++
++For now, You can install FastFold:
++### Using Conda (Recommended)
++
++We highly recommend installing an Anaconda or Miniconda environment and install PyTorch with conda.
++Lines below would create a new conda environment called "fastfold":
+ 
+ ```shell
+ git clone https://github.com/hpcaitech/FastFold
+ cd FastFold
+-```
+-We highly recommend installing an Anaconda or Miniconda environment and install PyTorch with conda:
+-
+-```shell
+ conda env create --name=fastfold -f environment.yml
+ conda activate fastfold
+ bash scripts/patch_openmm.sh
++python setup.py install
+ ```
+ 
+-You can get the FastFold source and install it with setuptools:
++### Using PyPi
++You can download FastFold with pre-built CUDA extensions.
+ 
+ ```shell
+-python setup.py install
++pip install fastfold -f https://release.colossalai.org/fastfold
++```
++
++## Use Docker
++
++### Build On Your Own
++Run the following command to build a docker image from Dockerfile provided.
++
++> Building FastFold from scratch requires GPU support, you need to use Nvidia Docker Runtime as the default when doing `docker build`. More details can be found [here](https://stackoverflow.com/questions/59691207/docker-build-with-nvidia-runtime).
++
++```shell
++cd ColossalAI
++docker build -t fastfold ./docker
++```
++
++Run the following command to start the docker container in interactive mode.
++```shell
++docker run -ti --gpus all --rm --ipc=host fastfold bash
+ ```
+ 
+ ## Usage
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+new file mode 100644
+index 00000000..7e143199
+--- /dev/null
++++ b/docker/Dockerfile
+@@ -0,0 +1,21 @@
++FROM hpcaitech/cuda-conda:11.3
++
++
++# install dependency
++RUN yum install -y patch
++
++RUN conda install pytorch==1.10.0 torchvision torchaudio cudatoolkit=11.3 -c pytorch \
++ && conda install setuptools=59.5.0 openmm=7.5.1 pdbfixer -c conda-forge \
++ && conda install hmmer==3.3.2 hhsuite=3.3.0 kalign2=2.04 -c bioconda
++
++RUN pip install biopython==1.79 dm-tree==0.1.6 ml-collections==0.1.0 numpy==1.21.2 \
++ PyYAML==5.4.1 requests==2.26.0 scipy==1.7.1 tqdm==4.62.2 typing-extensions==3.10.0.2 einops 
++
++RUN pip install colossalai==0.1.8+torch1.10cu11.3 -f https://release.colossalai.org
++
++
++# prepare environment
++Run git clone https://github.com/hpcaitech/FastFold.git\
++ && cd ./FastFold \
++ && /bin/bash scripts/patch_openmm.sh \
++ && python setup.py install
+diff --git a/setup.py b/setup.py
+index c76405e8..7a167320 100644
+--- a/setup.py
++++ b/setup.py
+@@ -129,7 +129,7 @@ def cuda_ext_helper(name, sources, extra_cuda_flags):
+ 
+ setup(
+     name='fastfold',
+-    version='0.1.0-beta',
++    version='0.1.0',
+     packages=find_packages(exclude=(
+         'assets',
+         'benchmark',

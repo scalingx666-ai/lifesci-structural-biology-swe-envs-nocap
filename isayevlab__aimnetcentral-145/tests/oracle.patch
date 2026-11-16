@@ -1,0 +1,390 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fcbda0e..c56d8a6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,7 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Added PyTorch 2.14 to the supported range. It joins the per-pull-request `tests-torch` matrix, the documented range, and the default version list of the manual GPU validation script. The resolver floor is now `torch>=2.10` with no upper bound and the locked torch stays at 2.13.0, so 2.14 is tested and supported without being required. The scheduled `torch-latest` lane keeps its job as an early-warning probe for whatever ships next; it had already been passing against 2.14.0 for weeks before this promotion.
+ - Added `aimnet.calculators.vibrations`, a numpy-only harmonic vibrational analysis of the calculator's dense Hessian. `analyze_hessian` symmetrizes and mass-weights the `(N, 3, N, 3)` or `(3N, 3N)` Hessian, projects out rigid translations and rotations with an SVD-orthonormalized basis (three for a single atom, five for a linear molecule, six otherwise), diagonalizes only the vibrational subspace, and returns wavenumbers in cm^-1 with imaginary modes as negative values, vibrational quanta in eV, and unit-norm Cartesian normal modes; `vibrational_analysis(calc, data)` wraps the `hessian=True` evaluation for a single structure and warns when the model embeds a dispersion module whose curvature the Hessian currently omits. Unlike `ase.vibrations.VibrationsData`, which does not project rigid-body motions, or the former `sorted(freqs)[6:]` recipe, which mishandled linear molecules and could hide an imaginary mode, the result is orientation-independent and correct for linear and near-linear geometries. Masses come from the bundled `aimnet.constants` table, so no ASE install is required; the geometry-optimization tutorial's thermochemistry step now uses it.
+ - Added `aimnet download <model...|--all>` to prefetch registry model weights into the local cache for offline/HPC use.
+-- Added `deterministic=True` calculator option: routes external DFT-D3 and DSF Coulomb through their differentiable pure-torch paths, making repeated identical evaluations bitwise reproducible on the same machine/build (issue #93). This holds only on the dense CUDA layout (3D input with at most `nb_threshold` atoms per system, no cell, no Hessian) and for the same batch composition; the packed neighbor-list layout, used above `nb_threshold` and for periodic systems, is not yet covered on CUDA (issue #140). CPU always uses the packed layout and has been bitwise repeatable in testing, though that is not yet guaranteed. Ewald/PME kernels are not covered and warn once.
++- Added `deterministic=True` calculator option: routes external DFT-D3 and DSF Coulomb through their differentiable pure-torch paths, making repeated identical evaluations bitwise reproducible on the same machine/build (issue #93). This holds only on the dense CUDA layout (3D input with at most `nb_threshold` atoms per system, no cell, no Hessian) and for the same batch composition; on the packed neighbor-list layout, used above `nb_threshold` and for periodic systems, the calculator sorts the neighbor rows it builds (not a caller-supplied `nbmat`) into a canonical order, so energies are bitwise reproducible on CUDA when `torch.use_deterministic_algorithms(True)` is also enabled (a one-time warning fires otherwise), while forces are not yet covered (issue #140). CPU always uses the packed layout and has been bitwise repeatable in testing, though that is not yet guaranteed. Ewald/PME kernels are not covered and warn once.
+ - Added weekly and manually dispatched strict fleet CI covering every official registry digest, strict-policy artifact load, and exact role-specific YAML defaults.
+ - Added `aimnet info` reporting package/torch/warp versions, CUDA availability, registered kernel ops, and the model cache location.
+ - Added a `weights` pytest marker on modules that need model weights, enabling a verified fully-offline test run (`-m "not weights ..."`) for packaging environments.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 7aceb21..a6479bf 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -89,9 +89,14 @@ class AIMNet2Calculator:
+         kernels. Default is False. On CUDA this makes repeated identical
+         evaluations bitwise reproducible only on the dense layout: 3D input
+         with at most ``nb_threshold`` atoms per system, no ``cell``, no
+-        Hessian, and no caller-supplied ``mol_idx`` or ``nbmat``. On CUDA the
+-        packed neighbor-list layout used otherwise keeps run-to-run noise of
+-        ~1e-6 eV/A in forces (issue #140). CPU always uses the packed layout;
++        Hessian, and no caller-supplied ``mol_idx`` or ``nbmat``. On the
++        packed neighbor-list layout used otherwise, the calculator sorts the
++        neighbor rows it builds into a canonical order (a caller-supplied
++        ``nbmat`` is used as given), so energies are also bitwise
++        reproducible on CUDA once ``torch.use_deterministic_algorithms(True)``
++        is enabled (a one-time warning fires without it); forces there keep
++        run-to-run noise of ~1e-6 eV/A (issue #140). CPU always uses the
++        packed layout;
+         repeated CPU evaluations have been bitwise identical in testing, but
+         that is not yet guaranteed. Ewald/PME Coulomb is not covered (a
+         one-time warning fires). Reproducibility also requires
+@@ -390,6 +395,7 @@ def __init__(
+         # deterministic, instead of the atomics-based nvalchemiops kernels.
+         self._deterministic = bool(deterministic)
+         self._warned_deterministic_lr = False
++        self._warned_deterministic_packed = False
+         self.model.train(train)
+         if not train:
+             # Disable gradients on all parameters for inference mode
+@@ -1187,6 +1193,7 @@ def prepare_input(self, data: dict[str, Any], *, hessian: bool = False) -> dict[
+                 "to a non-periodic method via set_lrcoulomb_method('simple' | 'dsf')."
+             )
+         if data["coord"].ndim == 2:
++            self._warn_deterministic_packed()
+             # Skip neighbor list calculation if already provided
+             if "nbmat" not in data:
+                 cache_key = self._static_nbmat_cache_key(
+@@ -1208,6 +1215,24 @@ def prepare_input(self, data: dict[str, Any], *, hessian: bool = False) -> dict[
+             data = self.pad_input(data)
+         return data
+ 
++    def _warn_deterministic_packed(self) -> None:
++        """Warn once that packed-layout determinism needs torch's deterministic mode."""
++        if (
++            not getattr(self, "_deterministic", False)
++            or getattr(self, "_warned_deterministic_packed", False)
++            or torch.device(self.device).type != "cuda"
++            or torch.are_deterministic_algorithms_enabled()
++        ):
++            return
++        warnings.warn(
++            "deterministic=True on the packed neighbor-list layout gives bitwise-reproducible "
++            "energies only with torch.use_deterministic_algorithms(True) (set "
++            "CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA starts, or pass warn_only=True); "
++            "forces are not yet covered (issue #140).",
++            stacklevel=5,  # the caller of __call__
++        )
++        self._warned_deterministic_packed = True
++
+     def _static_nbmat_cache_key(
+         self,
+         raw_data: dict[str, Any],
+@@ -1715,6 +1740,8 @@ def mol_unflatten(self, data: dict[str, Tensor], batch=None) -> dict[str, Tensor
+ 
+     def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+         assert self._max_mol_size > 0, "Molecule size is not set"
++        # Canonical row order makes the downstream summation order repeatable.
++        sort_rows = getattr(self, "_deterministic", False)
+ 
+         # Prepare batch_idx from mol_idx
+         mol_idx = data.get("mol_idx")
+@@ -1746,7 +1773,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+             fill_value=N,
+         )
+ 
+-        nbmat1, shifts1 = _add_padding_row(nbmat1, shifts1, N)
++        nbmat1, shifts1 = _add_padding_row(nbmat1, shifts1, N, sort=sort_rows)
+         data["nbmat"] = nbmat1
+         if cell is not None:
+             assert shifts1 is not None
+@@ -1790,7 +1817,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                 batch_idx=batch_idx,
+                 fill_value=N,
+             )
+-            nbmat_coulomb, shifts_coulomb = _add_padding_row(nbmat_coulomb, shifts_coulomb, N)
++            nbmat_coulomb, shifts_coulomb = _add_padding_row(nbmat_coulomb, shifts_coulomb, N, sort=sort_rows)
+             data["nbmat_coulomb"] = nbmat_coulomb
+             data["nbmat_lr"] = nbmat_coulomb
+             assert shifts_coulomb is not None
+@@ -1806,7 +1833,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                     batch_idx=batch_idx,
+                     fill_value=N,
+                 )
+-                nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N)
++                nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N, sort=sort_rows)
+                 data["nbmat_dftd3"] = nbmat_dftd3
+                 if shifts_dftd3 is not None:
+                     data["shifts_dftd3"] = shifts_dftd3
+@@ -1819,7 +1846,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                     batch_idx=batch_idx,
+                     fill_value=N,
+                 )
+-                nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N)
++                nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N, sort=sort_rows)
+                 data["nbmat_dftd3"] = nbmat_dftd3
+                 if shifts_dftd3 is not None:
+                     data["shifts_dftd3"] = shifts_dftd3
+@@ -1836,7 +1863,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                 batch_idx=batch_idx,
+                 fill_value=N,
+             )
+-            nbmat_lr, shifts_lr = _add_padding_row(nbmat_lr, shifts_lr, N)
++            nbmat_lr, shifts_lr = _add_padding_row(nbmat_lr, shifts_lr, N, sort=sort_rows)
+ 
+             # All LR modules share the same neighbor list when cutoffs are similar
+             data["nbmat_lr"] = nbmat_lr
+@@ -1857,7 +1884,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                     batch_idx=batch_idx,
+                     fill_value=N,
+                 )
+-                nbmat_coulomb, shifts_coulomb = _add_padding_row(nbmat_coulomb, shifts_coulomb, N)
++                nbmat_coulomb, shifts_coulomb = _add_padding_row(nbmat_coulomb, shifts_coulomb, N, sort=sort_rows)
+                 data["nbmat_coulomb"] = nbmat_coulomb
+                 # Set nbmat_lr for backward compatibility with code expecting unified LR neighbor list
+                 data["nbmat_lr"] = nbmat_coulomb
+@@ -1873,7 +1900,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                         batch_idx=batch_idx,
+                         fill_value=N,
+                     )
+-                    nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N)
++                    nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N, sort=sort_rows)
+                     data["nbmat_dftd3"] = nbmat_dftd3
+                     if cell is not None and shifts_dftd3 is not None:
+                         data["shifts_dftd3"] = shifts_dftd3
+@@ -1887,7 +1914,7 @@ def make_nbmat(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                     batch_idx=batch_idx,
+                     fill_value=N,
+                 )
+-                nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N)
++                nbmat_dftd3, shifts_dftd3 = _add_padding_row(nbmat_dftd3, shifts_dftd3, N, sort=sort_rows)
+                 data["nbmat_dftd3"] = nbmat_dftd3
+                 data["nbmat_lr"] = nbmat_dftd3
+                 if cell is not None and shifts_dftd3 is not None:
+diff --git a/aimnet/calculators/neighbors.py b/aimnet/calculators/neighbors.py
+index aa5b687..b10d1cb 100644
+--- a/aimnet/calculators/neighbors.py
++++ b/aimnet/calculators/neighbors.py
+@@ -276,6 +276,8 @@ def _add_padding_row(
+     nbmat: Tensor,
+     shifts: Tensor | None,
+     N: int,
++    *,
++    sort: bool = False,
+ ) -> tuple[Tensor, Tensor | None]:
+     """Add padding row to neighbor matrix and shifts.
+ 
+@@ -287,12 +289,20 @@ def _add_padding_row(
+         Shift vectors for PBC or None, shape (N, max_neighbors, 3).
+     N : int
+         Number of atoms (used as fill value for padding row).
++    sort : bool
++        Put each row in canonical order first: ascending neighbor index, ties
++        between periodic images broken by shift, fill entries last with zero
++        shift. The CUDA neighbor-list kernels assign slots with atomics, so
++        without this the slot order, and with it the summation order
++        downstream, varies from run to run.
+ 
+     Returns
+     -------
+     tuple[Tensor, Tensor | None]
+         Tuple of (nbmat, shifts) with padding row added.
+     """
++    if sort:
++        nbmat, shifts = _sort_neighbor_rows(nbmat, shifts, N)
+     device = nbmat.device
+     dtype = nbmat.dtype
+     nnb_max = nbmat.shape[1]
+@@ -306,6 +316,21 @@ def _add_padding_row(
+     return nbmat, shifts
+ 
+ 
++def _sort_neighbor_rows(nbmat: Tensor, shifts: Tensor | None, N: int) -> tuple[Tensor, Tensor | None]:
++    """Sort each neighbor row by (index, shift_x, shift_y, shift_z)."""
++    if shifts is None:
++        return torch.sort(nbmat, dim=1).values, None
++    # Fill slots carry arbitrary shifts; zero them so equal rows sort equally.
++    shifts = shifts.masked_fill((nbmat == N).unsqueeze(-1), 0)
++    # Lexicographic order via stable argsorts, least significant key first.
++    order = torch.argsort(shifts[..., 2], dim=1, stable=True)
++    for key in (shifts[..., 1], shifts[..., 0], nbmat):
++        order = order.gather(1, torch.argsort(key.gather(1, order), dim=1, stable=True))
++    nbmat = nbmat.gather(1, order)
++    shifts = shifts.gather(1, order.unsqueeze(-1).expand(-1, -1, 3))
++    return nbmat, shifts
++
++
+ def maybe_pad_dim0(a: Tensor, N: int, value=0.0) -> Tensor:
+     _shape_diff = N - a.shape[0]
+     assert _shape_diff == 0 or _shape_diff == 1, "Invalid shape"
+diff --git a/docs/calculator.md b/docs/calculator.md
+index 15b87ab..beb00f9 100644
+--- a/docs/calculator.md
++++ b/docs/calculator.md
+@@ -277,12 +277,23 @@ Route external DFT-D3 (and DSF Coulomb) through their differentiable pure-torch
+ 
+ The kernel defaults accumulate pairwise terms with atomic adds, so repeated identical evaluations differ at the float32 rounding level (~1e-7 eV in energies). That noise is physically negligible but is amplified chaotically by iterative optimizers: batched geometry optimizations from byte-identical inputs can follow different trajectories. With `deterministic=True`, identical inputs give bitwise-identical energies and forces on the same machine and build **on the dense layout only**, at negligible cost for typical batched workloads.
+ 
+-The dense layout is used on CUDA for 3D input with at most `nb_threshold` atoms per system (default 120), no `cell`, no Hessian, and no caller-supplied `mol_idx` or `nbmat`. Everything else runs on the packed neighbor-list layout, which `deterministic=True` does not yet make reproducible on CUDA: its neighbor-list row order, per-molecule reductions, and the ConvSV backward kernel still accumulate in varying order, leaving run-to-run noise of about 1e-6 eV/Å in forces ([#140](https://github.com/isayevlab/aimnetcentral/issues/140)). CPU evaluations always use the packed layout; they have been bitwise repeatable in testing, but that is not yet guaranteed.
++The dense layout is used on CUDA for 3D input with at most `nb_threshold` atoms per system (default 120), no `cell`, no Hessian, and no caller-supplied `mol_idx` or `nbmat`. Everything else runs on the packed neighbor-list layout. There, `deterministic=True` sorts each row of the neighbor lists the calculator builds into a canonical order (a caller-supplied `nbmat` is used in the order given), which makes energies bitwise reproducible on CUDA once PyTorch's deterministic mode is also on; without it a one-time `UserWarning` fires. Forces on the packed layout are not yet covered: the ConvSV backward kernel still accumulates in varying order, leaving run-to-run noise of about 1e-6 eV/Å ([#140](https://github.com/isayevlab/aimnetcentral/issues/140)). CPU evaluations always use the packed layout; they have been bitwise repeatable in testing, but that is not yet guaranteed.
+ 
+ ```python
+ calc = AIMNet2Calculator("aimnet2", deterministic=True)
+ ```
+ 
++For reproducible energies on the packed layout, enable PyTorch's deterministic mode as well. It is process-wide, so the calculator leaves that choice to you:
++
++```python
++import os
++
++os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # before CUDA is first used
++torch.use_deterministic_algorithms(True)  # or (True, warn_only=True) without the variable
++```
++
++PyTorch's deterministic reductions are slower; in one measurement on an L40S they roughly doubled the cost of an energy-and-forces call for a batch of 32 molecules, so benchmark your workload.
++
+ Notes:
+ 
+ - Covers external D3 and `simple`/`dsf` Coulomb. Ewald/PME kernels are not covered; a one-time `UserWarning` fires if combined.
+diff --git a/tests/test_calculator_gpu.py b/tests/test_calculator_gpu.py
+index d8e2768..a89fe4d 100644
+--- a/tests/test_calculator_gpu.py
++++ b/tests/test_calculator_gpu.py
+@@ -4,9 +4,11 @@
+ Run with: pytest -m gpu
+ """
+ 
++import warnings
++
+ import pytest
+ import torch
+-from conftest import CAFFEINE_FILE, TAXOL_FILE, load_mol
++from conftest import CAFFEINE_FILE, CIF_SPIRO, TAXOL_FILE, load_mol
+ 
+ from aimnet.calculators import AIMNet2Calculator
+ from aimnet.modules.lr import _mode2_backend_inputs
+@@ -796,14 +798,75 @@ def test_dense_layout_bitwise_reproducible_for_drug_sized_molecule(self):
+             assert torch.equal(out["energy"], outs[0]["energy"])
+             assert torch.equal(out["forces"], outs[0]["forces"])
+ 
++    @pytest.fixture
++    def torch_deterministic(self):
++        """Enable torch's deterministic algorithms for one test, then restore."""
++        enabled = torch.are_deterministic_algorithms_enabled()
++        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
++        torch.use_deterministic_algorithms(True, warn_only=True)
++        yield
++        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
++
+     @pytest.mark.ase
+-    @pytest.mark.xfail(strict=True, reason="#140: packed-layout neighbor order and reductions are nondeterministic")
+-    def test_packed_layout_energy_bitwise_reproducible(self):
++    def test_packed_layout_energy_bitwise_reproducible(self, torch_deterministic):
+         outs = self._repeat_taxol(nb_threshold=0)
+         assert all(torch.equal(out["energy"], outs[0]["energy"]) for out in outs[1:])
+ 
++    @pytest.mark.ase
++    def test_packed_layout_periodic_energy_bitwise_reproducible(self, torch_deterministic):
++        """Periodic images repeat neighbor indices, so the row order needs the shift tie-break."""
++        crystal = load_mol(CIF_SPIRO)
++        calc = AIMNet2Calculator("aimnet2", deterministic=True)
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")  # the DSF auto-switch for periodic input
++            energies = [calc(dict(crystal))["energy"] for _ in range(self._REPEATS)]
++        assert all(torch.equal(e, energies[0]) for e in energies[1:])
++
+     @pytest.mark.ase
+     @pytest.mark.xfail(strict=True, reason="#140: the Warp conv_sv_2d_sp backward accumulates with atomics")
+-    def test_packed_layout_forces_bitwise_reproducible(self):
++    def test_packed_layout_forces_bitwise_reproducible(self, torch_deterministic):
+         outs = self._repeat_taxol(nb_threshold=0)
+         assert all(torch.equal(out["forces"], outs[0]["forces"]) for out in outs[1:])
++
++    @staticmethod
++    def _packed_warnings(calc: AIMNet2Calculator, batched: bool = False) -> list[warnings.WarningMessage]:
++        """Packed-layout warnings from two evaluations of caffeine.
++
++        2D input always takes the packed layout; ``batched`` gives 3D input,
++        which stays dense up to ``nb_threshold`` atoms.
++        """
++        mol = load_mol(CAFFEINE_FILE)
++        data = {
++            "coord": torch.as_tensor(mol["coord"], dtype=torch.float32, device="cuda"),
++            "numbers": torch.as_tensor(mol["numbers"], device="cuda"),
++            "charge": torch.zeros(1, device="cuda"),
++        }
++        if batched:
++            data["coord"] = data["coord"].unsqueeze(0)
++            data["numbers"] = data["numbers"].unsqueeze(0)
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter("always")
++            for _ in range(2):
++                calc(dict(data), forces=True)
++        return [w for w in caught if "packed neighbor-list layout" in str(w.message)]
++
++    @pytest.mark.ase
++    def test_packed_layout_warns_once_without_torch_deterministic(self):
++        assert not torch.are_deterministic_algorithms_enabled()
++        calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=0)
++        assert len(self._packed_warnings(calc)) == 1
++
++    @pytest.mark.ase
++    def test_packed_layout_does_not_warn_with_torch_deterministic(self, torch_deterministic):
++        calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=0)
++        assert self._packed_warnings(calc) == []
++
++    @pytest.mark.ase
++    def test_dense_layout_does_not_warn(self):
++        calc = AIMNet2Calculator("aimnet2", deterministic=True)
++        assert self._packed_warnings(calc, batched=True) == []
++
++    @pytest.mark.ase
++    def test_packed_layout_does_not_warn_without_deterministic(self):
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0)
++        assert self._packed_warnings(calc) == []
+diff --git a/tests/test_neighbors.py b/tests/test_neighbors.py
+index 5346513..d16e98c 100644
+--- a/tests/test_neighbors.py
++++ b/tests/test_neighbors.py
+@@ -117,3 +117,47 @@ def test_fresh_periodic_instance_is_not_truncated_by_the_initial_estimate(device
+     assert int(num_neighbors.max().item()) == expected
+     assert nbmat.shape[1] >= expected, "periodic neighbor matrix was silently truncated on a fresh instance"
+     assert shifts is not None and shifts.shape[:2] == nbmat.shape
++
++
++def test_padding_row_sort_makes_gas_rows_order_independent() -> None:
++    """The same neighbors in any slot order give one canonical row, fills last."""
++    from aimnet.calculators.neighbors import _add_padding_row
++
++    N = 6
++    a = torch.tensor([[3, N, 1, 5], [N, 2, N, 0]], dtype=torch.int32)
++    b = torch.tensor([[5, 1, N, 3], [0, N, 2, N]], dtype=torch.int32)
++    nb_a, _ = _add_padding_row(a, None, N, sort=True)
++    nb_b, _ = _add_padding_row(b, None, N, sort=True)
++    assert torch.equal(nb_a, nb_b)
++    assert nb_a.tolist() == [[1, 3, 5, N], [0, 2, N, N], [N, N, N, N]]
++
++
++def test_padding_row_sort_orders_periodic_images_by_shift() -> None:
++    """Periodic images repeat a neighbor index; the shift breaks the tie, and
++    the arbitrary shifts left in fill slots must not affect the result."""
++    from aimnet.calculators.neighbors import _add_padding_row
++
++    N = 4
++    a = torch.tensor([[2, N, 2, 1]], dtype=torch.int32)
++    sa = torch.tensor([[[1, 0, 0], [7, 7, 7], [0, 0, -1], [0, 1, 0]]], dtype=torch.int32)
++    b = torch.tensor([[1, 2, 2, N]], dtype=torch.int32)
++    sb = torch.tensor([[[0, 1, 0], [0, 0, -1], [1, 0, 0], [-3, 2, 9]]], dtype=torch.int32)
++    nb_a, sh_a = _add_padding_row(a, sa, N, sort=True)
++    nb_b, sh_b = _add_padding_row(b, sb, N, sort=True)
++    assert sh_a is not None and sh_b is not None
++    assert torch.equal(nb_a, nb_b)
++    assert torch.equal(sh_a, sh_b)
++    assert nb_a[0].tolist() == [1, 2, 2, N]
++    assert sh_a[0].tolist() == [[0, 1, 0], [0, 0, -1], [1, 0, 0], [0, 0, 0]]
++
++
++def test_padding_row_without_sort_keeps_slot_order() -> None:
++    from aimnet.calculators.neighbors import _add_padding_row
++
++    N = 4
++    nbmat = torch.tensor([[2, N, 0, 1]], dtype=torch.int32)
++    shifts = torch.tensor([[[1, 0, 0], [7, 7, 7], [0, 0, 0], [0, 1, 0]]], dtype=torch.int32)
++    nb, sh = _add_padding_row(nbmat, shifts, N)
++    assert sh is not None
++    assert torch.equal(nb[:1], nbmat)
++    assert torch.equal(sh[:1], shifts)

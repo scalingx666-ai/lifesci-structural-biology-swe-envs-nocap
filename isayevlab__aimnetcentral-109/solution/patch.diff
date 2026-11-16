@@ -1,0 +1,393 @@
+diff --git a/aimnet/models/aimnet2.py b/aimnet/models/aimnet2.py
+index 1001beb4..68623506 100644
+--- a/aimnet/models/aimnet2.py
++++ b/aimnet/models/aimnet2.py
+@@ -164,7 +164,7 @@ def forward(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+                 _in = torch.cat([self._prepare_in_a(data), self._prepare_in_q(data)], dim=-1)
+ 
+             _out = mlp(_in)
+-            if data["_input_padded"].item():
++            if nbops.is_input_padded(data):
+                 _out = nbops.mask_i_(_out, data, mask_value=0.0)
+ 
+             if ipass == 0:
+diff --git a/aimnet/modules/core.py b/aimnet/modules/core.py
+index 6cf96bf0..49bce4c7 100644
+--- a/aimnet/modules/core.py
++++ b/aimnet/modules/core.py
+@@ -126,7 +126,7 @@ def extra_repr(self) -> str:
+ 
+     def forward(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
+         v = self.mlp(data[self.key_in]).squeeze(-1)
+-        if data["_input_padded"].item():
++        if nbops.is_input_padded(data):
+             v = nbops.mask_i_(v, data, mask_value=0.0)
+         data[self.key_out] = v
+         return data
+diff --git a/aimnet/nbops.py b/aimnet/nbops.py
+index 4d5e5e52..b86e6ae1 100644
+--- a/aimnet/nbops.py
++++ b/aimnet/nbops.py
+@@ -16,8 +16,45 @@ def set_nb_mode(data: dict[str, Tensor]) -> dict[str, Tensor]:
+     return data
+ 
+ 
++def infer_nb_mode(data: dict[str, Tensor]) -> int:
++    """Derive the neighbor mode from tensor metadata alone.
++
++    This is the definition `set_nb_mode` writes into `_nb_mode`, factored out
++    so it can be evaluated without reading a tensor value. Ranks are static
++    metadata, so this costs nothing and -- unlike `Tensor.item()` -- does not
++    force a graph break under `torch.compile`.
++
++    The `numbers` fallback covers data dicts assembled by hand for the packed
++    layout without a neighbor matrix (`mol_sum` only needs `mol_idx`): packed
++    inputs carry a flat 1D `numbers`, dense ones carry (B, N).
++    """
++    if "nbmat" in data:
++        ndim = data["nbmat"].ndim
++        if ndim == 2:
++            return 1
++        if ndim == 3:
++            return 2
++        raise ValueError("Invalid neighbor matrix shape")
++    if "numbers" in data and data["numbers"].ndim == 1:
++        return 1
++    return 0
++
++
+ def get_nb_mode(data: dict[str, Tensor]) -> int:
+-    """Get the neighbor model."""
++    """Get the neighbor model.
++
++    Eager reads the `_nb_mode` tensor, which is the serialized contract and
++    stays the single source of truth there. Under `torch.compile` the same
++    value is recovered from tensor metadata instead: `Tensor.item()` is a
++    graph break, and this function is called ~27 times per forward, which on
++    its own accounted for most of the breaks in a compiled AIMNet2 forward.
++
++    The two agree by construction for anything that went through
++    `set_nb_mode`, which every model forward calls in `prepare_input` before
++    any consumer runs.
++    """
++    if torch.compiler.is_compiling():
++        return infer_nb_mode(data)
+     return int(data["_nb_mode"].item())
+ 
+ 
+@@ -43,16 +80,24 @@ def calc_masks(data: dict[str, Tensor]) -> dict[str, Tensor]:
+         # padding must be the last atom
+         data["mask_i"] = torch.zeros(data["numbers"].shape[0], device=data["numbers"].device, dtype=torch.bool)
+         data["mask_i"][-1] = True
+-        # Track processed arrays by their data pointer to avoid redundant mask calculations
++        # Track processed arrays by their data pointer to avoid redundant mask
++        # calculations. `Tensor.data_ptr()` is not traceable: under
++        # torch.compile the resulting dict key is unhashable, and dynamo
++        # responds by skipping the whole enclosing frame rather than breaking
++        # the graph. Recomputing these masks -- one elementwise compare each --
++        # is much cheaper than losing the compiled forward, so the dedup is
++        # eager-only.
++        dedup = not torch.compiler.is_compiling()
+         processed: dict[int, str] = {}  # data_ptr -> mask_suffix
+         for suffix in ("", "_lr", "_coulomb", "_dftd3"):
+             nbmat_key = f"nbmat{suffix}"
+             if nbmat_key in data:
+-                ptr = data[nbmat_key].data_ptr()
+-                if ptr in processed:
+-                    data[f"mask_ij{suffix}"] = data[f"mask_ij{processed[ptr]}"]
+-                    continue
+-                processed[ptr] = suffix
++                if dedup:
++                    ptr = data[nbmat_key].data_ptr()
++                    if ptr in processed:
++                        data[f"mask_ij{suffix}"] = data[f"mask_ij{processed[ptr]}"]
++                        continue
++                    processed[ptr] = suffix
+                 data[f"mask_ij{suffix}"] = data[nbmat_key] == data["numbers"].shape[0] - 1
+         data["_input_padded"] = torch.tensor(True)
+         data["mol_sizes"] = torch.bincount(data["mol_idx"])
+@@ -67,16 +112,18 @@ def calc_masks(data: dict[str, Tensor]) -> dict[str, Tensor]:
+             data["_num_mol"] = torch.tensor(data["mol_sizes"].shape[0])
+     elif nb_mode == 2:
+         data["mask_i"] = data["numbers"] == 0
+-        # Track processed arrays by their data pointer to avoid redundant mask calculations
++        # Same eager-only dedup as mode 1: see the note there on data_ptr().
++        dedup_nb2 = not torch.compiler.is_compiling()
+         processed_nb2: dict[int, str] = {}  # data_ptr -> mask_suffix
+         for suffix in ("", "_lr", "_coulomb", "_dftd3"):
+             nbmat_key = f"nbmat{suffix}"
+             if nbmat_key in data:
+-                ptr = data[nbmat_key].data_ptr()
+-                if ptr in processed_nb2:
+-                    data[f"mask_ij{suffix}"] = data[f"mask_ij{processed_nb2[ptr]}"]
+-                    continue
+-                processed_nb2[ptr] = suffix
++                if dedup_nb2:
++                    ptr = data[nbmat_key].data_ptr()
++                    if ptr in processed_nb2:
++                        data[f"mask_ij{suffix}"] = data[f"mask_ij{processed_nb2[ptr]}"]
++                        continue
++                    processed_nb2[ptr] = suffix
+                 data[f"mask_ij{suffix}"] = _calc_mask_ij_mode2(data[nbmat_key], data["mask_i"])
+         data["_input_padded"] = torch.tensor(True)
+         data["mol_sizes"] = (~data["mask_i"]).sum(-1)
+@@ -125,10 +172,28 @@ def mask_ij_(
+     return x
+ 
+ 
++def is_input_padded(data: dict[str, Tensor]) -> bool:
++    """Whether the input carries padding atoms that must be masked out.
++
++    Packed (mode 1) and batched-neighbor (mode 2) layouts always reserve
++    padding, so the answer is structural. Only the dense mode-0 layout makes
++    it depend on the data, and reading that bool costs a `Tensor.item()`.
++
++    Under `torch.compile` that read is a graph break, so this reports True
++    unconditionally instead. That is exact for modes 1 and 2, and for mode 0
++    it only means the mask is applied when it happens to be all-false --
++    `masked_fill` with an all-false mask is the identity, on values and on
++    gradients alike, so the result is unchanged either way.
++    """
++    if torch.compiler.is_compiling():
++        return True
++    return bool(data["_input_padded"].item())
++
++
+ def mask_i_(x: Tensor, data: dict[str, Tensor], mask_value: float = 0.0, inplace: bool = True) -> Tensor:
+     nb_mode = get_nb_mode(data)
+     if nb_mode == 0:
+-        if data["_input_padded"].item():
++        if is_input_padded(data):
+             mask = data["mask_i"]
+             for _i in range(x.ndim - mask.ndim):
+                 mask = mask.unsqueeze(-1)
+@@ -251,10 +316,32 @@ def mol_sum(x: Tensor, data: dict[str, Tensor]) -> Tensor:
+             2,
+         ), "Invalid tensor shape for mol_sum, ndim should be 1 or 2"
+         idx = data["mol_idx"]
+-        if torch.compiler.is_compiling():
+-            # under torch.compile, read the molecule count directly: dynamo
+-            # handles the .item() graph break, while routing it through a
+-            # cached scalar tensor trips inductor codegen
++        if torch.compiler.is_compiling() and "charge" in data and x.device.type != "cpu":
++            # `charge` carries one entry per molecule and is a genuine model
++            # input, so its length is static shape metadata: reading it costs
++            # no device sync and no graph break.
++            #
++            # Deliberately NOT `data["mol_sizes"].shape[0]`, even though it
++            # is the same number: mol_sizes comes out of `torch.bincount`, so
++            # its length is a data-dependent (unbacked) symbol and sizing an
++            # allocation from it hands inductor a shape it cannot reason about.
++            #
++            # CPU is excluded on purpose: it keeps the .item() graph break
++            # below. Through torch 2.10, inductor's CPU scheduler fuses the
++            # atomic_add scatters of the PBC distance backward with a
++            # dependent pointwise, and CppScheduling.try_loop_split then dies
++            # on the fused group with `AssertionError: expected_var_ranges ==
++            # extra_indexing_ranges` (a degenerate loop split). The fusion is
++            # outlawed upstream by pytorch/pytorch#172301, first released in
++            # torch 2.11. The break costs nothing on CPU -- .item() has no
++            # device sync there -- and restores the graph partitioning that
++            # avoids the fused group. Drop this exclusion when the supported
++            # torch floor reaches 2.11.
++            out_size = data["charge"].shape[0]
++        elif torch.compiler.is_compiling():
++            # data dict assembled without `charge`: dynamo handles the .item()
++            # graph break, while routing it through a cached scalar tensor
++            # trips inductor codegen
+             # assuming mol_idx is sorted, replace with max if not
+             out_size = int(idx[-1].item()) + 1
+         else:
+@@ -266,12 +353,25 @@ def mol_sum(x: Tensor, data: dict[str, Tensor]) -> Tensor:
+                 data["_num_mol"] = torch.tensor(int(idx[-1].item()) + 1)
+             out_size = int(data["_num_mol"].item())
+ 
+-        if x.ndim == 1:
+-            res = torch.zeros(out_size, device=x.device, dtype=x.dtype)
++        if torch.compiler.is_compiling() and out_size == 1:
++            # A single molecule makes the scatter degenerate into a plain sum
++            # over atoms. Spell it that way under torch.compile: inductor
++            # (2.9.1+cu128) miscompiles `scatter_add_` into a size-1 leading
++            # dim when the result is gathered from later in the same graph --
++            # it fuses the degenerate reduction into the consumer and returns
++            # garbage, silently, with no error. Verified standalone: the same
++            # pattern is correct for out_size >= 2.
++            # Compile-only so eager stays bit-for-bit unchanged; mol_idx is all
++            # zeros whenever out_size is 1, so the two agree exactly up to
++            # summation order.
++            res = x.sum(dim=0, keepdim=True)
+         else:
+-            idx = idx.unsqueeze(-1).expand(-1, x.shape[1])
+-            res = torch.zeros(out_size, x.shape[1], device=x.device, dtype=x.dtype)
+-        res.scatter_add_(0, idx, x)
++            if x.ndim == 1:
++                res = torch.zeros(out_size, device=x.device, dtype=x.dtype)
++            else:
++                idx = idx.unsqueeze(-1).expand(-1, x.shape[1])
++                res = torch.zeros(out_size, x.shape[1], device=x.device, dtype=x.dtype)
++            res.scatter_add_(0, idx, x)
+     else:
+         raise ValueError(f"Invalid neighbor mode: {nb_mode}")
+     return res
+diff --git a/aimnet/ops.py b/aimnet/ops.py
+index e16dbac9..be1e40e3 100644
+--- a/aimnet/ops.py
++++ b/aimnet/ops.py
+@@ -117,21 +117,25 @@ def nse(
+         F_u = F_u.unsqueeze(-2)
+         dQ = dQ.unsqueeze(-2)
+     elif nb_mode == 1:
+-        if torch.compiler.is_compiling():
+-            # under torch.compile keep the repeat_interleave formulation: the
+-            # index_select gather below fuses with mol_sum's scatter into one
+-            # graph and trips inductor's CPU codegen
+-            data["mol_sizes"][-1] += 1
+-            F_u = torch.repeat_interleave(F_u, data["mol_sizes"], dim=0)
+-            dQ = torch.repeat_interleave(dQ, data["mol_sizes"], dim=0)
+-            data["mol_sizes"][-1] -= 1
++        # broadcast per-molecule values to atoms with a gather on mol_idx;
++        # equivalent to repeat_interleave over mol_sizes (mol_idx is sorted)
++        # but stays on-device. The trailing padding atom picks up the value
++        # for its own mol_idx entry, exactly as repeat_interleave with the
++        # padding-inclusive mol_sizes did before.
++        # This form is also the compilable one: repeat_interleave has a
++        # data-dependent output shape and was costing several graph breaks per
++        # forward, while the gather keeps a static shape.
++        mol_idx = data["mol_idx"]
++        if torch.compiler.is_compiling() and F_u.shape[0] == 1:
++            # Single molecule: every atom reads row 0, so the gather is just a
++            # broadcast of a (1, C) tensor against (n_atoms, C). Leaving it as
++            # a broadcast keeps its backward a plain reduction instead of a
++            # scatter into a size-1 buffer, which inductor (2.9.1+cu128)
++            # miscompiles. Compile-only: eager keeps the gather so its
++            # floating-point summation order is unchanged.
++            F_u = F_u.expand(mol_idx.shape[0], -1)
++            dQ = dQ.expand(mol_idx.shape[0], -1)
+         else:
+-            # broadcast per-molecule values to atoms with a gather on mol_idx;
+-            # equivalent to repeat_interleave over mol_sizes (mol_idx is sorted)
+-            # but stays on-device. The trailing padding atom picks up the value
+-            # for its own mol_idx entry, exactly as repeat_interleave with the
+-            # padding-inclusive mol_sizes did before.
+-            mol_idx = data["mol_idx"]
+             F_u = torch.index_select(F_u, 0, mol_idx)
+             dQ = torch.index_select(dQ, 0, mol_idx)
+     else:
+diff --git a/tests/test_compile_paths.py b/tests/test_compile_paths.py
+new file mode 100644
+index 00000000..ab2cff49
+--- /dev/null
++++ b/tests/test_compile_paths.py
+@@ -0,0 +1,112 @@
++"""Guards for the torch.compile-only fast paths in nbops and ops.
++
++The eager and compiled branches of `get_nb_mode`, `is_input_padded`,
++`mol_sum` and `ops.nse` must agree. Under torch.compile these functions
++deliberately avoid `Tensor.item()` (a graph break) and read tensor metadata
++instead, so nothing else pins them together.
++"""
++
++import pytest
++import torch
++
++from aimnet import nbops, ops
++
++
++class TestInferNbMode:
++    """infer_nb_mode must reproduce what set_nb_mode writes."""
++
++    def test_matches_set_nb_mode_no_nbmat(self, device):
++        data = nbops.set_nb_mode({"numbers": torch.tensor([[6, 1, 1]], device=device)})
++        assert nbops.infer_nb_mode(data) == int(data["_nb_mode"].item())
++
++    def test_matches_set_nb_mode_2d_nbmat(self, device):
++        nbmat = torch.randint(0, 5, (5, 3), device=device)
++        data = nbops.set_nb_mode({"nbmat": nbmat})
++        assert nbops.infer_nb_mode(data) == int(data["_nb_mode"].item()) == 1
++
++    def test_matches_set_nb_mode_3d_nbmat(self, device):
++        nbmat = torch.randint(0, 5, (2, 5, 3), device=device)
++        data = nbops.set_nb_mode({"nbmat": nbmat})
++        assert nbops.infer_nb_mode(data) == int(data["_nb_mode"].item()) == 2
++
++    def test_packed_dict_without_nbmat(self, device):
++        """mol_sum-style dicts carry a flat 1D numbers and no nbmat."""
++        data = {
++            "numbers": torch.tensor([6, 1, 1, 6, 1, 0], device=device),
++            "mol_idx": torch.tensor([0, 0, 0, 1, 1, 2], device=device),
++        }
++        assert nbops.infer_nb_mode(data) == 1
++
++    def test_invalid_nbmat_shape(self, device):
++        data = {"nbmat": torch.randint(0, 5, (2, 3, 4, 5), device=device)}
++        with pytest.raises(ValueError, match="Invalid neighbor matrix shape"):
++            nbops.infer_nb_mode(data)
++
++
++class TestIsInputPadded:
++    """Eager must reproduce the _input_padded flag exactly."""
++
++    @pytest.mark.parametrize("padded", [False, True])
++    def test_matches_flag(self, device, padded):
++        numbers = torch.tensor([[6, 1, 1, 0]] if padded else [[6, 1, 1]], device=device)
++        data = nbops.calc_masks(nbops.set_nb_mode({"numbers": numbers}))
++        assert nbops.is_input_padded(data) is bool(data["_input_padded"].item())
++        assert nbops.is_input_padded(data) is padded
++
++
++def _packed_data(n_mol, n_atom_per_mol, device, nfeat=2):
++    """Packed (mode 1) data dict with the usual trailing padding atom."""
++    mol_idx = torch.arange(n_mol, device=device).repeat_interleave(n_atom_per_mol)
++    mol_idx = torch.cat([mol_idx, mol_idx[-1:]])
++    numbers = torch.full((mol_idx.shape[0],), 6, dtype=torch.long, device=device)
++    numbers[-1] = 0
++    nbmat = torch.zeros((mol_idx.shape[0], 4), dtype=torch.int32, device=device)
++    data = {
++        "numbers": numbers,
++        "mol_idx": mol_idx,
++        "nbmat": nbmat,
++        "charge": torch.zeros(n_mol, device=device),
++    }
++    return nbops.calc_masks(nbops.set_nb_mode(data))
++
++
++@pytest.mark.parametrize("n_mol", [1, 2, 5])
++def test_mol_sum_compiled_matches_eager(device, n_mol):
++    """The compiled branch reads the count from `charge`; the eager one from
++    the `_num_mol` cache. A single molecule additionally takes the sum path,
++    which keeps a degenerate size-1 scatter out of the graph entirely."""
++    if device.type != "cuda":
++        pytest.skip("compiled parity is only meaningful on the GPU backend")
++    data = _packed_data(n_mol, 4, device)
++    x = torch.randn(data["mol_idx"].shape[0], 3, device=device)
++
++    torch._dynamo.reset()
++    compiled = torch.compile(nbops.mol_sum)
++    got = compiled(x, dict(data))
++    ref = nbops.mol_sum(x, dict(data))
++    assert got.shape == ref.shape == (n_mol, 3)
++    torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
++
++
++@pytest.mark.parametrize("n_mol", [1, 3])
++def test_nse_compiled_matches_eager(device, n_mol):
++    """ops.nse broadcasts per-molecule values back to atoms. For a single
++    molecule the compiled path must broadcast rather than gather: a gather's
++    backward is a scatter into a size-1 buffer, which inductor miscompiles."""
++    if device.type != "cuda":
++        pytest.skip("compiled parity is only meaningful on the GPU backend")
++    data = _packed_data(n_mol, 4, device)
++    n_atom = data["mol_idx"].shape[0]
++    q_u = torch.randn(n_atom, 1, device=device, requires_grad=True)
++    f_u = torch.rand(n_atom, 1, device=device) + 0.5
++    Q = torch.zeros(n_mol, 1, device=device)
++
++    ref = ops.nse(Q, q_u, f_u, dict(data))
++    ref_g = torch.autograd.grad(ref.sum(), q_u)[0]
++
++    torch._dynamo.reset()
++    got = torch.compile(ops.nse)(Q, q_u, f_u, dict(data))
++    got_g = torch.autograd.grad(got.sum(), q_u)[0]
++
++    torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
++    torch.testing.assert_close(got_g, ref_g, rtol=1e-5, atol=1e-5)

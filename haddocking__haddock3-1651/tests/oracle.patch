@@ -1,0 +1,397 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f6af710ec8..35133081ae 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,6 @@
+ # Changelog
+ 
++- 2026-08-04: Added workflow module ordering validation - related to Issue #1530
+ - 2026-08-02: Fixed logging/warning leaks - Issue #1647
+ - 2026-07-31: Fixed D-amino acid detection - Issue #1636
+ - 2026-07-31: Fixed topocg issue removing ligands - Issue #1638
+diff --git a/docs/pages/architecture.md b/docs/pages/architecture.md
+index 5562dda3d5..5505055b82 100644
+--- a/docs/pages/architecture.md
++++ b/docs/pages/architecture.md
+@@ -158,6 +158,7 @@ CLI and the modules. Each handles one cross-cutting concern.
+ | [parameters.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/parameters.py) | Definitions of mandatory/general parameter sets |
+ | [expandable_parameters.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/expandable_parameters.py) | Per-molecule / repeatable parameter blocks (e.g. `mol_*`, `seg_*`) |
+ | [validations.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/validations.py) | Domain-specific validation rules |
++| [workflow_ordering.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/workflow_ordering.py) | Validate module sequence against the rules in `workflow_rules.yaml` |
+ | [restart_run.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/restart_run.py) | `--restart` flag logic |
+ | [extend_run.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/extend_run.py) | `--extend-run` flag + `haddock3-copy`; `WorkflowManagerExtend` |
+ | [clean_steps.py](https://github.com/haddocking/haddock3/blob/main/src/haddock/gear/clean_steps.py) | Compress/clean a step's output files |
+diff --git a/examples/analysis/plot-finetune-clustfcc.cfg b/examples/analysis/plot-finetune-clustfcc.cfg
+index cadff186dd..e3da955fdb 100644
+--- a/examples/analysis/plot-finetune-clustfcc.cfg
++++ b/examples/analysis/plot-finetune-clustfcc.cfg
+@@ -32,12 +32,6 @@ molecules = "./data/ensemble_4G6M.pdb"
+ # Generate topologies for each structure in the ensemble.
+ [topoaa]
+ 
+-# ClustFCC with matrix plot, 
+-#  setting min_population (minimum number of cluster members to define a cluster) to 1
+-[clustfcc]
+-min_population = 1  # Even singlotons will be `clustered`
+-plot_matrix = true  # Generate a plot of the matrix for visual inspection
+-
+ # ClustFCC with increased `clust_cutoff` to 0.8, enabling to uncluster 
+ #  some structures and setting minimum number of members (min_population) to 2
+ [clustfcc]
+diff --git a/src/haddock/gear/prepare_run.py b/src/haddock/gear/prepare_run.py
+index 540c16ca36..795c0d2ef3 100644
+--- a/src/haddock/gear/prepare_run.py
++++ b/src/haddock/gear/prepare_run.py
+@@ -62,6 +62,7 @@
+     v_rundir,
+     validate_defaults_yaml,
+ )
++from haddock.gear.workflow_ordering import validate_workflow_order
+ from haddock.gear.yaml2cfg import (
+     read_from_yaml_config,
+     find_incompatible_parameters,
+@@ -227,6 +228,7 @@ def setup_run(
+     #. validate the config file
+        * confirm modules' names are correctly spelled
+        * check if requested modules are installed
++       * validate the module ordering (except for ``--extend-run``)
+        * check additional validations
+     #. validate modules' parameters
+     #. copy input files to data/ directory
+@@ -309,6 +311,10 @@ def setup_run(
+         general_params[RUNDIR] = extend_run
+ 
+     check_if_modules_are_installed(modules_params)
++    # --extend-run configs describe only the modules to append to an existing
++    # run, so the full workflow order is not known here and cannot be validated.
++    if extend_run is None:
++        validate_workflow_order([get_module_name(step) for step in modules_params])
+     check_specific_validations(general_params)
+ 
+     # define starting conditions
+diff --git a/src/haddock/gear/workflow_ordering.py b/src/haddock/gear/workflow_ordering.py
+new file mode 100644
+index 0000000000..eac1de3782
+--- /dev/null
++++ b/src/haddock/gear/workflow_ordering.py
+@@ -0,0 +1,155 @@
++"""
++Validate the ordering of modules in a HADDOCK3 workflow.
++
++Module- and parameter-level validation (see :mod:`haddock.gear.prepare_run`)
++confirms that each requested module exists and that its parameters are valid,
++but it does not enforce constraints on the *sequence* of modules. Some modules
++only make sense when another module ran before them (e.g. ``clustrmsd`` needs
++an RMSD matrix), some must not be chained to themselves (e.g. two consecutive
++``seletop``), and a workflow must always start by building topologies.
++
++Those constraints are declared as data in ``workflow_rules.yaml`` and applied
++here against the ordered list of modules taken from the user configuration
++file. Keeping the rules in a data file means new constraints can be added
++without editing this logic.
++
++Rule types (see ``workflow_rules.yaml`` for the exact syntax):
++
++- ``disallowed_sequences``: module B must not directly follow module A.
++- ``required_preceding``: module B must be immediately preceded by one of a set.
++- ``required_prior``: module B must be preceded anywhere earlier by one of a set.
++- ``required_first``: the first module must be one of a set.
++"""
++
++from pathlib import Path
++
++from haddock import log
++from haddock.core.exceptions import ConfigurationError
++from haddock.libs.libio import read_from_yaml
++
++
++DEFAULT_RULES = Path(Path(__file__).resolve().parent, "workflow_rules.yaml")
++
++
++def read_workflow_rules(rules_file=DEFAULT_RULES):
++    """
++    Read the workflow ordering rules from a YAML file.
++
++    Parameters
++    ----------
++    rules_file : str or pathlib.Path
++        Path to the YAML file defining the ordering rules.
++        Defaults to the bundled ``workflow_rules.yaml``.
++
++    Returns
++    -------
++    dict
++        The parsed rules, with every supported rule key present (empty
++        containers for the ones not defined in the file).
++    """
++    rules = read_from_yaml(rules_file)
++    # guarantee all keys exist so callers need not test for their presence
++    rules.setdefault("disallowed_sequences", [])
++    rules.setdefault("required_preceding", {})
++    rules.setdefault("required_prior", {})
++    rules.setdefault("required_first", [])
++    return rules
++
++
++def _check_required_first(modules, required_first):
++    """Collect a violation if the first module is not an allowed one."""
++    errors = []
++    if required_first and modules and modules[0] not in required_first:
++        errors.append(
++            f"The first module of a workflow must be one of "
++            f"{_join(required_first)}, but {modules[0]!r} was found."
++        )
++    return errors
++
++
++def _check_disallowed_sequences(modules, disallowed_sequences):
++    """Collect violations for modules directly following a disallowed one."""
++    errors = []
++    disallowed = {tuple(pair) for pair in disallowed_sequences}
++    for position, (before, after) in enumerate(zip(modules, modules[1:]), start=2):
++        if (before, after) in disallowed:
++            errors.append(
++                f"Module {after!r} (step {position}) cannot directly follow "
++                f"module {before!r}."
++            )
++    return errors
++
++
++def _check_required_preceding(modules, required_preceding):
++    """Collect violations for modules lacking a required direct predecessor."""
++    errors = []
++    for position, module in enumerate(modules, start=1):
++        allowed = required_preceding.get(module)
++        if allowed is None:
++            continue
++        preceding = modules[position - 2] if position >= 2 else None
++        if preceding not in allowed:
++            found = f"{preceding!r}" if preceding is not None else "nothing"
++            errors.append(
++                f"Module {module!r} (step {position}) must be directly preceded "
++                f"by one of {_join(allowed)}, but {found} was found."
++            )
++    return errors
++
++
++def _check_required_prior(modules, required_prior):
++    """Collect violations for modules lacking a required earlier module."""
++    errors = []
++    for position, module in enumerate(modules, start=1):
++        allowed = required_prior.get(module)
++        if allowed is None:
++            continue
++        earlier = modules[: position - 1]
++        if not any(mod in earlier for mod in allowed):
++            errors.append(
++                f"Module {module!r} (step {position}) requires one of "
++                f"{_join(allowed)} to run at some earlier step."
++            )
++    return errors
++
++
++def _join(modules):
++    """Render a collection of module names as a readable quoted list."""
++    return ", ".join(repr(mod) for mod in modules)
++
++
++def validate_workflow_order(modules, rules_file=DEFAULT_RULES):
++    """
++    Validate the order of the modules of a workflow against the rules.
++
++    Parameters
++    ----------
++    modules : sequence of str
++        The module names in workflow order (without their ``.N`` suffix).
++
++    rules_file : str or pathlib.Path
++        Path to the YAML file defining the ordering rules.
++        Defaults to the bundled ``workflow_rules.yaml``.
++
++    Raises
++    ------
++    haddock.core.exceptions.ConfigurationError
++        If the workflow violates one or more ordering rules. All detected
++        violations are reported together.
++    """
++    modules = list(modules)
++    rules = read_workflow_rules(rules_file)
++
++    errors = []
++    errors.extend(_check_required_first(modules, rules["required_first"]))
++    errors.extend(_check_disallowed_sequences(modules, rules["disallowed_sequences"]))
++    errors.extend(_check_required_preceding(modules, rules["required_preceding"]))
++    errors.extend(_check_required_prior(modules, rules["required_prior"]))
++
++    if errors:
++        msg = "Invalid workflow module order:" + "".join(
++            f"\n  - {error}" for error in errors
++        )
++        raise ConfigurationError(msg)
++
++    log.info("Workflow module order validated.")
+diff --git a/src/haddock/gear/workflow_rules.yaml b/src/haddock/gear/workflow_rules.yaml
+new file mode 100644
+index 0000000000..7d05d1ef93
+--- /dev/null
++++ b/src/haddock/gear/workflow_rules.yaml
+@@ -0,0 +1,52 @@
++# =============================================================================
++# HADDOCK3 workflow ordering rules
++# =============================================================================
++#
++# Individual module- and parameter-level validation (see gear/prepare_run.py)
++# confirms that each requested module exists and that its parameters are valid.
++# It does *not* enforce constraints on the *sequence* in which modules appear.
++#
++# This file declares those sequence constraints as data, so that they can be
++# reviewed and extended without touching the validation logic in
++# `gear/workflow_ordering.py`. Module names below are the module folder names
++# (e.g. `topoaa`, `clustrmsd`), i.e. the keys used in a workflow config file
++# without their `.N` occurrence suffix.
++#
++# Four rule types are supported:
++#
++#   disallowed_sequences  a pair [A, B]: module B must NOT come directly
++#                         after module A (guards against meaningless repeats).
++#
++#   required_preceding    B: [A1, A2, ...]: module B must be immediately
++#                         preceded by one of A1, A2, ...
++#
++#   required_prior        B: [A1, A2, ...]: module B must be preceded
++#                         somewhere earlier in the workflow (not necessarily
++#                         directly) by at least one of A1, A2, ...
++#
++#   required_first        [M1, M2, ...]: the very first module of a workflow
++#                         must be one of M1, M2, ...
++#
++# All checks are skipped for entries whose "trigger" module is not present in
++# the workflow, so adding a rule never breaks unrelated workflows.
++# -----------------------------------------------------------------------------
++
++# Module B must not directly follow module A. Each entry is a [A, B] pair.
++disallowed_sequences:
++  - [clustrmsd, clustrmsd]
++  - [clustfcc, clustfcc]
++  - [seletop, seletop]
++  - [seletopclusts, seletopclusts]
++
++# Module (key) must be immediately preceded by one of the listed modules.
++required_preceding:
++  clustrmsd: [rmsdmatrix, ilrmsdmatrix]
++  topocg: [topoaa]
++
++# Module (key) must be preceded anywhere earlier by one of the listed modules.
++required_prior:
++  cgtoaa: [topocg]
++
++# The first module of the workflow must be one of these.
++required_first:
++  - topoaa
+diff --git a/tests/test_gear_workflow_ordering.py b/tests/test_gear_workflow_ordering.py
+new file mode 100644
+index 0000000000..9d1325158f
+--- /dev/null
++++ b/tests/test_gear_workflow_ordering.py
+@@ -0,0 +1,101 @@
++"""Test the workflow module ordering validation."""
++
++import pytest
++
++from haddock.core.exceptions import ConfigurationError
++from haddock.gear.workflow_ordering import (
++    read_workflow_rules,
++    validate_workflow_order,
++)
++
++
++def test_read_workflow_rules_has_all_keys():
++    """The bundled rules expose every supported rule key."""
++    rules = read_workflow_rules()
++    assert set(rules) >= {
++        "disallowed_sequences",
++        "required_preceding",
++        "required_prior",
++        "required_first",
++    }
++
++
++@pytest.mark.parametrize(
++    "modules",
++    [
++        ["topoaa", "rigidbody", "flexref", "emref"],
++        ["topoaa", "rigidbody", "rmsdmatrix", "clustrmsd", "seletopclusts"],
++        ["topoaa", "rigidbody", "ilrmsdmatrix", "clustrmsd"],
++        ["topoaa", "topocg", "rigidbody"],
++        ["topoaa", "topocg", "rigidbody", "cgtoaa", "flexref"],
++        ["topoaa", "rigidbody", "clustfcc", "seletopclusts", "clustfcc"],
++    ],
++)
++def test_valid_workflows_pass(modules):
++    """Well-ordered workflows validate without error."""
++    validate_workflow_order(modules)
++
++
++def test_required_first_violation():
++    """A workflow not starting with topoaa is rejected."""
++    with pytest.raises(ConfigurationError, match="first module"):
++        validate_workflow_order(["rigidbody", "flexref"])
++
++
++@pytest.mark.parametrize(
++    "modules",
++    [
++        ["topoaa", "rmsdmatrix", "clustrmsd", "clustrmsd"],
++        ["topoaa", "rigidbody", "clustfcc", "clustfcc"],
++        ["topoaa", "rigidbody", "seletop", "seletop"],
++        ["topoaa", "seletopclusts", "seletopclusts"],
++    ],
++)
++def test_disallowed_sequence_violation(modules):
++    """Repeating a non-repeatable module directly is rejected."""
++    with pytest.raises(ConfigurationError, match="cannot directly follow"):
++        validate_workflow_order(modules)
++
++
++def test_required_preceding_violation_wrong_predecessor():
++    """clustrmsd not directly preceded by an rmsd matrix is rejected."""
++    with pytest.raises(ConfigurationError, match="directly preceded"):
++        validate_workflow_order(["topoaa", "rigidbody", "clustrmsd"])
++
++
++def test_required_preceding_violation_topocg():
++    """topocg must directly follow topoaa."""
++    with pytest.raises(ConfigurationError, match="directly preceded"):
++        validate_workflow_order(["topoaa", "rigidbody", "topocg"])
++
++
++def test_required_prior_violation():
++    """cgtoaa requires topocg somewhere earlier."""
++    # required_first also fires here, but the prior-module message must appear
++    with pytest.raises(ConfigurationError, match="earlier step"):
++        validate_workflow_order(["rigidbody", "cgtoaa"])
++
++
++def test_multiple_violations_reported_together():
++    """All ordering violations are collected in a single error."""
++    with pytest.raises(ConfigurationError) as exc:
++        validate_workflow_order(["rigidbody", "seletop", "seletop"])
++    message = str(exc.value)
++    assert "first module" in message
++    assert "cannot directly follow" in message
++
++
++def test_empty_workflow_does_not_raise():
++    """An empty module list is not an ordering error on its own."""
++    validate_workflow_order([])
++
++
++def test_custom_rules_file(tmp_path):
++    """Rules are read from the provided file."""
++    rules_file = tmp_path / "rules.yaml"
++    rules_file.write_text("required_first:\n  - rigidbody\n")
++    # topoaa first now violates the custom rule
++    with pytest.raises(ConfigurationError, match="first module"):
++        validate_workflow_order(["topoaa"], rules_file=rules_file)
++    # rigidbody first satisfies it
++    validate_workflow_order(["rigidbody"], rules_file=rules_file)

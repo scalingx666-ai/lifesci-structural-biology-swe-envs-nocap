@@ -1,0 +1,811 @@
+diff --git a/minifold/model/kernels/gating.py b/minifold/model/kernels/gating.py
+index ed3a691..2335765 100644
+--- a/minifold/model/kernels/gating.py
++++ b/minifold/model/kernels/gating.py
+@@ -150,38 +150,46 @@ def inference_kernel(
+ 
+ 
+ def gating_kernel(X, W1, W2, b1, b2, wn, bn):
+-    B, N1, N2, C1 = X.shape
+-    M = B * N1 * N2
+-    C1, C2 = W1.shape
+-
+-    X = X.contiguous()
+-    O = torch.empty((B, N1, N2, C2), device=X.device, dtype=X.dtype)
+-
+-    BLOCK_SIZE_M = 64
+-    BLOCK_SIZE_C2 = 64
+-    assert M >= BLOCK_SIZE_M
+-    assert M % BLOCK_SIZE_M == 0
+-    assert C2 >= BLOCK_SIZE_C2
+-    assert C2 % BLOCK_SIZE_C2 == 0
+-    assert C1 <= 128
+-
+-    grid = lambda META: (triton.cdiv(M, BLOCK_SIZE_M),)
+-    inference_kernel[grid](
+-        X,
+-        W1,
+-        W2,
+-        b1,
+-        b2,
+-        wn,
+-        bn,
+-        O,
+-        M,
+-        C1,
+-        C2,
+-        BLOCK_SIZE_M,
+-        BLOCK_SIZE_C2,
+-    )
+-    return O
++    if X.device.type == "cuda":
++        B, N1, N2, C1 = X.shape
++        M = B * N1 * N2
++        C1, C2 = W1.shape
++
++        X = X.contiguous()
++        O = torch.empty((B, N1, N2, C2), device=X.device, dtype=X.dtype)
++
++        BLOCK_SIZE_M = 64
++        BLOCK_SIZE_C2 = 64
++        assert M >= BLOCK_SIZE_M
++        assert M % BLOCK_SIZE_M == 0
++        assert C2 >= BLOCK_SIZE_C2
++        assert C2 % BLOCK_SIZE_C2 == 0
++        assert C1 <= 128
++
++        grid = lambda META: (triton.cdiv(M, BLOCK_SIZE_M),)
++        inference_kernel[grid](
++            X,
++            W1,
++            W2,
++            b1,
++            b2,
++            wn,
++            bn,
++            O,
++            M,
++            C1,
++            C2,
++            BLOCK_SIZE_M,
++            BLOCK_SIZE_C2,
++        )
++        return O
++    else:
++        # Use unfused fallback for MPS/CPU
++        x = F.layer_norm(X, X.shape[-1:], weight=wn, bias=bn, eps=1e-5)
++        o = F.linear(x, W1, b1)
++        o.sigmoid_()
++        o *= F.linear(x, W2, b2)
++        return o
+ 
+ 
+ #---------------- TESTS ----------------#
+@@ -306,62 +314,67 @@ def clear_gradients(*args):
+ 
+ 
+ def clear_memory(device):
+-    torch._C._cuda_clearCublasWorkspaces()
+-    torch._dynamo.reset()
+-    gc.collect()
+-    torch.cuda.empty_cache()
+-    torch.cuda.reset_peak_memory_stats(device)
++    if device.type == "cuda":
++        torch._C._cuda_clearCublasWorkspaces()
++        torch._dynamo.reset()
++        gc.collect()
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats(device)
++    elif device.type == "mps":
++        gc.collect()
++        torch.mps.empty_cache()
++    else:
++        gc.collect()
+ 
+ 
+ def peak_memory(f, *args, device=None):
+     for _ in range(10):
+-        # Clean everything
+         clear_memory(device)
+         clear_gradients(*args)
+-
+-        # Run once
+         f(*args)
+-
+-        # Measure peak memory
+-        torch.cuda.synchronize()
+-        memory = torch.cuda.max_memory_allocated(device)
+-
++        if device.type == "cuda":
++            torch.cuda.synchronize()
++            memory = torch.cuda.max_memory_allocated(device)
++        elif device.type == "mps":
++            torch.mps.synchronize()
++            memory = torch.mps.current_allocated_memory()
++        else:
++            memory = 0
+     return memory
+ 
+ 
+ def memory_triton(f, device=None):
+-    # Clean everything
+     clear_memory(device)
+-
+-    # Initialize inputs
+     x, W1, W2, b1, b2, wn, bn = create_input(
+         device=device, dtype=torch.bfloat16, grad=False
+     )
+-
+-    # Run measurement
+-    print("Current memory: ", torch.cuda.memory_allocated(device) / (1024**3))
++    print("Current memory: ", (
++        torch.cuda.memory_allocated(device) / (1024**3)
++        if device.type == "cuda"
++        else torch.mps.current_allocated_memory() / (1024**3)
++        if device.type == "mps"
++        else 0
++    ))
+     memory = peak_memory(f, x, W1, W2, b1, b2, wn, bn, device=device)
+-
+     print("Peak memory: ", memory / (1024**3))
+     return memory
+ 
+ 
+ def memory_baselines(f, device=None):
+-    # Clean everything
+     clear_memory(device)
+-
+-    # Initialize inputs
+     x, W1, W2, b1, b2, wn, bn = create_input(
+         device=device, dtype=torch.bfloat16, grad=False
+     )
+-
+     W1 = W1.t().contiguous()
+     W2 = W2.t().contiguous()
+-
+-    # Run measurement
+-    print("Current memory: ", torch.cuda.memory_allocated(device) / (1024**3))
++    print("Current memory: ", (
++        torch.cuda.memory_allocated(device) / (1024**3)
++        if device.type == "cuda"
++        else torch.mps.current_allocated_memory() / (1024**3)
++        if device.type == "mps"
++        else 0
++    ))
+     memory = peak_memory(f, x, W1, W2, b1, b2, wn, bn, device=device)
+-
+     print("Peak memory: ", memory / (1024**3))
+     return memory
+ 
+@@ -370,7 +383,12 @@ def test():
+     # Setup
+     torch.manual_seed(0)
+     torch.set_grad_enabled(False)
+-    device = torch.device("cuda")
++    if torch.cuda.is_available():
++        device = torch.device("cuda")
++    elif torch.backends.mps.is_available():
++        device = torch.device("mps")
++    else:
++        device = torch.device("cpu")
+ 
+     # Check correctness
+     check_correctness(fused, unfused, device=device)
+@@ -378,7 +396,10 @@ def test():
+     # Compute performance
+     print("")
+     print("Performance")
+-    benchmark.run(print_data=True, show_plots=False)
++    if device.type == "cuda":
++        benchmark.run(print_data=True, show_plots=False)
++    else:
++        print("Benchmarking only supported on CUDA.")
+     print("")
+ 
+     # Compute memory
+@@ -387,8 +408,8 @@ def test():
+     memory_compile = memory_baselines(compiled, device=device)
+ 
+     print("")
+-    print("Memory savings against unfused: ", memory_unfused / memory_fused)
+-    print("Memory savings against compile: ", memory_compile / memory_fused)
++    print("Memory savings against unfused: ", memory_unfused / memory_fused if memory_fused else "N/A")
++    print("Memory savings against compile: ", memory_compile / memory_fused if memory_fused else "N/A")
+     print("")
+ 
+ 
+diff --git a/minifold/model/kernels/mlp.py b/minifold/model/kernels/mlp.py
+index 945c0fa..69e33e4 100644
+--- a/minifold/model/kernels/mlp.py
++++ b/minifold/model/kernels/mlp.py
+@@ -149,37 +149,45 @@ def inference_kernel(
+ 
+ 
+ def mlp_kernel(X, W1, W2, b1, b2, wn, bn):
+-    B, N1, N2, C1 = X.shape
+-    M = B * N1 * N2
+-    C2 = W1.shape[1]
+-
+-    X = X.contiguous()
+-    O = torch.empty_like(X)
+-
+-    BLOCK_SIZE_M = 128
+-    BLOCK_SIZE_C2 = 32
+-
+-    assert M > BLOCK_SIZE_M
+-    assert M % BLOCK_SIZE_M == 0
+-    assert C1 <= 128
+-
+-    grid = lambda META: (triton.cdiv(M, BLOCK_SIZE_M),)
+-    inference_kernel[grid](
+-        X,
+-        W1,
+-        W2,
+-        b1,
+-        b2,
+-        wn,
+-        bn,
+-        O,
+-        M,
+-        C1,
+-        C2,
+-        BLOCK_SIZE_M,
+-        BLOCK_SIZE_C2,
+-    )
+-    return O
++    if X.device.type == "cuda":
++        B, N1, N2, C1 = X.shape
++        M = B * N1 * N2
++        C2 = W1.shape[1]
++
++        X = X.contiguous()
++        O = torch.empty_like(X)
++
++        BLOCK_SIZE_M = 128
++        BLOCK_SIZE_C2 = 32
++
++        assert M > BLOCK_SIZE_M
++        assert M % BLOCK_SIZE_M == 0
++        assert C1 <= 128
++
++        grid = lambda META: (triton.cdiv(M, BLOCK_SIZE_M),)
++        inference_kernel[grid](
++            X,
++            W1,
++            W2,
++            b1,
++            b2,
++            wn,
++            bn,
++            O,
++            M,
++            C1,
++            C2,
++            BLOCK_SIZE_M,
++            BLOCK_SIZE_C2,
++        )
++        return O
++    else:
++        # Use unfused fallback for MPS/CPU
++        x = F.layer_norm(X, X.shape[-1:], weight=wn, bias=bn, eps=1e-5)
++        x = F.linear(x, W1, b1)
++        x.relu_()
++        x = F.linear(x, W2, b2)
++        return x
+ 
+ 
+ #---------------- TESTS ----------------#
+@@ -252,27 +260,30 @@ def check_correctness(f1, f2, device):
+     triton.testing.Benchmark(
+         x_names=["size"],
+         x_vals=[2**i for i in range(5, 13)],
+-        line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
+-        line_vals=["triton", "torch-compile", "torch"],  # Possible values for `line_arg`.
+-        line_names=["Triton", "Torch-compile", "Torch"],  # Label name for the lines.
+-        plot_name="performance",  # Name for the plot. Used also as a file name for saving the plot.
+-        args={},  # Values for function arguments not in `x_names` and `y_name`.
++        line_arg="provider",
++        line_vals=["triton", "torch-compile", "torch"],
++        line_names=["Triton", "Torch-compile", "Torch"],
++        plot_name="performance",
++        args={},
+     )
+ )
+-def benchmark(size, provider):
++def benchmark(size, provider, device="cuda"):
+     x, W1, W2, b1, b2, wn, bn = create_input(
+-        "cuda", dtype=torch.bfloat16, grad=False, size=size
++        device, dtype=torch.bfloat16, grad=False, size=size
+     )
+ 
+     if provider == "triton":
+-        ms = triton.testing.do_bench(lambda: fused(x, W1, W2, b1, b2, wn, bn))
++        if device == "cuda":
++            ms = triton.testing.do_bench(lambda: fused(x, W1, W2, b1, b2, wn, bn))
++        else:
++            ms = float("nan")
+     if provider == "torch":
+         W1 = W1.t().contiguous()
+-        W2 = W1.t().contiguous()
++        W2 = W2.t().contiguous()
+         ms = triton.testing.do_bench(lambda: unfused(x, W1, W2, b1, b2, wn, bn))
+     if provider == "torch-compile":
+         W1 = W1.t().contiguous()
+-        W2 = W1.t().contiguous()
++        W2 = W2.t().contiguous()
+         ms = triton.testing.do_bench(lambda: compiled(x, W1, W2, b1, b2, wn, bn))
+ 
+     return ms
+@@ -285,86 +296,97 @@ def clear_gradients(*args):
+ 
+ 
+ def clear_memory(device):
+-    torch._C._cuda_clearCublasWorkspaces()
+-    torch._dynamo.reset()
+-    gc.collect()
+-    torch.cuda.empty_cache()
+-    torch.cuda.reset_peak_memory_stats(device)
++    if device.type == "cuda":
++        torch._C._cuda_clearCublasWorkspaces()
++        torch._dynamo.reset()
++        gc.collect()
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats(device)
++    elif device.type == "mps":
++        gc.collect()
++        torch.mps.empty_cache()
++    else:
++        gc.collect()
+ 
+ 
+ def peak_memory(f, *args, device=None):
+     for _ in range(10):
+-        # Clean everything
+         clear_memory(device)
+         clear_gradients(*args)
+-
+-        # Run once
+         f(*args)
+-
+-        # Measure peak memory
+-        torch.cuda.synchronize()
+-        memory = torch.cuda.max_memory_allocated(device)
+-
++        if device.type == "cuda":
++            torch.cuda.synchronize()
++            memory = torch.cuda.max_memory_allocated(device)
++        elif device.type == "mps":
++            torch.mps.synchronize()
++            memory = torch.mps.current_allocated_memory()
++        else:
++            memory = 0
+     return memory
+ 
+ 
+ def memory_triton(f, device=None):
+-    # Clean everything
+     clear_memory(device)
+-
+-    # Initialize inputs
+     x, W1, W2, b1, b2, wn, bn = create_input(device, dtype=torch.bfloat16, grad=False)
+-
+-    # Run measurement
+-    print("Current memory: ", torch.cuda.memory_allocated(device) / (1024**3))
++    if device.type == "cuda":
++        print("Current memory: ", torch.cuda.memory_allocated(device) / (1024**3))
++    elif device.type == "mps":
++        print("Current memory: ", torch.mps.current_allocated_memory() / (1024**3))
++    else:
++        print("Current memory: 0")
+     memory = peak_memory(f, x, W1, W2, b1, b2, wn, bn, device=device)
+-
+     print("Peak memory: ", memory / (1024**3))
+     return memory
+ 
+ 
+ def memory_baseline(f, device=None):
+-    # Clean everything
+     clear_memory(device)
+-
+-    # Initialize inputs
+     x, W1, W2, b1, b2, wn, bn = create_input(device, dtype=torch.bfloat16, grad=False)
+-
+     W1 = W1.t().contiguous()
+-    W2 = W1.t().contiguous()
+-
+-    # Run measurement
+-    print("Current memory: ", torch.cuda.memory_allocated(device) / (1024**3))
++    W2 = W2.t().contiguous()
++    if device.type == "cuda":
++        print("Current memory: ", torch.cuda.memory_allocated(device) / (1024**3))
++    elif device.type == "mps":
++        print("Current memory: ", torch.mps.current_allocated_memory() / (1024**3))
++    else:
++        print("Current memory: 0")
+     memory = peak_memory(f, x, W1, W2, b1, b2, wn, bn, device=device)
+-
+     print("Peak memory: ", memory / (1024**3))
+     return memory
+ 
+ 
+ def test():
+-    # Setup
+     torch.manual_seed(0)
+     torch.set_grad_enabled(False)
+-    device = torch.device("cuda")
++    if torch.cuda.is_available():
++        device = torch.device("cuda")
++    elif torch.backends.mps.is_available():
++        device = torch.device("mps")
++    else:
++        device = torch.device("cpu")
+ 
+-    # Check correctness
+     check_correctness(fused, unfused, device=device)
+ 
+-    # Compute performance
+     print("")
+     print("Performance")
+-    benchmark.run(print_data=True, show_plots=False)
++    if device.type == "cuda":
++        benchmark.run(print_data=True, show_plots=False, device="cuda")
++    elif device.type == "mps":
++        benchmark.run(print_data=True, show_plots=False, device="mps")
++    else:
++        benchmark.run(print_data=True, show_plots=False, device="cpu")
+     print("")
+ 
+-    # Compute memory
+-    memory_fused = memory_triton(fused, device=device)
+-    memory_unfused = memory_baseline(unfused, device=device)
+-    memory_compile = memory_baseline(compiled, device=device)
+-
+-    print("")
+-    print("Memory savings against unfused: ", memory_unfused / memory_fused)
+-    print("Memory savings against compile: ", memory_compile / memory_fused)
+-    print("")
++    if device.type == "cuda":
++        memory_fused = memory_triton(fused, device=device)
++        memory_unfused = memory_baseline(unfused, device=device)
++        memory_compile = memory_baseline(compiled, device=device)
++        print("")
++        print("Memory savings against unfused: ", memory_unfused / memory_fused)
++        print("Memory savings against compile: ", memory_compile / memory_fused)
++        print("")
++    else:
++        print("Memory profiling only supported on CUDA.")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/minifold/model/miniformer.py b/minifold/model/miniformer.py
+index f3386a0..68a7bea 100644
+--- a/minifold/model/miniformer.py
++++ b/minifold/model/miniformer.py
+@@ -42,7 +42,8 @@ def triangular(
+     x = x * mask.unsqueeze(-1)
+ 
+     # Split input and cast to float
+-    with torch.autocast("cuda", enabled=False):
++    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
++    with torch.autocast(device.type, enabled=False):
+         a1, b1, a2, b2 = torch.chunk(x.float(), 4, dim=-1)
+ 
+         # Triangular projection
+@@ -95,7 +96,8 @@ def triangular_kernel_func(
+     x = x * mask.unsqueeze(-1)
+ 
+     # Split input and cast to float
+-    with torch.autocast("cuda", enabled=False):
++    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
++    with torch.autocast(device.type, enabled=False):
+         a1, b1, a2, b2 = torch.chunk(x.float(), 4, dim=-1)
+ 
+         # Triangular projection
+diff --git a/minifold/model/model.py b/minifold/model/model.py
+index 4715f98..482bb80 100644
+--- a/minifold/model/model.py
++++ b/minifold/model/model.py
+@@ -274,7 +274,8 @@ def forward(self, batch: dict, num_recycling: int = 0):
+             raise ValueError("Kernels can only be used at inference.")
+ 
+         # For some reason having inference issues with autocast on the LM
+-        with torch.autocast("cuda", enabled=self.training, dtype=torch.bfloat16):
++        device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
++        with torch.autocast(device.type, enabled=self.training, dtype=torch.bfloat16):
+             idx = self.lm.num_layers
+             lm_out = self.lm(batch["seq"], repr_layers=[idx], need_head_weights=True)
+             s_s = lm_out.pop("representations")[idx]
+diff --git a/minifold/model/structure.py b/minifold/model/structure.py
+index 47f54a7..98e2c01 100644
+--- a/minifold/model/structure.py
++++ b/minifold/model/structure.py
+@@ -396,7 +396,8 @@ def forward(
+         unnormalized_angles, angles = self.angle_resnet(s, s_initial)
+ 
+         # Predict positions
+-        with torch.autocast("cuda", enabled=False):
++        device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
++        with torch.autocast(device.type, enabled=False):
+             # Predict frames
+             n, ca, c = self.bb_update(s.float()).chunk(3, dim=-1)
+             rigids = Rigid.make_transform_from_reference(n, ca, c, eps=1e-7)
+diff --git a/minifold/utils/profile.py b/minifold/utils/profile.py
+index 6753efd..1eb8187 100644
+--- a/minifold/utils/profile.py
++++ b/minifold/utils/profile.py
+@@ -1,4 +1,3 @@
+-
+ import torch
+ import gc
+ 
+@@ -10,11 +9,17 @@ def clear_gradients(*args):
+ 
+ 
+ def clear_memory(device):
+-    torch._C._cuda_clearCublasWorkspaces()
+-    torch._dynamo.reset()
+-    gc.collect()
+-    torch.cuda.empty_cache()
+-    torch.cuda.reset_peak_memory_stats(device)
++    if device.type == "cuda":
++        torch._C._cuda_clearCublasWorkspaces()
++        torch._dynamo.reset()
++        gc.collect()
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats(device)
++    elif device.type == "mps":
++        gc.collect()
++        torch.mps.empty_cache()
++    else:
++        gc.collect()
+ 
+ 
+ def peak_memory(f, *args, device):
+@@ -27,14 +32,25 @@ def peak_memory(f, *args, device):
+         f(*args)
+ 
+         # Measure peak memory
+-        torch.cuda.synchronize()
+-        memory = torch.cuda.max_memory_allocated(device)
++        if device.type == "cuda":
++            torch.cuda.synchronize()
++            memory = torch.cuda.max_memory_allocated(device)
++        elif device.type == "mps":
++            torch.mps.synchronize()
++            memory = torch.mps.current_allocated_memory()
++        else:
++            memory = 0
+ 
+     return memory
+ 
+ 
+ def current_memory(device):
+-    return torch.cuda.memory_allocated(device) / (1024**3)
++    if device.type == "cuda":
++        return torch.cuda.memory_allocated(device) / (1024**3)
++    elif device.type == "mps":
++        return torch.mps.current_allocated_memory() / (1024**3)
++    else:
++        return 0
+ 
+ 
+ def memory_measure(f, device, num_iters=3):
+@@ -60,8 +76,14 @@ def memory_measure_simple(f, device, *args, **kwargs):
+     out = f(*args, **kwargs)
+ 
+     # Measure peak memory
+-    torch.cuda.synchronize()
+-    memory = torch.cuda.max_memory_allocated(device)
++    if device.type == "cuda":
++        torch.cuda.synchronize()
++        memory = torch.cuda.max_memory_allocated(device)
++    elif device.type == "mps":
++        torch.mps.synchronize()
++        memory = torch.mps.current_allocated_memory()
++    else:
++        memory = 0
+     memory = memory / (1024**3)
+     memory = memory - current
+ 
+diff --git a/minifold/utils/rigid_utils.py b/minifold/utils/rigid_utils.py
+index 472a052..86aefc1 100644
+--- a/minifold/utils/rigid_utils.py
++++ b/minifold/utils/rigid_utils.py
+@@ -738,47 +738,37 @@ def map_tensor_fn(self, fn: Callable[torch.Tensor, torch.Tensor]) -> Rotation:
+ 
+     def cuda(self) -> Rotation:
+         """
+-        Analogous to the cuda() method of torch Tensors
++        Moves the transformation object to GPU memory (CUDA or MPS if available)
+ 
+         Returns:
+-            A copy of the Rotation in CUDA memory
++            A version of the transformation on GPU (CUDA or MPS)
+         """
+-        if self._rot_mats is not None:
+-            return Rotation(rot_mats=self._rot_mats.cuda(), quats=None)
+-        elif self._quats is not None:
+-            return Rotation(
+-                rot_mats=None, quats=self._quats.cuda(), normalize_quats=False
+-            )
++        # Prefer CUDA if available, else MPS, else CPU
++        if torch.cuda.is_available():
++            device = torch.device("cuda")
++        elif torch.backends.mps.is_available():
++            device = torch.device("mps")
+         else:
+-            raise ValueError("Both rotations are None")
++            device = torch.device("cpu")
++        return self.to(device)
+ 
+-    def to(
+-        self, device: Optional[torch.device], dtype: Optional[torch.dtype]
+-    ) -> Rotation:
++    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> Rigid:
+         """
+-        Analogous to the to() method of torch Tensors
++        Moves the transformation object to the specified device and dtype.
+ 
+         Args:
+-            device:
+-                A torch device
+-            dtype:
+-                A torch dtype
++            device: torch.device or None
++            dtype: torch.dtype or None
+         Returns:
+-            A copy of the Rotation using the new device and dtype
++            A version of the transformation on the specified device/dtype
+         """
+-        if self._rot_mats is not None:
+-            return Rotation(
+-                rot_mats=self._rot_mats.to(device=device, dtype=dtype),
+-                quats=None,
+-            )
+-        elif self._quats is not None:
+-            return Rotation(
+-                rot_mats=None,
+-                quats=self._quats.to(device=device, dtype=dtype),
+-                normalize_quats=False,
+-            )
+-        else:
+-            raise ValueError("Both rotations are None")
++        rots = self._rots
++        trans = self._trans
++        if rots is not None:
++            rots = rots.to(device=device, dtype=dtype)
++        if trans is not None:
++            trans = trans.to(device=device, dtype=dtype)
++        return Rigid(rots, trans)
+ 
+     def detach(self) -> Rotation:
+         """
+@@ -1365,9 +1355,54 @@ def make_transform_from_reference(n_xyz, ca_xyz, c_xyz, eps=1e-20):
+ 
+     def cuda(self) -> Rigid:
+         """
+-        Moves the transformation object to GPU memory
++        Moves the transformation object to GPU memory (CUDA or MPS if available)
+ 
+         Returns:
+-            A version of the transformation on GPU
++            A version of the transformation on GPU (CUDA or MPS)
++        """
++        # Prefer CUDA if available, else MPS, else CPU
++        if torch.cuda.is_available():
++            device = torch.device("cuda")
++        elif torch.backends.mps.is_available():
++            device = torch.device("mps")
++        else:
++            device = torch.device("cpu")
++        return self.to(device)
++
++    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> Rigid:
+         """
+-        return Rigid(self._rots.cuda(), self._trans.cuda())
++        Moves the transformation object to the specified device and dtype.
++
++        Args:
++            device: torch.device or None
++            dtype: torch.dtype or None
++        Returns:
++            A version of the transformation on the specified device/dtype
++        """
++        rots = self._rots
++        trans = self._trans
++        if rots is not None:
++            rots = rots.to(device=device, dtype=dtype)
++        if trans is not None:
++            trans = trans.to(device=device, dtype=dtype)
++        return Rigid(rots, trans)
++
++    def detach(self) -> Rotation:
++        """
++        Returns a copy of the Rotation whose underlying Tensor has been
++        detached from its torch graph.
++
++        Returns:
++            A copy of the Rotation whose underlying Tensor has been detached
++            from its torch graph
++        """
++        if self._rot_mats is not None:
++            return Rotation(rot_mats=self._rot_mats.detach(), quats=None)
++        elif self._quats is not None:
++            return Rotation(
++                rot_mats=None,
++                quats=self._quats.detach(),
++                normalize_quats=False,
++            )
++        else:
++            raise ValueError("Both rotations are None")
+diff --git a/predict.py b/predict.py
+index b8c3ab1..d5cc255 100644
+--- a/predict.py
++++ b/predict.py
+@@ -62,7 +62,16 @@ def output_to_pdb(seq, coords, mask, plddt):
+     return to_pdb(pred)
+ 
+ 
+-def create_model(checkpoint, compile=False, kernels=False):
++def get_device():
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    elif torch.backends.mps.is_available():
++        return torch.device("mps")
++    else:
++        return torch.device("cpu")
++
++
++def create_model(checkpoint, device, compile=False, kernels=False):
+     # Load checkpoint
+     ckpt = torch.load(checkpoint, map_location="cpu")
+     hparams = ckpt["hyper_parameters"]
+@@ -106,7 +115,7 @@ def create_model(checkpoint, compile=False, kernels=False):
+         )
+ 
+     # Move model to device
+-    model = model.to("cuda")
++    model = model.to(device)
+     model.eval()
+ 
+     return alphabet, model
+@@ -239,6 +248,10 @@ def predict(
+     # Download necessary data and model
+     download(cache, model_size)
+ 
++    # Detect device
++    device = get_device()
++    print(f"Using device: {device}")
++
+     # Load model
+     if checkpoint is None:
+         checkpoint = cache / f"minifold_{model_size}.ckpt"
+@@ -251,7 +264,7 @@ def predict(
+ 
+     # Load checkpoint
+     print("Load model...")
+-    alphabet, model = create_model(checkpoint, compile)
++    alphabet, model = create_model(checkpoint, device, compile)
+ 
+     # Create batches
+     config = model_config(
+@@ -306,14 +319,15 @@ def predict(
+ 
+         # Move to device
+         model_batch = {
+-            "seq": seq.to("cuda"),
+-            "mask": mask.to("cuda"),
+-            "batch_of": {k: v.to("cuda") for k, v in batch_of.items()},
++            "seq": seq.to(device),
++            "mask": mask.to(device),
++            "batch_of": {k: v.to(device) for k, v in batch_of.items()},
+         }
+ 
+         # Run predictions
+         try:
+-            with torch.autocast("cuda", dtype=torch.bfloat16):
++            autocast_device = "cuda" if device.type == "cuda" else ("cpu" if device.type == "cpu" else "mps")
++            with torch.autocast(autocast_device, dtype=torch.bfloat16):
+                 out = model(model_batch, num_recycling=num_recycling)
+                 out_pos = out.pop("final_atom_positions")
+                 out_mask = out.pop("final_atom_mask")

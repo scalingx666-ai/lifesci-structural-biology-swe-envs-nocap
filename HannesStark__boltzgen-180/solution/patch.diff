@@ -1,0 +1,1321 @@
+diff --git a/example/design_spec_showcasing_all_functionalities.yaml b/example/design_spec_showcasing_all_functionalities.yaml
+index f0048b06..dc8fe824 100644
+--- a/example/design_spec_showcasing_all_functionalities.yaml
++++ b/example/design_spec_showcasing_all_functionalities.yaml
+@@ -1,7 +1,14 @@
+ entities:
+-  - protein: 
++  - protein:
+       id: G
+       sequence: 15..20AAAAAAVTTTT18PPP # range between 15 and 20 inclusive on both sides
++      residue_constraints:
++        - position: 1
++          allowed: A # Only Alanine at position 1
++        - position: 3..5
++          disallowed: CM # No Cysteine or Methionine at positions 3-5
++        - position: 8
++          allowed: AGS # Only Ala, Gly, or Ser at position 8
+   - protein: 
+       id: R
+       sequence: 3..5C6C3 # Random number of design residues between 3 and 5, then a Cystein, then 6 design residues, then ...
+diff --git a/example/residue_constraints_test.yaml b/example/residue_constraints_test.yaml
+new file mode 100644
+index 00000000..6b216a2a
+--- /dev/null
++++ b/example/residue_constraints_test.yaml
+@@ -0,0 +1,33 @@
++# Test file for per-residue amino acid constraints
++# This tests the new residue_constraints feature
++#
++# Usage:
++#   boltzgen check example/residue_constraints_test.yaml
++#   boltzgen run example/residue_constraints_test.yaml --output test_output/ --steps design inverse_folding --num_designs 50
++#
++# Note: Use --num_designs 50 (not 5) for statistically meaningful verification.
++# With only 5 designs, blacklist constraints have a ~21% false-pass probability.
++#
++# Note: Supports both string format ("AGS") and list format ([A, G, S])
++#       String format is preferred for consistency with sequence/binding_types
++
++entities:
++  - protein:
++      id: A
++      sequence: 10
++      residue_constraints:
++        # Position 1: Force Alanine only
++        - position: 1
++          allowed: A
++
++        # Positions 3-5: Exclude Cysteine and Methionine
++        - position: 3..5
++          disallowed: CM
++
++        # Position 8: Allow only small amino acids
++        - position: 8
++          allowed: AGS
++
++        # Position 10: Force Proline
++        - position: 10
++          allowed: P
+diff --git a/src/boltzgen/data/const.py b/src/boltzgen/data/const.py
+index ff93d45d..a2847f94 100755
+--- a/src/boltzgen/data/const.py
++++ b/src/boltzgen/data/const.py
+@@ -3525,6 +3525,7 @@
+     "res_type_clone",
+     "is_standard",
+     "design_mask",
++    "aa_constraint_mask",
+     "binding_type",
+     "structure_group",
+     "token_bonds",
+diff --git a/src/boltzgen/data/data.py b/src/boltzgen/data/data.py
+index f8acb2b1..78acacd6 100755
+--- a/src/boltzgen/data/data.py
++++ b/src/boltzgen/data/data.py
+@@ -1,4 +1,5 @@
+ import json
++import warnings
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ import re
+@@ -1930,6 +1931,7 @@ class DesignInfo(NumpySerializable):
+     res_structure_groups: npt.NDArray[np.int_]
+     res_ss_types: npt.NDArray[np.int_]
+     res_binding_type: npt.NDArray[np.int_]
++    res_aa_constraint_mask: npt.NDArray[np.float32]  # Shape: (num_residues, 20), 0=allowed, 1=disallowed
+ 
+     @classmethod
+     def is_valid(self, info: "DesignInfo") -> bool:
+@@ -1939,6 +1941,7 @@ def is_valid(self, info: "DesignInfo") -> bool:
+             len(info.res_design_mask) == len(info.res_structure_groups)
+             and len(info.res_structure_groups) == len(info.res_ss_types)
+             and len(info.res_ss_types) == len(info.res_binding_type)
++            and len(info.res_aa_constraint_mask) == len(info.res_design_mask)
+         ), (
+             "There must be a bug in the code. All residue level design info objects should have the same length."
+         )
+@@ -1955,6 +1958,22 @@ def is_valid(self, info: "DesignInfo") -> bool:
+             msg = "Misspecified design info. There were residues that have a secondary structure type specified but are not set to be designed."
+             raise ValueError(msg)
+ 
++        # Validate residue constraints
++        has_constraints = info.res_aa_constraint_mask.any(axis=1)
++        if any(has_constraints & ~info.res_design_mask.astype(bool)):
++            warnings.warn(
++                "Residue constraints specified for non-designed residues "
++                "will be ignored during inverse folding.",
++                UserWarning,
++                stacklevel=2,
++            )
++
++        # Check if any designed position has ALL amino acids blocked
++        all_blocked = info.res_aa_constraint_mask.all(axis=1)
++        if any(all_blocked & info.res_design_mask.astype(bool)):
++            msg = "Invalid residue constraints: some designed positions have all amino acids disallowed."
++            raise ValueError(msg)
++
+         return True
+ 
+ 
+@@ -2049,6 +2068,7 @@ def load(cls: "JSONSerializable", path: Path) -> "JSONSerializable":
+     ("design_mask", np.dtype("?")),
+     ("binding_type", np.dtype("i4")),
+     ("structure_group", np.dtype("i4")),
++    ("aa_constraint_mask", np.dtype("20f4")),  # Per-residue AA constraints: 20 floats (one per canonical AA)
+     ("ccd", np.dtype("5i4")),
+     ("target_msa_mask", np.dtype("?")),
+     ("design_ss_mask", np.dtype("?")),
+diff --git a/src/boltzgen/data/feature/featurizer.py b/src/boltzgen/data/feature/featurizer.py
+index c6af5b69..a74ccf96 100755
+--- a/src/boltzgen/data/feature/featurizer.py
++++ b/src/boltzgen/data/feature/featurizer.py
+@@ -701,6 +701,12 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
+     res_type = from_numpy(token_data["res_type"]).long()
+     is_standard = from_numpy(token_data["is_standard"])
+     design = from_numpy(token_data["design_mask"]).long()
++    # Per-residue amino acid constraint mask (shape: num_tokens x 20)
++    if "aa_constraint_mask" in token_data.dtype.names:
++        aa_constraint_mask = from_numpy(token_data["aa_constraint_mask"]).float()
++    else:
++        # Default: no constraints (all zeros = all AAs allowed)
++        aa_constraint_mask = torch.zeros(len(token_data), len(const.canonical_tokens))
+     res_type = one_hot(res_type, num_classes=const.num_tokens)
+     modified = from_numpy(token_data["modified"]).long()
+     ccd = from_numpy(token_data["ccd"]).long()
+@@ -864,6 +870,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
+             res_type = pad_dim(res_type, 0, pad_len)
+             is_standard = pad_dim(is_standard, 0, pad_len)
+             design = pad_dim(design, 0, pad_len)
++            aa_constraint_mask = pad_dim(aa_constraint_mask, 0, pad_len)
+             binding_type = pad_dim(binding_type, 0, pad_len)
+             structure_group = pad_dim(structure_group, 0, pad_len)
+             pad_mask = pad_dim(pad_mask, 0, pad_len)
+@@ -901,6 +908,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
+         "res_type_clone": res_type.clone(),
+         "is_standard": is_standard,
+         "design_mask": design,
++        "aa_constraint_mask": aa_constraint_mask,
+         "binding_type": binding_type,
+         "structure_group": structure_group,
+         "token_bonds": bonds,
+diff --git a/src/boltzgen/data/parse/schema.py b/src/boltzgen/data/parse/schema.py
+index 82696967..62376582 100644
+--- a/src/boltzgen/data/parse/schema.py
++++ b/src/boltzgen/data/parse/schema.py
+@@ -337,6 +337,11 @@ def get_mol(ccd: str, mols: dict, moldir: str) -> Mol:
+     "atom",
+     "use_assembly",
+     "symmetric_group",
++    # Per-residue amino acid constraints
++    "residue_constraints",
++    "position",
++    "allowed",
++    "disallowed",
+ ]
+ 
+ 
+@@ -679,6 +684,182 @@ def parse_range(ranges, c_start=0, c_end=None):
+     return indices
+ 
+ 
++def _normalize_aa_spec(aa_spec) -> list[str]:
++    """Normalize amino acid specification to a list of individual codes.
++
++    Supports both BoltzGen conventions:
++    - String format: "AGS" (concatenated 1-letter codes, consistent with sequence/binding_types)
++    - List format: [A, G, S] or [ALA, GLY, SER]
++
++    Parameters
++    ----------
++    aa_spec : str or list
++        Amino acid specification in string or list format
++
++    Returns
++    -------
++    list[str]
++        List of individual amino acid codes
++    """
++    if isinstance(aa_spec, str):
++        # String format: "AGS" -> ["A", "G", "S"]
++        # Handle both "AGS" and "ALA" (single 3-letter code)
++        aa_spec = aa_spec.strip().upper()
++        if len(aa_spec) <= 3 and aa_spec.isalpha():
++            # Could be single 3-letter code like "ALA" or 1-3 single letters like "A", "AG", "AGS"
++            # Check if it's a valid 3-letter code
++            if len(aa_spec) == 3 and aa_spec in ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]:
++                return [aa_spec]
++            # Otherwise treat as concatenated 1-letter codes
++            return list(aa_spec)
++        else:
++            # Longer string: treat as concatenated 1-letter codes
++            return list(aa_spec)
++    elif isinstance(aa_spec, list):
++        # List format: [A, G, S] or [ALA, GLY, SER]
++        return [str(x).strip().upper() for x in aa_spec]
++    else:
++        raise ValueError(f"Invalid amino acid specification: {aa_spec}")
++
++
++def _convert_aa_names_to_indices(
++    aa_names: list,
++    canonical_tokens: list[str],
++    prot_letter_to_token: dict[str, str],
++) -> list[int]:
++    """Convert amino acid names (1-letter or 3-letter) to canonical token indices.
++
++    Parameters
++    ----------
++    aa_names : list
++        List of amino acid names (1-letter like 'A' or 3-letter like 'ALA')
++    canonical_tokens : list[str]
++        List of canonical 3-letter amino acid codes
++    prot_letter_to_token : dict[str, str]
++        Mapping from 1-letter to 3-letter codes
++
++    Returns
++    -------
++    list[int]
++        List of indices into canonical_tokens
++    """
++    indices = []
++    for name in aa_names:
++        name = str(name).strip().upper()
++        # Convert 1-letter to 3-letter if needed
++        if len(name) == 1:
++            if name not in prot_letter_to_token:
++                raise ValueError(f"Unknown amino acid code: {name}")
++            name = prot_letter_to_token[name]
++
++        # Find index in canonical_tokens
++        if name not in canonical_tokens:
++            raise ValueError(f"Unknown amino acid: {name}")
++        indices.append(canonical_tokens.index(name))
++
++    return indices
++
++
++def parse_residue_constraints(
++    constraints_spec: list,
++    chain_length: int,
++    canonical_tokens: list[str],
++    prot_letter_to_token: dict[str, str],
++) -> np.ndarray:
++    """Parse residue_constraints into a per-residue constraint mask.
++
++    Parameters
++    ----------
++    constraints_spec : list
++        List of constraint specifications from YAML
++    chain_length : int
++        Length of the chain (number of residues)
++    canonical_tokens : list[str]
++        List of canonical 3-letter amino acid codes (20 AAs)
++    prot_letter_to_token : dict[str, str]
++        Mapping from 1-letter to 3-letter codes
++
++    Returns
++    -------
++    np.ndarray
++        Shape (chain_length, 20) where:
++        - 0.0 means allowed
++        - 1.0 means disallowed (will be converted to -inf logit bias in model)
++
++    Notes
++    -----
++    Overlapping constraints use **intersection** semantics: if multiple
++    constraints cover the same position, only amino acids allowed by ALL
++    of them survive. For example, ``allowed: AG`` at pos 1..10 followed
++    by ``allowed: GS`` at pos 5..15 results in only G being allowed at
++    positions 5-10 (the intersection of {A,G} and {G,S}).
++    """
++    num_aa = len(canonical_tokens)  # Should be 20
++    constraint_mask = np.zeros((chain_length, num_aa), dtype=np.float32)
++
++    for constraint in constraints_spec:
++        # Parse position(s)
++        position_spec = constraint.get("position")
++        if position_spec is None:
++            raise ValueError("residue_constraints: 'position' is required")
++
++        # Use parse_range to handle single positions and ranges (1-indexed)
++        positions = parse_range(str(position_spec), c_start=0, c_end=chain_length)
++
++        # Validate positions are within bounds
++        for pos in positions:
++            if pos < 0 or pos >= chain_length:
++                raise ValueError(
++                    f"Position {pos + 1} is out of bounds for chain of length {chain_length}"
++                )
++
++        # Parse amino acid specification
++        allowed = constraint.get("allowed", None)
++        disallowed = constraint.get("disallowed", None)
++
++        # Validate: cannot have both allowed and disallowed
++        if allowed is not None and disallowed is not None:
++            raise ValueError(
++                f"Position {position_spec}: cannot specify both 'allowed' and 'disallowed'"
++            )
++
++        if allowed is None and disallowed is None:
++            raise ValueError(
++                f"Position {position_spec}: must specify either 'allowed' or 'disallowed'"
++            )
++
++        if allowed is not None:
++            # Whitelist mode: block all except specified AAs
++            # Uses np.maximum to accumulate with existing constraints (intersection semantics):
++            # if a position already has constraints, only AAs allowed by BOTH survive.
++            aa_list = _normalize_aa_spec(allowed)
++            if len(aa_list) == 0:
++                raise ValueError(
++                    f"Position {position_spec}: 'allowed' cannot be empty"
++                )
++            aa_indices = _convert_aa_names_to_indices(
++                aa_list, canonical_tokens, prot_letter_to_token
++            )
++            new_block = np.ones(num_aa, dtype=np.float32)
++            for idx in aa_indices:
++                new_block[idx] = 0.0
++            for pos in positions:
++                constraint_mask[pos, :] = np.maximum(constraint_mask[pos, :], new_block)
++
++        elif disallowed is not None:
++            # Blacklist mode: only block specified
++            # Normalize input: supports both "CM" (string) and [C, M] (list)
++            aa_list = _normalize_aa_spec(disallowed)
++            aa_indices = _convert_aa_names_to_indices(
++                aa_list, canonical_tokens, prot_letter_to_token
++            )
++            for pos in positions:
++                for idx in aa_indices:
++                    constraint_mask[pos, idx] = 1.0  # Block specified
++
++    return constraint_mask
++
++
+ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
+     extra_mols: dict[str, Mol] = {}
+     parsed_chains: dict[str, ParsedChain] = {}
+@@ -960,6 +1141,31 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
+         else:
+             ss_type.extend([const.ss_type_ids["UNSPECIFIED"]] * num)
+ 
++    # Parse residue_constraints for per-residue amino acid restrictions
++    entry = item[entity_type]
++    constraints_spec = entry.get("residue_constraints", None)
++    ids = item[entity_type]["id"]
++    num_chains = 1 if isinstance(ids, str) else len(ids)
++    res_aa_constraint_list = []
++    for _ in range(num_chains):
++        if constraints_spec is not None and entity_type == "protein":
++            res_aa_constraints = parse_residue_constraints(
++                constraints_spec,
++                chain_length=num,
++                canonical_tokens=const.canonical_tokens,
++                prot_letter_to_token=const.prot_letter_to_token,
++            )
++        else:
++            # No constraints: all 20 amino acids allowed (zeros)
++            res_aa_constraints = np.zeros((num, len(const.canonical_tokens)), dtype=np.float32)
++        res_aa_constraint_list.append(res_aa_constraints)
++
++    # Concatenate constraint masks for all chain copies
++    if res_aa_constraint_list:
++        res_aa_constraint_mask = np.concatenate(res_aa_constraint_list, axis=0)
++    else:
++        res_aa_constraint_mask = np.zeros((0, len(const.canonical_tokens)), dtype=np.float32)
++
+     # Add as many parsed_chains as provided ids
+     if entity_type in {"protein", "dna", "rna", "ligand"}:
+         ids = item[entity_type]["id"]
+@@ -987,6 +1193,7 @@ def parse_entity(item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto):
+         chain_to_msa,
+         fuse_info,
+         ligand_id,
++        res_aa_constraint_mask,
+     )
+ 
+ 
+@@ -1218,6 +1425,7 @@ def recursive_check(data):
+             res_design_mask = np.array([], dtype=bool)
+             res_bind_type = np.array([], dtype=np.int32)
+             ss_type = np.array([], dtype=np.int32)
++            res_aa_constraint_mask = np.zeros((0, len(const.canonical_tokens)), dtype=np.float32)
+             chain_to_msa = {}
+ 
+             global_asym_id = 0
+@@ -1241,6 +1449,7 @@ def recursive_check(data):
+                         entity_chain_to_msa,
+                         fuse_info,
+                         ligand_id,
++                        new_res_aa_constraint_mask,
+                     ) = parse_entity(
+                         item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto
+                     )
+@@ -1249,6 +1458,7 @@ def recursive_check(data):
+                     extra_mols.update(new_extra_mols)
+                     res_bind_type = np.concatenate([res_bind_type, new_res_bind_type])
+                     ss_type = np.concatenate([ss_type, new_ss_type])
++                    res_aa_constraint_mask = np.concatenate([res_aa_constraint_mask, new_res_aa_constraint_mask], axis=0)
+                     for asym_id, (chain_name, chain) in enumerate(
+                         parsed_chains.items()
+                     ):
+@@ -1452,6 +1662,9 @@ def recursive_check(data):
+                     res_design_mask = np.concatenate([res_design_mask, new_design_mask])
+                     res_bind_type = np.concatenate([res_bind_type, fbind_types])
+                     ss_type = np.concatenate([ss_type, fss_type])
++                    # File entities have no residue constraints — pad with zeros (all AAs allowed)
++                    file_constraint_mask = np.zeros((len(new_design_mask), len(const.canonical_tokens)), dtype=np.float32)
++                    res_aa_constraint_mask = np.concatenate([res_aa_constraint_mask, file_constraint_mask], axis=0)
+                     extra_mols.update(new_extra_mols)
+                     if len(renaming) > 0:
+                         msg = f"\nChain ids conflict with existing chain ids. Renaming with {renaming}. This is for the structure from '{path}'."
+@@ -1621,6 +1834,7 @@ def recursive_check(data):
+             res_structure_groups=structure_groups,
+             res_binding_type=res_bind_type,
+             res_ss_types=ss_type,
++            res_aa_constraint_mask=res_aa_constraint_mask,
+         )
+         DesignInfo.is_valid(design_info)
+ 
+diff --git a/src/boltzgen/data/tokenize/tokenizer.py b/src/boltzgen/data/tokenize/tokenizer.py
+index 3c368a7f..47181a6f 100755
+--- a/src/boltzgen/data/tokenize/tokenizer.py
++++ b/src/boltzgen/data/tokenize/tokenizer.py
+@@ -50,6 +50,7 @@ class TokenData:
+     design: bool
+     binding_type: int
+     structure_group: int
++    aa_constraint_mask: np.ndarray  # Shape: (20,) - per-residue AA constraints
+     ccd: np.ndarray
+     target_msa_mask: bool
+     design_ss_mask: bool
+@@ -266,6 +267,7 @@ def tokenize(
+                         design=False,
+                         binding_type=const.binding_type_ids["UNSPECIFIED"],
+                         structure_group=0,
++                        aa_constraint_mask=np.zeros(20, dtype=np.float32),
+                         ccd=convert_ccd(res["name"]),
+                         target_msa_mask=0,
+                         design_ss_mask=0,
+@@ -331,6 +333,7 @@ def tokenize(
+                             design=False,
+                             binding_type=const.binding_type_ids["UNSPECIFIED"],
+                             structure_group=0,
++                            aa_constraint_mask=np.zeros(20, dtype=np.float32),
+                             ccd=convert_ccd(res["name"]),
+                             target_msa_mask=0,
+                             design_ss_mask=0,
+@@ -390,6 +393,7 @@ def tokenize(
+                         design=False,
+                         binding_type=const.binding_type_ids["UNSPECIFIED"],
+                         structure_group=0,
++                        aa_constraint_mask=np.zeros(20, dtype=np.float32),
+                         ccd=convert_ccd(res["name"]),
+                         target_msa_mask=0,
+                         design_ss_mask=0,
+diff --git a/src/boltzgen/model/modules/inverse_fold.py b/src/boltzgen/model/modules/inverse_fold.py
+index 99d39639..56974c12 100755
+--- a/src/boltzgen/model/modules/inverse_fold.py
++++ b/src/boltzgen/model/modules/inverse_fold.py
+@@ -1,4 +1,5 @@
+-from typing import Dict, Tuple, List
++from typing import Dict, Tuple, List, Optional
++import warnings
+ 
+ import torch
+ from torch import Tensor, nn
+@@ -38,6 +39,75 @@ def softmax_dropout(
+     )
+ 
+ 
++def build_constraint_logit_mask(
++    num_nodes: int,
++    aa_constraint_mask: Optional[Tensor],
++    inverse_fold_restriction: list[str],
++    canonical_tokens: list[str],
++    inf: float,
++    device: torch.device,
++) -> Tensor:
++    """Build per-position inverse-folding logit mask.
++
++    The mask uses additive logit bias semantics:
++    0.0 = allowed, -inf = disallowed.
++    """
++    num_aa = len(canonical_tokens)
++    has_per_residue_constraints = False
++
++    if aa_constraint_mask is None:
++        per_residue_blocked = torch.zeros(
++            num_nodes, num_aa, dtype=torch.bool, device=device
++        )
++    else:
++        expected_shape = (num_nodes, num_aa)
++        if aa_constraint_mask.shape != expected_shape:
++            warnings.warn(
++                f"aa_constraint_mask shape mismatch: "
++                f"got {aa_constraint_mask.shape}, expected {expected_shape}. "
++                f"Ignoring per-residue constraints.",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++            per_residue_blocked = torch.zeros(
++                num_nodes, num_aa, dtype=torch.bool, device=device
++            )
++        else:
++            has_per_residue_constraints = True
++            per_residue_blocked = aa_constraint_mask.to(device=device) > 0
++
++    global_blocked = torch.zeros(num_aa, dtype=torch.bool, device=device)
++    for res_type in inverse_fold_restriction:
++        global_blocked[canonical_tokens.index(res_type)] = True
++
++    combined_blocked = per_residue_blocked | global_blocked.unsqueeze(0)
++    all_blocked = combined_blocked.all(dim=1)
++
++    if all_blocked.any() and has_per_residue_constraints:
++        blocked_positions = torch.where(all_blocked)[0].tolist()
++        warnings.warn(
++            f"Positions {blocked_positions} have all amino acids blocked by the "
++            f"combination of per-residue constraints and '--inverse_fold_avoid'. "
++            f"Relaxing per-residue constraints for these positions.",
++            RuntimeWarning,
++            stacklevel=2,
++        )
++        per_residue_blocked = per_residue_blocked.clone()
++        per_residue_blocked[all_blocked] = False
++        combined_blocked = per_residue_blocked | global_blocked.unsqueeze(0)
++
++    still_all_blocked = combined_blocked.all(dim=1)
++    if still_all_blocked.any():
++        blocked_positions = torch.where(still_all_blocked)[0].tolist()
++        raise ValueError(
++            f"Inverse folding has no valid amino acids at token positions "
++            f"{blocked_positions} after applying '--inverse_fold_avoid'. "
++            f"Reduce global restrictions to keep at least one amino acid."
++        )
++
++    return combined_blocked.to(dtype=torch.float32) * (-inf)
++
++
+ class MLPAttnGNN(nn.Module):
+     def __init__(
+         self,
+@@ -588,14 +658,17 @@ def sample(self, s, z, edge_idx, valid_mask, feats):
+             f"num_design: {num_design}, num_not_design: {num_not_design}"
+         )
+ 
+-        # Create restriction mask that sets the probability of excluded residues to 0
+-        if len(self.inverse_fold_restriction) > 0:
+-            restriction_mask = torch.zeros(len(const.canonical_tokens), device=s.device)
+-            for res_type in self.inverse_fold_restriction:
+-                restriction_mask[const.canonical_tokens.index(res_type)] = -self.inf
+-            restriction_mask = restriction_mask.unsqueeze(0)
+-        else:
+-            restriction_mask = torch.zeros(len(const.canonical_tokens), device=s.device)
++        constraint_mask = None
++        if "aa_constraint_mask" in feats:
++            constraint_mask = feats["aa_constraint_mask"][valid_mask]
++        per_residue_mask = build_constraint_logit_mask(
++            num_nodes=num_nodes,
++            aa_constraint_mask=constraint_mask,
++            inverse_fold_restriction=self.inverse_fold_restriction,
++            canonical_tokens=const.canonical_tokens,
++            inf=self.inf,
++            device=s.device,
++        )
+ 
+         order = torch.randperm(num_nodes, device=s.device).cpu().numpy().tolist()
+         # Non-design residues are not sampled and used as the condition. So the order should filter them out.
+@@ -667,7 +740,7 @@ def sample(self, s, z, edge_idx, valid_mask, feats):
+                     const.canonicals_offset : len(const.canonical_tokens)
+                     + const.canonicals_offset,
+                 ]
+-                + restriction_mask
++                + per_residue_mask[i : i + 1]  # Position-specific mask
+             )
+             if self.sampling_temperature is None:
+                 ids_canonical = torch.argmax(pred_canonical, dim=-1)
+diff --git a/src/boltzgen/model/modules/masker.py b/src/boltzgen/model/modules/masker.py
+index f2f8b92a..0a7f2a56 100755
+--- a/src/boltzgen/model/modules/masker.py
++++ b/src/boltzgen/model/modules/masker.py
+@@ -88,6 +88,9 @@ def forward(self, feats):
+                 new["disto_target"] = clone["disto_target"]
+             new["token_pair_mask"] = clone["token_pair_mask"]
+             new["binding_type"] = clone["binding_type"]
++            # Per-residue amino acid constraints for inverse folding
++            if "aa_constraint_mask" in clone:
++                new["aa_constraint_mask"] = clone["aa_constraint_mask"]
+             new["structure_group"] = clone["structure_group"]
+             new["cyclic"] = clone["cyclic"]
+             new["modified"] = clone["modified"]
+diff --git a/src/boltzgen/task/predict/data_from_generated.py b/src/boltzgen/task/predict/data_from_generated.py
+index f5585db6..4947e480 100755
+--- a/src/boltzgen/task/predict/data_from_generated.py
++++ b/src/boltzgen/task/predict/data_from_generated.py
+@@ -2,6 +2,7 @@
+ from pathlib import Path
+ import random
+ import re
++import warnings
+ from typing import Dict, List, Optional
+ from collections import defaultdict
+ from rdkit.Chem import Mol
+@@ -319,8 +320,28 @@ def getitem_from_paths(self, metadata_path, generated_path, native_path) -> Dict
+         if "binding_type" in metadata:
+             binding_type = metadata["binding_type"]
+ 
++        # Per-residue amino acid constraints for inverse folding
++        aa_constraint_mask = None
++        if "aa_constraint_mask" in metadata:
++            loaded_mask = metadata["aa_constraint_mask"]
++            # Validate the loaded mask is a proper array with expected shape
++            if (
++                isinstance(loaded_mask, np.ndarray)
++                and loaded_mask.ndim == 2
++                and loaded_mask.shape[1] == 20  # 20 canonical amino acids
++            ):
++                aa_constraint_mask = loaded_mask
++            else:
++                warnings.warn(
++                    f"Invalid aa_constraint_mask in NPZ: "
++                    f"type={type(loaded_mask)}, shape={getattr(loaded_mask, 'shape', 'N/A')}. "
++                    f"Expected ndarray with shape (N, 20). Ignoring constraints.",
++                    RuntimeWarning,
++                    stacklevel=2,
++                )
++
+         # Get features
+-        feat = self.get_feat(generated_path, design_mask, ss_type, binding_type)
++        feat = self.get_feat(generated_path, design_mask, ss_type, binding_type, aa_constraint_mask)
+ 
+         # Get native features
+         if self.return_native:
+@@ -334,7 +355,7 @@ def getitem_from_paths(self, metadata_path, generated_path, native_path) -> Dict
+ 
+         return feat
+ 
+-    def get_feat(self, path, design_mask, ss_type=None, binding_type=None):
++    def get_feat(self, path, design_mask, ss_type=None, binding_type=None, aa_constraint_mask=None):
+         # Load design
+         if self.extra_mol_dir is not None:
+             mols = {
+@@ -462,6 +483,9 @@ def get_feat(self, path, design_mask, ss_type=None, binding_type=None):
+             features["ss_type"] = torch.from_numpy(ss_type).long()
+         if binding_type is not None:
+             features["binding_type"] = torch.from_numpy(binding_type).long()
++        # Per-residue amino acid constraints for inverse folding
++        if aa_constraint_mask is not None:
++            features["aa_constraint_mask"] = torch.from_numpy(aa_constraint_mask).float()
+ 
+         # If we do not want the design mask to impact the featurizer (e.g. represent atoms as atom14), we set the design mask only here.
+         if not self.design:
+diff --git a/src/boltzgen/task/predict/data_from_yaml.py b/src/boltzgen/task/predict/data_from_yaml.py
+index 6679da09..77fbf84c 100755
+--- a/src/boltzgen/task/predict/data_from_yaml.py
++++ b/src/boltzgen/task/predict/data_from_yaml.py
+@@ -216,6 +216,10 @@ def get_sample(self, path: Path, sample_id: Optional[str] = None) -> Dict:
+         tokenized.tokens["structure_group"] = design_info.res_structure_groups[
+             token_to_res
+         ]
++        # Transfer per-residue amino acid constraints (shape: num_tokens x 20)
++        tokenized.tokens["aa_constraint_mask"] = design_info.res_aa_constraint_mask[
++            token_to_res
++        ]
+ 
+         # Propagate design mask to obtain chain_design_mask (True whenever something is covalently bound to any residue that is in a chain that contains a design residue).
+         chain_design_mask = tokenized.tokens["design_mask"].astype(bool)
+diff --git a/src/boltzgen/task/predict/writer.py b/src/boltzgen/task/predict/writer.py
+index 00279589..551956ec 100755
+--- a/src/boltzgen/task/predict/writer.py
++++ b/src/boltzgen/task/predict/writer.py
+@@ -384,34 +384,31 @@ def write_on_batch_end(  # noqa: PLR0915
+ 
+                 # Write metadata
+                 metadata_path = f"{self.outdir}/{file_name}.npz"
++                token_mask = sample["token_pad_mask"].bool()
++
++                # Build metadata dict with required fields
++                metadata_dict = {
++                    "design_mask": design_mask[token_mask].cpu().numpy(),
++                    "mol_type": sample["mol_type"][token_mask].cpu().numpy(),
++                    "ss_type": sample["ss_type"][token_mask].cpu().numpy(),
++                    "token_resolved_mask": sample["token_resolved_mask"][token_mask].cpu().numpy(),
++                    "binding_type": binding_type[token_mask].cpu().numpy(),
++                }
++
++                # Add optional fields only if they have valid values (avoid None -> object array)
++                if "inverse_fold_design_mask" in sample:
++                    metadata_dict["inverse_fold_design_mask"] = (
++                        sample["inverse_fold_design_mask"][token_mask].cpu().numpy()
++                    )
+ 
+-                np.savez_compressed(
+-                    metadata_path,
+-                    design_mask=design_mask[sample["token_pad_mask"].bool()]
+-                    .cpu()
+-                    .numpy(),
+-                    inverse_fold_design_mask=sample["inverse_fold_design_mask"][
+-                        sample["token_pad_mask"].bool()
+-                    ]
+-                    .cpu()
+-                    .numpy()
+-                    if "inverse_fold_design_mask" in sample
+-                    else None,
+-                    mol_type=sample["mol_type"][sample["token_pad_mask"].bool()]
+-                    .cpu()
+-                    .numpy(),
+-                    ss_type=sample["ss_type"][sample["token_pad_mask"].bool()]
+-                    .cpu()
+-                    .numpy(),
+-                    token_resolved_mask=sample["token_resolved_mask"][
+-                        sample["token_pad_mask"].bool()
+-                    ]
+-                    .cpu()
+-                    .numpy(),
+-                    binding_type=binding_type[sample["token_pad_mask"].bool()]
+-                    .cpu()
+-                    .numpy(),
+-                )
++                # Per-residue amino acid constraints (for inverse folding step)
++                # Only save if constraints exist AND have non-zero values
++                if "aa_constraint_mask" in batch:
++                    aa_mask = batch["aa_constraint_mask"][0]
++                    if aa_mask.any():  # Only save if there are actual constraints
++                        metadata_dict["aa_constraint_mask"] = aa_mask[token_mask].cpu().numpy()
++
++                np.savez_compressed(metadata_path, **metadata_dict)
+ 
+                 # Write trajectories
+                 if self.save_traj:
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 00000000..5594ac1a
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,79 @@
++"""Optional test configuration for mocking heavy dependencies.
++
++Enable with:
++    pytest --mock-heavy-deps tests/test_residue_constraints.py
++
++By default no mocking is performed, so integration tests run against
++real dependencies.
++"""
++import sys
++from unittest.mock import MagicMock
++
++
++def _install_mock(name: str) -> None:
++    """Install a mock module (and parent packages) into sys.modules."""
++    parts = name.split(".")
++    for i in range(len(parts)):
++        mod_name = ".".join(parts[: i + 1])
++        if mod_name not in sys.modules:
++            sys.modules[mod_name] = MagicMock()
++
++
++# Heavy dependencies that schema.py imports transitively but are NOT
++# needed by the three constraint-parsing functions under test.
++_MOCK_MODULES = [
++    "torch",
++    "torch.nn",
++    "torch.nn.functional",
++    "torch.utils",
++    "torch.utils.data",
++    "pytorch_lightning",
++    "hydra",
++    "hydra.core",
++    "hydra.core.config_store",
++    "einops",
++    "einx",
++    "mashumaro",
++    "biotite",
++    "biotite.structure",
++    "biotite.structure.io",
++    "biotite.structure.io.pdbx",
++    "pydssp",
++    "logomaker",
++    "hydride",
++    "gemmi",
++    "pdbeccdutils",
++    "pdbeccdutils.core",
++    "pdbeccdutils.core.ccd_reader",
++    "edit_distance",
++    "huggingface_hub",
++    "nvidia_ml_py",
++    "cuequivariance_ops_cu12",
++    "cuequivariance_ops_torch_cu12",
++    "cuequivariance_torch",
++    "numba",
++    "sklearn",
++    "sklearn.cluster",
++    "sklearn.neighbors",
++    "pandas",
++    "matplotlib",
++    "matplotlib.pyplot",
++    "tqdm",
++    "Bio",
++    "Bio.PDB",
++]
++
++
++def pytest_addoption(parser) -> None:
++    parser.addoption(
++        "--mock-heavy-deps",
++        action="store_true",
++        default=False,
++        help="Mock heavy optional dependencies for parser-only unit tests.",
++    )
++
++
++def pytest_configure(config) -> None:
++    if config.getoption("--mock-heavy-deps"):
++        for mod in _MOCK_MODULES:
++            _install_mock(mod)
+diff --git a/tests/test_inverse_fold_constraint_masks.py b/tests/test_inverse_fold_constraint_masks.py
+new file mode 100644
+index 00000000..74b3a00a
+--- /dev/null
++++ b/tests/test_inverse_fold_constraint_masks.py
+@@ -0,0 +1,90 @@
++"""Integration tests for inverse-folding constraint mask composition."""
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from boltzgen.data import const
++from boltzgen.model.modules.inverse_fold import build_constraint_logit_mask
++
++
++INF = 10**6
++
++
++def _allowed_only_mask(allowed_tokens: list[str]) -> torch.Tensor:
++    """Build a single-row mask where only `allowed_tokens` are permitted."""
++    num_aa = len(const.canonical_tokens)
++    mask = torch.ones((1, num_aa), dtype=torch.float32)
++    for token in allowed_tokens:
++        mask[0, const.canonical_tokens.index(token)] = 0.0
++    return mask
++
++
++def test_conflict_allowed_and_global_avoid_keeps_global_restriction() -> None:
++    cys_idx = const.canonical_tokens.index("CYS")
++    aa_constraint_mask = _allowed_only_mask(["CYS"])
++
++    with pytest.warns(RuntimeWarning, match="Relaxing per-residue constraints"):
++        out = build_constraint_logit_mask(
++            num_nodes=1,
++            aa_constraint_mask=aa_constraint_mask,
++            inverse_fold_restriction=["CYS"],
++            canonical_tokens=const.canonical_tokens,
++            inf=INF,
++            device=torch.device("cpu"),
++        )
++
++    # Global avoid must still block CYS after conflict handling.
++    assert out[0, cys_idx].item() == -INF
++    # All other residues remain available.
++    assert (out[0] == 0).sum().item() == len(const.canonical_tokens) - 1
++
++
++def test_non_conflicting_constraints_compose_correctly() -> None:
++    ala_idx = const.canonical_tokens.index("ALA")
++    cys_idx = const.canonical_tokens.index("CYS")
++    aa_constraint_mask = _allowed_only_mask(["ALA"])
++
++    out = build_constraint_logit_mask(
++        num_nodes=1,
++        aa_constraint_mask=aa_constraint_mask,
++        inverse_fold_restriction=["CYS"],
++        canonical_tokens=const.canonical_tokens,
++        inf=INF,
++        device=torch.device("cpu"),
++    )
++
++    # Only ALA should remain available.
++    assert out[0, ala_idx].item() == 0.0
++    assert out[0, cys_idx].item() == -INF
++    assert (out[0] == 0).sum().item() == 1
++
++
++def test_global_restrictions_that_block_all_raise() -> None:
++    with pytest.raises(ValueError, match="no valid amino acids"):
++        build_constraint_logit_mask(
++            num_nodes=1,
++            aa_constraint_mask=None,
++            inverse_fold_restriction=const.canonical_tokens,
++            canonical_tokens=const.canonical_tokens,
++            inf=INF,
++            device=torch.device("cpu"),
++        )
++
++
++def test_shape_mismatch_ignores_per_residue_mask() -> None:
++    bad_shape = torch.zeros((2, 20), dtype=torch.float32)
++
++    with pytest.warns(RuntimeWarning, match="shape mismatch"):
++        out = build_constraint_logit_mask(
++            num_nodes=1,
++            aa_constraint_mask=bad_shape,
++            inverse_fold_restriction=[],
++            canonical_tokens=const.canonical_tokens,
++            inf=INF,
++            device=torch.device("cpu"),
++        )
++
++    # No restrictions should remain after ignoring mismatched input.
++    assert out.shape == (1, len(const.canonical_tokens))
++    assert torch.all(out == 0)
+diff --git a/tests/test_residue_constraints.py b/tests/test_residue_constraints.py
+new file mode 100644
+index 00000000..fe51da59
+--- /dev/null
++++ b/tests/test_residue_constraints.py
+@@ -0,0 +1,381 @@
++"""Unit tests for per-residue amino acid constraint parsing.
++
++Tests parse_residue_constraints(), _normalize_aa_spec(), and
++_convert_aa_names_to_indices() from boltzgen.data.parse.schema.
++"""
++
++import numpy as np
++import pytest
++
++from boltzgen.data import const
++from boltzgen.data.parse.schema import (
++    _convert_aa_names_to_indices,
++    _normalize_aa_spec,
++    parse_residue_constraints,
++)
++
++# Shorthand fixtures
++CANONICAL = const.canonical_tokens  # 20 three-letter codes
++LETTER_MAP = const.prot_letter_to_token  # e.g. {"A": "ALA", ...}
++
++
++# ============================================================================
++# _normalize_aa_spec
++# ============================================================================
++
++class TestNormalizeAASpec:
++    """Tests for _normalize_aa_spec helper."""
++
++    def test_single_letter(self):
++        assert _normalize_aa_spec("A") == ["A"]
++
++    def test_multi_letter_string(self):
++        assert _normalize_aa_spec("AGS") == ["A", "G", "S"]
++
++    def test_long_string(self):
++        assert _normalize_aa_spec("AVILMFYW") == list("AVILMFYW")
++
++    def test_three_letter_code(self):
++        assert _normalize_aa_spec("ALA") == ["ALA"]
++
++    def test_three_letter_not_valid(self):
++        # "AGS" is 3 chars but NOT a valid 3-letter code → split into 1-letter
++        assert _normalize_aa_spec("AGS") == ["A", "G", "S"]
++
++    def test_list_format_single_letters(self):
++        assert _normalize_aa_spec(["A", "G", "S"]) == ["A", "G", "S"]
++
++    def test_list_format_three_letter(self):
++        assert _normalize_aa_spec(["ALA", "GLY"]) == ["ALA", "GLY"]
++
++    def test_lowercase_normalised(self):
++        assert _normalize_aa_spec("ags") == ["A", "G", "S"]
++
++    def test_whitespace_stripped(self):
++        assert _normalize_aa_spec(" AG ") == ["A", "G"]
++
++    def test_invalid_type_raises(self):
++        with pytest.raises(ValueError):
++            _normalize_aa_spec(123)
++
++
++# ============================================================================
++# _convert_aa_names_to_indices
++# ============================================================================
++
++class TestConvertAANamesToIndices:
++    """Tests for _convert_aa_names_to_indices helper."""
++
++    def test_single_letter_a(self):
++        indices = _convert_aa_names_to_indices(["A"], CANONICAL, LETTER_MAP)
++        assert indices == [CANONICAL.index("ALA")]
++
++    def test_single_letter_c(self):
++        indices = _convert_aa_names_to_indices(["C"], CANONICAL, LETTER_MAP)
++        assert indices == [CANONICAL.index("CYS")]
++
++    def test_three_letter_code(self):
++        indices = _convert_aa_names_to_indices(["ALA", "GLY"], CANONICAL, LETTER_MAP)
++        assert indices == [CANONICAL.index("ALA"), CANONICAL.index("GLY")]
++
++    def test_mixed_formats(self):
++        indices = _convert_aa_names_to_indices(["A", "GLY"], CANONICAL, LETTER_MAP)
++        assert indices == [CANONICAL.index("ALA"), CANONICAL.index("GLY")]
++
++    def test_all_20_aas(self):
++        all_letters = list("ACDEFGHIKLMNPQRSTVWY")
++        indices = _convert_aa_names_to_indices(all_letters, CANONICAL, LETTER_MAP)
++        assert len(indices) == 20
++        assert len(set(indices)) == 20  # all unique
++
++    def test_invalid_letter_raises(self):
++        with pytest.raises(ValueError, match="Unknown amino acid"):
++            _convert_aa_names_to_indices(["X"], CANONICAL, LETTER_MAP)
++
++    def test_invalid_three_letter_raises(self):
++        with pytest.raises(ValueError, match="Unknown amino acid"):
++            _convert_aa_names_to_indices(["ZZZ"], CANONICAL, LETTER_MAP)
++
++
++# ============================================================================
++# parse_residue_constraints — valid inputs
++# ============================================================================
++
++class TestParseResidueConstraintsValid:
++    """Tests for parse_residue_constraints with valid YAML specs."""
++
++    def test_empty_list_returns_zeros(self):
++        mask = parse_residue_constraints([], 10, CANONICAL, LETTER_MAP)
++        assert mask.shape == (10, 20)
++        assert mask.sum() == 0.0
++
++    def test_single_allowed(self):
++        spec = [{"position": 1, "allowed": "A"}]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        ala_idx = CANONICAL.index("ALA")
++        # Position 0 (1-indexed=1): only ALA allowed (0.0), rest blocked (1.0)
++        assert mask[0, ala_idx] == 0.0
++        assert mask[0].sum() == 19.0  # 19 blocked, 1 allowed
++        # Other positions untouched
++        assert mask[1:].sum() == 0.0
++
++    def test_single_disallowed(self):
++        spec = [{"position": 3, "disallowed": "CM"}]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        cys_idx = CANONICAL.index("CYS")
++        met_idx = CANONICAL.index("MET")
++        # Position 2 (1-indexed=3): CYS and MET blocked
++        assert mask[2, cys_idx] == 1.0
++        assert mask[2, met_idx] == 1.0
++        assert mask[2].sum() == 2.0  # only 2 blocked
++
++    def test_range_positions(self):
++        spec = [{"position": "3..5", "disallowed": "C"}]
++        mask = parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++        cys_idx = CANONICAL.index("CYS")
++        # Positions 2,3,4 (1-indexed 3,4,5) should have CYS blocked
++        for pos in [2, 3, 4]:
++            assert mask[pos, cys_idx] == 1.0
++        # Other positions untouched
++        for pos in [0, 1, 5, 6, 7, 8, 9]:
++            assert mask[pos, cys_idx] == 0.0
++
++    def test_allowed_multiple_aas(self):
++        spec = [{"position": 8, "allowed": "AGS"}]
++        mask = parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++        ala_idx = CANONICAL.index("ALA")
++        gly_idx = CANONICAL.index("GLY")
++        ser_idx = CANONICAL.index("SER")
++        # Position 7 (1-indexed=8): only A,G,S allowed
++        assert mask[7, ala_idx] == 0.0
++        assert mask[7, gly_idx] == 0.0
++        assert mask[7, ser_idx] == 0.0
++        assert mask[7].sum() == 17.0  # 17 blocked
++
++    def test_list_format_allowed(self):
++        spec = [{"position": 1, "allowed": ["A", "G"]}]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        ala_idx = CANONICAL.index("ALA")
++        gly_idx = CANONICAL.index("GLY")
++        assert mask[0, ala_idx] == 0.0
++        assert mask[0, gly_idx] == 0.0
++        assert mask[0].sum() == 18.0
++
++    def test_multiple_constraints_no_overlap(self):
++        spec = [
++            {"position": 1, "allowed": "A"},
++            {"position": 5, "allowed": "P"},
++        ]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        ala_idx = CANONICAL.index("ALA")
++        pro_idx = CANONICAL.index("PRO")
++        assert mask[0, ala_idx] == 0.0
++        assert mask[0].sum() == 19.0
++        assert mask[4, pro_idx] == 0.0
++        assert mask[4].sum() == 19.0
++        # Middle positions untouched
++        assert mask[1:4].sum() == 0.0
++
++    # ------------------------------------------------------------------
++    # Intersection semantics (overlapping constraints)
++    # ------------------------------------------------------------------
++
++    def test_overlapping_allowed_intersection(self):
++        """Two allowed constraints on same position → only common AAs survive."""
++        spec = [
++            {"position": 1, "allowed": "AG"},
++            {"position": 1, "allowed": "GS"},
++        ]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        gly_idx = CANONICAL.index("GLY")
++        ala_idx = CANONICAL.index("ALA")
++        ser_idx = CANONICAL.index("SER")
++        # Only G is in both sets
++        assert mask[0, gly_idx] == 0.0  # allowed
++        assert mask[0, ala_idx] == 1.0  # blocked (not in 2nd)
++        assert mask[0, ser_idx] == 1.0  # blocked (not in 1st)
++        assert mask[0].sum() == 19.0  # only GLY allowed
++
++    def test_overlapping_allowed_range_intersection(self):
++        """Overlapping ranges intersect at overlap positions."""
++        spec = [
++            {"position": "1..5", "allowed": "AG"},
++            {"position": "3..7", "allowed": "GS"},
++        ]
++        mask = parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++        gly_idx = CANONICAL.index("GLY")
++        ala_idx = CANONICAL.index("ALA")
++        ser_idx = CANONICAL.index("SER")
++        # Positions 0,1 (1-indexed 1,2): only AG (first constraint only)
++        assert mask[0, ala_idx] == 0.0
++        assert mask[0, gly_idx] == 0.0
++        assert mask[0].sum() == 18.0
++        # Positions 2,3,4 (1-indexed 3,4,5): intersection of {A,G} and {G,S} = {G}
++        for pos in [2, 3, 4]:
++            assert mask[pos, gly_idx] == 0.0
++            assert mask[pos, ala_idx] == 1.0
++            assert mask[pos, ser_idx] == 1.0
++            assert mask[pos].sum() == 19.0
++        # Positions 5,6 (1-indexed 6,7): only GS (second constraint only)
++        assert mask[5, gly_idx] == 0.0
++        assert mask[5, ser_idx] == 0.0
++        assert mask[5].sum() == 18.0
++
++    def test_allowed_then_disallowed_same_position(self):
++        """allowed + disallowed on same position: disallowed narrows the set."""
++        spec = [
++            {"position": 5, "allowed": "AGILMV"},
++            {"position": 5, "disallowed": "CM"},
++        ]
++        mask = parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++        met_idx = CANONICAL.index("MET")
++        ala_idx = CANONICAL.index("ALA")
++        # M was in allowed set but then blocked by disallowed
++        assert mask[4, met_idx] == 1.0
++        # A was in allowed set and not disallowed
++        assert mask[4, ala_idx] == 0.0
++
++    def test_disallowed_then_allowed_same_position(self):
++        """Order independent: disallowed then allowed gives same result."""
++        spec_ab = [
++            {"position": 5, "allowed": "AGILMV"},
++            {"position": 5, "disallowed": "CM"},
++        ]
++        spec_ba = [
++            {"position": 5, "disallowed": "CM"},
++            {"position": 5, "allowed": "AGILMV"},
++        ]
++        mask_ab = parse_residue_constraints(spec_ab, 10, CANONICAL, LETTER_MAP)
++        mask_ba = parse_residue_constraints(spec_ba, 10, CANONICAL, LETTER_MAP)
++        np.testing.assert_array_equal(mask_ab, mask_ba)
++
++    def test_disjoint_allowed_sets_all_blocked(self):
++        """Two allowed sets with no overlap → all 20 AAs blocked."""
++        spec = [
++            {"position": 1, "allowed": "AG"},
++            {"position": 1, "allowed": "VILM"},
++        ]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        # All 20 blocked at position 0
++        assert mask[0].sum() == 20.0
++
++    def test_multiple_disallowed_accumulate(self):
++        """Multiple disallowed on same position: union of blocked sets."""
++        spec = [
++            {"position": 1, "disallowed": "CM"},
++            {"position": 1, "disallowed": "WK"},
++        ]
++        mask = parse_residue_constraints(spec, 5, CANONICAL, LETTER_MAP)
++        cys_idx = CANONICAL.index("CYS")
++        met_idx = CANONICAL.index("MET")
++        trp_idx = CANONICAL.index("TRP")
++        lys_idx = CANONICAL.index("LYS")
++        assert mask[0, cys_idx] == 1.0
++        assert mask[0, met_idx] == 1.0
++        assert mask[0, trp_idx] == 1.0
++        assert mask[0, lys_idx] == 1.0
++        assert mask[0].sum() == 4.0
++
++    def test_dtype_and_shape(self):
++        spec = [{"position": 1, "allowed": "A"}]
++        mask = parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++        assert mask.dtype == np.float32
++        assert mask.shape == (10, 20)
++
++
++# ============================================================================
++# parse_residue_constraints — error paths
++# ============================================================================
++
++class TestParseResidueConstraintsErrors:
++    """Tests for parse_residue_constraints with invalid YAML specs."""
++
++    def test_missing_position(self):
++        spec = [{"allowed": "A"}]
++        with pytest.raises(ValueError, match="position.*required"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_position_out_of_bounds_high(self):
++        spec = [{"position": 11, "allowed": "A"}]
++        with pytest.raises(ValueError, match="out of bounds"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_position_out_of_bounds_zero(self):
++        # Position 0 is invalid (1-indexed); parse_range catches this
++        spec = [{"position": 0, "allowed": "A"}]
++        with pytest.raises(ValueError, match="1 indexed|out of bounds"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_both_allowed_and_disallowed(self):
++        spec = [{"position": 1, "allowed": "A", "disallowed": "C"}]
++        with pytest.raises(ValueError, match="cannot specify both"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_neither_allowed_nor_disallowed(self):
++        spec = [{"position": 1}]
++        with pytest.raises(ValueError, match="must specify either"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_empty_allowed(self):
++        spec = [{"position": 1, "allowed": ""}]
++        with pytest.raises(ValueError, match="cannot be empty"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_invalid_amino_acid_code(self):
++        spec = [{"position": 1, "allowed": "X"}]
++        with pytest.raises(ValueError, match="Unknown amino acid"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++    def test_invalid_amino_acid_in_disallowed(self):
++        spec = [{"position": 1, "disallowed": "XZ"}]
++        with pytest.raises(ValueError, match="Unknown amino acid"):
++            parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++
++# ============================================================================
++# Regression: original test case (no overlaps)
++# ============================================================================
++
++class TestOriginalTestCase:
++    """Regression test matching residue_constraints_test.yaml."""
++
++    def test_original_yaml_constraints(self):
++        """Matches the constraints from example/residue_constraints_test.yaml."""
++        spec = [
++            {"position": 1, "allowed": "A"},
++            {"position": "3..5", "disallowed": "CM"},
++            {"position": 8, "allowed": "AGS"},
++            {"position": 10, "allowed": "P"},
++        ]
++        mask = parse_residue_constraints(spec, 10, CANONICAL, LETTER_MAP)
++
++        ala_idx = CANONICAL.index("ALA")
++        cys_idx = CANONICAL.index("CYS")
++        met_idx = CANONICAL.index("MET")
++        gly_idx = CANONICAL.index("GLY")
++        ser_idx = CANONICAL.index("SER")
++        pro_idx = CANONICAL.index("PRO")
++
++        # Position 1: only A
++        assert mask[0, ala_idx] == 0.0
++        assert mask[0].sum() == 19.0
++
++        # Positions 3-5: C and M blocked
++        for pos in [2, 3, 4]:
++            assert mask[pos, cys_idx] == 1.0
++            assert mask[pos, met_idx] == 1.0
++            assert mask[pos].sum() == 2.0
++
++        # Position 8: only A, G, S
++        assert mask[7, ala_idx] == 0.0
++        assert mask[7, gly_idx] == 0.0
++        assert mask[7, ser_idx] == 0.0
++        assert mask[7].sum() == 17.0
++
++        # Position 10: only P
++        assert mask[9, pro_idx] == 0.0
++        assert mask[9].sum() == 19.0
++
++        # Unconstrained positions (2, 6, 7, 9 in 0-indexed) are all zeros
++        for pos in [1, 5, 6, 8]:
++            assert mask[pos].sum() == 0.0

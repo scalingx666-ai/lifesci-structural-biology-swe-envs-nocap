@@ -1,0 +1,939 @@
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/.gitignore b/rna_tools/tools/rna_calc_evo_rmsd/.gitignore
+new file mode 100644
+index 000000000..4ac214be5
+--- /dev/null
++++ b/rna_tools/tools/rna_calc_evo_rmsd/.gitignore
+@@ -0,0 +1 @@
++test_data/RF01750/
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/RNAalignment.py b/rna_tools/tools/rna_calc_evo_rmsd/RNAalignment.py
+index 667ad559d..6721e4d6a 100755
+--- a/rna_tools/tools/rna_calc_evo_rmsd/RNAalignment.py
++++ b/rna_tools/tools/rna_calc_evo_rmsd/RNAalignment.py
+@@ -72,44 +72,78 @@ def is_selector_record(record_id):
+             "Alignment must contain an EvoClust/x line, a #=GC RF reference annotation, or columns without gaps"
+         )
+ 
+-    def get_range(self, seqid, offset=0, verbose=None):
+-        """Get a list of positions for selected residues based on the last line of the alignment!
+-
+-        If seqis not found in the alignment, raise an exception, like ::
++    def get_column_positions(self, seqid, offset=0):
++        """Get the residue position (1-based, + offset) for every selected column.
+ 
+-            Exception: Seq not found in the alignment: 'CP000879.1/21644622164546
++        Returns a list with one entry per selected column of the alignment; the
++        entry is ``None`` when the sequence has a gap in that column. Lists
++        returned for different sequences are therefore column-wise comparable,
++        which is what is needed to pair residues between two structures.
+ 
+-        .. warning:: EvoClust lines has to be -1 in the alignemnt."""
+-        # evoclust/reference line
++        If seqid is not found in the alignment, raise an exception."""
+         x = self._selection_track  # ---(((((((----xxxxx-- or RF annotation
+-
+-        if verbose is None:
+-            verbose = self.verbose
+-
+-        x_range = []
+-        seq_found = False
+         for record in self.alignment:
+             if record.id.strip().lower() in ("x", "evoclust"):
+                 continue
+             if record.id == seqid.strip():
+-                seq_found = True
++                positions = []
+                 spos = 0
+-                for xi, si in zip(x, record.seq):
+-                    if si != '-':
++                for xi, si in zip(x, str(record.seq)):
++                    is_gap = si in ('-', '.', '~')
++                    if not is_gap:
+                         spos += 1
+                     if self._include_column(xi):
+-                        # print xi, si,
+-                        # print si, spos
+-                        x_range.append(spos + offset)
+-        # if verbose: print '  # selected residues:', len(x_range)
++                        positions.append(None if is_gap else spos + offset)
++                return positions
++        raise Exception('Seq not found in the alignment: %s' % seqid)
++
++    def get_range(self, seqid, offset=0, verbose=None):
++        """Get a list of positions for selected residues based on the selector line.
++
++        Columns where the sequence has a gap are skipped.
++
++        If seqis not found in the alignment, raise an exception, like ::
++
++            Exception: Seq not found in the alignment: 'CP000879.1/21644622164546
++        """
++        if verbose is None:
++            verbose = self.verbose
++        x_range = [p for p in self.get_column_positions(seqid, offset) if p is not None]
+         if verbose:
+             print(' Selected residues for %s: %s' % (seqid, x_range))
+-        if not seq_found:
+-            raise Exception('Seq not found in the alignment: %s' % seqid)
+         if not x_range:
+             raise Exception('Seq not found or selector line is malformed')
+         return x_range
+ 
++    def get_seq(self, seqid):
++        """Get the aligned sequence (with gaps) of seqid."""
++        for record in self.alignment:
++            if record.id.strip().lower() in ("x", "evoclust"):
++                continue
++            if record.id == seqid.strip():
++                return str(record.seq)
++        raise Exception('Seq not found in the alignment: %s' % seqid)
++
++    def get_paired_positions(self, seqid1, seqid2, offset=0, verbose=None):
++        """Get residue positions of two sequences paired by selected alignment columns.
++
++        Only columns where both sequences have a residue are kept.
++
++        :returns: (positions1, positions2), two lists of the same length"""
++        if verbose is None:
++            verbose = self.verbose
++        pairs = [(a, b) for a, b in zip(self.get_column_positions(seqid1, offset),
++                                         self.get_column_positions(seqid2, offset))
++                 if a is not None and b is not None]
++        if not pairs:
++            raise Exception('No selected columns shared by %s and %s' % (seqid1, seqid2))
++        positions1 = [a for a, b in pairs]
++        positions2 = [b for a, b in pairs]
++        if verbose:
++            print(' Paired residues %s <-> %s: %s' % (seqid1, seqid2,
++                                                    ' '.join('%s:%s' % p for p in pairs)))
++        return positions1, positions2
++
+     def _include_column(self, selector_char):
+         """Return True when the selector character marks a column to use."""
+         if not selector_char:
+@@ -127,7 +161,7 @@ def _build_gapless_selector(self):
+ 
+         selector_chars = []
+         for column in zip(*sequences):
+-            if all(base != '-' for base in column):
++            if all(base not in ('-', '.', '~') for base in column):
+                 selector_chars.append('x')
+             else:
+                 selector_chars.append('-')
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/RNAmodel.py b/rna_tools/tools/rna_calc_evo_rmsd/RNAmodel.py
+index 31c1898f4..bd82c6d05 100644
+--- a/rna_tools/tools/rna_calc_evo_rmsd/RNAmodel.py
++++ b/rna_tools/tools/rna_calc_evo_rmsd/RNAmodel.py
+@@ -32,6 +32,33 @@
+ def get_atom_selection_summary():
+     return ATOM_SELECTION_SUMMARY
+ 
++
++def get_nucleotide_residues(struc):
++    """Get nucleotides of the first model, in the file order.
++
++    Waters, ions and ligands are skipped; modified nucleotides (HETATM with
++    P and C1' atoms) are kept. The n-th residue returned here corresponds to
++    the n-th residue of the sequence in an alignment (1-based)."""
++    model = next(struc.get_models())
++    residues = []
++    for res in model.get_residues():
++        hetflag = res.id[0]
++        if hetflag == ' ' or (hetflag.startswith('H_') and res.has_id('P') and res.has_id("C1'")):
++            residues.append(res)
++    return residues
++
++
++def get_sequence(struc):
++    """Get the sequence of nucleotides (see get_nucleotide_residues), unknown residues as N."""
++    seq = ''
++    for res in get_nucleotide_residues(struc):
++        resname = res.get_resname().strip().upper()
++        if resname in ('A', 'C', 'G', 'U', 'T', 'DA', 'DC', 'DG', 'DT'):
++            seq += resname[-1]
++        else:
++            seq += 'N'
++    return seq
++
+ class RNAmodel:
+     """RNAmodel
+ 
+@@ -52,7 +79,7 @@ class RNAmodel:
+     def __init__(self, fpath, residues, save=False, output_dir=""):
+ 
+         # parser 1-5 -> 1 2 3 4 5
+-        self.struc = Bio.PDB.PDBParser().get_structure('', fpath)
++        self.struc = RNAmodel.parse(fpath)
+         self.fpath = fpath
+         self.fn = os.path.basename(fpath)
+         self.residues = residues #self.__parser_residues(residues)
+@@ -61,6 +88,11 @@ def __init__(self, fpath, residues, save=False, output_dir=""):
+         if save:
+             self.save(output_dir) # @save
+ 
++    @staticmethod
++    def parse(fpath):
++        """Parse a PDB file, return Bio.PDB structure"""
++        return Bio.PDB.PDBParser(QUIET=True).get_structure('', fpath)
++
+     def __parser_residues(self, residues):
+         """Get string and parse it
+         '1 4 5 10-15' -> [1, 4, 5, 10, 11, 12, 13, 14, 15]"""
+@@ -74,27 +106,36 @@ def __parser_residues(self, residues):
+         return rs
+ 
+     def __get_atoms(self):
++        """Select atoms of the residues.
++
++        self.residues are positions (1-based) in the sequence of the structure
++        (see get_nucleotide_residues), not the residue numbers from the PDB file.
++        Atoms are keyed by (index in self.residues, atom name) so two models
++        built from lists of paired positions can be compared directly."""
+         self.atoms = []
+-        self.atom_ids = []  # (resSeq, atomName)
++        self.atom_ids = []  # (index in self.residues, atomName)
+         self.atom_lookup = {}
+-        for res in self.struc.get_residues():
+-            res_seq = res.id[1]
+-            if res_seq not in self.residues:
+-                continue
++        nts = get_nucleotide_residues(self.struc)
++        self.selected_residues = []
++        for i, pos in enumerate(self.residues):
++            if pos < 1 or pos > len(nts):
++                raise Exception('residue position %s out of range (%s has %s nucleotides)' % (pos, self.fn, len(nts)))
++            res = nts[pos - 1]
++            self.selected_residues.append(res)
+             # backbone atoms
+             for atom_name in BACKBONE_ATOMS:
+-                self._append_atom_if_present(res, res_seq, atom_name)
++                self._append_atom_if_present(res, i, atom_name)
+             # base atoms
+             for atom_name in self._get_base_atoms(res):
+-                self._append_atom_if_present(res, res_seq, atom_name)
++                self._append_atom_if_present(res, i, atom_name)
+         if len(self.atom_ids) <= 0:
+             raise Exception('problem: no atoms were selected!: %s' % self.fn)
+         return self.atoms
+ 
+-    def _append_atom_if_present(self, residue, res_seq, atom_name):
++    def _append_atom_if_present(self, residue, index, atom_name):
+         if residue.has_id(atom_name):
+             atom = residue[atom_name]
+-            key = (res_seq, atom_name)
++            key = (index, atom_name)
+             self.atom_lookup[key] = atom
+             self.atom_ids.append(key)
+             self.atoms.append(atom)
+@@ -177,13 +218,13 @@ def save(self, output_dir, verbose=True):
+         except OSError:
+             pass
+ 
+-        RESI = self.residues
++        RESI = set(id(r) for r in self.selected_residues)
+         if not self.struc:
+             raise Exception('self.struct was not defined! Can not save a pdb!')
+ 
+         class BpSelect(Select):
+             def accept_residue(self, residue):
+-                if residue.get_id()[1] in RESI:
++                if id(residue) in RESI:
+                     return 1
+                 else:
+                     return 0
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/RfamAlign.py b/rna_tools/tools/rna_calc_evo_rmsd/RfamAlign.py
+new file mode 100644
+index 000000000..acd338728
+--- /dev/null
++++ b/rna_tools/tools/rna_calc_evo_rmsd/RfamAlign.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python
++"""Find the Rfam family shared by structures and align them to its covariance model.
++
++1. ``cmscan`` all sequences against Rfam (Rfam.cm),
++2. for each model, pick the best family hit by both the target and the model,
++3. ``cmfetch`` the family CM and ``cmalign`` the sequences to it.
++
++The resulting Stockholm alignment has a ``#=GC RF`` line, so the consensus
++(RF) columns are used to pair residues for the RMSD calculation.
++
++Setup:
++
++- install Infernal http://eddylab.org/infernal/ (cmscan, cmfetch, cmalign in $PATH),
++- download ftp://ftp.ebi.ac.uk/pub/databases/Rfam/CURRENT/Rfam.cm.gz, gunzip and run ``cmpress Rfam.cm``,
++- give the path with ``--rfam_db``, or set ``RFAM_DB_PATH`` (environment variable or the rna-tools config).
++"""
++from __future__ import print_function
++import os
++import re
++import shutil
++import subprocess
++
++
++class RfamAlignError(Exception):
++    pass
++
++
++def get_rfam_db(rfam_db=None):
++    """Get path to Rfam.cm: given path, $RFAM_DB_PATH or RFAM_DB_PATH from rna_tools_config."""
++    if not rfam_db:
++        rfam_db = os.environ.get('RFAM_DB_PATH')
++    if not rfam_db:
++        try:
++            from rna_tools.rna_tools_config import RFAM_DB_PATH
++            rfam_db = RFAM_DB_PATH
++        except ImportError:
++            pass
++    if not rfam_db or not os.path.isfile(rfam_db):
++        raise RfamAlignError('Rfam.cm not found (%s). Give it with --rfam_db or set RFAM_DB_PATH. '
++                             'Download: ftp://ftp.ebi.ac.uk/pub/databases/Rfam/CURRENT/Rfam.cm.gz, '
++                             'gunzip and run cmpress Rfam.cm' % rfam_db)
++    for tool in ('cmscan', 'cmfetch', 'cmalign'):
++        if not shutil.which(tool):
++            raise RfamAlignError('%s not found, install Infernal http://eddylab.org/infernal/' % tool)
++    return rfam_db
++
++
++def run(cmd, verbose=False):
++    if verbose:
++        print(' ' + ' '.join(cmd))
++    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
++    if p.returncode != 0:
++        raise RfamAlignError('%s failed:\n%s%s' % (cmd[0], p.stdout, p.stderr))
++    return p.stdout
++
++
++def write_fasta(seqs, fn):
++    with open(fn, 'w') as f:
++        for name, seq in seqs:
++            f.write('>%s\n%s\n' % (name, seq))
++
++
++def cmscan(seqs, rfam_db, workdir, evalue=None, verbose=False):
++    """Run cmscan of seqs against Rfam.
++
++    :param seqs: list of (name, seq)
++    :param evalue: if None, use Rfam gathering thresholds (--cut_ga), otherwise report hits with E-value <= evalue
++    :returns: list of hits, dicts with keys: family, accession, name, seq_from, seq_to, strand, score, evalue
++    """
++    fasta = os.path.join(workdir, 'seqs.fa')
++    tblout = os.path.join(workdir, 'cmscan.tblout')
++    write_fasta(seqs, fasta)
++    cmd = ['cmscan', '--rfam', '--nohmmonly', '--tblout', tblout]
++    if evalue is None:
++        cmd += ['--cut_ga']
++    else:
++        cmd += ['-E', str(evalue)]
++    run(cmd + [rfam_db, fasta], verbose)
++    hits = []
++    for line in open(tblout):
++        if line.startswith('#') or not line.strip():
++            continue
++        # target name, accession, query name, accession, mdl, mdl from, mdl to, seq from, seq to,
++        # strand, trunc, pass, gc, bias, score, E-value, inc, description of target
++        cols = line.split()
++        hits.append({'family': cols[0], 'accession': cols[1], 'name': cols[2],
++                     'seq_from': int(cols[7]), 'seq_to': int(cols[8]), 'strand': cols[9],
++                     'score': float(cols[14]), 'evalue': float(cols[15])})
++    if verbose:
++        for h in hits:
++            print(' hit: %(name)s %(family)s %(accession)s %(seq_from)s-%(seq_to)s %(strand)s score: %(score)s E: %(evalue)s' % h)
++    return hits
++
++
++def get_best_scores(hits):
++    """:returns: {seq name: {family: best score}}, only hits on the + strand"""
++    scores = {}
++    for h in hits:
++        if h['strand'] != '+':
++            continue
++        fam = scores.setdefault(h['name'], {})
++        fam[h['family']] = max(fam.get(h['family'], h['score']), h['score'])
++    return scores
++
++
++def find_common_family(scores, name1, name2):
++    """Get the family hit by both sequences with the highest sum of scores, or None."""
++    fams1 = scores.get(name1, {})
++    fams2 = scores.get(name2, {})
++    common = set(fams1) & set(fams2)
++    if not common:
++        return None
++    return max(common, key=lambda f: fams1[f] + fams2[f])
++
++
++def cmalign(family, seqs, rfam_db, workdir, output_fn, verbose=False):
++    """Fetch the family CM from Rfam and align seqs to it, save the alignment (Stockholm) to output_fn.
++
++    Whole sequences are aligned; residues outside of the family (e.g. flanks)
++    end up in insert columns ('.' in RF) and are not used."""
++    cm = os.path.join(workdir, family + '.cm')
++    fasta = os.path.join(workdir, family + '.fa')
++    run(['cmfetch', '-o', cm, rfam_db, family], verbose)
++    write_fasta(seqs, fasta)
++    run(['cmalign', '-o', output_fn, cm, fasta], verbose)
++    return output_fn
++
++
++def get_seq_names(fns):
++    """Get unique names, safe for Stockholm/fasta, for files (basename without extension)."""
++    names = []
++    for fn in fns:
++        name = re.sub(r'[^\w.\-]', '_', os.path.splitext(os.path.basename(fn))[0]) or 'seq'
++        new = name
++        i = 2
++        while new in names:
++            new = '%s_%s' % (name, i)
++            i += 1
++        names.append(new)
++    return names
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/readme.md b/rna_tools/tools/rna_calc_evo_rmsd/readme.md
+index 26c9ecd95..29b848e5e 100644
+--- a/rna_tools/tools/rna_calc_evo_rmsd/readme.md
++++ b/rna_tools/tools/rna_calc_evo_rmsd/readme.md
+@@ -37,3 +37,24 @@
+ 	 Selected residues for 6Y2L_2_std: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73]
+ 			 target           model   rmsd group_name
+ 	0  1ehz_std.pdb  6Y2L_2_std.pdb  1.652
++
++Automated mode, no alignment needed. Sequences are taken from the PDB files and searched against Rfam (`cmscan`); if the target and a model hit the same family, they are aligned to the family covariance model (`cmalign`) and the residues in the consensus (`#=GC RF`) columns are used for the RMSD. Requires Infernal and Rfam.cm (`--rfam_db` or `RFAM_DB_PATH`, see RfamAlign.py). Alignments are saved to `<output>_rfam/<family>.sto`:
++
++	rna_calc_evo_rmsd.py --rfam_db Rfam.cm -t test_data/1ehz_std.pdb test_data/6Y2L_2_std.pdb
++
++Use `--rfam_evalue 0.01` instead of Rfam gathering thresholds (`--cut_ga`, default). Models that do not share a family with the target are skipped.
++
++All vs all: map all structures on Rfam families, build an alignment per family, and calculate RMSD and sequence identity for all pairs within each family, with a plot of sequence identity vs RMSD (`<output>_seqid_vs_rmsd.png`):
++
++	rna_calc_evo_rmsd.py --all_vs_all --rfam_db Rfam.cm -o rmsd.csv *.pdb
++
++Sequence identity (column `seq_identity`) is calculated in all modes with `esl-alipid` from Easel (https://github.com/EddyRivasLab/easel, comes with HMMER/Infernal source distributions), if it is in the $PATH.
++
++Without Rfam, `--auto pairwise` aligns each model to the target with a pairwise sequence alignment (all aligned residues are used):
++
++	rna_calc_evo_rmsd.py --auto pairwise -t test_data/1ehz_std.pdb test_data/6Y2L_2_std.pdb
++
++	         target           model  rmsd  n_residues  seq_identity family group_name
++	0  1ehz_std.pdb  6Y2L_2_std.pdb   3.3          76         63.16
++
++Residues are paired according to the alignment columns (the n-th residue of a sequence in the alignment is the n-th nucleotide in the PDB file), not by the residue numbers in the PDB files.
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/rna_calc_evo_rmsd.py b/rna_tools/tools/rna_calc_evo_rmsd/rna_calc_evo_rmsd.py
+index 34e9a91fc..68c996bfc 100755
+--- a/rna_tools/tools/rna_calc_evo_rmsd/rna_calc_evo_rmsd.py
++++ b/rna_tools/tools/rna_calc_evo_rmsd/rna_calc_evo_rmsd.py
+@@ -25,10 +25,46 @@
+ 
+ When ``--target_name`` is not given the script uses the basename of the target
+ structure passed with ``--target`` as the identifier in the alignment.
++
++Automated mode (no alignment), Rfam
++-----------------------------------
++
++If ``-a/--rna_alignment_fn`` is omitted, sequences are taken from the PDB files
++and searched against Rfam with ``cmscan``. For each model, the Rfam family hit
++by both the target and the model (the best one, if there are more) is taken,
++the sequences are aligned to its covariance model with ``cmalign``, and the
++residues in the consensus (``#=GC RF``) columns are used for the RMSD
++calculation. No alignment, mapping or selector line has to be prepared by hand::
++
++    rna_calc_evo_rmsd.py --rfam_db Rfam.cm -t test_data/1ehz_std.pdb test_data/6Y2L_2_std.pdb
++
++The alignments are saved to ``<output>_rfam/<family>.sto`` (they can be
++inspected and re-used with ``-a``). Models that do not share a family with the
++target are skipped. Requires Infernal and Rfam.cm (see RfamAlign.py).
++
++All vs all: with ``--all_vs_all`` every structure is mapped on its best Rfam
++family, structures of each family are aligned together to the family covariance
++model and RMSD and sequence identity (``esl-alipid`` of Easel) are calculated for
++all pairs within each family. A plot of sequence identity vs RMSD is saved to
++``<output>_seqid_vs_rmsd.png``::
++
++    rna_calc_evo_rmsd.py --all_vs_all --rfam_db Rfam.cm -o rmsd.csv *.pdb
++
++Sequence identity is calculated in all modes (column ``seq_identity``) with
++``esl-alipid`` (Easel, https://github.com/EddyRivasLab/easel), if available.
++
++With ``--auto pairwise`` the sequences are instead aligned with a simple
++pairwise sequence alignment (no Rfam needed), and all aligned positions are
++used. This works best for closely related sequences.
++
++Residues are always paired according to the alignment columns (the n-th residue
++in the alignment is the n-th nucleotide in the PDB file), not according to the
++residue numbers in the PDB files.
+ """
+ from __future__ import print_function
+ import pandas as pd
+ pd.set_option('display.width', 1000)
++pd.set_option('display.max_columns', None)
+ import matplotlib.pyplot as plt
+ plt.style.use('ggplot')
+ import argparse
+@@ -46,7 +82,10 @@
+ from Bio.PDB import PDBIO, Superimposer
+ 
+ from RNAalignment import RNAalignment
+-from RNAmodel import RNAmodel, get_atom_selection_summary
++from RNAmodel import RNAmodel, get_atom_selection_summary, get_sequence
++from Bio.Align import PairwiseAligner
++import RfamAlign
++import tempfile
+ import csv
+ 
+ debug = False
+@@ -107,9 +146,20 @@ def get_parser():
+     parser = argparse.ArgumentParser()
+ 
+     parser.add_argument('-a', "--rna_alignment_fn",
+-                        help="Stockholm alignment file with either an x/EvoClust selector line, a #=GC RF reference annotation, or gap-free columns that will be auto-detected (e.g. test_data/rp14sub.stk)",
+-                        required=True)
+-    parser.add_argument('-t', "--target", help="the native structure file", required=True)
++                        help="Stockholm alignment file with either an x/EvoClust selector line, a #=GC RF reference annotation, or gap-free columns that will be auto-detected (e.g. test_data/rp14sub.stk). \
++                        If omitted, the alignment is made automatically, see --auto.",
++                        default=None)
++    parser.add_argument('--auto', choices=['rfam', 'pairwise'], default='rfam',
++                        help="how to align the structures if no alignment (-a) is given: rfam - find the Rfam family shared by the target and a model (cmscan) and align them to its covariance model (cmalign), \
++                        consensus (RF) columns are used; pairwise - a pairwise sequence alignment of the model to the target, all aligned residues are used (default: rfam)")
++    parser.add_argument('--rfam_db', help="path to Rfam.cm (cmpress'ed), by default $RFAM_DB_PATH or RFAM_DB_PATH from the rna-tools config")
++    parser.add_argument('--rfam_evalue', type=float,
++                        help="report Rfam hits with E-value <= this value; by default Rfam gathering thresholds (--cut_ga) are used")
++    parser.add_argument('-t', "--target", help="the native structure file (required, unless --all_vs_all)")
++    parser.add_argument('--all_vs_all', action='store_true',
++                        help="map all structures (files and --target, if given) on Rfam families, build an alignment per family \
++                        (<output>_rfam/<family>.sto) and calculate RMSD and sequence identity for all pairs within each family; \
++                        see the plot <output>_seqid_vs_rmsd.png")
+     parser.add_argument('-o', "--output_fn", help="output csv file", default="evoclust_rmsd.csv")
+     parser.add_argument('-n', "--target_name",
+                         help="target name in the alignment, used to map target on the alignment, e.g. target, ade, rp14 etc. Defaults to the basename of --target.")
+@@ -124,73 +174,301 @@ def get_parser():
+     return parser
+ 
+ _atom_summary_printed = False
++_esl_alipid_warned = False
++
++
++def calc_seq_identity(aligned1, aligned2, verbose=False):
++    """Calculate sequence identity (%id) of two aligned sequences with esl-alipid (Easel).
++
++    %id = identical aligned residues / min(length of seq1, length of seq2) * 100,
++    as defined by esl-alipid. Returns NaN if esl-alipid is not available.
++
++    esl-alipid is one of Easel miniapps (https://github.com/EddyRivasLab/easel),
++    it is installed with HMMER/Infernal source distributions."""
++    global _esl_alipid_warned
++    if not shutil.which('esl-alipid'):
++        if not _esl_alipid_warned:
++            print(' WARNING: esl-alipid (Easel) not found, sequence identity not calculated')
++            _esl_alipid_warned = True
++        return float('nan')
++    # write a clean two-seq Stockholm file, Easel is strict about the format
++    def clean(seq):
++        return ''.join('-' if c in '.~' else c for c in seq)
++    with tempfile.NamedTemporaryFile('w', suffix='.sto', delete=False) as f:
++        f.write('# STOCKHOLM 1.0\n\nseq1 %s\nseq2 %s\n//\n' % (clean(aligned1), clean(aligned2)))
++        fn = f.name
++    try:
++        out = RfamAlign.run(['esl-alipid', '--rna', '--noheader', fn], verbose)
++    finally:
++        os.remove(fn)
++    # seqname1 seqname2 %id nid denomid %match nmatch denommatch
++    for line in out.splitlines():
++        cols = line.split()
++        if len(cols) >= 3 and cols[0] == 'seq1' and cols[1] == 'seq2':
++            return float(cols[2])
++    raise Exception('Could not parse esl-alipid output:\n' + out)
++
++
++def align_structures(target_struc, model_struc, verbose=False):
++    """Align sequences of two structures with a global pairwise alignment.
++
++    End gaps are penalized less than internal gaps, so a fragment can be aligned to a
++    full-length structure. This is a sequence-only alignment, for divergent homologs
++    provide a (structural) alignment with -a instead.
++
++    :returns: (target_positions, model_positions, (aligned target seq, aligned model seq)),
++              1-based positions of the aligned (non-gap) residues, two lists of the same length"""
++    seq1 = get_sequence(target_struc)
++    seq2 = get_sequence(model_struc)
++    aligner = PairwiseAligner()
++    aligner.mode = 'global'
++    aligner.match_score = 2
++    aligner.mismatch_score = -1
++    aligner.open_gap_score = -5
++    aligner.extend_gap_score = -1
++    aligner.end_gap_score = -1
++    aln = aligner.align(seq1, seq2)[0]
++    pos1, pos2 = [], []
++    for (s1, e1), (s2, e2) in zip(*aln.aligned):
++        pos1.extend(range(s1 + 1, e1 + 1))
++        pos2.extend(range(s2 + 1, e2 + 1))
++    if verbose:
++        print(aln)
++    return pos1, pos2, (aln[0], aln[1])
++
++
++def rfam_align(targetfn, files, output_dir, rfam_db=None, rfam_evalue=None, verbose=False):
++    """Align the target and models using Rfam, see RfamAlign.py.
++
++    :returns: list of (target fn, model fn, target positions, model positions, family, (aligned target seq, aligned model seq))"""
++    rfam_db = RfamAlign.get_rfam_db(rfam_db)
++    print(' Rfam db:', rfam_db)
++    fns = [targetfn] + files
++    names = RfamAlign.get_seq_names(fns)
++    target_name = names[0]
++    seqs = [(name, get_sequence(RNAmodel.parse(fn))) for name, fn in zip(names, fns)]
++
++    pairs = []
++    workdir = tempfile.mkdtemp()
++    try:
++        hits = RfamAlign.cmscan(seqs, rfam_db, workdir, rfam_evalue, verbose)
++        scores = RfamAlign.get_best_scores(hits)
++        print(' Rfam families of the target (%s): %s' % (target_name, ', '.join(sorted(scores.get(target_name, {}))) or 'none'))
++        if not scores.get(target_name):
++            raise RfamAlign.RfamAlignError('No Rfam hit for the target %s' % targetfn)
++        families = {}  # family: [(fn, name), ...]
++        for fn, name in zip(fns[1:], names[1:]):
++            family = RfamAlign.find_common_family(scores, target_name, name)
++            if not family:
++                print(' WARNING: no Rfam family shared with the target, skipped:', fn)
++                continue
++            print(' %s: %s' % (name, family))
++            families.setdefault(family, []).append((fn, name))
++
++        if families and not os.path.isdir(output_dir):
++            os.makedirs(output_dir)
++        seq_of = dict(seqs)
++        for family, models in families.items():
++            aln_fn = os.path.join(output_dir, family + '.sto')
++            RfamAlign.cmalign(family, [(target_name, seq_of[target_name])] + [(name, seq_of[name]) for fn, name in models],
++                              rfam_db, workdir, aln_fn, verbose)
++            print(' alignment saved:', aln_fn)
++            ra = RNAalignment(aln_fn, verbose=verbose)
++            for fn, name in models:
++                target_pos, model_pos = ra.get_paired_positions(target_name, name, verbose=verbose)
++                pairs.append((targetfn, fn, target_pos, model_pos, family, (ra.get_seq(target_name), ra.get_seq(name))))
++    finally:
++        shutil.rmtree(workdir, ignore_errors=True)
++    return pairs
++
++
++def rfam_all_vs_all(files, output_dir, rfam_db=None, rfam_evalue=None, verbose=False):
++    """Map structures on Rfam families and align structures of each family, see RfamAlign.py.
++
++    Each structure is assigned to its best Rfam family (the highest score), structures
++    of each family are aligned together to the family CM (one alignment per family,
++    saved to output_dir/<family>.sto), and all pairs within a family are returned.
++
++    :returns: list of (target fn, model fn, target positions, model positions, family,
++              (aligned target seq, aligned model seq))"""
++    rfam_db = RfamAlign.get_rfam_db(rfam_db)
++    print(' Rfam db:', rfam_db)
++    names = RfamAlign.get_seq_names(files)
++    seqs = [(name, get_sequence(RNAmodel.parse(fn))) for name, fn in zip(names, files)]
++    seq_of = dict(seqs)
++
++    pairs = []
++    workdir = tempfile.mkdtemp()
++    try:
++        hits = RfamAlign.cmscan(seqs, rfam_db, workdir, rfam_evalue, verbose)
++        scores = RfamAlign.get_best_scores(hits)
++        families = {}  # family: [(fn, name), ...]
++        for fn, name in zip(files, names):
++            fams = scores.get(name)
++            if not fams:
++                print(' WARNING: no Rfam hit, skipped:', fn)
++                continue
++            family = max(fams, key=fams.get)
++            print(' %s: %s' % (name, family))
++            families.setdefault(family, []).append((fn, name))
++
++        if families and not os.path.isdir(output_dir):
++            os.makedirs(output_dir)
++        for family, structures in sorted(families.items()):
++            if len(structures) < 2:
++                print(' WARNING: only one structure in %s, skipped: %s' % (family, structures[0][0]))
++                continue
++            aln_fn = os.path.join(output_dir, family + '.sto')
++            RfamAlign.cmalign(family, [(name, seq_of[name]) for fn, name in structures],
++                              rfam_db, workdir, aln_fn, verbose)
++            print(' alignment saved:', aln_fn)
++            ra = RNAalignment(aln_fn, verbose=verbose)
++            for i, (fn1, name1) in enumerate(structures):
++                for fn2, name2 in structures[i + 1:]:
++                    pos1, pos2 = ra.get_paired_positions(name1, name2, verbose=verbose)
++                    pairs.append((fn1, fn2, pos1, pos2, family, (ra.get_seq(name1), ra.get_seq(name2))))
++    finally:
++        shutil.rmtree(workdir, ignore_errors=True)
++    return pairs
++
++
++def get_rmsd_table(pairs, group_name='', verbose=False):
++    """Calculate RMSD and sequence identity for pairs.
++
++    :param pairs: list of (target fn, model fn, target positions, model positions, family,
++                  (aligned target seq, aligned model seq))
++    :returns: pandas DataFrame"""
++    data = {'target': [], 'model': [], 'rmsd': [], 'n_residues': [], 'seq_identity': [], 'family': [], 'group_name': []}
++    for targetfn, f, target_pos, model_pos, family, aligned in pairs:
++        target = RNAmodel(targetfn, target_pos, save=False, output_dir=None)
++        model = RNAmodel(f, model_pos, save=False, output_dir=None)
++        rmsd = target.get_rmsd_to(model)
++        data['target'].append(target)
++        data['model'].append(model)
++        data['rmsd'].append(rmsd)
++        data['n_residues'].append(len(target_pos))
++        data['seq_identity'].append(calc_seq_identity(aligned[0], aligned[1], verbose))
++        data['family'].append(family)
++        data['group_name'].append(group_name)
++    return pd.DataFrame(data, columns=('target', 'model', 'rmsd', 'n_residues', 'seq_identity', 'family', 'group_name'))
++
++
++def plot_seq_identity_vs_rmsd(df, fn):
++    """Scatter plot of sequence identity vs RMSD, one color per Rfam family, save to fn."""
++    df = df.dropna(subset=['seq_identity'])
++    if df.empty:
++        return
++    fig, ax = plt.subplots()
++    for family, g in df.groupby('family'):
++        ax.scatter(g['seq_identity'], g['rmsd'], label=family or None, alpha=0.8)
++    if (df['family'] != '').any():
++        ax.legend(title='Rfam family')
++    ax.set_xlabel('sequence identity [%] (esl-alipid)')
++    ax.set_ylabel('RMSD [A]')
++    ax.set_xlim(0, 100)
++    ax.set_ylim(bottom=0)
++    fig.savefig(fn, dpi=150, bbox_inches='tight')
++    plt.close(fig)
++    print(' plot saved:', fn)
++
++
++def save_results(df, output_fn):
++    """Save the table (csv), the plot of sorted RMSDs (.png) and of sequence identity vs RMSD (_seqid_vs_rmsd.png)."""
++    df.to_csv(output_fn)
++    base = os.path.splitext(output_fn)[0]
++    try:
++        df.sort_values(by='rmsd').plot(y='rmsd', use_index=False)
++    except TypeError:
++        print('Check if the representives have tags, e.g. c1_thf_pk_...')
++    plt.savefig(base + '.png')
++    plt.close('all')
++    plot_seq_identity_vs_rmsd(df, base + '_seqid_vs_rmsd.png')
++
++
++def calc_evo_rmsd_all_vs_all(files, output_fn=None, group_name='', verbose=False, rfam_db=None, rfam_evalue=None):
++    """Map structures on Rfam families, align them and calculate RMSD and sequence
++    identity for all pairs of structures within each family (see rfam_all_vs_all)."""
++    global _atom_summary_printed
++    if not _atom_summary_printed:
++        print(get_atom_selection_summary())
++        _atom_summary_printed = True
++    files = list(dict.fromkeys(files))  # remove duplicates, keep order
++    output_dir = os.path.splitext(output_fn or 'evoclust_rmsd.csv')[0] + '_rfam'
++    pairs = rfam_all_vs_all(files, output_dir, rfam_db, rfam_evalue, verbose)
++    df = get_rmsd_table(pairs, group_name, verbose)
++    if output_fn:
++        save_results(df, output_fn)
++    return df
+ 
+ 
+ def calc_evo_rmsd(targetfn, target_name_alignment, files, mapping_fn, rna_alignment_fn, group_name='', output_fn=None,
+-                  verbose=False):
++                  verbose=False, auto='rfam', rfam_db=None, rfam_evalue=None):
++    """Calculate RMSD of models to the target.
++
++    If rna_alignment_fn is None, the models are automatically aligned to the target
++    and mapping_fn is ignored: auto='rfam' (see rfam_align) or auto='pairwise'
++    (see align_structures)."""
+     global _atom_summary_printed
+     if not _atom_summary_printed:
+         print(get_atom_selection_summary())
+         _atom_summary_printed = True
+-    ra = RNAalignment(rna_alignment_fn, verbose=verbose)
+     print('target', targetfn)
+-    target_residues = ra.get_range(target_name_alignment, verbose=verbose)
+-    target = RNAmodel(targetfn, target_residues, save=False, output_dir=None)
+ 
+-    # parse mapping to get models (list models)
+-    if mapping_fn:
+-        mapping_content = open(mapping_fn).read().replace('\n', '').strip()
+-        rnastruc = [item.strip() for item in mapping_content.split('|') if item.strip()]
++    pairs = []  # see get_rmsd_table
++    if not rna_alignment_fn:
++        files = [f for f in files if os.path.abspath(f) != os.path.abspath(targetfn)]
++        if auto == 'rfam':
++            print(' alignment not provided; aligning models to the target with Rfam')
++            output_dir = os.path.splitext(output_fn or 'evoclust_rmsd.csv')[0] + '_rfam'
++            pairs = rfam_align(targetfn, files, output_dir, rfam_db, rfam_evalue, verbose)
++        else:
++            print(' alignment not provided; aligning models to the target (pairwise)')
++            target_struc = RNAmodel.parse(targetfn)
++            for f in files:
++                if verbose:
++                    print(' ', os.path.basename(targetfn), '<->', os.path.basename(f))
++                target_pos, model_pos, aligned = align_structures(target_struc, RNAmodel.parse(f), verbose)
++                if not target_pos:
++                    raise Exception('Sequences of %s and %s could not be aligned' % (targetfn, f))
++                pairs.append((targetfn, f, target_pos, model_pos, '', aligned))
+     else:
+-        rnastruc = []
+-        for pdb_path in files:
+-            pdb_name = os.path.splitext(os.path.basename(pdb_path))[0]
+-            rnastruc.append(f"{pdb_name}:{pdb_name}")
+-        print(' mapping file not provided; using PDB basenames as alignment IDs')
+-    print(' # of rnastruc :', len(rnastruc))
+-    print(' rnastruc:', rnastruc)
+-    print(' WARNING: if any of your PDB file is missing, check mapping!')
+-    models = []
+-
+-    for rs in rnastruc:
+-        try:
+-            rs_name_alignment, rs_name_dir = [value.strip() for value in rs.split(':', 1)]  # target:rp14_farna_eloop_nol2fixed_cst
+-        except ValueError:
+-            # if -m 'tpp|tpp_pdb|CP000050.1/ ..
+-            # rnastruc: ['tpp', 'tpp_pdb', 'CP000050.1/1019813-1019911:tc5_pdb', 'AE017180.1/640928-641029:tae_pdb', 'BX248356.1/234808-234920:tb2_pdb']
+-            # Traceback (most recent call last):
+-            # File "/home/magnus/work/src/evoClustRNA/evoClustRNA.py", line 100, in <module>
+-            # raise Exception("There is an error in your mapping, check all : and | carefully")
+-            # Exception: There is an error in your mapping, check all : and | carefully
+-            raise Exception("There is an error in your mapping, check all : and | carefully")
+-
+-        # print ' ', rs_name_alignment,'<->', rs_name_dir # AACY023581040 <-> aacy23_cst
+-        for f in files:
+-            #
+-            if rs_name_dir in f:  # rp14_farna_eloop_nol2fixed_cst*pdb
+-                # print(rs_name_dir)
+-                # models.extend(get_rna_models_from_dir(input_dir + os.sep + rs_name_dir, ra.get_range(rs_name_alignment), False, False)[:])
+-                # print(ra.get_range(rs_name_alignment))
+-                models.append(RNAmodel(f, ra.get_range(rs_name_alignment), False, False))
+-
+-    data = {'target': [], 'model': [], 'rmsd': [], 'group_name': []}
+-    for model in models:
+-        # print
+-        # print r1.fn, r2.fn, r1.get_rmsd_to(r2)#, 'tmp.pdb')
+-        rmsd = target.get_rmsd_to(model)  # , 'tmp.pdb')
+-        # print target, model, rmsd, group_name
+-        data['target'].append(target)
+-        data['model'].append(model)
+-        data['rmsd'].append(rmsd)
+-        data['group_name'].append(group_name)
+-    df = pd.DataFrame(data, columns=('target', 'model', 'rmsd', 'group_name'))
++        ra = RNAalignment(rna_alignment_fn, verbose=verbose)
++        # check if the target is in the alignment
++        ra.get_range(target_name_alignment, verbose=verbose)
++
++        # parse mapping to get models (list models)
++        if mapping_fn:
++            mapping_content = open(mapping_fn).read().replace('\n', '').strip()
++            rnastruc = [item.strip() for item in mapping_content.split('|') if item.strip()]
++        else:
++            rnastruc = []
++            for pdb_path in files:
++                pdb_name = os.path.splitext(os.path.basename(pdb_path))[0]
++                rnastruc.append(f"{pdb_name}:{pdb_name}")
++            print(' mapping file not provided; using PDB basenames as alignment IDs')
++        print(' # of rnastruc :', len(rnastruc))
++        print(' rnastruc:', rnastruc)
++        print(' WARNING: if any of your PDB file is missing, check mapping!')
++
++        for rs in rnastruc:
++            try:
++                rs_name_alignment, rs_name_dir = [value.strip() for value in rs.split(':', 1)]  # target:rp14_farna_eloop_nol2fixed_cst
++            except ValueError:
++                # if -m 'tpp|tpp_pdb|CP000050.1/ ..
++                # rnastruc: ['tpp', 'tpp_pdb', 'CP000050.1/1019813-1019911:tc5_pdb', 'AE017180.1/640928-641029:tae_pdb', 'BX248356.1/234808-234920:tb2_pdb']
++                raise Exception("There is an error in your mapping, check all : and | carefully")
++
++            # print ' ', rs_name_alignment,'<->', rs_name_dir # AACY023581040 <-> aacy23_cst
++            for f in files:
++                if rs_name_dir in f:  # rp14_farna_eloop_nol2fixed_cst*pdb
++                    target_pos, model_pos = ra.get_paired_positions(target_name_alignment, rs_name_alignment,
++                                                                    verbose=verbose)
++                    pairs.append((targetfn, f, target_pos, model_pos, '',
++                                  (ra.get_seq(target_name_alignment), ra.get_seq(rs_name_alignment))))
++
++    df = get_rmsd_table(pairs, group_name, verbose)
+     if output_fn:
+-        df.to_csv(output_fn)
+-    try:
+-        df.sort_values(by='rmsd').plot(y='rmsd', use_index=False)
+-    except TypeError:
+-        print('Check if the representives have tags, e.g. c1_thf_pk_...')
+-    plt.savefig(output_fn.replace('.csv', '.png'))
++        save_results(df, output_fn)
+     return df
+ 
+ 
+@@ -208,11 +486,27 @@ def test():
+     # if True: test()
+     parser = get_parser()
+     opts = parser.parse_args()
++    if opts.all_vs_all:
++        try:
++            df = calc_evo_rmsd_all_vs_all(([opts.target] if opts.target else []) + opts.files, opts.output_fn,
++                                          opts.group_name, opts.verbose, opts.rfam_db, opts.rfam_evalue)
++        except RfamAlign.RfamAlignError as e:
++            print('Error:', e)
++            sys.exit(1)
++        print(df)
++        sys.exit(0)
++    if not opts.target:
++        parser.error('the following arguments are required: -t/--target (or use --all_vs_all)')
+     target_name = opts.target_name
+-    if not target_name:
++    if not target_name and opts.rna_alignment_fn:
+         target_name = os.path.splitext(os.path.basename(opts.target))[0]
+         print(' target name not provided; using basename:', target_name)
+-    df = calc_evo_rmsd(opts.target, target_name, opts.files, opts.mapping_fn,
+-                       opts.rna_alignment_fn, opts.group_name, opts.output_fn,
+-                       verbose=opts.verbose)
++    try:
++        df = calc_evo_rmsd(opts.target, target_name, opts.files, opts.mapping_fn,
++                           opts.rna_alignment_fn, opts.group_name, opts.output_fn,
++                           verbose=opts.verbose, auto=opts.auto, rfam_db=opts.rfam_db,
++                           rfam_evalue=opts.rfam_evalue)
++    except RfamAlign.RfamAlignError as e:
++        print('Error:', e)
++        sys.exit(1)
+     print(df)
+diff --git a/rna_tools/tools/rna_calc_evo_rmsd/test.sh b/rna_tools/tools/rna_calc_evo_rmsd/test.sh
+index e8b89fcca..e2b0ceae8 100755
+--- a/rna_tools/tools/rna_calc_evo_rmsd/test.sh
++++ b/rna_tools/tools/rna_calc_evo_rmsd/test.sh
+@@ -4,3 +4,40 @@
+ ./rna_calc_evo_rmsd.py -a test_data/aln_nox.sto -t test_data/4qk8_cl.pdb test_data/4qlm_cl.pdb -v
+ 
+ ./rna_calc_evo_rmsd.py -a test_data/trna.sto -t test_data/1ehz_std.pdb test_data/6Y2L_2_std.pdb
++
++# automated, no alignment needed: Rfam (requires Infernal and Rfam.cm, see RfamAlign.py)
++#./rna_calc_evo_rmsd.py --rfam_db Rfam.cm -t test_data/1ehz_std.pdb test_data/6Y2L_2_std.pdb -v
++# automated, pairwise sequence alignment
++./rna_calc_evo_rmsd.py --auto pairwise -t test_data/1ehz_std.pdb test_data/6Y2L_2_std.pdb
++./rna_calc_evo_rmsd.py --auto pairwise -t test_data/4qk8_cl.pdb test_data/4qlm_cl.pdb -v
++
++# Rfam family example, RF01750 (ZMP/ZTP riboswitch): get the list of 3D structures of the family
++# from Rfam, download them (one PDB file per chain), map them on Rfam, align them to the family
++# covariance model and calculate RMSD and sequence identity (esl-alipid, Easel) for all pairs;
++# plot: test_data/RF01750/RF01750_rmsd_seqid_vs_rmsd.png. Requires internet, Infernal, Easel and biopython.
++FAM=RF01750
++D=test_data/$FAM
++mkdir -p $D
++# structures of the family: rfam_acc pdb_id chain pdb_start pdb_end bit_score evalue_score cm_start cm_end hex_colour
++curl -sS https://ftp.ebi.ac.uk/pub/databases/Rfam/CURRENT/Rfam.pdb.gz | gunzip -c | awk -v fam=$FAM '$1 == fam' > $D/${FAM}_structures.tsv
++echo "# structures of $FAM in Rfam:"
++cat $D/${FAM}_structures.tsv
++# covariance model of the family, used as the Rfam db (instead of the whole Rfam.cm)
++curl -sS -o $D/$FAM.cm https://rfam.org/family/$FAM/cm
++cmpress -F $D/$FAM.cm > /dev/null
++# download structures (mmCIF, works also for big entries) and save each chain as <pdb>_<chain>.pdb
++awk '{print tolower($2), $3}' $D/${FAM}_structures.tsv | sort -u | while read pdb chain; do
++    [ -f $D/${pdb}.cif ] || curl -sS -o $D/${pdb}.cif https://files.rcsb.org/download/${pdb}.cif
++    python -c "
++import sys
++from Bio.PDB import MMCIFParser, PDBIO, Select
++cif, chain, out = sys.argv[1:]
++s = MMCIFParser(QUIET=True).get_structure('', cif)
++class ChainSelect(Select):
++    def accept_model(self, m): return m.id == 0
++    def accept_chain(self, c): return c.id == chain
++io = PDBIO(); io.set_structure(s); io.save(out, ChainSelect())
++" $D/${pdb}.cif $chain $D/${pdb}_${chain}.pdb
++done
++# all vs all, alignment saved to test_data/RF01750/RF01750_rmsd_rfam/RF01750.sto
++./rna_calc_evo_rmsd.py --all_vs_all --rfam_db $D/$FAM.cm -o $D/${FAM}_rmsd.csv $D/*_*.pdb

@@ -1,0 +1,366 @@
+diff --git a/.travis.yml b/.travis.yml
+index 946e5959..cc9c6d2a 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -52,7 +52,7 @@ install:
+     - source activate test-environment
+     - |
+         if [[ "$MINIMAL_REQ" == "1" ]]; then
+-            conda install -q numpy=1.8 scipy=0.13 pandas=0.13 joblib=0.8;
++            conda install -q numpy=1.8 scipy=0.13 pandas=0.13 joblib=0.8 scikit-image=0.10; 
+             pip install scikit-learn==0.18;
+             if [[ "$ODDT_TOOLKIT" == "ob" ]]; then
+                 conda install -q -c mwojcikowski openbabel=2.3.2;
+@@ -60,7 +60,7 @@ install:
+                 conda install -q -c mwojcikowski -c rdkit rdkit=2016.03 numpy=1.8;
+             fi
+         else
+-            conda install -q numpy scipy scikit-learn joblib pandas;
++            conda install -q numpy scipy scikit-learn joblib pandas scikit-image;
+             if [[ "$ODDT_TOOLKIT" == "ob" ]]; then
+                 conda install -q -c openbabel openbabel;
+             elif [[ "$ODDT_TOOLKIT" == "rdk" ]]; then
+diff --git a/README.md b/README.md
+index 1b891c4c..5a2e1089 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,7 @@ Open Drug Discovery Toolkit (ODDT) is modular and comprehensive toolkit for use
+   * Sklearn (0.18+)
+   * joblib (0.8+)
+   * pandas (0.13+)
++  * Skimage (0.10+)
+ 
+ ## Install
+ 
+diff --git a/docs/index.rst b/docs/index.rst
+index 36d2b36b..b7212e06 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -21,6 +21,7 @@ Requirements
+ * Sklearn (0.18+)
+ * joblib (0.8+)
+ * pandas (0.13+)
++* Skimage (0.10+)
+ 
+ .. note:: All installation methods assume that one of toolkits is installed. For detailed installation procedure visit toolkit’s website (OpenBabel, RDKit)
+ 
+diff --git a/oddt/surface.py b/oddt/surface.py
+new file mode 100644
+index 00000000..5af460b6
+--- /dev/null
++++ b/oddt/surface.py
+@@ -0,0 +1,172 @@
++"""This module generates and does computation with molecular surfaces.
++"""
++
++from __future__ import division
++from numbers import Number
++from distutils.version import LooseVersion
++
++import oddt.toolkits
++import numpy as np
++from skimage.morphology import ball, binary_closing
++from skimage import __version__ as skimage_version
++if LooseVersion(skimage_version) >= LooseVersion('0.13'):
++    from skimage.measure import marching_cubes_lewiner as marching_cubes
++else:
++    from skimage.measure import marching_cubes
++from scipy.spatial import cKDTree
++
++def generate_surface_marching_cubes(molecule, remove_hoh=False, scaling=1.,
++                                    probe_radius=1.4):
++    """Generates a molecular surface mesh using the marching_cubes
++    method from scikit-image. Ignores hydrogens present in the molecule.
++
++    Parameters
++    ----------
++    molecule : oddt.toolkit.Molecule object
++        Molecule for which the surface will be generated
++
++    remove_hoh : bool (default = False)
++        If True, remove waters from the molecule before generating the surface.
++        Requires molecule.protein to be set to True.
++
++    scaling : float (default = 1.0)
++        Expands the grid in which computation is done by a factor of scaling.
++        Results in a more accurate representation of the surface, but increases
++        computation time.
++
++    probe_radius : float (default = 1.4)
++        Radius of a ball used to patch up holes inside the molecule
++        resulting from some molecular distances being larger
++        (usually in protein). Basically reduces the surface to one
++        accesible by other molecules of radius smaller than probe_radius.
++
++    Returns
++    -------
++    verts : numpy array
++        Spatial coordinates for mesh vertices.
++
++    faces : numpy array
++        Faces are defined by referencing vertices from verts.
++    """
++    # Input validation
++    if not isinstance(molecule, oddt.toolkit.Molecule):
++        raise TypeError('molecule needs to be of type oddt.toolkit.Molecule')
++    if not (isinstance(probe_radius, Number) and probe_radius >= 0):
++        raise ValueError('probe_radius needs to be a positive number')
++
++    # Removing waters and hydrogens
++    atom_dict = molecule.atom_dict
++    atom_dict = atom_dict[atom_dict['atomicnum'] != 1]
++    if remove_hoh:
++        if molecule.protein is not True:
++            raise ValueError('Residue names are needed for water removal, '
++                             'molecule.protein property must be set to True')
++        no_hoh = atom_dict['resname'] != 'HOH'
++        atom_dict = atom_dict[no_hoh]
++
++    # Take a molecule's coordinates and atom radii and scale if necessary
++    coords = atom_dict['coords'] * scaling
++    radii = atom_dict['radius'] * scaling
++
++    # More input validation
++    if radii.min() < 1:
++        raise ValueError('Scaling times the radius of the smallest atom must '
++                         'be larger than 1')
++    # Create a ball for each atom in the molecule
++    ball_dict = {radius: ball(radius, dtype=bool) for radius in set(radii)}
++    ball_radii = np.array([ball_dict[radius].shape[0] for radius in radii])
++
++    # Transform the coordinates because the grid starts at (0, 0 ,0)
++    min_coords = np.min(coords, axis=0)
++    max_rad = np.max(ball_radii, axis=0)
++    adjusted = np.round(coords - min_coords + max_rad * 5).astype(np.int64)
++    offset = adjusted[0] - coords[0]
++
++    # Calculate boundries in the grid for each ball.
++    ball_coord_min = (adjusted.T - np.floor(ball_radii / 2).astype(np.int64)).T
++    ball_coord_max = (ball_coord_min.T + ball_radii).T
++
++    # Create the grid
++    grid = np.zeros(shape=ball_coord_max.max(axis=0) + int(8 * scaling), dtype=bool)
++
++    # Place balls in grid
++    for radius, coord_min, coord_max in zip(radii, ball_coord_min, ball_coord_max):
++        grid[coord_min[0]:coord_max[0],
++             coord_min[1]:coord_max[1],
++             coord_min[2]:coord_max[2]] += ball_dict[radius]
++    spacing = (1 / scaling,) * 3
++
++    # Hole-filling with morphological closing
++    grid = binary_closing(grid, ball(probe_radius * 2 * scaling))
++
++    # Marching cubes
++    verts, faces = marching_cubes(grid, level=0, spacing=spacing)[:2]
++
++    # Verts already scaled by the marching cubes function (spacing parameter)
++    # Only need to scale the offset
++    # Results in skimage version lower than 0.11 are offset by 1 in each direction
++    if LooseVersion(skimage_version) < LooseVersion('0.11'):
++        verts += 1 / scaling
++    return verts - offset / scaling, faces
++
++
++def find_surface_residues(molecule, max_dist=None, scaling=1.):
++    """Finds residues close to the molecular surface using
++    generate_surface_marching_cubes. Ignores hydrogens and
++    waters present in the molecule.
++
++    Parameters
++    ----------
++    molecule : oddt.toolkit.Molecule
++        Molecule to find surface residues in.
++
++    max_dist : array_like, numeric or None (default = None)
++        Maximum distance from the surface where residues would
++        still be considered close. If None, compares distances
++        to radii of respective atoms.
++
++    scaling : float (default = 1.0)
++        Expands the grid in which computation is done by
++        generate_surface_marching_cubes by a factor of scaling.
++        Results in a more accurate representation of the surface,
++        and therefore more accurate computation of distances
++        but increases computation time.
++
++    Returns
++    -------
++    atom_dict : numpy array
++        An atom_dict containing only the surface residues
++        from the original molecule.
++    """
++    # Input validation
++    if not isinstance(molecule, oddt.toolkit.Molecule):
++        raise TypeError('molecule needs to be of type oddt.toolkit.Molecule')
++
++    # Copy the atom_dict, remove waters
++    atom_dict = molecule.atom_dict
++    mask = (atom_dict['resname'] != 'HOH') & (atom_dict['atomicnum'] != 1)
++    atom_dict = atom_dict[mask]
++    coords = atom_dict['coords']
++    if max_dist is None:
++        max_dist = atom_dict['radius']
++
++    # More input validation
++    elif isinstance(max_dist, Number):
++        max_dist = np.repeat(max_dist, coords.shape[0])
++    else:
++        max_dist = np.array(max_dist)
++    if not np.issubdtype(max_dist.dtype, np.number):
++        raise ValueError('max_dist has to be a number or an '
++                         'array_like object containing numbers')
++    if coords.shape[0] != len(max_dist):
++        raise ValueError('max_dist doesn\'t match coords\' length')
++
++    # Marching cubes
++    verts, _ = generate_surface_marching_cubes(molecule, remove_hoh=True,
++                                               scaling=scaling, probe_radius=1.4)
++
++    # Calculate distances between atoms and the surface
++    tree_verts = cKDTree(verts)
++    mask = [bool(tree_verts.query_ball_point(point, radius))
++            for point, radius in zip(coords, max_dist)]
++    return atom_dict[np.array(mask)]
+diff --git a/requirements.txt b/requirements.txt
+index 97ca5480..e843e536 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,3 +5,4 @@ scipy>=0.13
+ scikit-learn>=0.18
+ joblib>=0.8
+ pandas>=0.13
++scikit-image>=0.10
+diff --git a/tests/test_surface.py b/tests/test_surface.py
+new file mode 100644
+index 00000000..671db48c
+--- /dev/null
++++ b/tests/test_surface.py
+@@ -0,0 +1,127 @@
++import os
++
++import oddt
++from oddt.surface import (generate_surface_marching_cubes,
++                          find_surface_residues)
++from sklearn.utils.testing import (assert_array_equal,
++                                   assert_equal)
++from nose.tools import assert_raises
++import numpy as np
++from skimage import __version__ as skimageversion
++
++test_data_dir = os.path.dirname(os.path.abspath(__file__))
++protein = next(oddt.toolkit.readfile('pdb', os.path.join(
++    test_data_dir, 'data/dude/xiap/receptor_rdkit.pdb')))
++protein.protein = True
++protein.addh(only_polar=True)
++
++def test_generate_surface_marching_cubes():
++    """Tests generating surfaces"""
++    verts1, faces1 = generate_surface_marching_cubes(protein, scaling=1., probe_radius=1.4, remove_hoh=False)
++    verts2, faces2 = generate_surface_marching_cubes(protein, scaling=2., probe_radius=1.4, remove_hoh=False)
++    verts3, faces3 = generate_surface_marching_cubes(protein, scaling=1., probe_radius=1.4, remove_hoh=True)
++    verts4, faces4 = generate_surface_marching_cubes(protein, scaling=1., probe_radius=0, remove_hoh=True)
++
++    # Higher scaling should result in a higher number of vertices
++    assert len(verts2) > len(verts1), ('Higher scaling should result in '
++                                       'a higher number of vertices')
++
++    # versions of skimage older than 0.12 use a slightly different version of the marching cubes algorithm
++    # producing slightly different results
++    if float(skimageversion.rsplit('.', 1)[0]) >= 0.13:
++        if oddt.toolkit.backend == 'ob':
++            ref_vert_shape_1 = (9040, 3)
++            ref_face_shape_1 = (18094, 3)
++            ref_vert_shape_2 = (35950, 3)
++            ref_face_shape_2 = (71926, 3)
++            ref_vert_shape_3 = (9040, 3)
++            ref_face_shape_3 = (18094, 3)
++            ref_vert_shape_4 = (14881, 3)
++            ref_face_shape_4 = (30468, 3)
++        else:
++            ref_vert_shape_1 = (9044, 3)
++            ref_face_shape_1 = (18102, 3)
++            ref_vert_shape_2 = (35788, 3)
++            ref_face_shape_2 = (71578, 3)
++            ref_vert_shape_3 = (9044, 3)
++            ref_face_shape_3 = (18102, 3)
++            ref_vert_shape_4 = (15035, 3)
++            ref_face_shape_4 = (30848, 3)
++    else:
++        if oddt.toolkit.backend == 'ob':
++            ref_vert_shape_1 = (5923, 3)
++            ref_face_shape_1 = (11862, 3)
++            ref_vert_shape_2 = (20819, 3)
++            ref_face_shape_2 = (41634, 3)
++            ref_vert_shape_3 = (5923, 3)
++            ref_face_shape_3 = (11862, 3)
++            ref_vert_shape_4 = (10263, 3)
++            ref_face_shape_4 = (21658, 3)
++        else:
++            ref_vert_shape_1 = (5916, 3)
++            ref_face_shape_1 = (11848, 3)
++            ref_vert_shape_2 = (20845, 3)
++            ref_face_shape_2 = (41686, 3)
++            ref_vert_shape_3 = (5916, 3)
++            ref_face_shape_3 = (11848, 3)
++            ref_vert_shape_4 = (10243, 3)
++            ref_face_shape_4 = (21686, 3)
++
++    assert_equal(ref_vert_shape_1, verts1.shape)
++    assert_equal(ref_face_shape_1, faces1.shape)
++
++    assert_equal(ref_vert_shape_2, verts2.shape)
++    assert_equal(ref_face_shape_2, faces2.shape)
++
++    assert_equal(ref_vert_shape_3, verts3.shape)
++    assert_equal(ref_face_shape_3, faces3.shape)
++
++    assert_equal(ref_vert_shape_4, verts4.shape)
++    assert_equal(ref_face_shape_4, faces4.shape)
++
++    assert_raises(TypeError, generate_surface_marching_cubes, molecule=1)
++    assert_raises(ValueError, generate_surface_marching_cubes, molecule=protein, probe_radius=-1)
++    assert_raises(ValueError, generate_surface_marching_cubes, molecule=protein, scaling=0.1)
++
++def test_find_surface_residues():
++    """Tests finding residues on the surface"""
++    atom_dict_0 = find_surface_residues(protein, max_dist=0, scaling=1)
++    atom_dict_1 = find_surface_residues(protein, max_dist=2, scaling=1)
++    atom_dict_2 = find_surface_residues(protein, max_dist=3, scaling=1)
++    atom_dict_3 = find_surface_residues(protein, max_dist=None, scaling=1)
++    atom_dict_4 = find_surface_residues(protein, max_dist=None, scaling=2)
++
++    assert_equal(atom_dict_0.size, 0)
++    assert len(atom_dict_1) > len(atom_dict_0), ('Increasing max_dist should '
++                                                 'result in more/equal number '
++                                                 'of atoms found')
++
++    assert len(atom_dict_2) >= len(atom_dict_1), ('Increasing max_dist should '
++                                                  'result in more/equal number '
++                                                  'of atoms found')
++    assert_array_equal(np.intersect1d(atom_dict_1['id'], atom_dict_2['id']), atom_dict_1['id'])
++
++    if oddt.toolkit.backend == 'ob':
++        ref_len_1 = 762
++        ref_len_2 = 968
++        ref_len_3 = 654
++        ref_len_4 = 379
++    else:
++        ref_len_1 = 759
++        ref_len_2 = 966
++        ref_len_3 = 735
++        ref_len_4 = 489
++
++    assert_equal(len(atom_dict_1), ref_len_1)
++    assert_equal(len(atom_dict_2), ref_len_2)
++    assert_equal(len(atom_dict_3), ref_len_3)
++    assert_equal(len(atom_dict_4), ref_len_4)
++
++    # Adding hydrogen atoms should have no effect on the result
++    protein.addh()
++    atom_dict_addh = find_surface_residues(protein, max_dist=2, scaling=1)
++    assert_array_equal(atom_dict_addh['id'], atom_dict_1['id'])
++
++    assert_raises(TypeError, find_surface_residues, molecule=1)
++    assert_raises(ValueError, find_surface_residues, molecule=protein, max_dist='a')
++    assert_raises(ValueError, find_surface_residues, molecule=protein, max_dist=[1, 1, 1])

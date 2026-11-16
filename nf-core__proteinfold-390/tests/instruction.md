@@ -1,0 +1,31 @@
+# Issue
+
+**Title:** Fix for AF2 standard obsolete.dat path #387
+
+## Description
+
+- Matches the pathing in run_alphafold2 to the split versions to solve 
+
+<!--
+# nf-core/proteinfold pull request
+
+Many thanks for contributing to nf-core/proteinfold!
+
+Please fill in the appropriate checklist below (delete whatever is not relevant).
+These are the most common things requested on pull requests (PRs).
+
+Remember that PRs should be made against the dev branch, unless you're preparing a pipeline release.
+
+Learn more about contributing: [CONTRIBUTING.md](https://github.com/nf-core/proteinfold/tree/master/.github/CONTRIBUTING.md)
+-->
+
+## PR checklist
+
+- [x] This comment contains a description of changes (with reason).
+- [x] Make sure your code lints (`nf-core lint`).
+- [x] Ensure the test suite passes (`nextflow run . -profile test,docker --outdir <OUTDIR>`).
+- [x] `CHANGELOG.md` is updated.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `994b8c790244`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

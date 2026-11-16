@@ -1,0 +1,633 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 856105dd..03b15de8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
+ - sevenn.train.modal_dataset SevenNetMultiModalDataset
+ - sevenn.scripts.backward_compatibility.py
+ - sevenn.checkpoint.py
++- D3 wB97M param
+ 
+ ### Changed
+ - Sort instructions of tensor product in convolution (+ fix flipped w3j coeff of old model)
+@@ -24,10 +25,13 @@ All notable changes to this project will be documented in this file.
+ - Checkpoint things using `sevenn/checkpoint.py`
+ - e3nn >= 0.5.0, to ensure changed CG coeff later on
+ - pandas as dependency
++- old v1 presets are removed, liquid electrolyte fine-tune yaml is added
+ 
+ ### Fixed
+ - More refactor for shift scale things + few bug fixes
+ - Correctly shuffle training set when distributed training is enabled
++- D3 calculator system swap memory error fixed
++- D3 compile uses $HOME/.cache if package directory is not writable
+ 
+ 
+ ## [0.10.4]
+diff --git a/README.md b/README.md
+index 0053320a..b19707d7 100644
+--- a/README.md
++++ b/README.md
+@@ -67,6 +67,7 @@ In addition to these latest models, you can find our legacy models from [pretrai
+     - [Installation](#installation)
+     - [Single-GPU MD](#single-gpu-md)
+     - [Multi-GPU MD](#multi-gpu-md)
++  - [Application of SevenNet-0](#application-of-sevennet-0)
+ - [Citation](#citation)
+ 
+ ## Installation<a name="installation"></a>
+@@ -323,6 +324,17 @@ One GPU per MPI process is expected. The simulation may run inefficiently if the
+ > [!CAUTION]
+ > Currently, the parallel version raises an error when there are no atoms in one of the subdomain cells. This issue can be addressed using the `processors` command and, more optimally, the `fix balance` command in LAMMPS. This will be patched in the future.
+ 
++### Application of SevenNet-0
++If you are interested in the actual application of SevenNet, refer to [this paper](https://arxiv.org/abs/2501.05211) (data available at: [Zenodo](https://zenodo.org/records/14734414)).
++In this study, SevenNet-0 was applied to the simulation of liquid electrolytes.
++
++The fine-tuning procedure and relevant input files are provided in the links above, particularly in the `Fine-tuning.tar.xz` archive on Zenodo.
++
++The yaml file used for fine-tuning is available via the command:
++```bash
++sevenn_preset fine_tune_le > input.yaml
++```
++
+ ## Citation<a name="citation"></a>
+ 
+ If you use this code, please cite our paper:
+diff --git a/sevenn/calculator.py b/sevenn/calculator.py
+index 32a0a2a2..e22e2d46 100644
+--- a/sevenn/calculator.py
++++ b/sevenn/calculator.py
+@@ -1,9 +1,7 @@
+ import ctypes
+ import os
+ import pathlib
+-import sysconfig
+ import warnings
+-from itertools import chain
+ from typing import Any, Optional, Union
+ 
+ import numpy as np
+@@ -237,49 +235,48 @@ def __init__(
+         super().__init__([sevennet_calc, d3_calc])
+ 
+ 
+-def _compile_d3(path: str, verbose: bool = True):
+-    import subprocess
++def _load(name: str) -> ctypes.CDLL:
++    from torch.utils.cpp_extension import LIB_EXT, _get_build_directory, load
+ 
+-    if verbose:
+-        print(f'Attempt D3 compilation to {path}')
++    # Load the library from the candidate locations
++
++    package_dir = os.path.dirname(os.path.abspath(__file__))
+     try:
+-        subprocess.run(
+-            ['nvcc', '--version'],
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.PIPE,
+-            check=True,
+-        )
+-        # print('CUDA is installed. Starting compilation of libpaird3.')
+-        if verbose:
+-            print('nvcc compiler found. start compilation')
+-    except FileNotFoundError as e:
+-        raise NotImplementedError(
+-            'CUDA is not installed or nvcc is not available. D3 compilation failed'
+-        ) from e
+-    src = os.path.join(os.path.dirname(__file__), 'pair_e3gnn/pair_d3_for_ase.cu')
+-    sms = [61, 70, 75, 80, 86, 89, 90]
+-    compile = [  # TODO: make ruff not lint these
+-        'nvcc',
+-        '-o',
+-        path,
+-        '-shared',
+-        '-fmad=false',
+-        '-O3',
+-        '--expt-relaxed-constexpr',
+-        src,
+-        '-Xcompiler',
+-        '-fPIC',
+-        '-lcudart',
+-    ] + list(
+-        chain(*[f'-gencode arch=compute_{sm},code=sm_{sm}'.split() for sm in sms])
+-    )
++        return ctypes.CDLL(os.path.join(package_dir, f'{name}{LIB_EXT}'))
++    except OSError:
++        pass
+ 
++    cache_dir = _get_build_directory(name, verbose=False)
+     try:
+-        subprocess.run(compile, check=True)
+-        if verbose:
+-            print('libpaird3.so compiled successfully.')
+-    except subprocess.CalledProcessError as e:
+-        raise RuntimeError('Failed to compile D3 (libpaird3.so)') from e
++        return ctypes.CDLL(os.path.join(cache_dir, f'{name}{LIB_EXT}'))
++    except OSError:
++        pass
++
++    # Compile the library if it is not found
++
++    if os.access(package_dir, os.W_OK):
++        compile_dir = package_dir
++    else:
++        print('Warning: package directory is not writable. Using cache directory.')
++        compile_dir = cache_dir
++
++    if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
++        print('Warning: TORCH_CUDA_ARCH_LIST is not set.')
++        print('Warning: Use default CUDA architectures: 61, 70, 75, 80, 86, 89, 90')
++        os.environ['TORCH_CUDA_ARCH_LIST'] = '6.1;7.0;7.5;8.0;8.6;8.9;9.0'
++
++    load(
++        name=name,
++        sources=[
++            os.path.join(package_dir, 'pair_e3gnn', 'pair_d3_for_ase.cu')
++        ],
++        extra_cuda_cflags=['-O3', '--expt-relaxed-constexpr', '-fmad=false'],
++        build_directory=compile_dir,
++        verbose=True,
++        is_python_module=False,
++    )
++
++    return ctypes.CDLL(os.path.join(compile_dir, f'{name}{LIB_EXT}'))
+ 
+ 
+ class PairD3(ctypes.Structure):
+@@ -312,20 +309,10 @@ def __init__(
+         functional_name: str = 'pbe',  # check the source code
+         vdw_cutoff: float = 9000,  # au^2, 0.52917726 angstrom = 1 au
+         cn_cutoff: float = 1600,  # au^2, 0.52917726 angstrom = 1 au
+-        verbose_compile: bool = True,
+         **kwargs,
+     ):
+         super().__init__(**kwargs)
+ 
+-        _ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
+-        lib_path = os.path.join(os.path.dirname(__file__), f'libpaird3{_ext_suffix}')
+-
+-        self._lib = None
+-        if not os.path.exists(lib_path):
+-            _compile_d3(lib_path, verbose_compile)
+-
+-        self._lib = ctypes.CDLL(lib_path)
+-
+         if not torch.cuda.is_available():
+             raise NotImplementedError('CPU + D3 is not implemented yet')
+ 
+@@ -337,6 +324,8 @@ def __init__(
+         if self.damp_name not in ['damp_bj', 'damp_zero']:
+             raise ValueError('Error: Invalid damping type.')
+ 
++        self._lib = _load('pair_d3')
++
+         self._lib.pair_init.restype = ctypes.POINTER(PairD3)
+         self.pair = self._lib.pair_init()
+ 
+diff --git a/sevenn/main/sevenn_preset.py b/sevenn/main/sevenn_preset.py
+index 283e7d82..6043f4ce 100644
+--- a/sevenn/main/sevenn_preset.py
++++ b/sevenn/main/sevenn_preset.py
+@@ -25,11 +25,10 @@ def cmd_parse_preset(args=None):
+     ag.add_argument(
+         'preset', choices=[
+             'fine_tune',
++            'fine_tune_le',
+             'sevennet-0',
+             'sevennet-l3i5',
+             'base',
+-            'fine_tune_v1',
+-            'base_v1',
+             'multi_modal'
+         ],
+         help=preset_help
+diff --git a/sevenn/pair_e3gnn/pair_d3.cu b/sevenn/pair_e3gnn/pair_d3.cu
+index b3750c4e..8fba919c 100644
+--- a/sevenn/pair_e3gnn/pair_d3.cu
++++ b/sevenn/pair_e3gnn/pair_d3.cu
+@@ -492,7 +492,7 @@ void PairD3::setfuncpar_bj() {
+         {"cam-b3lyp", 36}, {"lc-wpbe", 37}, {"b2gp-plyp", 38}, {"ptpss", 39}, {"pwpb95", 40},
+         {"hf/mixed", 41}, {"hf/sv", 42}, {"hf/minis", 43}, {"b3-lyp/6-31gd", 44}, {"hcth120", 45},
+         {"pw1pw", 46}, {"pwgga", 47}, {"hsesol", 48}, {"hf3c", 49}, {"hf3cv", 50}, {"pbeh3c", 51},
+-        {"pbeh-3c", 52}
++        {"pbeh-3c", 52}, {"wb97m", 53}
+     };
+ 
+     int commandCode = commandMap[functional];
+@@ -558,6 +558,7 @@ void PairD3::setfuncpar_bj() {
+         // special PBEh - D3 - gCP / def2 - mSVP parametrization;
+         case 51: rs6 = 0.4860; s18 = 0.0000; rs18 = 4.5000; break;
+         case 52: rs6 = 0.4860; s18 = 0.0000; rs18 = 4.5000; break;
++        case 53: rs6 = 0.5660; s18 = 0.3908; rs18 = 3.1280; break;
+         default:
+             error->all(FLERR, "Functional name unknown");
+             break;
+diff --git a/sevenn/pair_e3gnn/pair_d3_for_ase.cu b/sevenn/pair_e3gnn/pair_d3_for_ase.cu
+index 55baddaf..3d9ef99f 100644
+--- a/sevenn/pair_e3gnn/pair_d3_for_ase.cu
++++ b/sevenn/pair_e3gnn/pair_d3_for_ase.cu
+@@ -182,6 +182,7 @@ void PairD3::allocate() {
+     int n = atom->natoms;
+     int np1 = atom->ntypes + 1;
+     n_save = n;
++    np1_save = np1;
+ 
+     //cudaMallocManaged(&setflag, np1 * sizeof(int*)); for (int i = 0; i < np1; i++) { cudaMallocManaged(&setflag[i], np1 * sizeof(int)); }
+     //cudaMallocManaged(&cutsq, np1 * sizeof(double*)); for (int i = 0; i < np1; i++) { cudaMallocManaged(&cutsq[i], np1 * sizeof(double)); }
+@@ -480,7 +481,7 @@ void PairD3::setfuncpar_bj() {
+         {"cam-b3lyp", 36}, {"lc-wpbe", 37}, {"b2gp-plyp", 38}, {"ptpss", 39}, {"pwpb95", 40},
+         {"hf/mixed", 41}, {"hf/sv", 42}, {"hf/minis", 43}, {"b3-lyp/6-31gd", 44}, {"hcth120", 45},
+         {"pw1pw", 46}, {"pwgga", 47}, {"hsesol", 48}, {"hf3c", 49}, {"hf3cv", 50}, {"pbeh3c", 51},
+-        {"pbeh-3c", 52}
++        {"pbeh-3c", 52}, {"wb97m", 53}
+     };
+ 
+     int commandCode = commandMap[functional];
+@@ -546,6 +547,7 @@ void PairD3::setfuncpar_bj() {
+         // special PBEh - D3 - gCP / def2 - mSVP parametrization;
+         case 51: rs6 = 0.4860; s18 = 0.0000; rs18 = 4.5000; break;
+         case 52: rs6 = 0.4860; s18 = 0.0000; rs18 = 4.5000; break;
++        case 53: rs6 = 0.5660; s18 = 0.3908; rs18 = 3.1280; break;
+         default:
+             error->all(FLERR, "Functional name unknown");
+             break;
+@@ -629,6 +631,7 @@ void PairD3::setfuncpar() {
+ 
+ void PairD3::coeff(int* atomic_numbers) {
+     if (!allocated) allocate();
++    if (atom->ntypes + 1 != np1_save) { reallocate_arrays_np1(); }
+ 
+     int ntypes = atom->ntypes;
+     /*
+@@ -1111,6 +1114,51 @@ void PairD3::reallocate_arrays() {
+     /* -------------- Create new arrays -------------- */
+ }
+ 
++void PairD3::reallocate_arrays_np1() {
++    /* -------------- Destroy previous arrays -------------- */
++    cudaFree(r2r4);
++    cudaFree(rcov);
++    cudaFree(mxc);
++    for (int i = 0; i < np1_save; i++) { cudaFree(r0ab[i]); }; cudaFree(r0ab);
++    for (int i = 0; i < np1_save; i++) {
++        for (int j = 0; j < np1_save; j++) {
++            for (int k = 0; k < MAXC; k++) {
++                for (int l = 0; l < MAXC; l++) {
++                    cudaFree(c6ab[i][j][k][l]);
++                }
++                cudaFree(c6ab[i][j][k]);
++            }
++            cudaFree(c6ab[i][j]);
++        }
++        cudaFree(c6ab[i]);
++    }
++    cudaFree(c6ab);
++    /* -------------- Destroy previous arrays -------------- */
++
++    /* -------------- Create new arrays -------------- */
++    int np1 = atom->ntypes + 1;
++    np1_save = np1;
++
++    cudaMallocManaged(&r2r4, np1 * sizeof(float));
++    cudaMallocManaged(&rcov, np1 * sizeof(float));
++    cudaMallocManaged(&mxc, np1 * sizeof(int));
++    cudaMallocManaged(&r0ab, np1 * sizeof(float*)); for (int i = 0; i < np1; i++) { cudaMallocManaged(&r0ab[i], np1 * sizeof(float)); }
++    cudaMallocManaged(&c6ab, np1 * sizeof(float****));
++    for (int i = 0; i < np1; i++) {
++        cudaMallocManaged(&c6ab[i], np1 * sizeof(float***));
++        for (int j = 0; j < np1; j++) {
++            cudaMallocManaged(&c6ab[i][j], MAXC * sizeof(float**));
++            for (int k = 0; k < MAXC; k++) {
++                cudaMallocManaged(&c6ab[i][j][k], MAXC * sizeof(float*));
++                for (int l = 0; l < MAXC; l++) {
++                    cudaMallocManaged(&c6ab[i][j][k][l], 3 * sizeof(float));
++                }
++            }
++        }
++    }
++    /* -------------- Create new arrays -------------- */
++}
++
+ /* ----------------------------------------------------------------------
+   Initialize atomic positions & types (used in PairD3::compute)
+ 
+diff --git a/sevenn/pair_e3gnn/pair_d3_for_ase.h b/sevenn/pair_e3gnn/pair_d3_for_ase.h
+index 25aeea25..b9b44a32 100644
+--- a/sevenn/pair_e3gnn/pair_d3_for_ase.h
++++ b/sevenn/pair_e3gnn/pair_d3_for_ase.h
+@@ -175,6 +175,7 @@ class PairD3 : public Pair {
+ 
+     /* ------- Reallocate (when number of atoms changed) ------- */
+     void reallocate_arrays();
++    void reallocate_arrays_np1();
+     /* ------- Reallocate (when number of atoms changed) ------- */
+ 
+     /* ------- Coordination number ------- */
+@@ -240,6 +241,7 @@ class PairD3 : public Pair {
+ 
+     /*---------- Global values ---------*/
+     int n_save;                         // to check whether the number of atoms has changed
++    int np1_save;                       // to check whether the number of types has changed
+     float disp_total;                   // Dispersion energy
+     /*---------- Global values ---------*/
+ 
+diff --git a/sevenn/presets/base_v1.yaml b/sevenn/presets/base_v1.yaml
+deleted file mode 100644
+index a2ab183d..00000000
+--- a/sevenn/presets/base_v1.yaml
++++ /dev/null
+@@ -1,97 +0,0 @@
+-# Example input.yaml for training SevenNet.
+-# '*' signifies default. You can check log.sevenn for defaults.
+-# Use `sevenn -m train_v1` to run this, although -m train_v2 also work.
+-
+-model:
+-    chemical_species: 'Auto'                      # Chemical elements present in the dataset, guess them from load_dataset data if 'auto'
+-    cutoff: 5.0                                   # Cutoff radius in Angstroms. If two atoms are within the cutoff, they are connected.
+-    channel: 32                                   # The multiplicity(channel) of node features.
+-    lmax: 2                                       # Maximum order of irreducible representations (rotation order).
+-    num_convolution_layer: 3                      # The number of message passing layers.
+-
+-    #irreps_manual:                               # Manually set irreps of the model in each layer
+-        #- "128x0e"
+-        #- "128x0e+64x1e+32x2e"
+-        #- "128x0e+64x1e+32x2e"
+-        #- "128x0e+64x1e+32x2e"
+-        #- "128x0e+64x1e+32x2e"
+-        #- "128x0e"
+-
+-    weight_nn_hidden_neurons: [64, 64]            # Hidden neurons in convolution weight neural network
+-    radial_basis:                                 # Function and its parameters to encode radial distance
+-        radial_basis_name: 'bessel'               # Only 'bessel' is currently supported
+-        bessel_basis_num: 8
+-    cutoff_function:                              # Envelop function, multiplied to radial_basis functions to init edge features
+-        cutoff_function_name: 'poly_cut'          # {'poly_cut' and 'poly_cut_p_value'} or {'XPLOR' and 'cutoff_on'}
+-        poly_cut_p_value: 6
+-
+-    act_gate: {'e': 'silu', 'o': 'tanh'}          # Equivalent to 'nonlinearity_gates' in nequip
+-    act_scalar: {'e': 'silu', 'o': 'tanh'}        # Equivalent to 'nonlinearity_scalars' in nequip
+-
+-    is_parity: False                              # Pairy True (E(3) group) or False (to SE(3) group)
+-
+-    self_connection_type: 'nequip'                # Default is 'nequip'. 'linear' is used for SevenNet-0.
+-
+-    conv_denominator: "avg_num_neigh"             # Valid options are "avg_num_neigh*", "sqrt_avg_num_neigh", or float
+-    train_denominator: False                      # Enable training for denominator in convolution layer
+-    train_shift_scale: False                      # Enable training for shift & scale in output layer
+-
+-train:
+-    random_seed: 1
+-    is_train_stress: True                         # Includes stress in the loss function
+-    epoch: 200                                    # Ends training after this number of epochs
+-
+-    #loss: 'Huber'                                # Default is 'mse' (mean squared error)
+-    #loss_param:
+-        #delta: 0.01
+-
+-    # Each optimizer and scheduler have different available parameters.
+-    # You can refer to sevenn/train/optim.py for supporting optimizer & schedulers
+-    optimizer: 'adam'                             # Options available are 'sgd', 'adagrad', 'adam', 'adamw', 'radam'
+-    optim_param:
+-        lr: 0.005
+-    scheduler: 'exponentiallr'                    # 'steplr', 'multisteplr', 'exponentiallr', 'cosineannealinglr', 'reducelronplateau', 'linearlr'
+-    scheduler_param:
+-        gamma: 0.99
+-
+-    force_loss_weight: 0.1                        # Coefficient for force loss
+-    stress_loss_weight: 1e-06                     # Coefficient for stress loss (to kbar unit)
+-
+-    per_epoch: 10                                 # Generate checkpoints every this epoch
+-
+-    # ['target y', 'metric']
+-    # Target y: TotalEnergy, Energy, Force, Stress, Stress_GPa, TotalLoss
+-    # Metric  : RMSE, MAE, or Loss
+-    error_record:
+-        - ['Energy', 'RMSE']
+-        - ['Force', 'RMSE']
+-        - ['Stress', 'RMSE']
+-        - ['TotalLoss', 'None']
+-
+-    # Continue training model from given checkpoint, or pre-trained model checkpoint for fine-tuning
+-    #continue:
+-        #checkpoint: 'checkpoint_best.pth'         # Checkpoint of pre-trained model or a model want to continue training.
+-        #reset_optimizer: False                    # Set True for fine-tuning
+-        #reset_scheduler: False                    # Set True for fine-tuning
+-        #use_statistic_values_of_checkpoint: False # Set True to use shift, scale, and avg_num_neigh from checkpoint or not
+-
+-data:
+-    batch_size: 4                                 # Per GPU batch size.
+-    data_divide_ratio: 0.1                        # Split dataset into training and validation sets by this ratio
+-
+-    shift: 'per_atom_energy_mean'                 # One of 'per_atom_energy_mean*', 'elemwise_reference_energies', float
+-    scale: 'force_rms'                            # One of 'force_rms*', 'per_atom_energy_std', 'elemwise_force_rms', float
+-
+-    # ase.io.read readable data files or structure_list or .sevenn_data files can be used as dataset.
+-    # .sevenn_data is preprocessed data set has edges connected (can be obtained by using sevenn_graph_build or by save_** options below)
+-    data_format: 'ase'                            # One of 'ase', 'structure_list' (.sevenn_data is always readable)
+-    data_format_args:                             # if `data_format` is `ase`, args will be passed to `ase.io.read`
+-        index: ':'                                # see `https://wiki.fysik.dtu.dk/ase/ase/io/io.html` for more valid arguments
+-
+-    # If only load_dataset_path is provided, train/valid set is automatically decided by splitting dataset by divide ratio
+-    # If both load_dataset_path & load_validset_path is provided, use load_dataset_path as training set.
+-    load_dataset_path: ['../data/train.extxyz']   # Example of using ase as data_format, support multiple datasets and expansion(*)
+-    #load_validset_path: ['./valid.sevenn_data']
+-
+-    #save_dataset_path: './total'                 # Save the preprocessed (in load_dataset_path) dataset
+-    #save_by_train_valid: True                    # Save the preprocessed train.sevenn_data, valid.sevenn_data
+diff --git a/sevenn/presets/fine_tune_le.yaml b/sevenn/presets/fine_tune_le.yaml
+new file mode 100644
+index 00000000..d273491b
+--- /dev/null
++++ b/sevenn/presets/fine_tune_le.yaml
+@@ -0,0 +1,83 @@
++# Application of 7net-0 on liquid electrolyte system via fine-tuning
++# Paper: https://arxiv.org/abs/2501.05211
++
++model:
++    # parameters of SevenNet-0, should not be changed
++    chemical_species: 'auto'
++    cutoff: 5.0
++    channel: 128
++    is_parity: False
++    lmax: 2
++    num_convolution_layer: 5
++    irreps_manual:
++        - "128x0e"
++        - "128x0e+64x1e+32x2e"
++        - "128x0e+64x1e+32x2e"
++        - "128x0e+64x1e+32x2e"
++        - "128x0e+64x1e+32x2e"
++        - "128x0e"
++    weight_nn_hidden_neurons: [64, 64]
++    radial_basis:
++        radial_basis_name: 'bessel'
++        bessel_basis_num: 8
++    cutoff_function:
++        cutoff_function_name: 'XPLOR'
++        cutoff_on: 4.5
++
++    act_gate: {'e': 'silu', 'o': 'tanh'}
++    act_scalar: {'e': 'silu', 'o': 'tanh'}
++
++    self_connection_type: 'linear'
++
++    # useful for fine-tuning
++    train_shift_scale: True
++    train_avg_num_neigh: True
++
++train:
++    random_seed: 1
++    is_train_stress: True
++    epoch: 100  # we went through 100 epochs and chose checkpoint at 50 epoch where the error have reached plateau.
++
++    loss: 'Huber'
++    loss_param:
++        delta: 0.01
++
++    optimizer: 'adam'
++    optim_param:
++        lr: 0.0001
++    scheduler: 'linearlr'
++    scheduler_param:
++        start_factor: 1.0
++        total_iters: 600
++        end_factor: 0.000001
++
++    force_loss_weight: 1.00
++    stress_loss_weight: 1.00  # 7net-0 quantitatively lacked accuracy on pressure histograms compared to DFT, so we increased stress loss weight
++
++    error_record:
++        - ['Energy', 'RMSE']
++        - ['Force', 'RMSE']
++        - ['Stress', 'RMSE']
++        - ['Energy', 'MAE']
++        - ['Force', 'MAE']
++        - ['Stress', 'MAE']
++        - ['Energy', 'Loss']
++        - ['Force', 'Loss']
++        - ['Stress', 'Loss']
++        - ['TotalLoss', 'None']
++
++    per_epoch: 10   # Generate epoch every this number of times
++
++    continue:
++        use_statistic_values_of_checkpoint: True
++        checkpoint: '7net-0'  # fine-tuning from 7net-0
++        reset_optimizer: True
++        reset_scheduler: True
++
++data:
++    batch_size: 1   # our fine-tuning dataset had ~360 atoms per structure, so we used batch size of 1 to avoid GPU OOM error.
++    shift: 'elemwise_reference_energies'
++    scale: 1.858
++    data_format: 'ase'
++    data_divide_ratio: 0.05
++    load_dataset_path: ["./data/total.extxyz"]
+diff --git a/sevenn/presets/fine_tune_v1.yaml b/sevenn/presets/fine_tune_v1.yaml
+deleted file mode 100644
+index df838581..00000000
+--- a/sevenn/presets/fine_tune_v1.yaml
++++ /dev/null
+@@ -1,86 +0,0 @@
+-# Example input.yaml for fine-tuning sevennet-0
+-# '*' signifies default. You can check log.sevenn for defaults.
+-# Use `sevenn -m train_v1` to run this, although -m train_v2 also work.
+-
+-model:  # model keys should be consistent except for train_* keys
+-    chemical_species: 'Auto'
+-    cutoff: 5.0
+-    channel: 128
+-    is_parity: False
+-    lmax: 2
+-    num_convolution_layer: 5
+-    irreps_manual:
+-        - "128x0e"
+-        - "128x0e+64x1e+32x2e"
+-        - "128x0e+64x1e+32x2e"
+-        - "128x0e+64x1e+32x2e"
+-        - "128x0e+64x1e+32x2e"
+-        - "128x0e"
+-
+-    weight_nn_hidden_neurons: [64, 64]
+-    radial_basis:
+-        radial_basis_name: 'bessel'
+-        bessel_basis_num: 8
+-    cutoff_function:
+-        cutoff_function_name: 'XPLOR'
+-        cutoff_on: 4.5
+-    self_connection_type: 'linear'
+-
+-    train_shift_scale: False   # customizable (True | False)
+-    train_denominator: False   # customizable (True | False)
+-
+-train:  # Customizable
+-    random_seed: 1
+-    is_train_stress: True
+-    epoch: 100
+-
+-    loss: 'Huber'  # keeping original loss function give better ft result
+-    loss_param:
+-        delta: 0.01
+-
+-    optimizer: 'adam'
+-    optim_param:
+-        lr: 0.004
+-    scheduler: 'exponentiallr'
+-    scheduler_param:
+-        gamma: 0.99
+-
+-    force_loss_weight: 1.0
+-    stress_loss_weight: 0.01
+-
+-    per_epoch: 10  # Generate checkpoints every this epoch
+-
+-    # ['target y', 'metric']
+-    # Target y: TotalEnergy, Energy, Force, Stress, Stress_GPa, TotalLoss
+-    # Metric  : RMSE, MAE, or Loss
+-    error_record:
+-        - ['Energy', 'RMSE']
+-        - ['Force', 'RMSE']
+-        - ['Stress', 'RMSE']
+-        - ['TotalLoss', 'None']
+-
+-    continue:
+-        reset_optimizer: True
+-        reset_scheduler: True
+-        reset_epoch: True
+-        checkpoint: 'SevenNet-0_11July2024'
+-        # Set True to use shift, scale, and avg_num_neigh from checkpoint (highly recommended)
+-        use_statistic_values_of_checkpoint: True
+-
+-data:  # Customizable
+-    batch_size: 4
+-    data_divide_ratio: 0.1
+-
+-    # ase.io.read readable data files or structure_list or .sevenn_data files can be used as dataset.
+-    # .sevenn_data is preprocessed data set has edges connected (can be obtained by using sevenn_graph_build or by save_** options below)
+-    data_format: 'ase'                            # One of 'ase', 'structure_list' (.sevenn_data is always readable)
+-    data_format_args:                             # if `data_format` is `ase`, args will be passed to `ase.io.read`
+-        index: ':'                                # see `https://wiki.fysik.dtu.dk/ase/ase/io/io.html` for more valid arguments
+-
+-    # If only load_dataset_path is provided, train/valid set is automatically decided by splitting dataset by divide ratio
+-    # If both load_dataset_path & load_validset_path is provided, use load_dataset_path as training set.
+-    load_dataset_path: ['fine_tune.extxyz']       # Support multiple files and expansion(*)
+-    #load_validset_path: ['./valid.sevenn_data']
+-
+-    #save_dataset_path: './total'                 # Save the preprocessed (in load_dataset_path) dataset
+-    #save_by_train_valid: True                    # Save the preprocessed train.sevenn_data, valid.sevenn_data
+diff --git a/tests/unit_tests/test_modal.py b/tests/unit_tests/test_modal.py
+index b1b4f3e6..000476f0 100644
+--- a/tests/unit_tests/test_modal.py
++++ b/tests/unit_tests/test_modal.py
+@@ -16,8 +16,8 @@
+ 
+ import sevenn.train.graph_dataset as graph_ds
+ import sevenn.util as util
++from sevenn.calculator import SevenNetCalculator
+ from sevenn.model_build import build_E3_equivariant_model
+-from sevenn.sevennet_calculator import SevenNetCalculator
+ 
+ cutoff = 5.0
+ data_root = (pathlib.Path(__file__).parent.parent / 'data').resolve()

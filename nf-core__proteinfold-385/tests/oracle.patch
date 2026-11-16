@@ -1,0 +1,526 @@
+diff --git a/bin/extract_metrics.py b/bin/extract_metrics.py
+index 9305448b7..c8db72619 100755
+--- a/bin/extract_metrics.py
++++ b/bin/extract_metrics.py
+@@ -297,10 +297,50 @@ def read_json(name, json_files):
+             data = json.load(f)
+             if json_file.endswith("_data.json"): #AF3 output with MSA info
+                 # Can't just used format_msa_rows since there's FASTA headers in the json content
+-                unpaired_MSAs = data['sequences'][0]['protein']['unpairedMsa']
+-                msa_lines = [''.join(c for c in line if not c.islower()) for line in unpaired_MSAs.split("\n") if line.strip() and not line.startswith(">")]
+-                msa_rows = [[str(AA_to_int.get(residue, 20)) for residue in line] for line in msa_lines]
+-                write_tsv(f"{name}_msa.tsv", msa_rows)
++                paired_msa_rows = []
++                unpaired_msa_rows = []
++                for chain in data['sequences']:
++                    unpaired_MSA = chain['protein']['unpairedMsa']
++                    unpaired_msa_lines = [''.join(c for c in line if not c.islower()) for line in unpaired_MSA.split("\n") if line.strip() and not line.startswith(">")]
++                    unpaired_msa_rows.append([[str(AA_to_int.get(residue, 20)) for residue in line] for line in unpaired_msa_lines])
++                    paired_MSA = chain['protein']['pairedMsa']
++                    paired_msa_lines = [''.join(c for c in line if not c.islower()) for line in paired_MSA.split("\n") if line.strip() and not line.startswith(">")]
++                    paired_msa_rows.append([[str(AA_to_int.get(residue, 20)) for residue in line] for line in paired_msa_lines])
++
++                chains = len(data['sequences'])
++                final_rows = []
++                # Paired
++                for i in range(len(paired_msa_rows[0])): #The number of paired lines is common to all MSAs
++                    temp_row = []
++                    #This needs to be fixed if inference is batched in future.
++                    for j in range(chains):
++                        temp_row.extend(paired_msa_rows[j][i])
++                    final_rows.append(temp_row)
++
++                # Un-paired
++                msa_widths = [len(paired_msa_rows[chain][0]) for chain in range(chains)]
++                msa_heights = [len(unpaired_msa_rows[chain]) for chain in range(chains)]
++
++                cum_total_rows = np.cumsum(msa_heights)
++
++                for row_idx in range(cum_total_rows[-1]):
++                    temp_row = []
++
++                    for i in range(chains):
++                        msa = unpaired_msa_rows[i]
++                        width = msa_widths[i]
++                        if i == 0:
++                            minrow = 0
++                        else:
++                            minrow = cum_total_rows[i-1]
++                        maxrow = cum_total_rows[i]
++                        if minrow <= row_idx < maxrow:
++                            msa_row_idx = row_idx - minrow
++                            temp_row.extend(msa[msa_row_idx])
++                        else:
++                            temp_row.extend(["21"] * width) #gap
++                    final_rows.append(temp_row)
++                write_tsv(f"{name}_msa.tsv", final_rows)
+             #AF3 output with PAE info, or HF3 PAE data. TODO: Need to make sure the workflow points to [protein]/[protein]_rank1/all_results.json
+ 
+             # TODO: I think I need to capture model_id and inference_id  -- MUST FIX since this is so fragile and will be different for different programs.
+@@ -313,8 +353,10 @@ def read_json(name, json_files):
+             if 'predictions' in json_file: # Boltz-1 confidences in predictions/[protein]/confidence_[protein]_model_*.json
+             # TODO: haven't tested this for multiple models with --diffusion_samples
+                 model_id = os.path.basename(json_file).split('_model_')[-1].split('.json')[0]
+-            if 'summary_confidences' in json_file: #Prevent crash when model_id is not defined
+-                model_id = os.path.basename(json_file).split('summary_confidences_')[-1].split('.json')[0]
++            #TODO: Fix this for AF3 - the top-ranked files are in the top-level directory
++            if 'confidences' in json_file: #Prevent crash when model_id is not defined
++                #model_id = os.path.basename(json_file).split('confidences_')[-1].split('.json')[0]
++                model_id = 0
+ 
+             if "pae" not in data.keys():
+                 print(f"No PAE output in {json_file}, it was likely a monomer calculation")
+@@ -330,7 +372,8 @@ def read_json(name, json_files):
+             if 'iptm' not in data.keys():
+                 print(f"No pTM/iPTM output in {json_file}, it was likely a monomer calculation")
+             else:
+-                iptm_data[model_id] = f"{np.round(data['iptm'],3)}\n"
++                if data['iptm']: #ie not null
++                    iptm_data[model_id] = f"{np.round(data['iptm'],3)}\n"
+ 
+             if 'chain_pair_iptm' not in data.keys() and 'pair_chains_iptm' not in data.keys():
+                 print(f"No chain-wise iPTM output in {json_file}, it was likely a monomer calculation")
+diff --git a/bin/fasta_to_alphafold3_json.py b/bin/fasta_to_alphafold3_json.py
+index 9a08919ba..2c8cadb0f 100755
+--- a/bin/fasta_to_alphafold3_json.py
++++ b/bin/fasta_to_alphafold3_json.py
+@@ -4,6 +4,8 @@
+ import argparse
+ import json
+ import string
++import re
++from Bio import SeqIO
+ 
+ def parse_args(args=None):
+     """
+@@ -44,6 +46,31 @@ def parse_args(args=None):
+ 
+     return parser.parse_args(args)
+ 
++def infer_entity_type(header, sequence):
++    ENTITY_TYPES = ["protein", "ccd", "smiles", "dna", "rna"]
++
++    header_lower = header.lower()
++
++    for entity in ENTITY_TYPES:
++        if entity in header_lower:
++            return entity
++    seq = sequence.strip()
++    seq_set = set(seq)
++    # RNA: only A,C,U,G,N
++    if len(seq_set - set("ACUGN")) == 0:
++        return "rna"
++    # DNA: only A,C,T,G,N
++    if len(seq_set - set("ACTGN")) == 0:
++        return "dna"
++    # Protein: only 20 AA, not just A,C,T,G,U,N
++    protein_letters = set("ACDEFGHIKLMNPQRSTVWY")
++    if len(seq_set - protein_letters) == 0 and not (seq_set <= set("ACUGTN")):
++        return "protein"
++    # SMILES: fallback
++    if re.fullmatch(r"[A-Za-z0-9@+\\-\\[\\]\\(\\)=#\\\$%]+", seq):
++        return "smiles"
++    return "unknown"
++
+ def sanitised_name(id):
+     """
+     Sanitize the input ID to create a valid filename.
+@@ -63,7 +90,7 @@ def sanitised_name(id):
+     allowed_chars = set(string.ascii_lowercase + string.digits + '_-.')
+     return ''.join(l for l in lower_spaceless_name if l in allowed_chars)
+ 
+-def fasta_to_alphafold3_json(file_in, id):
++def fasta_to_alphafold3_json(file_in):
+     """
+     Convert a single-sequence FASTA file to AlphaFold3 JSON format.
+ 
+@@ -85,27 +112,18 @@ def fasta_to_alphafold3_json(file_in, id):
+     Raises:
+         RuntimeError: If the input file contains multiple sequences
+     """
+-    sequence_list = []
+-    sequence = None
+-    fasta_mapping_dict = {}
+-
+-    with open(file_in, "r", encoding="utf-8-sig") as fin:
+-        n_seq = 0
+-        for l in fin:
+-            l = l.strip()
+-            if l.startswith(">"):
+-                if n_seq > 1:
+-                    raise RuntimeError("Multifasta files are not allowed")
+-                n_seq += 1
+-                if sequence:
+-                    sequence_list.append(sequence)
+-                sequence = {"id": id, "sequence": ""}
+-            else:
+-                sequence["sequence"] += l
+-
+-    return sequence
+-
+-def create_json_dict(sequence, model_seed):
++    VALID_CHAIN_IDS = list(string.ascii_uppercase) + list(string.ascii_lowercase) + [str(x) for x in range(0, 10)]
++    entities = []
++
++    for i, record in enumerate(SeqIO.parse(file_in, "fasta")):
++        sequence = record.seq._data.decode()
++        header = record.description
++        entity_type = infer_entity_type(header, sequence)
++        entities.append((entity_type, VALID_CHAIN_IDS[i], sequence))
++
++    return entities
++
++def create_json_dict(id, entities, model_seed):
+     """
+     Create the final JSON dictionary in AlphaFold3 format.
+ 
+@@ -132,26 +150,29 @@ def create_json_dict(sequence, model_seed):
+     Returns:
+         dict: JSON-compatible dictionary in AlphaFold3 format
+     """
+-    json_sequence_dict = {}
+ 
+-    item = {
+-        "name": f"{sequence['id']}",
+-        "sequences": [
+-            {
+-                "protein": {
+-                    "id": "A",
+-                    "sequence": sequence["sequence"]
+-                }
+-            },
+-        ],
++    json_sequence_list = []
++
++    for entity in entities:
++        item = {
++            entity[0]: {
++                "id": entity[1],
++                "sequence": entity[2]
++            }
++        }
++
++        json_sequence_list.append(item)
++
++
++    alphafold3_json_dict = {
++        "name": f"{id}",
++        "sequences": json_sequence_list,
+         "modelSeeds": model_seed,
+         "dialect": "alphafold3",
+         "version": 1
+     }
+ 
+-    json_sequence_dict[sequence["id"]] = item
+-
+-    return json_sequence_dict
++    return alphafold3_json_dict
+ 
+ def main(args=None):
+     """
+@@ -177,12 +198,12 @@ def main(args=None):
+ 
+     out_json = f"{reformatted_id}.json"
+ 
+-    sequence = fasta_to_alphafold3_json(args.FILE_IN, reformatted_id)
+-    json_dict = create_json_dict(sequence, args.MODEL_SEED)
++    entities = fasta_to_alphafold3_json(args.FILE_IN)
++    json_dict = create_json_dict(reformatted_id, entities, args.MODEL_SEED)
+ 
+     print ("json file " + out_json)
+     with open(out_json, "w") as fout:
+-        json.dump(json_dict[reformatted_id], fout, indent=4)
++        json.dump(json_dict, fout, indent=4)
+ 
+     with open(out_json, 'r') as f:
+         json_str = f.read()
+diff --git a/modules/local/fasta_to_alphafold3_json/main.nf b/modules/local/fasta_to_alphafold3_json/main.nf
+index e4a8e947f..4a67ff26c 100644
+--- a/modules/local/fasta_to_alphafold3_json/main.nf
++++ b/modules/local/fasta_to_alphafold3_json/main.nf
+@@ -1,22 +1,20 @@
+ process FASTA_TO_ALPHAFOLD3_JSON {
+     tag   "$meta.id"
+     label 'process_single'
+-
+     conda "${moduleDir}/environment.yml"
++    //container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
++    //    'https://community-cr-prod.seqera.io/docker/registry/v2/blobs/sha256/03/039aff8ec1838a0529ecc5d60ea2065cc214306a68aa15965fb359ab0db0950a/data' :
++    //    'community.wave.seqera.io/library/python:3.13.0--a025ad9838d75455' }"
+     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+-        'https://community-cr-prod.seqera.io/docker/registry/v2/blobs/sha256/03/039aff8ec1838a0529ecc5d60ea2065cc214306a68aa15965fb359ab0db0950a/data' :
+-        'community.wave.seqera.io/library/python:3.13.0--a025ad9838d75455' }"
+-
++        'https://community-cr-prod.seqera.io/docker/registry/v2/blobs/sha256/eb/eb3700531c7ec639f59f084ab64c05e881d654dcf829db163539f2f0b095e09d/data' :
++        'community.wave.seqera.io/library/biopython:1.84--3318633dad0031e7' }"
+     input:
+     tuple val(meta), path(fasta)
+-
+     output:
+     tuple val(meta), path("*.json"), emit: json
+     path "versions.yml"            , emit: versions
+-
+     when:
+     task.ext.when == null || task.ext.when
+-
+     script:
+     def args    = task.ext.args ?: ''
+     def prefix  = task.ext.prefix ?: "${meta.id}"
+@@ -25,18 +23,15 @@ process FASTA_TO_ALPHAFOLD3_JSON {
+         ${fasta} \\
+         ${prefix} \\
+         $args
+-
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+         python: \$(python3 --version | sed 's/Python //g')
+     END_VERSIONS
+     """
+-
+     stub:
+     def prefix  = task.ext.prefix ?: "${meta.id}"
+     """
+     touch ${prefix}.json
+-
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+         python: \$(python3 --version | sed 's/Python //g')
+diff --git a/modules/local/run_alphafold3/main.nf b/modules/local/run_alphafold3/main.nf
+index 4cf709784..51be1de3c 100644
+--- a/modules/local/run_alphafold3/main.nf
++++ b/modules/local/run_alphafold3/main.nf
+@@ -5,9 +5,7 @@ process RUN_ALPHAFOLD3 {
+     tag "$meta.id"
+     label 'process_medium'
+     label 'process_gpu'
+-
+     container "nf-core/proteinfold_alphafold3_standard:1.2.0dev"
+-
+     input:
+     tuple val(meta), path(json)
+     path "params/*"
+@@ -17,24 +15,20 @@ process RUN_ALPHAFOLD3 {
+     path "uniref90/*"
+     path "pdb_seqres/*"
+     path "uniprot/*"
+-
+     output:
+-    tuple val(meta), path ("publish/*top_ranked.cif"), emit: top_ranked_cif
+-    tuple val(meta), path ("publish/*ranked_*.cif")  , emit: cif
+-    tuple val(meta), path ("${meta.id}_plddt.tsv")   , emit: multiqc
+-    tuple val(meta), path ("${meta.id}_msa.tsv")     , emit: msa
+-    tuple val(meta), path ("${meta.id}_0_pae.tsv")   , emit: pae
+-    path "versions.yml"                              , emit: versions
+-
++    tuple val(meta), path ("publish/*alphafold3.cif")       , emit: top_ranked_cif
++    tuple val(meta), path ("publish/*ranked_*.cif")         , emit: cif
++    tuple val(meta), path ("${meta.id}_plddt.tsv")          , emit: multiqc
++    tuple val(meta), path ("${meta.id}_alphafold3_msa.tsv") , emit: msa
++    tuple val(meta), path ("${meta.id}_0_pae.tsv")          , emit: pae
++    path "versions.yml"                                     , emit: versions
+     when:
+     task.ext.when == null || task.ext.when
+-
+     script:
+     // Exit if running this module with -profile conda / -profile mamba
+     if (workflow.profile.tokenize(',').intersect(['conda', 'mamba']).size() >= 1) {
+         error("Local RUN_ALPHAFOLD3 module does not support Conda. Please use Docker / Singularity / Podman instead.")
+     }
+-
+     def args   = task.ext.args ?: ''
+     def prefix = task.ext.prefix ?: "${meta.id}"
+     def af3_id = meta.id.toLowerCase()
+@@ -43,7 +37,6 @@ process RUN_ALPHAFOLD3 {
+     then
+         sed -i "/^\\w*0/d" pdb_seqres/pdb_seqres.txt
+     fi
+-
+     python3 /app/alphafold/run_alphafold.py \\
+         --json_path=${json} \\
+         --model_dir=./params \\
+@@ -55,60 +48,44 @@ process RUN_ALPHAFOLD3 {
+         --seqres_database_path=./pdb_seqres/pdb_seqres_2022_09_28.fasta \\
+         --output_dir=\$PWD \\
+         $args
+-
+     ## Rename the top ranked model
+     if [ ! -d publish ]; then
+         mkdir -p publish
+     fi
+-
+     ## Move the rest of the models and rename them according to their rank
+     name=\$(jq -r '.name' ${json})
+-    cp -n "\${name}/\${name}_model.cif" "publish/${prefix}_top_ranked.cif"
+-
++    cp -n "\${name}/\${name}_model.cif" "publish/${prefix}_alphafold3.cif"
+     # Sort the rows by ranking_score in descending order
+     sorted_csv=\$(head -n 1 "\${name}/ranking_scores.csv"; tail -n +2 "\${name}/ranking_scores.csv" | sort -t, -k3 -nr)
+-
+     rank=0
+     touch publish/combined_plddt_mqc.tsv
+-
+     # Generate files with rank tag
+     echo "\$sorted_csv" | tail -n +2 | while IFS=',' read -r seed sample ranking_score; do
+     cp -n "\${name}/seed-\${seed}_sample-\${sample}/model.cif" "publish/seed_\${seed}_sample_\${sample}_ranked_\${rank}.cif"
+     rank=\$((rank + 1))
+     done
+-
+     extract_metrics.py --name ${prefix} \\
+-        --jsons ${af3_id}/${af3_id}_data.json \\
++        --jsons ${af3_id}/${af3_id}_data.json ${af3_id}/${af3_id}_summary_confidences.json ${af3_id}/${af3_id}_confidences.json \\
+         --structs publish/*ranked_*.cif
+-
+-    # Ensure dummy MSA/PAE files exist if not generated
+-    if [ ! -f "${meta.id}_msa.tsv" ]; then
+-        echo "0" > "${meta.id}_msa.tsv"
+-    fi
+-    if [ ! -f "${meta.id}_0_pae.tsv" ]; then
+-        echo "0" > "${meta.id}_0_pae.tsv"
+-    fi
+-
++    mv "${prefix}_msa.tsv" "${meta.id}_alphafold3_msa.tsv"
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+         python: \$(python3 --version | sed 's/Python //g')
+     END_VERSIONS
+     """
+-
+     stub:
+     def prefix = task.ext.prefix ?: "${meta.id}"
+     """
+     mkdir publish
+-    touch publish/${prefix}_top_ranked.cif
++    touch publish/${prefix}_alphafold3.cif
+     touch publish/${prefix}_ranked_1.cif
+     touch publish/${prefix}_ranked_2.cif
+     touch publish/${prefix}_ranked_3.cif
+     touch publish/${prefix}_ranked_4.cif
+     touch publish/${prefix}_ranked_5.cif
+     touch ${prefix}_plddt.tsv
+-    touch ${prefix}_msa.tsv
++    touch ${prefix}_alphafold3_msa.tsv
+     touch ${prefix}_0_pae.tsv
+-
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+         python: \$(python3 --version | sed 's/Python //g')
+diff --git a/tests/alphafold3.nf.test.snap b/tests/alphafold3.nf.test.snap
+index 74046fcaf..4dccffbc2 100644
+--- a/tests/alphafold3.nf.test.snap
++++ b/tests/alphafold3.nf.test.snap
+@@ -4,7 +4,7 @@
+             11,
+             {
+                 "FASTA_TO_ALPHAFOLD3_JSON": {
+-                    "python": "3.13.0"
++                    "python": "3.12.7"
+                 },
+                 "GENERATE_REPORT": {
+                     "python": "3.12.7",
+@@ -26,24 +26,24 @@
+             [
+                 "alphafold3",
+                 "alphafold3/T1024_0_pae.tsv",
+-                "alphafold3/T1024_msa.tsv",
++                "alphafold3/T1024_alphafold3_msa.tsv",
+                 "alphafold3/T1024_plddt.tsv",
+                 "alphafold3/T1026_0_pae.tsv",
+-                "alphafold3/T1026_msa.tsv",
++                "alphafold3/T1026_alphafold3_msa.tsv",
+                 "alphafold3/T1026_plddt.tsv",
+                 "alphafold3/publish",
++                "alphafold3/publish/T1024_alphafold3.cif",
+                 "alphafold3/publish/T1024_ranked_1.cif",
+                 "alphafold3/publish/T1024_ranked_2.cif",
+                 "alphafold3/publish/T1024_ranked_3.cif",
+                 "alphafold3/publish/T1024_ranked_4.cif",
+                 "alphafold3/publish/T1024_ranked_5.cif",
+-                "alphafold3/publish/T1024_top_ranked.cif",
++                "alphafold3/publish/T1026_alphafold3.cif",
+                 "alphafold3/publish/T1026_ranked_1.cif",
+                 "alphafold3/publish/T1026_ranked_2.cif",
+                 "alphafold3/publish/T1026_ranked_3.cif",
+                 "alphafold3/publish/T1026_ranked_4.cif",
+                 "alphafold3/publish/T1026_ranked_5.cif",
+-                "alphafold3/publish/T1026_top_ranked.cif",
+                 "fasta",
+                 "fasta/T1024.json",
+                 "fasta/T1026.json",
+@@ -52,18 +52,18 @@
+                 "generate/test_alphafold2_report.html",
+                 "generate/test_seq_coverage.png",
+                 "mmcif2pdb",
++                "mmcif2pdb/T1024_alphafold3.cif.pdb",
+                 "mmcif2pdb/T1024_ranked_1.cif.pdb",
+                 "mmcif2pdb/T1024_ranked_2.cif.pdb",
+                 "mmcif2pdb/T1024_ranked_3.cif.pdb",
+                 "mmcif2pdb/T1024_ranked_4.cif.pdb",
+                 "mmcif2pdb/T1024_ranked_5.cif.pdb",
+-                "mmcif2pdb/T1024_top_ranked.cif.pdb",
++                "mmcif2pdb/T1026_alphafold3.cif.pdb",
+                 "mmcif2pdb/T1026_ranked_1.cif.pdb",
+                 "mmcif2pdb/T1026_ranked_2.cif.pdb",
+                 "mmcif2pdb/T1026_ranked_3.cif.pdb",
+                 "mmcif2pdb/T1026_ranked_4.cif.pdb",
+                 "mmcif2pdb/T1026_ranked_5.cif.pdb",
+-                "mmcif2pdb/T1026_top_ranked.cif.pdb",
+                 "multiqc",
+                 "multiqc/multiqc_data",
+                 "multiqc/multiqc_plots",
+@@ -73,46 +73,46 @@
+             ],
+             [
+                 "T1024_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1024_alphafold3_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_0_pae.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1026_alphafold3_msa.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_plddt.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1024_alphafold3.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_1.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_2.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_3.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_4.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_5.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_top_ranked.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1026_alphafold3.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_1.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_2.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_3.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_4.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_5.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_top_ranked.cif:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024.json:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026.json:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "test_LDDT.html:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "test_alphafold2_report.html:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "test_seq_coverage.png:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1024_alphafold3.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_1.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_2.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_3.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_4.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1024_ranked_5.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1024_top_ranked.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
++                "T1026_alphafold3.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_1.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_2.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_3.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "T1026_ranked_4.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_ranked_5.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "T1026_top_ranked.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e"
++                "T1026_ranked_5.cif.pdb:md5,d41d8cd98f00b204e9800998ecf8427e"
+             ]
+         ],
+         "meta": {
+             "nf-test": "0.9.2",
+             "nextflow": "25.04.6"
+         },
+-        "timestamp": "2025-08-21T17:54:31.439431078"
++        "timestamp": "2025-09-12T16:29:11.148097114"
+     }
+-}
+\ No newline at end of file
++}

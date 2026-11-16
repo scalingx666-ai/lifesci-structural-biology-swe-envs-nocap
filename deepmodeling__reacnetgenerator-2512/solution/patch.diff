@@ -1,0 +1,607 @@
+diff --git a/docs/guide/index.rst b/docs/guide/index.rst
+index 1cef22dd6..56c847851 100644
+--- a/docs/guide/index.rst
++++ b/docs/guide/index.rst
+@@ -9,6 +9,7 @@ User Guide
+    install
+    format
+    run
++   species
+    report
+    timed-output-schema
+    gui
+diff --git a/docs/guide/species.md b/docs/guide/species.md
+new file mode 100644
+index 000000000..4933d2ac9
+--- /dev/null
++++ b/docs/guide/species.md
+@@ -0,0 +1,52 @@
++# Chemical species identification
++
++By default (`--miso 0`), equivalent Kekulé representations of an aromatic
++molecule have the same species name. For example, shifting the alternating
++single and double bonds in 1-chloro-2-fluorobenzene does not create a second
++species or a reaction between the two representations. Both SMILES and VF2
++identification use the same aromatic bond normalization.
++
++## Normalization policy
++
++ReacNetGenerator uses RDKit's default aromaticity model on a temporary copy of
++the molecular graph. This requires successful valence checking, ring perception,
++kekulization, radical assignment and aromaticity perception. All hydrogens remain
++explicit; missing hydrogens or formal charges are not inferred from the input.
++
++Only the resulting aromatic atom flags and aromatic bond orders are used for
++species identification. Other bond orders, atom identities and connectivity are
++preserved. A bond can carry an aromatic flag while retaining a triple-bond type;
++that type is preserved too. This does not merge tautomers, neutralize charges,
++repair nitro groups or convert metal coordination bonds to dative bonds.
++
++The supported elements are H, B, C, N, O, F, Si, P, S, Cl, As, Se, Br, Te and I,
++with single, double, triple or aromatic bonds. Acyclic structures, molecules
++outside this domain, and structures that fail valence or kekulization checks
++retain their original bond graph and naming behavior. In particular, a transient
++overvalent intermediate or a molecule missing charge information is retained;
++normalization failure does not discard its frames. If SMILES serialization itself
++fails, the existing VF2/`_unknownSMILES` fallback still applies.
++
++The equivalence is limited to aromatic bonds recognized by this RDKit model;
++it is not a general resonance equivalence algorithm. Literal canonical names
++can also differ across RDKit versions or from earlier ReacNetGenerator releases.
++
++## Filtering, merging and trajectory evidence
++
++Normalization happens during species identification, **after HMM filtering**.
++Detection and HMM still operate on the original atom-and-bond records. Signals
++for different Kekulé assignments are not pooled before filtering, so short-lived
++assignments can still be filtered independently. Normalization does not recover
++records already removed by HMM. Use the [HMM guidance](hmm.md) when choosing
++filter parameters.
++
++`--miso 1` additionally ignores all bond orders, while `--miso 2` additionally
++ignores connectivity. These broader merging modes retain their existing meaning;
++they are not needed to merge the supported aromatic representations.
++
++Molecule text/CSV and [timed output](timed-output-schema.md) preserve the original
++atom indices and bond records. Separate molecule instances can therefore share a
++normalized species name/`species_id` while retaining distinct `molecule_id` values
++and different raw bond orders. A switch between equivalent representations does
++not produce a species reaction event; the molecule records and their frame ranges
++remain available as evidence.
+diff --git a/reacnetgenerator/_path.py b/reacnetgenerator/_path.py
+index 890d0846f..da1db4c5f 100644
+--- a/reacnetgenerator/_path.py
++++ b/reacnetgenerator/_path.py
+@@ -37,6 +37,7 @@
+ from tqdm.auto import tqdm
+ 
+ from ._reaction import ReactionsFinder
++from ._species import species_molecule
+ from ._step3state import (
+     _STEP3_SCAN_ROWS,
+     _AtomFrameReader,
+@@ -545,15 +546,7 @@ def convertSMILES(self, atoms, bonds):
+         ValueError
+             (RDKit error) Maximum BFS search size exceeded.
+         """
+-        m = Chem.RWMol(Chem.MolFromSmiles(""))
+-        d = {}
+-        for name, number in zip(self.atomnames[atoms], atoms):
+-            d[number] = m.AddAtom(Chem.Atom(name))
+-        for atom1, atom2, level in bonds:
+-            m.AddBond(d[atom1], d[atom2], Chem.BondType(level))
+-        # https://github.com/rdkit/rdkit/discussions/6613#discussioncomment-6688021
+-        for a in m.GetAtoms():
+-            a.SetNoImplicit(True)
++        m = species_molecule(self.atomnames[atoms], atoms, bonds)
+         name = Chem.MolToSmiles(m)
+         return self._re(name)
+ 
+@@ -923,6 +916,13 @@ def smiles(self, value):
+         self._smiles = value
+ 
+     def _makemoleculegraph(self):
++        """Build a VF2 graph according to the selected isomer equivalence mode.
++
++        Normal mode shares aromatic bond normalization with SMILES conversion
++        and retains raw bond levels if RDKit cannot construct the molecule.
++        The broader modes discard bond orders or connectivity, respectively.
++        Trajectory atom indices and the original bond records are preserved.
++        """
+         if self._miso not in (0, 1, 2):
+             raise ValueError(f"Unknown isomer identification method: {self._miso}.")
+         graph = nx.Graph()
+@@ -938,6 +938,17 @@ def _makemoleculegraph(self):
+                 pass
+         for atomnumber, atomtype in zip(self.atoms, self._atomtypes):
+             graph.add_node(atomnumber, atom=atomtype)
++        if self._miso == 0:
++            try:
++                molecule = species_molecule(self._atomnames, self.atoms, self.bonds)
++            except (ValueError, RuntimeError):
++                # VF2 also supports graphs RDKit cannot construct. Keep the
++                # existing raw-graph fallback when even construction fails.
++                return graph
++            for bond in molecule.GetBonds():
++                atom1 = self.atoms[bond.GetBeginAtomIdx()]
++                atom2 = self.atoms[bond.GetEndAtomIdx()]
++                graph[atom1][atom2]["level"] = int(bond.GetBondType())
+         return graph
+ 
+     def isomorphic(self, mol):
+diff --git a/reacnetgenerator/_species.py b/reacnetgenerator/_species.py
+new file mode 100644
+index 000000000..e918a97a3
+--- /dev/null
++++ b/reacnetgenerator/_species.py
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Build species graphs without changing the underlying trajectory records."""
++
++from rdkit import Chem, rdBase
++
++# Limit perception to ordinary organic chemistry. In particular, a missing
++# metal/ligand charge or coordination bond must not trigger charge/bond cleanup.
++_AROMATIC_ELEMENTS = frozenset((1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 52, 53))
++_AROMATIC_BOND_TYPES = frozenset(
++    (
++        Chem.BondType.SINGLE,
++        Chem.BondType.DOUBLE,
++        Chem.BondType.TRIPLE,
++        Chem.BondType.AROMATIC,
++    )
++)
++_AROMATIC_SANITIZE_OPS = (
++    Chem.SanitizeFlags.SANITIZE_PROPERTIES
++    | Chem.SanitizeFlags.SANITIZE_SYMMRINGS
++    | Chem.SanitizeFlags.SANITIZE_KEKULIZE
++    | Chem.SanitizeFlags.SANITIZE_FINDRADICALS
++    | Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
++)
++
++
++def species_molecule(atomnames, atoms, bonds):
++    """Build a molecule with equivalent Kekule forms sharing aromatic bonds.
++
++    Atom names follow the order of ``atoms``; bond endpoints use trajectory
++    indices. All hydrogens must be explicit. Only aromatic flags and aromatic
++    bond orders are transferred from a successfully validated copy. Charge
++    cleanup, hydrogen adjustment and tautomer enumeration are never requested.
++    Unsupported chemistry or failed perception retains the original graph.
++    """
++    mol = Chem.RWMol()
++    indices = {}
++    for name, number in zip(atomnames, atoms):
++        atom = Chem.Atom(name)
++        # Preserve radicals and missing hydrogens as in the trajectory.
++        atom.SetNoImplicit(True)
++        indices[number] = mol.AddAtom(atom)
++    for atom1, atom2, level in bonds:
++        mol.AddBond(indices[atom1], indices[atom2], Chem.BondType(int(level)))
++
++    # Avoid sanitization/copying for acyclic species, including common small
++    # reactive intermediates. Ring discovery only sets computed properties.
++    Chem.FastFindRings(mol)
++    if not mol.GetRingInfo().NumRings():
++        return mol
++    if any(atom.GetAtomicNum() not in _AROMATIC_ELEMENTS for atom in mol.GetAtoms()):
++        return mol
++    if any(bond.GetBondType() not in _AROMATIC_BOND_TYPES for bond in mol.GetBonds()):
++        return mol
++
++    candidate = Chem.Mol(mol)
++    # A failed sanitization can partially mutate its argument. Discard that
++    # copy, and keep the serializable raw graph instead of losing the record.
++    # Such failures are expected for transient/charge-incomplete MD structures.
++    with rdBase.BlockLogs():
++        failed = Chem.SanitizeMol(
++            candidate, sanitizeOps=_AROMATIC_SANITIZE_OPS, catchErrors=True
++        )
++    if failed:
++        return mol
++    for bond in candidate.GetBonds():
++        if bond.GetIsAromatic():
++            original = mol.GetBondWithIdx(bond.GetIdx())
++            # RDKit can mark an aryne triple bond aromatic while retaining its
++            # triple bond type. The aromatic flag alone does not imply AROMATIC.
++            original.SetBondType(bond.GetBondType())
++            original.SetIsAromatic(True)
++            original.GetBeginAtom().SetIsAromatic(True)
++            original.GetEndAtom().SetIsAromatic(True)
++    return mol
+diff --git a/tests/test_aromatic_species.py b/tests/test_aromatic_species.py
+new file mode 100644
+index 000000000..3f7ec68e3
+--- /dev/null
++++ b/tests/test_aromatic_species.py
+@@ -0,0 +1,390 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Aromatic identity, conservative fallback and trajectory evidence regressions."""
++
++import csv
++from collections import defaultdict
++from pathlib import Path
++
++import numpy as np
++import pytest
++from rdkit import Chem
++
++from reacnetgenerator import ReacNetGenerator
++from reacnetgenerator._detect import _Detect
++from reacnetgenerator._hmmfilter import _HMMFilter
++from reacnetgenerator._matrix import _GenerateMatrix
++from reacnetgenerator._path import Molecule, _CollectPaths, _CollectSMILESPaths
++from reacnetgenerator._species import species_molecule
++from reacnetgenerator.timedoutput import (
++    iter_molecule_ranges,
++    iter_molecules,
++    iter_reaction_events,
++    iter_species,
++    validate_timed_output,
++)
++from reacnetgenerator.tools import read_species
++
++
++def _collector(symbols, miso=0):
++    """Build only the collector state needed for SMILES and VF2 identity checks."""
++    collector = object.__new__(_CollectSMILESPaths)
++    collector.atomnames = np.asarray(symbols)
++    collector.atomname = np.asarray(list(dict.fromkeys(symbols)))
++    collector.atomtype = np.asarray(
++        [list(collector.atomname).index(symbol) for symbol in symbols]
++    )
++    collector.miso = miso
++    collector.n_unknown = 0
++    return collector
++
++
++def _halobenzene(shift=0, position=1):
++    """Return explicit-H 1-chloro-2/3/4-fluorobenzene with either Kekule form."""
++    symbols = ["C"] * 6 + ["F", "Cl"] + ["H"] * 4
++    bonds = [(i, (i + 1) % 6, 2 if (i + shift) % 2 == 0 else 1) for i in range(6)]
++    bonds.extend(((0, 6, 1), (position, 7, 1)))
++    bonds.extend(
++        (atom, hydrogen, 1)
++        for hydrogen, atom in enumerate(
++            (i for i in range(6) if i not in (0, position)), 8
++        )
++    )
++    return symbols, np.asarray(bonds, dtype=int)
++
++
++def _records(molecule):
++    """Export atom symbols and indexed RDKit bond types for identity fixtures."""
++    symbols = [atom.GetSymbol() for atom in molecule.GetAtoms()]
++    bonds = np.asarray(
++        [
++            (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), int(bond.GetBondType()))
++            for bond in molecule.GetBonds()
++        ],
++        dtype=int,
++    )
++    return symbols, bonds
++
++
++def _aryne_bond_change():
++    """Return explicit-H C6H4 graphs differing in one triple/double bond order."""
++    symbols = ["C"] * 6 + ["H"] * 4
++    bonds = [(i, (i + 1) % 6, order) for i, order in enumerate((3, 1, 2, 1, 2, 1))]
++    bonds.extend((i, i + 4, 1) for i in range(2, 6))
++    aryne = np.asarray(bonds, dtype=int)
++    diradical = aryne.copy()
++    diradical[0, 2] = 2
++    return symbols, aryne, diradical
++
++
++def _identity(symbols, bonds):
++    """Return SMILES and VF2 representations built from the same raw records."""
++    collector = _collector(symbols)
++    atoms = np.arange(len(symbols))
++    return collector.convertSMILES(atoms, bonds), Molecule(collector, atoms, bonds)
++
++
++def test_kekule_forms_and_permutations_have_one_identity():
++    """Canonicalization must ignore Kekule choice as well as insertion order."""
++    symbols, first = _halobenzene()
++    _, second = _halobenzene(1)
++    originals = [first.copy(), second.copy()]
++    collector = _collector(symbols)
++    atoms = np.arange(len(symbols))
++    reference = Molecule(collector, atoms, first)
++    names = set()
++    random = np.random.default_rng(2510)
++    for bonds in (first, second):
++        for _ in range(16):
++            atom_order = random.permutation(atoms)
++            bond_order = random.permutation(bonds)
++            names.add(collector.convertSMILES(atom_order, bond_order))
++            assert reference.isomorphic(Molecule(collector, atom_order, bond_order))
++    assert len(names) == 1
++    name = names.pop()
++    assert "[c]" in name
++    np.testing.assert_array_equal(first, originals[0])
++    np.testing.assert_array_equal(second, originals[1])
++
++
++@pytest.mark.parametrize("smiles", ["c1ccc2ccccc2c1", "c1ccncc1", "c1cc[nH]c1"])
++def test_aromatic_and_kekule_input_agree(smiles):
++    """Fused rings and heteroaromatics use the same policy as benzene rings."""
++    molecule = Chem.AddHs(Chem.MolFromSmiles(smiles))
++    symbols, aromatic = _records(molecule)
++    Chem.Kekulize(molecule, clearAromaticFlags=True)
++    _, kekule = _records(molecule)
++    aromatic_name, aromatic_graph = _identity(symbols, aromatic)
++    kekule_name, kekule_graph = _identity(symbols, kekule)
++    assert aromatic_name == kekule_name
++    assert aromatic_graph.isomorphic(kekule_graph)
++
++
++def test_positional_isomers_remain_distinct():
++    """Aromaticity normalization must not erase substituent positions."""
++    identities = [_identity(*_halobenzene(position=position)) for position in (1, 2, 3)]
++    assert len({name for name, _ in identities}) == 3
++    for i, (_, graph) in enumerate(identities):
++        for _, other in identities[i + 1 :]:
++            assert not graph.isomorphic(other)
++
++
++@pytest.mark.parametrize(
++    ("left", "right"),
++    [
++        ("C=C", "[CH2][CH2]"),
++        ("C1=CC=CC=C1", "[CH]1[CH]C=CC=C1"),
++        ("CC=O", "C=CO"),
++        ("[CH3]", "C"),
++    ],
++)
++def test_bond_changes_tautomers_and_radicals_remain_distinct(left, right):
++    """Same formula, genuine bond changes and hydrogen counts remain meaningful."""
++    left_name, left_graph = _identity(*_records(Chem.AddHs(Chem.MolFromSmiles(left))))
++    right_name, right_graph = _identity(
++        *_records(Chem.AddHs(Chem.MolFromSmiles(right)))
++    )
++    assert left_name != right_name
++    assert not left_graph.isomorphic(right_graph)
++
++
++def test_heteroatom_radical_is_not_aromatized():
++    """Perception must account for an N radical before assigning aromaticity."""
++    symbols, bonds = _records(Chem.AddHs(Chem.MolFromSmiles("C1=C[N]C=C1")))
++    molecule = species_molecule(symbols, np.arange(len(symbols)), bonds)
++    assert not any(bond.GetIsAromatic() for bond in molecule.GetBonds())
++
++
++def test_aromatic_flagged_triple_bond_is_preserved():
++    """An aromatic flag must not erase RDKit's retained triple bond type."""
++    symbols, aryne, diradical = _aryne_bond_change()
++    original = aryne.copy()
++    molecule = species_molecule(symbols, np.arange(len(symbols)), aryne)
++    bond = molecule.GetBondBetweenAtoms(0, 1)
++    assert bond.GetIsAromatic()
++    assert bond.GetBondType() == Chem.BondType.TRIPLE
++    aryne_name, aryne_graph = _identity(symbols, aryne)
++    diradical_name, diradical_graph = _identity(symbols, diradical)
++    assert aryne_name != diradical_name
++    assert not aryne_graph.isomorphic(diradical_graph)
++    np.testing.assert_array_equal(aryne, original)
++
++
++@pytest.mark.parametrize("case", ["overvalent", "nitro", "metal", "kekulization"])
++def test_unsupported_chemistry_retains_original_graph(case):
++    """Failed/unsupported perception cannot leak partial changes or add charge."""
++    symbols, original = _halobenzene()
++    bonds = original.tolist()
++    if case == "overvalent":
++        symbols.append("H")
++        bonds.append((0, 12, 1))
++    elif case == "nitro":
++        symbols[6] = "N"
++        symbols.extend(("O", "O"))
++        bonds.extend(((6, 12, 2), (6, 13, 2)))
++    elif case == "metal":
++        symbols[7] = "Cu"
++    else:
++        symbols = ["C"] * 5 + ["H"] * 5
++        bonds = [(i, (i + 1) % 5, 12) for i in range(5)]
++        bonds.extend((i, i + 5, 1) for i in range(5))
++    atoms = np.arange(len(symbols))
++    molecule = species_molecule(symbols, atoms, bonds)
++    assert _records(molecule)[1].tolist() == [list(bond) for bond in bonds]
++    assert all(atom.GetFormalCharge() == 0 for atom in molecule.GetAtoms())
++    assert all(atom.GetNoImplicit() for atom in molecule.GetAtoms())
++    name, graph = _identity(symbols, bonds)
++    assert "_unknownSMILES" not in name
++    assert graph.smiles == name
++    assert [graph.graph[a][b]["level"] for a, b, _ in bonds] == [
++        order for _, _, order in bonds
++    ]
++
++
++def test_smiles_failure_vf2_fallback_recognizes_aromatic_equivalence():
++    """A serialization failure still groups equivalent aromatic graphs."""
++    symbols, first = _halobenzene()
++    _, second = _halobenzene(1)
++    collector = _collector(symbols)
++    atoms = np.arange(len(symbols))
++    molecules = defaultdict(list)
++    names = [
++        collector._resolveSMILESname(None, atoms, bonds, molecules)
++        for bonds in (first, second)
++    ]
++    assert names[0] == names[1]
++    assert "_unknownSMILES_0" in names[0]
++
++
++def _write_bond_trajectory(path, symbols, variants):
++    """Write two 30-frame bond assignments in the ReaxFF bond-file format."""
++    atomnames = list(dict.fromkeys(symbols))
++    with path.open("w") as handle:
++        for frame in range(60):
++            bonds = variants[frame // 30]
++            adjacency = [[] for _ in symbols]
++            for atom1, atom2, order in bonds:
++                adjacency[atom1].append((atom2, order))
++                adjacency[atom2].append((atom1, order))
++            handle.write(
++                f"# Timestep {frame}\n#\n# Number of particles {len(symbols)}\n#\n"
++                "# Max number of bonds per atom 3 with coarse bond order cutoff 0.300\n"
++                "# Particle connection table and bond orders\n"
++                "# id type nb id_1...id_nb mol bo_1...bo_nb abo nlp q\n"
++            )
++            for i, (symbol, neighbors) in enumerate(zip(symbols, adjacency)):
++                row = [
++                    i + 1,
++                    atomnames.index(symbol) + 1,
++                    len(neighbors),
++                    *(atom + 1 for atom, _ in neighbors),
++                    1,
++                    *(order for _, order in neighbors),
++                    sum(order for _, order in neighbors),
++                    0,
++                    0,
++                ]
++                handle.write(" ".join(map(str, row)) + "\n")
++            handle.write("#\n")
++    return atomnames
++
++
++def _bond_set(bonds):
++    """Canonicalize endpoint order when comparing retained raw bond records."""
++    return frozenset((min(a, b), max(a, b), order) for a, b, order in bonds)
++
++
++@pytest.mark.parametrize("smiles", [True, False])
++@pytest.mark.parametrize("run_hmm", [True, False])
++@pytest.mark.parametrize("miso", [0, 1, 2])
++def test_kekule_switch_preserves_evidence_without_reaction(
++    tmp_path, smiles, run_hmm, miso
++):
++    """The real pipeline uses one species ID and retains both raw bond records."""
++    symbols, first = _halobenzene()
++    _, second = _halobenzene(1)
++    source = tmp_path / "kekule.bond"
++    atomnames = _write_bond_trajectory(source, symbols, (first, second))
++    timeline = tmp_path / "timeline.h5"
++    rng = ReacNetGenerator(
++        inputfilename=str(source),
++        inputfiletype="bond",
++        atomname=atomnames,
++        nproc=2,
++        runHMM=run_hmm,
++        SMILES=smiles,
++        miso=miso,
++        output_dir=tmp_path,
++        printreactionevent=True,
++        printmoleculetime=True,
++        needprintspecies=True,
++        timed_output=timeline,
++    )
++    try:
++        _Detect.gettype(rng).detect()
++        _HMMFilter(rng).filter()
++        _CollectPaths.getstype(rng).collect()
++        _GenerateMatrix(rng).generate()
++        assert rng.hmmit == 2
++        assert len(set(rng.mname)) == 1
++        assert Path(rng.reactionabcdfilename).read_text() == ""
++        assert Path(rng.reactionfilename).read_text() == ""
++        _, species_counts = read_species(rng.speciesfilename)
++        assert set(species_counts) == set(rng.mname)
++        np.testing.assert_array_equal(next(iter(species_counts.values())), np.ones(60))
++        with open(rng.reactioneventfilename, newline="") as handle:
++            assert list(csv.DictReader(handle)) == []
++        with open(rng.moleculetimelinefilename, newline="") as handle:
++            rows = list(csv.DictReader(handle))
++        assert len(rows) == 60
++        assert len({row["Species"] for row in rows}) == 1
++        assert len({row["BondIDs"] for row in rows}) == 2
++        assert len({row["AtomIDs"] for row in rows}) == 1
++
++        validate_timed_output(timeline)
++        assert len(list(iter_species(timeline))) == 1
++        molecules = list(iter_molecules(timeline))
++        assert len(molecules) == 2
++        assert {molecule.species_id for molecule in molecules} == {0}
++        assert {_bond_set(molecule.bonds) for molecule in molecules} == {
++            _bond_set(first),
++            _bond_set(second),
++        }
++        assert [
++            (row.start_frame, row.end_frame) for row in iter_molecule_ranges(timeline)
++        ] == [(0, 29), (30, 59)]
++        assert list(iter_reaction_events(timeline)) == []
++    finally:
++        for key in (
++            "moleculetempfilename",
++            "moleculetemp2filename",
++            "originfilename",
++            "hmmfilename",
++        ):
++            filename = getattr(rng, key, None)
++            if filename is not None:
++                Path(filename).unlink(missing_ok=True)
++
++
++@pytest.mark.parametrize("smiles", [True, False])
++@pytest.mark.parametrize("run_hmm", [True, False])
++def test_aromatic_triple_bond_change_retains_reaction(tmp_path, smiles, run_hmm):
++    """Keep the bond-order transition in species IDs and all reaction outputs."""
++    symbols, aryne, diradical = _aryne_bond_change()
++    source = tmp_path / "aryne.bond"
++    atomnames = _write_bond_trajectory(source, symbols, (aryne, diradical))
++    timeline = tmp_path / "timeline.h5"
++    rng = ReacNetGenerator(
++        inputfilename=str(source),
++        inputfiletype="bond",
++        atomname=atomnames,
++        nproc=1,
++        runHMM=run_hmm,
++        SMILES=smiles,
++        miso=0,
++        output_dir=tmp_path,
++        printreactionevent=True,
++        timed_output=timeline,
++    )
++    try:
++        _Detect.gettype(rng).detect()
++        _HMMFilter(rng).filter()
++        _CollectPaths.getstype(rng).collect()
++        _GenerateMatrix(rng).generate()
++        assert rng.hmmit == 2
++        assert len(set(rng.mname)) == 2
++        with open(rng.reactioneventfilename, newline="") as handle:
++            csv_events = list(csv.DictReader(handle))
++        assert len(csv_events) == 1
++        event = csv_events[0]
++        assert int(event["Timestep_Index"]) == 29
++        assert event["Reactant"] != event["Product"]
++        expected_reaction = f"1 {event['Reactant']}->{event['Product']}"
++        for filename in (rng.reactionabcdfilename, rng.reactionfilename):
++            assert Path(filename).read_text().splitlines() == [expected_reaction]
++
++        validate_timed_output(timeline)
++        assert len(list(iter_species(timeline))) == 2
++        molecules = list(iter_molecules(timeline))
++        assert len(molecules) == 2
++        assert len({molecule.species_id for molecule in molecules}) == 2
++        assert {_bond_set(molecule.bonds) for molecule in molecules} == {
++            _bond_set(aryne),
++            _bond_set(diradical),
++        }
++        assert [
++            (row.start_frame, row.end_frame) for row in iter_molecule_ranges(timeline)
++        ] == [(0, 29), (30, 59)]
++        hdf5_events = list(iter_reaction_events(timeline))
++        assert len(hdf5_events) == 1
++        assert hdf5_events[0].transition == 29
++        assert hdf5_events[0].count == 1
++    finally:
++        for key in (
++            "moleculetempfilename",
++            "moleculetemp2filename",
++            "originfilename",
++            "hmmfilename",
++        ):
++            filename = getattr(rng, key, None)
++            if filename is not None:
++                Path(filename).unlink(missing_ok=True)

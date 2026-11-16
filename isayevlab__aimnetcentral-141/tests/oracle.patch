@@ -1,0 +1,260 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 765c777..a64bab7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -41,7 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Compiled inference now always requests a full graph. Passing `compile_kwargs={"fullgraph": False}` is rejected so graph breaks cannot silently weaken the requested compilation path.
+ - Hessian and Hessian-vector-product requests continue to use the original eager AIMNet2 module when compiled inference is enabled; `_compiled_forward` is only a callable referencing that same module and never replaces the model or duplicates its parameters.
+ - **BREAKING:** `peratom_loss_fn` now computes mean squared error over real atoms (`numbers != 0`) in every neighbor mode. This makes padded mode 0 use the same per-atom normalization as modes 1 and 2. Mode-1 atom counts now ignore the final dummy atom and produce one count per molecule, and a dummy with its own molecule-index bucket is folded into the last molecule, so eager and compiled reductions agree. Because the default loader pads nearly every batch, the force loss is about 3-5x larger than before on padded batches (the old formula divided by 3N) and per-atom charge losses 1-1.6x; divide the forces weight by about 3 to reproduce the old effective weighting. The loss is now computed as a masked sum without a device-to-host sync.
+-- Training steps with a non-finite loss or gradient are now skipped on every rank (no optimizer step), counted in `engine.state.skipped_steps`, and logged; `TerminateOnNan` keeps its end-of-epoch behavior. The check is one fused device-side reduction with a single host sync per step.
++- Training steps with a non-finite loss or gradient are now skipped on every rank (no optimizer step), counted in `engine.state.skipped_steps` (also logged to wandb as `train/skipped_steps`, with the skipped step's NaN left out of the loss curve), and logged; `TerminateOnNan` keeps its end-of-epoch behavior. The check is one fused device-side reduction with a single host sync per step.
+ - Requesting `compile_model=True` for a legacy TorchScript `.jpt` model now raises immediately. Legacy models remain usable without compilation rather than silently accepting an unused compile option.
+ - **BREAKING:** Added canonical global packed mode 2 for batched sparse neighbor matrices. `(B, N, M)` neighbor matrices now carry global atom indices `b * N + j` with the sentinel `B * N`, every system must reserve its final atom slot as a dummy (`numbers[:, -1] == 0`), and full-3D periodic inputs must supply aligned integral lattice shifts of shape `(B, N, M, 3)`. Legacy 3D matrices with per-system local indices are rejected on every entry path; convert them with `aimnet.nbops.convert_mode2_local_to_global`. The converter does not add the dummy row, so a caller whose padded capacity was exactly filled must first extend `coord`, `numbers`, and every neighbor matrix by one padded slot. Inputs are validated before any kernel runs (index bounds, per-system ownership, packed sentinel tails, shift alignment, finite coordinates, non-singular cells): once per plain evaluation, with a Hessian request on a batch validating the batch before the split and each subsystem once more, and a standalone model validating every call; the check traces under `torch.compile` without graph breaks, and a violation surfaces on CUDA and in compiled code as a device-side assertion (`RuntimeError`), on eager CPU as `ValueError`. Ewald estimates its splitting parameter and k-space cutoff per system and PME one parameter set per batch, both from the real atoms only, so a mode-2 energy matches the flat evaluation to rounding whatever the padding width, and a system made of dummy rows only contributes zero energy without influencing the others, provided it carries a non-singular cell (copy a real one into padded slots; a zero cell has no reciprocal lattice). A batch in which every system is dummy rows only is rejected, matching the flat path. A single `(3, 3)` or `(1, 3, 3)` cell shared by a batch is broadcast to every system, like a `(3,)` `pbc`; the pure-torch ConvSV fallback masks the features it gathers for excluded neighbor slots instead of relying on a pre-masked geometry tensor. Because mode-2 callers supply the neighbor lists, `nbmat_coulomb` must be built at the Ewald/PME real-space cutoff. The declared cutoff is checked against that estimate for whichever list the Coulomb sum resolved to, and a warning is raised when it is shorter or when no cutoff was declared at all; reusing the model's short-range list instead costs of order 1 eV and 0.1 eV/A in forces for a condensed-phase cell. The calculator accepts the additional optional keys `nbmat_coulomb`, `nbmat_dftd3`, `shifts_coulomb`, `shifts_dftd3`, `cutoff_lr`, `cutoff_coulomb`, and `cutoff_dftd3`. See the calculator docs section "Batched sparse neighbor matrices (mode 2)" for the contract and migration steps.
+ - Migrated PME to the nvalchemiops energy+autograd API, completing the Ewald migration from #105 (fixes #106). PME inference forces/stress, force/stress training, dense Hessians, and HVPs now all flow through the calculator's total-energy autograd; the legacy explicit-terms path, the local `_PeriodicCoulombFunction` training wrapper, and the fixed-charge finite-difference Hessian/HVP helpers are removed. PME Hessians and HVPs are now **relaxed-charge** (they include the `d^2E/(dq.dr)` charge-response coupling), the same contract as DSF and Ewald — Ewald and PME are now directly comparable for vibrational analysis, while DSF still differs by its shifted-force truncation near the cutoff; values shift slightly against the former fixed-charge FD Hessians. The dense PME Hessian (`eval(..., hessian=True)`) is now returned in the force dtype (typically float32, matching Ewald since #105) instead of the FD block's float64; `hessian_vector_product` keeps its documented float64 return for periodic backends. `ExternalDerivativeTerms` loses its `hessian` field (no producer remains); external code constructing or reading it must drop the field. The `nvalchemi-toolkit-ops` floor moves from 0.4.0 to 0.4.1: on 0.4.0 an upstream composed-graph charge-gradient bug corrupts PME train-mode forces on the energy-graph route (max error 4.5 eV/A, 100% of force elements, on the tests/data spiro crystal; 0.4.1 is clean at the 1e-6 GPU noise floor), so selecting PME now raises `RuntimeError` on 0.4.0 — the pyproject pin alone would not protect already-installed environments from silent force corruption. This also retires the last upstream `DeprecationWarning` from the deprecated direct-output flags.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index cc14551..54f349a 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -1633,8 +1633,10 @@ def _broadcast_per_system(data: dict[str, Tensor], n_systems: int) -> None:
+         """Expand a shared scalar ``charge``/``mult`` to one entry per system.
+ 
+         Compiled inference sizes per-molecule reductions from ``charge``'s
+-        length, so every system needs its own entry. ``expand`` keeps any
+-        caller autograd link on the shared value.
++        length, so every system needs its own entry. ``repeat`` keeps any
++        caller autograd link on the shared value and gives contiguous
++        storage: a stride-0 ``expand`` view would change the compiled input
++        metadata and cost one extra graph.
+         """
+         for key in ("charge", "mult"):
+             value = data.get(key)
+@@ -1645,7 +1647,7 @@ def _broadcast_per_system(data: dict[str, Tensor], n_systems: int) -> None:
+                     f"'{key}' has {value.shape[0]} entries for {n_systems} systems; "
+                     "pass one value per system or a single shared value."
+                 )
+-            data[key] = value.expand(n_systems)
++            data[key] = value.repeat(n_systems)
+ 
+     def mol_flatten(self, data: dict[str, Tensor], *, hessian: bool = False) -> dict[str, Tensor]:
+         """Flatten the input data for multiple molecules.
+diff --git a/aimnet/nbops.py b/aimnet/nbops.py
+index 20b743f..a9b46e1 100644
+--- a/aimnet/nbops.py
++++ b/aimnet/nbops.py
+@@ -502,8 +502,10 @@ def calc_masks(data: dict[str, Tensor]) -> dict[str, Tensor]:
+             n_mol = data["charge"].shape[0]
+         else:
+             # Count molecules from mol_idx, ignoring the trailing dummy, so a
+-            # scalar charge shared by several molecules keeps working. The
+-            # host read costs the same sync bincount paid before.
++            # scalar charge shared by several molecules keeps working. This
++            # costs one host sync, no more than torch.bincount (which reads
++            # the max on the host to size its output). charge.shape[0] would
++            # avoid the sync but is wrong for a shared scalar charge.
+             n_mol = int(real_idx.max().item()) + 1 if real_idx.numel() > 0 else 1
+         # The dummy may carry its own bucket index (mol_idx[-1] == n_mol).
+         # Fold it into the last molecule so eager and compiled reductions
+diff --git a/aimnet/train/train.py b/aimnet/train/train.py
+index e301eb2..4c1134c 100644
+--- a/aimnet/train/train.py
++++ b/aimnet/train/train.py
+@@ -139,8 +139,6 @@ def run(local_rank, world_size, model_cfg, train_cfg, load, save):
+ 
+     # data loaders
+     train_loader, val_loader = utils.get_loaders(train_cfg.data)
+-    if needs_stress_runner:
+-        utils.check_stress_loader(train_loader)
+ 
+     # optimizer, scheduler, etc
+     model = utils.set_trainable_parameters(
+@@ -159,6 +157,8 @@ def run(local_rank, world_size, model_cfg, train_cfg, load, save):
+ 
+     # ignite engine
+     trainer, validator = utils.build_engine(model, optimizer, scheduler, loss, metrics, train_cfg, val_loader)
++    if needs_stress_runner:
++        utils.attach_stress_batch_check(trainer)
+ 
+     if local_rank == 0 and train_cfg.wandb is not None:
+         utils.setup_wandb(train_cfg, model_cfg, model, trainer, validator, optimizer)
+diff --git a/aimnet/train/utils.py b/aimnet/train/utils.py
+index be6a589..72fcfb5 100644
+--- a/aimnet/train/utils.py
++++ b/aimnet/train/utils.py
+@@ -1,5 +1,6 @@
+ import inspect
+ import logging
++import math
+ import re
+ from collections.abc import Callable
+ 
+@@ -552,22 +553,27 @@ def build_compiled_training_runner(
+     return _CompiledTrainingRunner(unwrap_module(model), target_keys, compile_training=compile_training)
+ 
+ 
+-def check_stress_loader(loader) -> None:
+-    """Fail before training when the loader cannot feed stress targets.
++def attach_stress_batch_check(trainer: Engine) -> None:
++    """Fail at the first training batch when the loader cannot feed stress targets.
+ 
+     Stress needs explicit mode-1 or mode-2 neighbor topology, a cell, and
+     aligned shifts. The built-in SizeGroupedDataset yields dense mode-0
+-    batches, so without this check the run fails only at its first step.
++    batches. The check reads the batch the trainer already fetched, so it
++    starts no extra loader iterator, and runs before the first step.
+     """
+-    x, _ = next(iter(loader))
+-    try:
+-        _CompiledTrainingRunner(nn.Identity(), ("stress",))._validate_stress_input(x)
+-    except ValueError as error:
+-        raise ValueError(
+-            f"{error} The built-in SizeGroupedDataset loader produces dense mode-0 batches without "
+-            "neighbor lists; stress training needs a custom dataset (data.datasets.train) that "
+-            "supplies mode-1 or mode-2 nbmat, matching shifts, and cell. See docs/train.md."
+-        ) from error
++
++    def _check(engine: Engine) -> None:
++        x, _ = engine.state.batch  # type: ignore[misc]
++        try:
++            _CompiledTrainingRunner(nn.Identity(), ("stress",))._validate_stress_input(x)
++        except ValueError as error:
++            raise ValueError(
++                f"{error} The built-in SizeGroupedDataset loader produces dense mode-0 batches without "
++                "neighbor lists; stress training needs a custom dataset (data.datasets.train) that "
++                "supplies mode-1 or mode-2 nbmat, matching shifts, and cell. See docs/train.md."
++            ) from error
++
++    trainer.add_event_handler(Events.ITERATION_STARTED(once=1), _check)
+ 
+ 
+ def _eager_derivative_predictions(
+@@ -786,6 +792,14 @@ def log_loss_weights(engine):
+     return trainer, validator
+ 
+ 
++def _wandb_train_output(loss: float, skipped_steps: int | None) -> dict[str, float]:
++    """Train metrics for wandb; a skipped step's NaN loss is left out of the loss curve."""
++    output: dict[str, float] = {"loss": loss} if math.isfinite(loss) else {}
++    if skipped_steps is not None:
++        output["skipped_steps"] = skipped_steps
++    return output
++
++
+ def setup_wandb(cfg, model_cfg, model, trainer, validator, optimizer):
+     import wandb
+     from ignite.handlers import WandBLogger, global_step_from_engine
+@@ -801,7 +815,7 @@ def setup_wandb(cfg, model_cfg, model, trainer, validator, optimizer):
+     wandb_logger.attach_output_handler(
+         trainer,
+         event_name=Events.ITERATION_COMPLETED(every=200),
+-        output_transform=lambda loss: {"loss": loss},
++        output_transform=lambda loss: _wandb_train_output(loss, getattr(trainer.state, "skipped_steps", None)),
+         tag="train",
+     )
+     wandb_logger.attach_output_handler(
+diff --git a/scripts/gpu_validate.sh b/scripts/gpu_validate.sh
+index d9720e9..61f904a 100755
+--- a/scripts/gpu_validate.sh
++++ b/scripts/gpu_validate.sh
+@@ -79,6 +79,7 @@ for V in $TORCH_VERSIONS; do
+         echo "  install FAILED for torch $V"
+         _set_status "$V" install fail
+         _set_status "$V" gpu_suite skipped
++        _set_status "$V" cpu_compile skipped
+         continue
+     fi
+ 
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index d6c58ea..8cc84c0 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -2880,6 +2880,14 @@ def test_broadcast_per_system_expands_charge_and_mult_and_keeps_grad():
+     assert same["charge"].shape == (3,)
+ 
+ 
++def test_broadcast_per_system_gives_contiguous_storage():
++    """A stride-0 view would change compiled input metadata and cost a recompile."""
++    data = {"charge": torch.zeros(1), "mult": torch.ones(1)}
++    AIMNet2Calculator._broadcast_per_system(data, 3)
++    for key in ("charge", "mult"):
++        assert data[key].is_contiguous() and data[key].stride() == (1,)
++
++
+ def test_mol_flatten_explicit_mode2_broadcasts_scalar_charge():
+     calc = AIMNet2Calculator("aimnet2", device="cpu")
+     data = {
+diff --git a/tests/test_train_utils.py b/tests/test_train_utils.py
+index 0256ce6..70b54c6 100644
+--- a/tests/test_train_utils.py
++++ b/tests/test_train_utils.py
+@@ -1545,10 +1545,37 @@ def test_peratom_loss_has_no_host_sync_on_cuda():
+     torch.testing.assert_close(actual, expected)
+ 
+ 
+-def test_check_stress_loader_rejects_dense_batches_with_guidance():
++def test_stress_batch_check_rejects_dense_batches_with_guidance():
+     pytest.importorskip("ignite")
+     torch = pytest.importorskip("torch")
+-    from aimnet.train.utils import check_stress_loader
++    from ignite.engine import Engine
++
++    from aimnet.train.utils import attach_stress_batch_check
++
++    class CountingLoader:
++        """Counts iterator starts: a second one would spawn loader workers again."""
++
++        def __init__(self, batches):
++            self.batches = batches
++            self.iterations = 0
++
++        def __iter__(self):
++            self.iterations += 1
++            return iter(self.batches)
++
++        def __len__(self):
++            return len(self.batches)
++
++    def run(x):
++        steps = []
++        trainer = Engine(lambda engine, batch: steps.append(batch))
++        attach_stress_batch_check(trainer)
++        loader = CountingLoader([(x, {"stress": torch.zeros(1, 3, 3)})])
++        try:
++            trainer.run(loader, max_epochs=1)
++        finally:
++            assert loader.iterations == 1
++        return steps
+ 
+     dense = {
+         "coord": torch.randn(1, 2, 3),
+@@ -1557,7 +1584,7 @@ def test_check_stress_loader_rejects_dense_batches_with_guidance():
+         "cell": torch.eye(3),
+     }
+     with pytest.raises(ValueError, match="custom dataset"):
+-        check_stress_loader([(dense, {"stress": torch.zeros(1, 3, 3)})])
++        run(dense)
+ 
+     packed = {
+         "coord": torch.randn(3, 3),
+@@ -1568,7 +1595,7 @@ def test_check_stress_loader_rejects_dense_batches_with_guidance():
+         "shifts": torch.zeros(3, 1, 3),
+         "cell": torch.eye(3),
+     }
+-    check_stress_loader([(packed, {"stress": torch.zeros(1, 3, 3)})])
++    assert len(run(packed)) == 1
+ 
+ 
+ def test_skipped_step_reports_nan_on_every_rank():
+@@ -1608,3 +1635,13 @@ def test_peratom_loss_ignores_nonfinite_values_in_padded_slots():
+     true[0, -1] = float("inf")
+     actual = peratom_loss_fn({"forces": pred, "numbers": numbers}, {"forces": true}, "forces", "forces")
+     torch.testing.assert_close(actual, torch.tensor(1.0))
++
++
++def test_wandb_train_output_drops_skipped_step_loss():
++    pytest.importorskip("ignite")
++    from aimnet.train.utils import _wandb_train_output
++
++    assert _wandb_train_output(0.25, None) == {"loss": 0.25}
++    assert _wandb_train_output(float("nan"), None) == {}
++    assert _wandb_train_output(float("inf"), 3) == {"skipped_steps": 3}
++    assert _wandb_train_output(0.25, 3) == {"loss": 0.25, "skipped_steps": 3}

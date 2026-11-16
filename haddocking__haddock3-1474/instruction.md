@@ -1,0 +1,36 @@
+# Issue
+
+**Title:** tidy before splitting input with `MODEL` record
+
+## Description
+
+You are about to submit a new Pull Request. Before continuing make sure you read the [contributing guidelines](CONTRIBUTING.md).
+
+## Checklist
+
+- [x] Tests added for the new code
+- [x] Documentation added for the code changes
+- [ ] Modifications / enhancements are reflected on the [haddock3 user-manual](https://github.com/haddocking/haddock3-user-manual)
+- [ ] `CHANGELOG.md` is updated to incorporate new changes
+- [x] Does not break licensing
+- [x] Does not add any dependencies, if it does please add a thorough explanation
+
+## Summary of the Pull Request  
+<!-- Describe what changes were made to the code, what was added, removed, etc. -->
+
+Here we are using `pdb-tools` specifically `splitmodel` - this function only writes atom lines to disk when it encounters ENDMDL. So if the input has `MODEL` but no `ENDMDL` our wrapper will create an empty output file, which will then be passed ahead and raise a `SetupError`.
+
+This PR fixes this by running `tidy` before splitting the models.
+
+## Related Issue
+<!-- If this PR is related to an issue, please link it here -->
+<!-- If this PR is related to the haddock3 user manual, please link the PR here -->
+
+#1470 
+
+## Additional Info
+<!-- Any additional information that might be helpful, if applicable -->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `13016fde5282`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

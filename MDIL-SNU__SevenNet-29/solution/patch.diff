@@ -1,0 +1,310 @@
+diff --git a/sevenn/model_build.py b/sevenn/model_build.py
+index 8b46bc17..f1bb00c9 100644
+--- a/sevenn/model_build.py
++++ b/sevenn/model_build.py
+@@ -421,7 +421,8 @@ def build_E3_equivariant_model(model_config: dict, parallel=False):
+         layers.update({'force output': gradient_module})
+ 
+     # output extraction part
++    type_map = model_config[KEY.TYPE_MAP]
+     if parallel:
+-        return [AtomGraphSequential(v) for v in layers_list]
++        return [AtomGraphSequential(v, cutoff, type_map) for v in layers_list]
+     else:
+-        return AtomGraphSequential(layers)
++        return AtomGraphSequential(layers, cutoff, type_map)
+diff --git a/sevenn/nn/sequential.py b/sevenn/nn/sequential.py
+index 0f5ce8dd..2fa1c5ed 100644
+--- a/sevenn/nn/sequential.py
++++ b/sevenn/nn/sequential.py
+@@ -1,6 +1,7 @@
+ from collections import OrderedDict
+ from typing import Dict
+ 
++import torch
+ import torch.nn as nn
+ from e3nn.util.jit import compile_mode
+ 
+@@ -16,9 +17,16 @@ class AtomGraphSequential(nn.Sequential):
+     https://github.com/pytorch/pytorch/issues/52588
+     """
+ 
+-    def __init__(self, modules: Dict[str, nn.Module]):
++    def __init__(
++        self,
++        modules: Dict[str, nn.Module],
++        cutoff: float,
++        type_map: Dict[int, int]
++    ):
+         if type(modules) != OrderedDict:
+             modules = OrderedDict(modules)
++        self.cutoff = cutoff
++        self.type_map = type_map
+         super().__init__(modules)
+ 
+     def set_is_batch_data(self, flag: bool):
+@@ -51,7 +59,24 @@ def delete_module_by_key(self, key: str):
+         if key in self._modules.keys():
+             del self._modules[key]
+ 
++    def to_onehot_idx(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        """
++        User must call this function first before the forward
++        if the data is not one-hot encoded
++        """
++        if self.type_map is None:
++            raise ValueError("type_map is not set")
++        device = data[KEY.NODE_FEATURE].device
++        data[KEY.NODE_FEATURE] = torch.LongTensor(
++            [self.type_map[z.item()] for z in data[KEY.NODE_FEATURE]]
++        ).to(device)
++
++        return data
++
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        """
++        type_map is a dict of {atomic_number: one_hot_idx}
++        """
+         for module in self:
+             data = module(data)
+         return data
+diff --git a/sevenn/sevennet_calculator.py b/sevenn/sevennet_calculator.py
+new file mode 100644
+index 00000000..5fc286f9
+--- /dev/null
++++ b/sevenn/sevennet_calculator.py
+@@ -0,0 +1,87 @@
++import os
++from typing import List, Union
++
++import numpy as np
++import torch
++from ase.calculators.calculator import Calculator, all_changes
++
++import sevenn.util
++from sevenn.nn.sequential import AtomGraphSequential
++import sevenn._keys as KEY
++
++
++class SevenNetCalculator(Calculator):
++    """ASE calculator for SevenNet models
++
++    Multi-GPU parallel MD is not supported for this mode.
++    Use LAMMPS for multi-GPU parallel MD.
++    This class is for convenience who want to run SevenNet models with ase.
++
++    Note than ASE calculator is designed to be interface of other programs.
++    But in this class, we simply run torch model inside ASE calculator.
++    So there is no FileIO things.
++    """
++
++    def __init__(
++        self,
++        model: Union[AtomGraphSequential, str] = "SevenNet-0",
++        device: Union[torch.device, str] = "cuda",
++        sevennet_config=None,
++        **kwargs
++    ):
++        """Initialize the calculator
++
++        Args:
++            model (SevenNet): AtomGraphSequential or path to the checkpoint file.
++            device (str, optional): Torch device to use. Defaults to "cuda".
++        """
++        super().__init__(**kwargs)
++
++        if not isinstance(model, AtomGraphSequential) and not isinstance(model, str):
++            raise ValueError("model must be an instance of AtomGraphSequential or str.")
++        if isinstance(model, str):
++            # TODO: Download it from internet
++            if model == "SevenNet-0":  # special case loading pre-trained model
++                checkpoint = os.path.join(
++                    os.path.dirname(__file__),
++                    "../SevenNet_0/checkpoint_sevennet_0.pth"
++                )
++            else:
++                checkpoint = model
++            model, config = sevenn.util.model_from_checkpoint(checkpoint)
++        else:
++            if model._use_type_map is False and model.type_map is None:
++                raise ValueError("model must have a type_map")
++            model.set_use_type_map(True)
++        self.sevennet_config = sevennet_config  # metadata which can be None
++        self.cutoff = model.cutoff
++        self.model = model
++
++        if not isinstance(device, torch.device) and not isinstance(device, str):
++            raise ValueError("device must be an instance of torch.device or str.")
++        if isinstance(device, str):
++            self.device = torch.device(device)
++        else:
++            self.device = device
++
++        self.model.to(self.device)
++        self.model.eval()
++        self.model.set_is_batch_data(False)
++
++        self.implemented_properties = ['energy', 'forces', 'stress']
++
++    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
++        # call parent class to set necessary atom attributes
++        Calculator.calculate(self, atoms, properties, system_changes)
++        data = sevenn.util.unlabeled_atoms_to_input(atoms, self.cutoff)
++        data = self.model.to_onehot_idx(data)
++        data.to(self.device)
++
++        output = self.model(data)
++
++        # Store results
++        self.results = {
++            'energy': output[KEY.PRED_TOTAL_ENERGY].detach().cpu().item(),
++            'forces': output[KEY.PRED_FORCE].detach().cpu().numpy(),
++            'stress': output[KEY.PRED_STRESS].detach().cpu().numpy()
++        }
+diff --git a/sevenn/train/dataload.py b/sevenn/train/dataload.py
+index 75fc5cd2..759f471b 100644
+--- a/sevenn/train/dataload.py
++++ b/sevenn/train/dataload.py
+@@ -26,6 +26,45 @@
+ from sevenn.atom_graph_data import AtomGraphData
+ from sevenn.train.dataset import AtomGraphDataset
+ 
++def unlabeled_atoms_to_graph(atoms: ase.Atoms, cutoff: float):
++    pos = atoms.get_positions()
++    cell = np.array(atoms.get_cell())
++
++    # building neighbor list
++    edge_src, edge_dst, edge_vec, shifts = primitive_neighbor_list(
++        'ijDS', atoms.get_pbc(), cell, pos, cutoff, self_interaction=True
++    )
++
++    # remove redundant edges (self interaction) but saves self interaction cross PBC
++    is_zero_idx = np.all(edge_vec == 0, axis=1)
++    is_self_idx = edge_src == edge_dst
++    non_trivials = ~(is_zero_idx & is_self_idx)
++    cell_shift = np.array(shifts[non_trivials])
++
++    edge_vec = edge_vec[non_trivials]
++    edge_src = edge_src[non_trivials]
++    edge_dst = edge_dst[non_trivials]
++    edge_idx = np.array([edge_src, edge_dst])
++
++    atomic_numbers = atoms.get_atomic_numbers()
++
++    cell = np.array(cell)
++
++    data = {
++        KEY.NODE_FEATURE: atomic_numbers,
++        KEY.ATOMIC_NUMBERS: atomic_numbers,
++        KEY.POS: pos,
++        KEY.EDGE_IDX: edge_idx,
++        KEY.EDGE_VEC: edge_vec,
++        KEY.CELL: cell,
++        KEY.CELL_SHIFT: cell_shift,
++        KEY.CELL_VOLUME: np.einsum(
++            'i,i', cell[0, :], np.cross(cell[1, :], cell[2, :])
++        ),
++        KEY.NUM_ATOMS: len(atomic_numbers),
++    }
++    data[KEY.INFO] = {}
++    return data
+ 
+ def atoms_to_graph(
+     atoms: ase.Atoms, cutoff: float, transfer_info: bool = True
+diff --git a/sevenn/util.py b/sevenn/util.py
+index 1fe72f9a..5bae4c8a 100644
+--- a/sevenn/util.py
++++ b/sevenn/util.py
+@@ -1,6 +1,9 @@
+ import numpy as np
+ import torch
++from torch_geometric.loader import DataLoader
+ 
++from sevenn.atom_graph_data import AtomGraphData
++import sevenn.train.dataload
+ import sevenn._keys as KEY
+ 
+ 
+@@ -136,7 +139,7 @@ def onehot_to_chem(one_hot_indicies, type_map):
+     return [chemical_symbols[type_map_rev[x]] for x in one_hot_indicies]
+ 
+ 
+-def load_model_from_checkpoint(checkpoint):
++def model_from_checkpoint(checkpoint):
+     from sevenn._const import (
+         DEFAULT_DATA_CONFIG,
+         DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG,
+@@ -173,10 +176,18 @@ def load_model_from_checkpoint(checkpoint):
+             config[k] = v.cpu()
+ 
+     model = build_E3_equivariant_model(config)
+-
+     model.load_state_dict(model_state_dict, strict=False)
+ 
+-    return model
++    return model, config
++
++
++def unlabeled_atoms_to_input(atoms, cutoff):
++    atom_graph = AtomGraphData.from_numpy_dict(
++        sevenn.train.dataload.unlabeled_atoms_to_graph(atoms, cutoff)
++    )
++    atom_graph[KEY.POS].requires_grad_(True)
++    atom_graph[KEY.BATCH] = torch.zeros([0])
++    return atom_graph
+ 
+ 
+ def chemical_species_preprocess(input_chem):
+@@ -218,3 +229,52 @@ def dtype_correct(v, float_dtype=torch.float32, int_dtype=torch.int64):
+         else:
+             # non-number
+             return v
++
++
++def load_model_from_checkpoint(checkpoint):
++    """
++    Deprecated
++    """
++    from sevenn._const import (
++        DEFAULT_DATA_CONFIG,
++        DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG,
++        DEFAULT_TRAINING_CONFIG,
++    )
++    from sevenn.model_build import build_E3_equivariant_model
++
++    if isinstance(checkpoint, str):
++        checkpoint = torch.load(checkpoint)
++    elif isinstance(checkpoint, dict):
++        pass
++    else:
++        raise ValueError('checkpoint must be either str or dict')
++
++    defaults = {
++        **DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG,
++        **DEFAULT_DATA_CONFIG,
++        **DEFAULT_TRAINING_CONFIG,
++    }
++
++    model_state_dict = checkpoint['model_state_dict']
++    config = checkpoint['config']
++
++    for k, v in defaults.items():
++        if k not in config:
++            print(f'Warning: {k} not in config, using default value {v}')
++            config[k] = v
++
++    # expect only non-tensor values in config, if exists, move to cpu
++    # This can be happen if config has torch tensor as value (shift, scale)
++    # TODO: putting only non-tensors at first place is better
++    for k, v in config.items():
++        if isinstance(v, torch.Tensor):
++            config[k] = v.cpu()
++
++    model = build_E3_equivariant_model(config)
++
++    model.load_state_dict(model_state_dict, strict=False)
++
++    return model
++
++
++

@@ -1,0 +1,454 @@
+diff --git a/src/components/Simulation.tsx b/src/components/Simulation.tsx
+index ab5cbbcf..77ea1beb 100644
+--- a/src/components/Simulation.tsx
++++ b/src/components/Simulation.tsx
+@@ -242,6 +242,16 @@ const SimulationComponent = () => {
+         const proxy = new LammpsWorkerProxy();
+         proxy.onPrint(onPrint);
+         proxy.onError((message) => onPrint(message));
++        // A crashed worker can't be restarted in place: flag the engine as
++        // unavailable (sidebar chip, run buttons disabled) until a reload.
++        // Any in-flight run has already been failed by the proxy.
++        proxy.onCrash((message) => {
++          setEngineError(`${message}. Reload the page to restart the engine.`);
++          notify.error({
++            message: "The simulation engine crashed",
++            description: "Reload the page to restart the engine.",
++          });
++        });
+         proxyRef.current = proxy;
+         await proxy.load();
+         return proxy;
+diff --git a/src/shell/Shell.tsx b/src/shell/Shell.tsx
+index 63d057e8..64397606 100644
+--- a/src/shell/Shell.tsx
++++ b/src/shell/Shell.tsx
+@@ -48,6 +48,8 @@ const Shell = () => {
+   const activeRun = useStoreState((state) => state.projects.activeRun);
+   const notice = useStoreState((state) => state.projects.notice);
+   const lammps = useStoreState((state) => state.simulation.lammps);
++  // Set when the engine failed to load or its worker crashed mid-session.
++  const engineError = useStoreState((state) => state.app.engineError);
+ 
+   const initialize = useStoreActions((actions) => actions.projects.initialize);
+   const openProject = useStoreActions(
+@@ -342,10 +344,19 @@ const Shell = () => {
+         setPaused(false);
+         setCancel(true);
+       },
+-      engineReady: lammps !== undefined,
++      engineReady: lammps !== undefined && !engineError,
+       examples,
+     }),
+-    [notify, quickRunExample, runProject, launch, setPaused, lammps, examples],
++    [
++      notify,
++      quickRunExample,
++      runProject,
++      launch,
++      setPaused,
++      lammps,
++      engineError,
++      examples,
++    ],
+   );
+ 
+   return (
+diff --git a/src/store/projects.integration.test.ts b/src/store/projects.integration.test.ts
+index 0f9a9ca2..2aa6fc68 100644
+--- a/src/store/projects.integration.test.ts
++++ b/src/store/projects.integration.test.ts
+@@ -508,6 +508,30 @@ describe("projects store integration", () => {
+       expect(runMeta?.finishedAt).toBeTruthy();
+       expect(store.getState().projects.activeRun).toBeUndefined();
+     });
++
++    it("records a failed run when the engine worker crashes mid-run", async () => {
++      const engine = createFakeEngine();
++      // What LammpsWorkerProxy does after worker.onerror: the pending run
++      // and every later snapshot reject with the crash error.
++      const crash = new Error("The simulation engine crashed: Aborted(OOM)");
++      engine.lammps.runFile = () => Promise.reject(crash);
++      engine.lammps.snapshotWorkdir = () => Promise.reject(crash);
++      const { store, libraryStorage } = await createTestStore(engine);
++      await store.getActions().projects.createProject({
++        displayName: "Crashy",
++        files: [{ fileName: "in.lmp", content: SCRIPT }],
++      });
++      const dirName = activeDirName(store);
++
++      await store.getActions().projects.startRuns([runRequest()]);
++
++      const runMeta = await readRunMeta(libraryStorage, dirName, "run-001");
++      expect(runMeta?.status).toBe("failed");
++      expect(runMeta?.error).toBe(crash.message);
++      expect(store.getState().simulation.running).toBe(false);
++      expect(store.getState().simulation.lastError).toBe(crash.message);
++      expect(store.getState().projects.activeRun).toBeUndefined();
++    });
+   });
+ 
+   describe("sweeps", () => {
+diff --git a/src/store/simulation.ts b/src/store/simulation.ts
+index e7da5b74..88e8ca60 100644
+--- a/src/store/simulation.ts
++++ b/src/store/simulation.ts
+@@ -458,6 +458,9 @@ export const simulationModel: SimulationModel = {
+         console.log("Got exception: ", exception);
+         if (typeof exception === "number") {
+           errorMessage = lammps.getExceptionMessage(exception);
++        } else if (exception instanceof Error) {
++          // e.g. the proxy's "The simulation engine crashed: …" rejection.
++          errorMessage = exception.message;
+         } else {
+           errorMessage = String(exception);
+         }
+diff --git a/src/wasm/LammpsWorkerProxy.test.ts b/src/wasm/LammpsWorkerProxy.test.ts
+new file mode 100644
+index 00000000..7ec5f648
+--- /dev/null
++++ b/src/wasm/LammpsWorkerProxy.test.ts
+@@ -0,0 +1,139 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { LammpsWorkerProxy } from "./LammpsWorkerProxy";
++import type { WorkerCommand, WorkerEvent } from "./workerMessages";
++
++/**
++ * Minimal stand-in for the engine Web Worker: records posted commands and
++ * lets a test emit events or simulate a crash via the handlers the proxy set.
++ */
++class FakeWorker {
++  static instances: FakeWorker[] = [];
++  onmessage: ((ev: MessageEvent<WorkerEvent>) => void) | null = null;
++  onerror: ((ev: ErrorEvent) => void) | null = null;
++  onmessageerror: ((ev: MessageEvent) => void) | null = null;
++  readonly posted: WorkerCommand[] = [];
++  readonly terminate = vi.fn();
++  private readonly listeners = new Set<(ev: MessageEvent) => void>();
++
++  constructor() {
++    FakeWorker.instances.push(this);
++  }
++  postMessage(command: WorkerCommand) {
++    this.posted.push(command);
++  }
++  addEventListener(_type: "message", listener: (ev: MessageEvent) => void) {
++    this.listeners.add(listener);
++  }
++  removeEventListener(_type: "message", listener: (ev: MessageEvent) => void) {
++    this.listeners.delete(listener);
++  }
++  emit(data: WorkerEvent) {
++    const ev = { data } as MessageEvent<WorkerEvent>;
++    for (const listener of [...this.listeners]) listener(ev);
++    this.onmessage?.(ev);
++  }
++  crash(message: string) {
++    this.onerror?.({ message, preventDefault: vi.fn() } as unknown as ErrorEvent);
++  }
++}
++
++let worker: FakeWorker;
++let proxy: LammpsWorkerProxy;
++
++beforeEach(() => {
++  FakeWorker.instances = [];
++  vi.stubGlobal("Worker", FakeWorker);
++  vi.spyOn(console, "error").mockImplementation(() => {});
++  proxy = new LammpsWorkerProxy();
++  worker = FakeWorker.instances[0];
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++});
++
++describe("LammpsWorkerProxy worker crash handling", () => {
++  it("rejects a pending run, reports the error and stops running", async () => {
++    const onError = vi.fn();
++    const onCrash = vi.fn();
++    proxy.onError(onError);
++    proxy.onCrash(onCrash);
++    const run = proxy.runFile("/sim/in.lmp");
++    expect(proxy.getIsRunning()).toBe(true);
++
++    worker.crash("RuntimeError: Aborted(OOM)");
++
++    await expect(run).rejects.toThrow(
++      "The simulation engine crashed: RuntimeError: Aborted(OOM)",
++    );
++    expect(proxy.getIsRunning()).toBe(false);
++    expect(proxy.crashed).toBe(true);
++    expect(worker.terminate).toHaveBeenCalled();
++    expect(onError).toHaveBeenCalledWith(
++      "The simulation engine crashed: RuntimeError: Aborted(OOM)",
++    );
++    expect(onCrash).toHaveBeenCalledTimes(1);
++  });
++
++  it("rejects later runs immediately without posting to the dead worker", async () => {
++    worker.crash("boom");
++    const before = worker.posted.length;
++
++    await expect(proxy.runFile("/sim/in.lmp")).rejects.toThrow(
++      "The simulation engine crashed: boom",
++    );
++    proxy.runCommand("run 10");
++    proxy.getModule().FS.writeFile("/sim/x", "data");
++    expect(proxy.start()).toBe(false);
++    expect(worker.posted.length).toBe(before);
++    expect(proxy.getIsRunning()).toBe(false);
++  });
++
++  it("rejects pending and subsequent snapshots", async () => {
++    vi.useFakeTimers();
++    try {
++      const pending = proxy.snapshotWorkdir("/sim");
++      worker.crash("boom");
++      await expect(pending).rejects.toThrow(
++        "The simulation engine crashed: boom",
++      );
++      await expect(proxy.snapshotWorkdir("/sim")).rejects.toThrow(
++        "The simulation engine crashed: boom",
++      );
++      // The 60s fallback timer was cleared, not left to fire later.
++      expect(vi.getTimerCount()).toBe(0);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("treats an undeliverable message as fatal", async () => {
++    const run = proxy.runFile("/sim/in.lmp");
++    worker.onmessageerror?.({} as MessageEvent);
++    await expect(run).rejects.toThrow(
++      "The simulation engine crashed: a worker message could not be deserialized",
++    );
++  });
++
++  it("rejects load() if the worker crashes before it is ready", async () => {
++    const load = proxy.load();
++    worker.crash("failed to fetch wasm");
++    await expect(load).rejects.toThrow(
++      "The simulation engine crashed: failed to fetch wasm",
++    );
++  });
++
++  it("still resolves runs normally when the worker is healthy", async () => {
++    const run = proxy.runFile("/sim/in.lmp");
++    const command = worker.posted.find((c) => c.type === "runFile");
++    expect(command).toBeDefined();
++    worker.emit({
++      type: "runFinished",
++      requestId: (command as { requestId: number }).requestId,
++      error: "",
++    });
++    await expect(run).resolves.toBeUndefined();
++    expect(proxy.crashed).toBe(false);
++  });
++});
+diff --git a/src/wasm/LammpsWorkerProxy.ts b/src/wasm/LammpsWorkerProxy.ts
+index f6a3ad3b..0ea08aeb 100644
+--- a/src/wasm/LammpsWorkerProxy.ts
++++ b/src/wasm/LammpsWorkerProxy.ts
+@@ -67,6 +67,12 @@ const cppArray = <T>(items: T[]) => ({
+ 
+ interface RunResolver {
+   resolve: () => void;
++  reject: (error: Error) => void;
++}
++
++interface SnapshotResolver {
++  resolve: (snapshot: WorkdirSnapshot) => void;
++  reject: (error: Error) => void;
+ }
+ 
+ export class LammpsWorkerProxy implements LammpsWeb {
+@@ -122,15 +128,19 @@ export class LammpsWorkerProxy implements LammpsWeb {
+ 
+   private nextRequestId = 1;
+   private readonly pendingRuns = new Map<number, RunResolver>();
+-  private readonly pendingSnapshots = new Map<
+-    number,
+-    (snapshot: WorkdirSnapshot) => void
+-  >();
++  private readonly pendingSnapshots = new Map<number, SnapshotResolver>();
++
++  // Set once the worker has crashed (uncaught error / wasm abort / OOM, or an
++  // undeliverable message). The worker cannot be recovered in place, so every
++  // later call fails fast instead of waiting on a reply that will never come.
++  private crashError?: Error;
++  private rejectLoad?: (error: Error) => void;
+ 
+   private readyPromise?: Promise<void>;
+   private stepListener?: () => void;
+   private printListener?: (text: string) => void;
+   private errorListener?: (message: string) => void;
++  private crashListener?: (message: string) => void;
+ 
+   private readonly moduleBridge: AtomifyWasmModule;
+ 
+@@ -140,6 +150,14 @@ export class LammpsWorkerProxy implements LammpsWeb {
+     });
+     this.worker.onmessage = (ev: MessageEvent<WorkerEvent>) =>
+       this.handleEvent(ev.data);
++    // Without these, a crashed worker leaves runFile/snapshotWorkdir promises
++    // pending forever and the UI stuck on "running".
++    this.worker.onerror = (ev: ErrorEvent) => {
++      ev.preventDefault();
++      this.handleCrash(ev.message || "unknown worker error");
++    };
++    this.worker.onmessageerror = () =>
++      this.handleCrash("a worker message could not be deserialized");
+     this.allocate(4096, 4096, 4096);
+     this.moduleBridge = this.buildModuleBridge();
+   }
+@@ -147,9 +165,42 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   // --- Worker plumbing ---------------------------------------------------
+ 
+   private send(command: WorkerCommand, transfer?: Transferable[]) {
++    // A dead worker can't answer; dropping fire-and-forget commands is safe,
++    // and request/reply callers check crashError before getting here.
++    if (this.crashError) return;
+     this.worker.postMessage(command, transfer ?? []);
+   }
+ 
++  /**
++   * The worker died: fail everything waiting on it, surface the message
++   * through the usual onError path (console output), and notify the crash
++   * listener so the app can tell the user to reload.
++   */
++  private handleCrash(detail: string) {
++    if (this.crashError) return;
++    const error = new Error(`The simulation engine crashed: ${detail}`);
++    this.crashError = error;
++    this.cRunning = false;
++    this.cError = error.message;
++    console.error("LAMMPS worker crashed:", detail);
++    this.rejectLoad?.(error);
++    this.rejectLoad = undefined;
++    const runs = [...this.pendingRuns.values()];
++    const snapshots = [...this.pendingSnapshots.values()];
++    this.pendingRuns.clear();
++    this.pendingSnapshots.clear();
++    for (const run of runs) run.reject(error);
++    for (const snapshot of snapshots) snapshot.reject(error);
++    this.worker.terminate();
++    this.errorListener?.(error.message);
++    this.crashListener?.(error.message);
++  }
++
++  /** True once the worker has crashed; the proxy must be replaced (reload). */
++  get crashed(): boolean {
++    return this.crashError !== undefined;
++  }
++
+   private handleEvent(event: WorkerEvent) {
+     switch (event.type) {
+       case "ready":
+@@ -187,10 +238,10 @@ export class LammpsWorkerProxy implements LammpsWeb {
+         break;
+       }
+       case "workdirSnapshot": {
+-        const resolve = this.pendingSnapshots.get(event.requestId);
+-        if (resolve) {
++        const pending = this.pendingSnapshots.get(event.requestId);
++        if (pending) {
+           this.pendingSnapshots.delete(event.requestId);
+-          resolve({
++          pending.resolve({
+             files: event.files.map((file: WorkdirFile) => ({
+               path: file.path,
+               bytes: new Uint8Array(file.bytes),
+@@ -447,15 +498,22 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   load(): Promise<void> {
+     if (!this.readyPromise) {
+       this.readyPromise = new Promise<void>((resolve, reject) => {
++        if (this.crashError) {
++          reject(this.crashError);
++          return;
++        }
++        this.rejectLoad = reject;
+         const onMessage = (ev: MessageEvent<WorkerEvent>) => {
+           if (ev.data.type === "ready") {
+             this.worker.removeEventListener("message", onMessage);
++            this.rejectLoad = undefined;
+             resolve();
+           } else if (ev.data.type === "error") {
+             // A failure during load() posts `error` instead of `ready`; reject
+             // so the caller can show it, rather than hanging forever at
+             // "Downloading LAMMPS…".
+             this.worker.removeEventListener("message", onMessage);
++            this.rejectLoad = undefined;
+             reject(new Error(ev.data.message));
+           }
+         };
+@@ -474,6 +532,14 @@ export class LammpsWorkerProxy implements LammpsWeb {
+     this.errorListener = listener;
+   }
+ 
++  /**
++   * Called once if the worker crashes (after onError has received the same
++   * message). The engine is unusable from then on; the page must be reloaded.
++   */
++  onCrash(listener: (message: string) => void) {
++    this.crashListener = listener;
++  }
++
+   /**
+    * Runs synchronously once per streamed timestep, after the bridge heap has
+    * been refreshed — the main-thread analogue of the adapter's step listener.
+@@ -485,6 +551,7 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   // --- LammpsWeb: lifecycle ---------------------------------------------
+ 
+   start(): boolean {
++    if (this.crashError) return false;
+     this.cRunning = true;
+     this.cError = "";
+     setCancel(false);
+@@ -519,11 +586,12 @@ export class LammpsWorkerProxy implements LammpsWeb {
+   }
+ 
+   runFile(path: string): Promise<void> {
++    if (this.crashError) return Promise.reject(this.crashError);
+     const requestId = this.nextRequestId++;
+     this.cRunning = true;
+     this.cError = "";
+-    return new Promise<void>((resolve) => {
+-      this.pendingRuns.set(requestId, { resolve });
++    return new Promise<void>((resolve, reject) => {
++      this.pendingRuns.set(requestId, { resolve, reject });
+       this.send({ type: "runFile", requestId, path });
+     });
+   }
+@@ -535,8 +603,9 @@ export class LammpsWorkerProxy implements LammpsWeb {
+    * mid-run copy; omit it for the complete end-of-run snapshot.
+    */
+   snapshotWorkdir(dir: string, maxBytes?: number): Promise<WorkdirSnapshot> {
++    if (this.crashError) return Promise.reject(this.crashError);
+     const requestId = this.nextRequestId++;
+-    return new Promise<WorkdirSnapshot>((resolve) => {
++    return new Promise<WorkdirSnapshot>((resolve, reject) => {
+       // Belt-and-braces against a dead/wedged worker: resolve empty after
+       // 60s rather than stranding the run pipeline on this await forever.
+       const timeout = setTimeout(() => {
+@@ -545,9 +614,15 @@ export class LammpsWorkerProxy implements LammpsWeb {
+           resolve({ files: [], skipped: [] });
+         }
+       }, 60_000);
+-      this.pendingSnapshots.set(requestId, (snapshot) => {
+-        clearTimeout(timeout);
+-        resolve(snapshot);
++      this.pendingSnapshots.set(requestId, {
++        resolve: (snapshot) => {
++          clearTimeout(timeout);
++          resolve(snapshot);
++        },
++        reject: (error) => {
++          clearTimeout(timeout);
++          reject(error);
++        },
+       });
+       this.send({ type: "snapshotWorkdir", requestId, dir, maxBytes });
+     });

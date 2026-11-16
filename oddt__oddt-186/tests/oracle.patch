@@ -1,0 +1,708 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 115cc701..4c160aa4 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -11,15 +11,20 @@ permissions:
+ 
+ jobs:
+   test:
+-    name: Python ${{ matrix.python-version }} (${{ matrix.toolkit }})
++    name: Python ${{ matrix.python-version }} (${{ matrix.toolkit }}, Vina ${{ matrix.vina }})
+     runs-on: ubuntu-latest
+     strategy:
+       fail-fast: false
+       matrix:
+         python-version: ["3.9", "3.12"]
+         toolkit: [rdk, ob]
++        vina: ["latest", "1.1.2"]
++        exclude:
++          - python-version: "3.9"
++            vina: "latest"
+     env:
+       ODDT_TOOLKIT: ${{ matrix.toolkit }}
++      VINA_VERSION: ${{ matrix.vina }}
+     defaults:
+       run:
+         shell: bash -el {0}
+@@ -45,10 +50,23 @@ jobs:
+ 
+       - name: Install package and test dependencies
+         run: |
+-          conda install --yes --override-channels --channel conda-forge --channel bioconda \
+-            pip setuptools wheel pytest-cov autodock-vina=1.1.2
++          conda install --yes --override-channels --channel conda-forge \
++            pip setuptools wheel pytest-cov
+           python -m pip install --no-build-isolation --no-deps .
+ 
++      - name: Install Vina
++        run: |
++          if [[ "$VINA_VERSION" == "1.1.2" ]]; then
++            if [[ "${{ matrix.python-version }}" == "3.12" ]]; then
++              conda remove --yes vina
++            fi
++            conda install --yes --override-channels \
++              --channel conda-forge --channel bioconda autodock-vina=1.1.2
++            vina --version
++          else
++            python -c "import vina; print('Vina Python API', vina.__version__)"
++          fi
++
+       - name: Run pytest
+         run: python -m pytest --cov=oddt -n 2 -v --durations=10 tests/
+ 
+diff --git a/README.md b/README.md
+index 0fe870dd..d0fbacd7 100644
+--- a/README.md
++++ b/README.md
+@@ -26,7 +26,7 @@ Open Drug Discovery Toolkit (ODDT) is modular and comprehensive toolkit for use
+   * Skimage (0.12.3+) (optional, only for surface generation)
+ 
+ CI tests Python 3.9 and 3.12 with both chemistry backends. The Python 3.12
+-development environment uses RDKit 2026.03.6+ and Open Babel 3.2.1+. Python 3.9
++development environment uses RDKit 2026.03.1+ and Open Babel 3.2.1+. Python 3.9
+ uses RDKit 2025.03.5 and Open Babel 3.1.1, since newer Open Babel conda builds
+ require Python 3.10 or later. Other Python versions retain the declared
+ compatibility range but are not in the current CI matrix.
+@@ -69,14 +69,26 @@ Create the Python 3.12 environment with both chemistry backends:
+ ```sh
+ conda env create -n oddt-dev -f environment.yml
+ conda activate oddt-dev
+-python -m pip install --no-deps -e .
++python -m pip install --no-build-isolation --no-deps -e .
+ ODDT_TOOLKIT=rdk python -m pytest tests
+ ODDT_TOOLKIT=ob python -m pytest tests
+ ```
+ 
+-Native docking and scoring tests additionally require the `vina` executable.
+-The supported external scoring interface is AutoDock Vina 1.1.2, installed
+-from Bioconda in CI. These tests are skipped when the executable is absent.
++The same environment includes conda-forge Vina 1.2.7+ and uses its Python API
++for docking and scoring. RDKit 2026.03.1 and Vina 1.2.7 share Boost 1.86, so
++there is no separate tool environment or additional library search path.
++
++Vina 1.1.2 remains supported through its command-line executable. If both the
++Python package and a legacy binary are available, pass the legacy binary's path
++as `executable` to select it explicitly. CI installs the selected Vina version
++in the ODDT environment: Python 3.12 tests both interfaces, while Python 3.9
++tests 1.1.2 because conda-forge's latest Python bindings require Python 3.10+.
++Native tests are skipped only when neither the Python package nor an executable
++is available.
++
++Vina 1.2 affinity comes from the Python API. Its unweighted interaction terms
++are reconstructed with ODDT's internal scorer because the API does not expose
++them separately. Vina 1.1.2 retains the original native scoring path.
+ 
+ ### Documentation
+ Automatic documentation for ODDT is available on [Readthedocs.org](https://oddt.readthedocs.org/). Additionally, it can be build locally:
+diff --git a/environment.yml b/environment.yml
+index 17ea11f8..b6f2a193 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -12,8 +12,9 @@ dependencies:
+ - pandas>=0.17.1
+ - packaging>=20
+ - xlsxwriter
+-- rdkit>=2026.03.6
++- rdkit>=2026.03.1
+ - openbabel>=3.2.1
++- vina>=1.2.7
+ - pytest
+ - pytest-xdist
+ - black
+\ No newline at end of file
+diff --git a/oddt/docking/AutodockVina.py b/oddt/docking/AutodockVina.py
+index 836f0abe..b43dacb6 100644
+--- a/oddt/docking/AutodockVina.py
++++ b/oddt/docking/AutodockVina.py
+@@ -7,12 +7,31 @@
+ from shutil import rmtree, which as find_executable
+ from tempfile import gettempdir
+ 
++import numpy as np
++from packaging.version import Version
+ from six import string_types
+ 
++try:
++    import vina as vina_python
++except ImportError:
++    vina_python = None
++
+ import oddt
++from oddt.docking.internal import vina_docking
+ from oddt.utils import is_openbabel_molecule, is_molecule, check_molecule
+ from oddt.spatial import rmsd
+ 
++_VINA_TERMS = ("gauss1", "gauss2", "repulsion", "hydrophobic", "hydrogen")
++
++
++def _explicit_donor_mask(molecule, atom_dict):
++    donors = [
++        atom.idx0
++        for atom in molecule.atoms
++        if atom.atomicnum in (7, 8) and any(neighbor.atomicnum == 1 for neighbor in atom.neighbors)
++    ]
++    return np.isin(atom_dict["id"], donors)
++
+ 
+ class autodock_vina(object):
+     def __init__(
+@@ -70,8 +89,9 @@ def __init__(
+             for reference see `tempfile.gettempdir`.
+ 
+         executable: string or None (default=None)
+-            Autodock Vina executable location in the system.
+-            It's really necessary if autodetection fails.
++            Legacy Autodock Vina executable location in the system.
++            If omitted, Vina 1.2 uses the installed Python package, or a
++            legacy executable is detected when the package is unavailable.
+ 
+         autocleanup: bool (default=True)
+             Should the docking engine clean up after execution?
+@@ -91,7 +111,11 @@ def __init__(
+                 auto_ligand = next(oddt.toolkit.readfile(extension, auto_ligand))
+             self.center = auto_ligand.coords.mean(axis=0).round(3)
+         # autodetect Vina executable
+-        if not executable:
++        self._vina = None
++        if executable is None and vina_python is not None:
++            self.executable = None
++            self.version = vina_python.__version__
++        elif not executable:
+             self.executable = find_executable("vina")
+             if not self.executable:
+                 raise Exception(
+@@ -102,7 +126,14 @@ def __init__(
+         else:
+             self.executable = executable
+         # detect version
+-        self.version = subprocess.check_output([self.executable, "--version"]).decode("ascii").split(" ")[2]
++        if self.executable is not None:
++            self.version = (
++                subprocess.check_output([self.executable, "--version"]).decode("ascii").split()[2].lstrip("v")
++            )
++        if Version(self.version) >= Version("1.2"):
++            if vina_python is None:
++                raise ImportError("Vina 1.2 requires the vina Python package; install it from conda-forge.")
++            self._vina = vina_python.Vina(sf_name="vina", cpu=n_cpu, seed=0 if seed is None else seed, verbosity=0)
+         self.autocleanup = autocleanup
+         self.cleanup_dirs = set()
+ 
+@@ -113,6 +144,10 @@ def __init__(
+             self.set_protein(protein)
+         self.skip_bad_mols = skip_bad_mols
+         self.n_cpu = n_cpu
++        self.exhaustiveness = exhaustiveness
++        self.num_modes = num_modes
++        self.energy_range = energy_range
++        self.seed = 0 if seed is None else seed
+         if self.n_cpu > exhaustiveness:
+             warnings.warn("Exhaustiveness is lower than n_cpus, thus CPU will " "not be saturated.")
+ 
+@@ -135,6 +170,12 @@ def __init__(
+         self.params += ["--num_modes", str(num_modes)]
+         self.params += ["--energy_range", str(energy_range)]
+ 
++    def _prepare_python_vina(self, ligand_file, center, box_size):
++        self._vina = vina_python.Vina(sf_name="vina", cpu=self.n_cpu, seed=self.seed, verbosity=0)
++        self._vina.set_receptor(self.protein_file)
++        self._vina.set_ligand_from_file(ligand_file)
++        self._vina.compute_vina_maps(center=center, box_size=box_size)
++
+     @property
+     def tmp_dir(self):
+         if not self._tmp_dir:
+@@ -157,6 +198,7 @@ def set_protein(self, protein):
+         # generate new directory
+         self._tmp_dir = None
+         if protein:
++            self.protein_file = None
+             if isinstance(protein, string_types):
+                 extension = protein.split(".")[-1]
+                 if extension == "pdbqt":
+@@ -172,10 +214,15 @@ def set_protein(self, protein):
+             # skip writing if we have PDBQT protein
+             if self.protein_file is None:
+                 self.protein_file = write_vina_pdbqt(self.protein, self.tmp_dir, flexible=False)
++            if self._vina is not None:
++                self._vina.set_receptor(self.protein_file)
+ 
+     def score(self, ligands, protein=None):
+         """Automated scoring procedure.
+ 
++        Vina 1.2 affinity is read from its Python API; unweighted interaction
++        terms absent from its output are computed with ODDT's internal scorer.
++
+         Parameters
+         ----------
+         ligands: iterable of oddt.toolkit.Molecule objects
+@@ -198,23 +245,47 @@ def score(self, ligands, protein=None):
+             ligands = [ligands]
+         ligand_dir = mkdtemp(dir=self.tmp_dir, prefix="ligands_")
+         output_array = []
++        internal_scorer = None
+         for n, ligand in enumerate(ligands):
+             check_molecule(ligand, force_coords=True)
+             ligand_file = write_vina_pdbqt(ligand, ligand_dir, name_id=n)
+             try:
+-                scores = parse_vina_scoring_output(
+-                    subprocess.check_output(
+-                        [self.executable, "--score_only", "--receptor", self.protein_file, "--ligand", ligand_file]
+-                        + self.params,
+-                        stderr=subprocess.STDOUT,
++                if self._vina is not None:
++                    lower = ligand.coords.min(axis=0).astype(float)
++                    upper = ligand.coords.max(axis=0).astype(float)
++                    self._prepare_python_vina(
++                        ligand_file,
++                        center=((lower + upper) / 2).tolist(),
++                        box_size=np.maximum(self.size, upper - lower + 2).tolist(),
++                    )
++                    scores = {"vina_affinity": float(self._vina.score()[0])}
++                else:
++                    scores = parse_vina_scoring_output(
++                        subprocess.check_output(
++                            [self.executable, "--score_only", "--receptor", self.protein_file, "--ligand", ligand_file]
++                            + self.params,
++                            stderr=subprocess.STDOUT,
++                        )
+                     )
+-                )
+             except subprocess.CalledProcessError as e:
+                 sys.stderr.write(e.output.decode("ascii"))
+                 if self.skip_bad_mols:
+                     continue
+                 else:
+                     raise Exception('Autodock Vina failed. Command: "%s"' % " ".join(e.cmd))
++            except (RuntimeError, ValueError) as error:
++                if self._vina is None or not self.skip_bad_mols:
++                    raise
++                warnings.warn(str(error))
++                continue
++            if self._vina is not None:
++                if internal_scorer is None:
++                    internal_scorer = vina_docking(self.protein)
++                    internal_scorer.rec_dict["isdonor"] &= _explicit_donor_mask(self.protein, internal_scorer.rec_dict)
++                internal_scorer.set_ligand(ligand)
++                internal_scorer.lig_dict["isdonor"] &= _explicit_donor_mask(ligand, internal_scorer.lig_dict)
++                for term, value in zip(_VINA_TERMS, internal_scorer.score_inter()):
++                    scores.setdefault("vina_" + term, value)
+             ligand.data.update(scores)
+             output_array.append(ligand)
+         rmtree(ligand_dir)
+@@ -250,28 +321,46 @@ def dock(self, ligands, protein=None):
+             ligand_file = write_vina_pdbqt(ligand, ligand_dir, name_id=n)
+             ligand_outfile = ligand_file[:-6] + "_out.pdbqt"
+             try:
+-                scores = parse_vina_docking_output(
+-                    subprocess.check_output(
+-                        [
+-                            self.executable,
+-                            "--receptor",
+-                            self.protein_file,
+-                            "--ligand",
+-                            ligand_file,
+-                            "--out",
+-                            ligand_outfile,
+-                        ]
+-                        + self.params
+-                        + ["--cpu", str(self.n_cpu)],
+-                        stderr=subprocess.STDOUT,
++                if self._vina is not None:
++                    self._prepare_python_vina(
++                        ligand_file,
++                        center=np.asarray(self.center, dtype=float).tolist(),
++                        box_size=np.asarray(self.size, dtype=float).tolist(),
++                    )
++                    self._vina.dock(exhaustiveness=self.exhaustiveness, n_poses=self.num_modes)
++                    self._vina.write_poses(
++                        ligand_outfile, n_poses=self.num_modes, energy_range=self.energy_range, overwrite=True
++                    )
++                    with open(ligand_outfile, "rb") as pose_file:
++                        scores = parse_vina_docking_output(pose_file.read())
++                else:
++                    scores = parse_vina_docking_output(
++                        subprocess.check_output(
++                            [
++                                self.executable,
++                                "--receptor",
++                                self.protein_file,
++                                "--ligand",
++                                ligand_file,
++                                "--out",
++                                ligand_outfile,
++                            ]
++                            + self.params
++                            + ["--cpu", str(self.n_cpu)],
++                            stderr=subprocess.STDOUT,
++                        )
+                     )
+-                )
+             except subprocess.CalledProcessError as e:
+                 sys.stderr.write(e.output.decode("ascii"))
+                 if self.skip_bad_mols:
+                     continue  # TODO: print some warning message
+                 else:
+                     raise Exception('Autodock Vina failed. Command: "%s"' % " ".join(e.cmd))
++            except (RuntimeError, ValueError) as error:
++                if self._vina is None or not self.skip_bad_mols:
++                    raise
++                warnings.warn(str(error))
++                continue
+ 
+             # docked conformations may have wrong connectivity - use source ligand
+             if is_openbabel_molecule(ligand):
+@@ -384,13 +473,20 @@ def parse_vina_scoring_output(output):
+         dicitionary containing scores computed by Autodock Vina
+     """
+     out = {}
+-    r = re.compile(r"^(Affinity:|\s{4})")
+-    for line in output.decode("ascii").split("\n")[13:]:  # skip some output
+-        if r.match(line):
+-            m = line.replace(" ", "").split(":")
+-            if m[0] == "Affinity":
+-                m[1] = m[1].replace("(kcal/mol)", "")
+-            out[str("vina_" + m[0].lower())] = float(m[1])
++    pattern = re.compile(
++        r"^\s*(Affinity|Estimated Free Energy of Binding|gauss\s*[12]|"
++        r"repulsion|hydrophobic|hydrogen)\s*:\s*([^\s(]+)",
++        re.IGNORECASE,
++    )
++    for line in output.decode("ascii").splitlines():
++        match = pattern.match(line)
++        if match:
++            term = match.group(1).lower()
++            if term in ("affinity", "estimated free energy of binding"):
++                term = "affinity"
++            else:
++                term = "".join(term.split())
++            out["vina_" + term] = float(match.group(2))
+     return out
+ 
+ 
+@@ -408,9 +504,12 @@ def parse_vina_docking_output(output):
+         dicitionary containing scores computed by Autodock Vina
+     """
+     out = []
+-    r = re.compile(r"^\s+\d\s+")
+-    for line in output.decode("ascii").split("\n")[13:]:  # skip some output
+-        if r.match(line):
++    r = re.compile(r"^\s+\d+\s+")
++    for line in output.decode("ascii").splitlines():
++        if line.startswith("REMARK VINA RESULT:"):
++            s = line.split()[3:]
++            out.append({"vina_affinity": s[0], "vina_rmsd_lb": s[1], "vina_rmsd_ub": s[2]})
++        elif r.match(line):
+             s = line.split()
+             out.append({"vina_affinity": s[1], "vina_rmsd_lb": s[2], "vina_rmsd_ub": s[3]})
+     return out
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+index 9cf9d35e..4ceb4a65 100644
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -1,5 +1,5 @@
+ import os
+-from types import GeneratorType
++from types import GeneratorType, SimpleNamespace
+ from tempfile import mkdtemp, NamedTemporaryFile
+ from shutil import which as find_executable
+ 
+@@ -10,6 +10,7 @@
+ from sklearn.metrics import r2_score
+ 
+ import oddt
++from oddt.docking.AutodockVina import autodock_vina, parse_vina_scoring_output, parse_vina_docking_output, vina_python
+ from oddt.scoring import scorer, ensemble_descriptor, ensemble_model
+ from oddt.scoring.descriptors import (
+     autodock_vina_descriptor,
+@@ -26,6 +27,198 @@
+ results = os.path.join(test_data_dir, "data", "results", "xiap")
+ 
+ 
++@pytest.mark.parametrize(
++    "output, expected",
++    [
++        (
++            b"Affinity: -3.57594 (kcal/mol)\n"
++            b"    gauss 1: 6.301213e1\n"
++            b"    gauss 2: 999.07625\n"
++            b"    repulsion: 3.63178\n"
++            b"    hydrophobic: 26.12648\n"
++            b"    hydrogen: 0\n",
++            {
++                "vina_affinity": -3.57594,
++                "vina_gauss1": 63.01213,
++                "vina_gauss2": 999.07625,
++                "vina_repulsion": 3.63178,
++                "vina_hydrophobic": 26.12648,
++                "vina_hydrogen": 0,
++            },
++        ),
++        (
++            b"Estimated Free Energy of Binding   : -3.576 (kcal/mol) [=(1)+(2)+(3)-(4)]\n"
++            b"(1) Final Intermolecular Energy    : -5.248 (kcal/mol)\n"
++            b"    Ligand - Receptor              : -5.248 (kcal/mol)\n",
++            {"vina_affinity": -3.576},
++        ),
++    ],
++)
++def test_vina_scoring_output(output, expected):
++    assert parse_vina_scoring_output(output) == pytest.approx(expected)
++
++
++@pytest.mark.parametrize(
++    "output",
++    [
++        b"mode | affinity | dist from best mode\n   1 -6.3 0.0 0.0\n  10 -3.5 2.4 3.1\n",
++        b"MODEL 1\nREMARK VINA RESULT: -6.3 0.0 0.0\nENDMDL\n" b"MODEL 2\nREMARK VINA RESULT: -3.5 2.4 3.1\nENDMDL\n",
++    ],
++)
++def test_vina_docking_output(output):
++    assert parse_vina_docking_output(output) == [
++        {"vina_affinity": "-6.3", "vina_rmsd_lb": "0.0", "vina_rmsd_ub": "0.0"},
++        {"vina_affinity": "-3.5", "vina_rmsd_lb": "2.4", "vina_rmsd_ub": "3.1"},
++    ]
++
++
++@pytest.mark.parametrize("version", ["1.1.2", "1.2.7"])
++def test_vina_scoring_grid(monkeypatch, tmp_path, version):
++    commands = []
++    maps = []
++
++    class PythonVina:
++        def __init__(self, **kwargs):
++            assert kwargs == {"sf_name": "vina", "cpu": 1, "seed": 0, "verbosity": 0}
++            self.ligand_loaded = False
++
++        def set_receptor(self, filename):
++            assert os.path.isfile(filename)
++
++        def set_ligand_from_file(self, filename):
++            assert os.path.isfile(filename)
++            assert not self.ligand_loaded, "Ligands must not reuse an atom-type-specific map context"
++            self.ligand_loaded = True
++
++        def compute_vina_maps(self, center, box_size):
++            maps.append((center, box_size))
++
++        def score(self):
++            return np.array([-3.576, -5.248, 0, 0, 0, 0, 1.672, 0])
++
++    def check_output(command, **kwargs):
++        assert version == "1.1.2", "Vina 1.2 must not run a subprocess"
++        if "--version" in command:
++            banner_version = "v" + version if version == "1.2.7" else version
++            return ("AutoDock Vina %s\n" % banner_version).encode("ascii")
++        commands.append(command)
++        return (
++            b"Affinity: -3.57594 (kcal/mol)\n"
++            b"    gauss 1: 63.01213\n    gauss 2: 999.07625\n"
++            b"    repulsion: 3.63178\n    hydrophobic: 26.12648\n    hydrogen: 0\n"
++        )
++
++    monkeypatch.setattr("oddt.docking.AutodockVina.subprocess.check_output", check_output)
++    monkeypatch.setattr("oddt.docking.AutodockVina.vina_python", SimpleNamespace(__version__="1.2.7", Vina=PythonVina))
++    receptor = next(oddt.toolkit.readfile("pdb", receptor_pdb))
++    ligand = next(oddt.toolkit.readfile("sdf", os.path.join(test_data_dir, "data/dude/xiap/crystal_ligand.sdf")))
++    engine = autodock_vina(
++        receptor, size=(1, 1, 1), executable="vina" if version == "1.1.2" else None, prefix_dir=str(tmp_path)
++    )
++    docking_params = engine.params.copy()
++    assert engine.version == version
++    assert engine.score(ligand) == [ligand]
++    assert engine.params == docking_params
++    assert engine.center == (0, 0, 0)
++    if version == "1.1.2":
++        assert commands[0][6:] == docking_params
++    else:
++        assert not commands
++        assert float(ligand.data["vina_affinity"]) == -3.576
++        assert engine.score(ligand) == [ligand]
++        for center, size, lower, upper in zip(
++            maps[0][0], maps[0][1], ligand.coords.min(axis=0), ligand.coords.max(axis=0)
++        ):
++            assert center - size / 2 < lower
++            assert center + size / 2 > upper
++    engine.clean()
++
++
++def test_vina_python_docking(monkeypatch, tmp_path):
++    calls = {}
++
++    class PythonVina:
++        def __init__(self, **kwargs):
++            calls["init"] = kwargs
++
++        def set_receptor(self, filename):
++            calls["receptor"] = filename
++
++        def set_ligand_from_file(self, filename):
++            self.ligand_file = filename
++
++        def compute_vina_maps(self, **kwargs):
++            calls["maps"] = kwargs
++
++        def dock(self, **kwargs):
++            calls["dock"] = kwargs
++
++        def write_poses(self, filename, **kwargs):
++            calls["poses"] = kwargs
++            with open(self.ligand_file) as ligand_file:
++                pdbqt = ligand_file.read()
++            with open(filename, "w") as pose_file:
++                pose_file.write("MODEL 1\nREMARK VINA RESULT: -6.3 0.0 0.0\n" + pdbqt + "ENDMDL\n")
++
++    def no_subprocess(*args, **kwargs):
++        pytest.fail("Vina 1.2 must not run a subprocess")
++
++    monkeypatch.setattr("oddt.docking.AutodockVina.subprocess.check_output", no_subprocess)
++    monkeypatch.setattr("oddt.docking.AutodockVina.vina_python", SimpleNamespace(__version__="1.2.7", Vina=PythonVina))
++    receptor = next(oddt.toolkit.readfile("pdb", receptor_pdb))
++    ligand = next(oddt.toolkit.readfile("sdf", os.path.join(test_data_dir, "data/dude/xiap/crystal_ligand.sdf")))
++    original_coords = ligand.coords.copy()
++    engine = autodock_vina(
++        receptor,
++        center=(1, 2, 3),
++        size=(10, 12, 14),
++        exhaustiveness=3,
++        num_modes=2,
++        energy_range=6,
++        seed=42,
++        n_cpu=2,
++        prefix_dir=str(tmp_path),
++    )
++    poses = engine.dock(ligand)
++    assert len(poses) == 1
++    assert poses[0] is not ligand
++    assert float(poses[0].data["vina_affinity"]) == -6.3
++    assert float(poses[0].data["vina_rmsd_lb"]) == 0
++    assert float(poses[0].data["vina_rmsd_ub"]) == 0
++    assert poses[0].coords.shape == original_coords.shape
++    assert_array_almost_equal(ligand.coords, original_coords)
++    assert calls["init"] == {"sf_name": "vina", "cpu": 2, "seed": 42, "verbosity": 0}
++    assert calls["maps"] == {"center": [1, 2, 3], "box_size": [10, 12, 14]}
++    assert calls["dock"] == {"exhaustiveness": 3, "n_poses": 2}
++    assert calls["poses"] == {"n_poses": 2, "energy_range": 6, "overwrite": True}
++    engine.set_protein(ligand)
++    assert calls["receptor"] == engine.protein_file
++    assert calls["receptor"] != receptor_pdb
++    engine.clean()
++
++
++@pytest.mark.parametrize("operation", ["score", "dock"])
++@pytest.mark.parametrize("skip_bad_mols", [False, True])
++def test_vina_python_invalid_ligand(monkeypatch, tmp_path, operation, skip_bad_mols):
++    def reject_ligand(filename):
++        raise RuntimeError("Invalid ligand")
++
++    def make_vina(**kwargs):
++        return SimpleNamespace(set_receptor=lambda filename: None, set_ligand_from_file=reject_ligand)
++
++    monkeypatch.setattr("oddt.docking.AutodockVina.vina_python", SimpleNamespace(__version__="1.2.7", Vina=make_vina))
++    receptor = next(oddt.toolkit.readfile("pdb", receptor_pdb))
++    ligand = next(oddt.toolkit.readfile("sdf", os.path.join(test_data_dir, "data/dude/xiap/crystal_ligand.sdf")))
++    engine = autodock_vina(receptor, skip_bad_mols=skip_bad_mols, prefix_dir=str(tmp_path))
++    if skip_bad_mols:
++        with pytest.warns(UserWarning, match="Invalid ligand"):
++            assert getattr(engine, operation)(ligand) == []
++    else:
++        with pytest.raises(RuntimeError, match="Invalid ligand"):
++            getattr(engine, operation)(ligand)
++    engine.clean()
++
++
+ @pytest.mark.filterwarnings("ignore:Data with input dtype int64 was converted")
+ def test_scorer():
+     np.random.seed(42)
+@@ -113,7 +306,7 @@ def test_ensemble_model():
+     assert_almost_equal(ensemble.score(X, Y), nn.score(X, Y))
+ 
+ 
+-@pytest.mark.skipif(find_executable("vina") is None, reason="Autodock Vina binary missing")
++@pytest.mark.skipif(vina_python is None and find_executable("vina") is None, reason="Autodock Vina unavailable")
+ def test_original_vina():
+     """Check orignal Vina partial scores descriptor"""
+     mols = list(oddt.toolkit.readfile("sdf", actives_sdf))
+diff --git a/tests/test_virtualscreening.py b/tests/test_virtualscreening.py
+index f175a5b6..b7266b68 100644
+--- a/tests/test_virtualscreening.py
++++ b/tests/test_virtualscreening.py
+@@ -8,6 +8,7 @@
+ import pandas as pd
+ 
+ import oddt
++from oddt.docking.AutodockVina import vina_python
+ from oddt.utils import method_caller
+ from oddt.spatial import rmsd
+ from oddt.scoring import scorer
+@@ -23,7 +24,7 @@
+ xiap_actives_docked = os.path.join(dude_data_dir, "actives_docked.sdf")
+ 
+ 
+-@pytest.mark.skipif(find_executable("vina") is None, reason="Autodock Vina binary missing")
++@pytest.mark.skipif(vina_python is None and find_executable("vina") is None, reason="Autodock Vina unavailable")
+ def test_vs_scoring_vina():
+     """VS scoring (Vina) tests"""
+     vs = virtualscreening(n_cpu=1)
+@@ -38,16 +39,16 @@ def test_vs_scoring_vina():
+     assert "vina_hydrogen" in mol_data
+     assert "vina_hydrophobic" in mol_data
+     assert "vina_repulsion" in mol_data
+-    assert mol_data["vina_affinity"] == "-3.57594"
+-    assert mol_data["vina_gauss1"] == "63.01213"
+-    assert mol_data["vina_gauss2"] == "999.07625"
+-    assert mol_data["vina_hydrogen"] == "0.0"
+-    assert mol_data["vina_hydrophobic"] == "26.12648"
+-    assert mol_data["vina_repulsion"] == "3.63178"
++    assert_array_almost_equal(float(mol_data["vina_affinity"]), -3.57594, decimal=3)
++    assert_array_almost_equal(
++        [float(mol_data["vina_" + term]) for term in ("gauss1", "gauss2", "hydrogen", "hydrophobic", "repulsion")],
++        [63.01213, 999.07625, 0.0, 26.12648, 3.63178],
++        decimal=4,
++    )
+ 
+ 
+ @pytest.mark.xfail(reason="flaky test due to varying docking results")
+-@pytest.mark.skipif(find_executable("vina") is None, reason="Autodock Vina binary missing")
++@pytest.mark.skipif(vina_python is None and find_executable("vina") is None, reason="Autodock Vina unavailable")
+ def test_vs_docking():
+     """VS docking (Vina) tests"""
+     vs = virtualscreening(n_cpu=1)
+@@ -75,9 +76,9 @@ def test_vs_docking():
+     assert "vina_rmsd_ub" in mol_data
+ 
+     if oddt.toolkit.backend == "ob":
+-        vina_scores = [-6.3, -6. , -5.8, -5.8, -3.9, -3. , -1.1]
++        vina_scores = [-6.3, -6.0, -5.8, -5.8, -3.9, -3.0, -1.1]
+     else:
+-        vina_scores = [-6.3, -6.1, -5.7, -3.8, -2.9, -1. , -1. ]
++        vina_scores = [-6.3, -6.1, -5.7, -3.8, -2.9, -1.0, -1.0]
+     assert_array_equal([float(m.data["vina_affinity"]) for m in mols], vina_scores)
+ 
+     # verify the SMILES of molecules
+@@ -88,7 +89,7 @@ def test_vs_docking():
+         # OB 2.4 recognizes the smiles chirality wrong
+         pass
+     else:
+-        vina_rmsd = [8.26206 , 5.292223, 8.510169, 9.060128, 8.995098, 8.626776, 7.923956]
++        vina_rmsd = [8.26206, 5.292223, 8.510169, 9.060128, 8.995098, 8.626776, 7.923956]
+         assert_array_equal([mol.smiles for mol in mols], [ref_mol.smiles] * len(mols))
+ 
+         assert_array_almost_equal([rmsd(ref_mol, mol, method="min_symmetry") for mol in mols], vina_rmsd)
+@@ -100,7 +101,7 @@ def test_vs_empty():
+         vs.fetch()
+ 
+ 
+-@pytest.mark.skipif(find_executable("vina") is None, reason="Autodock Vina binary missing")
++@pytest.mark.skipif(vina_python is None and find_executable("vina") is None, reason="Autodock Vina unavailable")
+ def test_vs_docking_empty():
+     vs = virtualscreening(n_cpu=1)
+     vs.load_ligands("smi", os.path.join(dude_data_dir, "actives_rdkit.smi"))
+@@ -120,7 +121,7 @@ def test_vs_docking_empty():
+         next(vs.fetch())
+ 
+ 
+-@pytest.mark.skipif(find_executable("vina") is None, reason="Autodock Vina binary missing")
++@pytest.mark.skipif(vina_python is None and find_executable("vina") is None, reason="Autodock Vina unavailable")
+ def test_vs_multithreading_fallback():
+     vs = virtualscreening(n_cpu=8)
+     vs.load_ligands("sdf", xiap_crystal_ligand)

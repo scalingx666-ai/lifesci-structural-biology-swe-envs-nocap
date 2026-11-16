@@ -1,0 +1,495 @@
+diff --git a/bin/train.py b/bin/train.py
+index d8ddf39..a4fbb31 100644
+--- a/bin/train.py
++++ b/bin/train.py
+@@ -266,6 +266,7 @@ def record_args_and_metadata(func_args: Dict[str, Any], results_folder: Path):
+     # Record current Git version
+     try:
+         import git
++
+         repo = git.Repo(
+             path=os.path.dirname(os.path.abspath(__file__)),
+             search_parent_directories=True,
+@@ -276,7 +277,9 @@ def record_args_and_metadata(func_args: Dict[str, Any], results_folder: Path):
+     except git.exc.InvalidGitRepositoryError:
+         logging.warning("Could not determine Git repo status -- not a git repo")
+     except ModuleNotFoundError:
+-        logging.warning(f"Could not determine Git repo status -- GitPython is not installed")
++        logging.warning(
++            f"Could not determine Git repo status -- GitPython is not installed"
++        )
+ 
+ 
+ def train(
+@@ -306,6 +309,7 @@ def train(
+     batch_size: int = 64,
+     lr: float = 5e-5,  # Default lr for huggingface BERT trainer
+     loss: modelling.LOSS_KEYS = "smooth_l1",
++    use_pdist_loss: Union[float, Tuple[float, float]] = 0.0,  # Use the pairwise distances between CAs as an additional loss term, multiplied by this scalar
+     l2_norm: float = 0.0,  # AdamW default has 0.01 L2 regularization, but BERT trainer uses 0.0
+     l1_norm: float = 0.0,
+     circle_reg: float = 0.0,
+@@ -429,6 +433,9 @@ def train(
+         ft_names=dsets[0].dset.feature_names[ft_key],
+         lr=lr,
+         loss=loss_fn,
++        use_pairwise_dist_loss=use_pdist_loss
++        if isinstance(use_pdist_loss, float)
++        else [*use_pdist_loss, timesteps],
+         l2=l2_norm,
+         l1=l1_norm,
+         circle_reg=circle_reg,
+diff --git a/foldingdiff/datasets.py b/foldingdiff/datasets.py
+index 72f4435..acc478d 100644
+--- a/foldingdiff/datasets.py
++++ b/foldingdiff/datasets.py
+@@ -384,6 +384,7 @@ def __getitem__(
+             "coords": coords,
+             "attn_mask": attn_mask,
+             "position_ids": position_ids,
++            "lengths": torch.tensor(l, dtype=torch.int64),
+         }
+         return retval
+ 
+@@ -468,7 +469,7 @@ def __getitem__(
+         assert torch.all(
+             return_dict["angles"] <= torch.pi
+         ), f"Maximum value {torch.max(return_dict['angles'])} higher than pi"
+-        return_dict.pop("coords", None)
++        # return_dict.pop("coords", None)
+ 
+         return return_dict
+ 
+@@ -734,6 +735,8 @@ def __getitem__(
+             "corrupted": noised_vals,
+             "t": t,
+             "known_noise": noise,
++            "sqrt_alphas_cumprod_t": sqrt_alphas_cumprod_t,
++            "sqrt_one_minus_alphas_cumprod_t": sqrt_one_minus_alphas_cumprod_t,
+         }
+ 
+         # Update dictionary if wrapped dset returns dicts, else just return
+diff --git a/foldingdiff/losses.py b/foldingdiff/losses.py
+index 232b59c..44f5774 100644
+--- a/foldingdiff/losses.py
++++ b/foldingdiff/losses.py
+@@ -1,13 +1,12 @@
+ """
+ Loss functions!
+ """
+-
+-import numpy as np
++from typing import Optional, Sequence, Tuple
+ 
+ import torch
+-from torch import nn
++from torch.nn import functional as F
+ 
+-from . import utils
++from foldingdiff import utils
+ 
+ 
+ def radian_l1_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+@@ -61,8 +60,98 @@ def radian_smooth_l1_loss(
+     return retval
+ 
+ 
++def _get_pairwise_dist_batch(
++    values: torch.Tensor, lengths: Sequence[int]
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Calculates the pairwise distance matrix for the given values
++    Returns two tensors of shape (batch, M) where M is the number of pairwise
++    distances, padded. First tensor is actual distances, second tensor is a mask.
++    Mask is formatted such that valid values are 1 and invalid values are 0.
++    """
++    assert values.ndim == 3, f"Expected 3D tensor of (batch, N, 3), got {values.ndim}D"
++    assert (
++        values.shape[-1] == 3
++    ), f"Expected 3D tensor of (batch, N, 3), got {values.shape}"
++    assert lengths.ndim == 1
++    assert values.shape[0] == lengths.shape[0]
++
++    # Calculate the pairwise distances
++    dev = values.device
++    values = [F.pdist(values[i, :l]) for i, l in enumerate(lengths)]
++
++    # Pad
++    lengths = [len(v) for v in values]
++    max_len = max(lengths)
++    mask = torch.zeros((len(values), max_len))
++    for i, l in enumerate(lengths):
++        mask[i, :l] = 1.0
++
++    retval = torch.zeros((len(values), max_len)).to(dev)
++    for i, v in enumerate(values):
++        retval[i, : len(v)] = v
++    assert retval.shape == mask.shape
++
++    return retval, mask
++
++
++def pairwise_dist_loss(
++    input: torch.Tensor,
++    target: torch.Tensor,
++    lengths: Optional[torch.Tensor] = None,
++    weights: Optional[torch.Tensor] = None,
++):
++    """
++    Calculates the pairwise distance matrix for both the input and the target,
++    which are given in 3D cartesian coordinates of the shape (batch, N, 3) and
++    calculates a loss based on the difference in the pairwise distances. Padding
++    is handled using the lengths tensor, which is a 1D tensor of shape (batch,)
++    and contains the number of valid values in each batch. Pairwise distances are
++    calculated betwen all given coordinates.
++
++    Note that since we are comparing pairwise distances, this loss function itself
++    is rotation and shift invariant.
++    """
++    if lengths is None:
++        lengths = torch.IntTensor(
++            [
++                torch.all(~torch.isnan(input[i]), dim=1).sum()
++                for i in range(input.shape[0])
++            ]
++        )
++    assert lengths.shape[0] == input.shape[0]
++    # Calculate pairwise distances; these return (batch, M) tensors
++    # of the distances and a mask (where 0 indicates a padding value)
++    input_dists, input_mask = _get_pairwise_dist_batch(input, lengths)
++    target_dists, target_mask = _get_pairwise_dist_batch(target, lengths)
++    assert torch.allclose(input_mask, target_mask)
++
++    batch_indices, _seq_indices = torch.where(input_mask)
++
++    # Get the loss
++    # https://pytorch.org/docs/stable/generated/torch.nn.functional.mse_loss.html
++    loss = F.mse_loss(
++        input_dists[torch.where(input_mask)],
++        target_dists[torch.where(target_mask)],
++        reduction="none",
++    )
++    # Scale by weights optionally
++    if weights is not None:
++        if weights.ndim > 1:
++            assert weights.shape[0] == input.shape[0]
++            # loss shape (batch, M), weights after indexing is (M,) --> (1, M)
++            loss *= weights[batch_indices].squeeze()
++        else:
++            loss *= weights
++    return torch.mean(loss)
++
++
+ def main():
+-    l = radian_smooth_l1_loss(torch.tensor(-17.0466), torch.tensor(-1.3888), beta=0.1)
++    lengths = torch.randint(2, 5, size=(16,)) * 3
++    x = torch.randn(16, 12, 3)
++    y = torch.randn(16, 12, 3)
++
++    l = pairwise_dist_loss(x, y, lengths)
+     print(l)
+ 
+ 
+diff --git a/foldingdiff/modelling.py b/foldingdiff/modelling.py
+index 920426f..aafb22a 100644
+--- a/foldingdiff/modelling.py
++++ b/foldingdiff/modelling.py
+@@ -28,7 +28,7 @@
+ from transformers.activations import get_activation
+ from transformers.optimization import get_linear_schedule_with_warmup
+ 
+-from foldingdiff import losses
++from foldingdiff import losses, nerf
+ from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY
+ 
+ LR_SCHEDULE = Optional[Literal["OneCycleLR", "LinearWarmup"]]
+@@ -310,7 +310,9 @@ def from_dir(
+         config = BertConfig.from_json_file(os.path.join(dirname, "config.json"))
+ 
+         if ft_is_angular is None:
+-            ft_is_angular = FEATURE_SET_NAMES_TO_ANGULARITY[train_args["angles_definitions"]]
++            ft_is_angular = FEATURE_SET_NAMES_TO_ANGULARITY[
++                train_args["angles_definitions"]
++            ]
+             logging.info(f"Auto constructed ft_is_angular: {ft_is_angular}")
+ 
+         model_args = dict(
+@@ -481,6 +483,7 @@ def __init__(
+         self,
+         lr: float = 5e-5,
+         loss: Union[Callable, LOSS_KEYS] = "smooth_l1",
++        use_pairwise_dist_loss: Union[float, Tuple[float, float, int]] = 0.0,
+         l2: float = 0.0,
+         l1: float = 0.0,
+         circle_reg: float = 0.0,
+@@ -523,6 +526,7 @@ def __init__(
+                 len(self.loss_func) == self.n_inputs
+             ), f"Got {len(self.loss_func)} loss functions, expected {self.n_inputs}"
+ 
++        self.use_pairwise_dist_loss = use_pairwise_dist_loss
+         self.l1_lambda = l1
+         self.l2_lambda = l2
+         self.circle_lambda = circle_reg
+@@ -599,6 +603,71 @@ def _get_loss_terms(
+                 }
+                 json.dump(d_to_write, f)
+ 
++        if (
++            isinstance(self.use_pairwise_dist_loss, (list, tuple))
++            or self.use_pairwise_dist_loss > 0
++        ):
++            # Compute the pairwise distance loss
++            bs = batch["sqrt_one_minus_alphas_cumprod_t"].shape[0]
++            # The alpha* have shape of [batch], e.g. [32]
++            # corrupted have shape of [batch, seq_len, num_angles], e.g. [32, 128, 6]
++            denoised_angles = (
++                batch["corrupted"]
++                - batch["sqrt_one_minus_alphas_cumprod_t"].view(bs, 1, 1)
++                * predicted_noise
++            )
++            denoised_angles /= batch["sqrt_alphas_cumprod_t"].view(bs, 1, 1)
++
++            known_angles = batch['angles']
++            inferred_coords = nerf.nerf_build_batch(
++                phi=known_angles[:, :, self.ft_names.index("phi")],
++                psi=known_angles[:, :, self.ft_names.index("psi")],
++                omega=known_angles[:, :, self.ft_names.index("omega")],
++                bond_angle_n_ca_c=known_angles[:, :, self.ft_names.index("tau")],
++                bond_angle_ca_c_n=known_angles[:, :, self.ft_names.index("CA:C:1N")],
++                bond_angle_c_n_ca=known_angles[
++                    :, :, self.ft_names.index("C:1N:1CA")
++                ],
++            )
++            denoised_coords = nerf.nerf_build_batch(
++                phi=denoised_angles[:, :, self.ft_names.index("phi")],
++                psi=denoised_angles[:, :, self.ft_names.index("psi")],
++                omega=denoised_angles[:, :, self.ft_names.index("omega")],
++                bond_angle_n_ca_c=denoised_angles[:, :, self.ft_names.index("tau")],
++                bond_angle_ca_c_n=denoised_angles[:, :, self.ft_names.index("CA:C:1N")],
++                bond_angle_c_n_ca=denoised_angles[
++                    :, :, self.ft_names.index("C:1N:1CA")
++                ],
++            )
++            ca_idx = torch.arange(start=1, end=denoised_coords.shape[1], step=3)
++            denoised_ca_coords = denoised_coords[:, ca_idx, :]
++            inferred_ca_coords = inferred_coords[:, ca_idx, :]
++            assert (
++                inferred_ca_coords.shape == denoised_ca_coords.shape
++            ), f"{inferred_ca_coords.shape} != {denoised_ca_coords.shape}"
++
++            # Determine coefficient for this loss term
++            if isinstance(self.use_pairwise_dist_loss, (list, tuple)):
++                min_coef, max_coef, max_timesteps = self.use_pairwise_dist_loss
++                assert 0 < min_coef < max_coef
++                # Linearly interpolate between min and max based on the timestep
++                # of each item in the batch
++                coef = min_coef + (max_coef - min_coef) * (
++                    (max_timesteps - batch["t"]) / max_timesteps
++                ).to(batch['t'].device)
++                assert torch.all(coef > 0)
++            else:
++                coef = self.use_pairwise_dist_loss
++                assert coef > 0
++
++            pdist_loss = losses.pairwise_dist_loss(
++                denoised_ca_coords,
++                inferred_ca_coords,
++                lengths=batch["lengths"],
++                weights=coef,
++            )
++            loss_terms.append(pdist_loss)
++
+         return torch.stack(loss_terms)
+ 
+     def training_step(self, batch, batch_idx):
+@@ -613,10 +682,15 @@ def training_step(self, batch, batch_idx):
+             l1_penalty = sum(torch.linalg.norm(p, 1) for p in self.parameters())
+             avg_loss += self.l1_lambda * l1_penalty
+ 
+-        assert len(loss_terms) == len(self.ft_names)
++        pseudo_ft_names = (
++            (self.ft_names + ["pairwise_dist_loss"])
++            if self.use_pairwise_dist_loss
++            else self.ft_names
++        )
++        assert len(loss_terms) == len(pseudo_ft_names)
+         loss_dict = {
+             f"train_loss_{val_name}": val
+-            for val_name, val in zip(self.ft_names, loss_terms)
++            for val_name, val in zip(pseudo_ft_names, loss_terms)
+         }
+         loss_dict["train_loss"] = avg_loss
+         self.log_dict(loss_dict)  # Don't seem to need rank zero or sync dist
+@@ -652,10 +726,15 @@ def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
+         avg_loss = torch.mean(loss_terms)
+ 
+         # Log each of the loss terms
+-        assert len(loss_terms) == len(self.ft_names)
++        pseudo_ft_names = (
++            (self.ft_names + ["pairwise_dist_loss"])
++            if self.use_pairwise_dist_loss
++            else self.ft_names
++        )
++        assert len(loss_terms) == len(pseudo_ft_names)
+         loss_dict = {
+             f"val_loss_{val_name}": self.all_gather(val)
+-            for val_name, val in zip(self.ft_names, loss_terms)
++            for val_name, val in zip(pseudo_ft_names, loss_terms)
+         }
+         loss_dict["val_loss"] = avg_loss
+         # with rank zero it seems that we don't need to use sync_dist
+diff --git a/foldingdiff/nerf.py b/foldingdiff/nerf.py
+index 541a8ac..b98d448 100644
+--- a/foldingdiff/nerf.py
++++ b/foldingdiff/nerf.py
+@@ -163,9 +163,9 @@ def place_dihedral(
+         cross = lambda x, y: np.cross(x, y, axis=-1)
+     else:
+         ensure_tensor = (
+-            lambda x: torch.tensor(x, requires_grad=False)
++            lambda x: torch.tensor(x, requires_grad=False).to(a.device)
+             if not isinstance(x, torch.Tensor)
+-            else x
++            else x.to(a.device)
+         )
+         a, b, c, bond_angle, bond_length, torsion_angle = [
+             ensure_tensor(x) for x in (a, b, c, bond_angle, bond_length, torsion_angle)
+@@ -226,9 +226,11 @@ def nerf_build_batch(
+     batch = phi.shape[0]
+ 
+     # (batch, seq, 3)
+-    coords = torch.tensor(
+-        np.array([N_INIT, CA_INIT, C_INIT]), requires_grad=True
+-    ).repeat(batch, 1, 1)
++    coords = (
++        torch.tensor(np.array([N_INIT, CA_INIT, C_INIT]), requires_grad=True)
++        .repeat(batch, 1, 1)
++        .to(phi.device)
++    )
+     assert coords.shape == (batch, 3, 3), f"Mismatched shape: {coords.shape}"
+ 
+     # perform broadcasting of bond lengths
+diff --git a/tests/test_data.py b/tests/test_data.py
+index 48c3932..f2e9096 100644
+--- a/tests/test_data.py
++++ b/tests/test_data.py
+@@ -8,7 +8,7 @@
+ import numpy as np
+ import torch
+ 
+-from foldingdiff import datasets
++from foldingdiff import datasets, utils
+ 
+ 
+ class TestCathCanonical(unittest.TestCase):
+@@ -25,7 +25,10 @@ def setUp(self) -> None:
+     def test_return_keys(self):
+         """Test that returned dictionary has expected keys"""
+         d = self.dset[0]
+-        self.assertEqual(set(d.keys()), set(["angles", "coords", "position_ids", "attn_mask"]))
++        self.assertEqual(
++            set(d.keys()),
++            set(["angles", "coords", "position_ids", "attn_mask", "lengths"]),
++        )
+ 
+     def test_num_feature(self):
+         """Test that we have the expected number of features"""
+@@ -66,7 +69,10 @@ def setUp(self) -> None:
+     def test_return_keys(self):
+         """Test that returned dictionary has expected keys"""
+         d = self.dset[0]
+-        self.assertEqual(set(d.keys()), set(["angles", "position_ids", "attn_mask"]))
++        self.assertEqual(
++            set(d.keys()),
++            set(["angles", "position_ids", "attn_mask", "coords", "lengths"]),
++        )
+ 
+     def test_num_features(self):
+         """Test that we return the expected number of features and have correctly removed distance"""
+@@ -146,3 +152,16 @@ def test_repeated_query(self):
+         x = self.noised_dset[1]["angles"]
+         y = self.noised_dset[1]["angles"]
+         self.assertTrue(torch.allclose(x, y))
++
++    def test_angles_reconstructed(self):
++        """Test that subtracting noise from corrupted angles (with constant scaling) recovers original angles"""
++        d = self.noised_dset[3]
++        noised_angles = d["corrupted"]
++        orig_angles = d["angles"]
++        noise = d["known_noise"]
++
++        recovered = (noised_angles - d["sqrt_one_minus_alphas_cumprod_t"] * noise) / d[
++            "sqrt_alphas_cumprod_t"
++        ]
++        recovered = utils.modulo_with_wrapped_range(recovered, -np.pi, np.pi)
++        self.assertTrue(torch.allclose(recovered, orig_angles, atol=1e-5))
+diff --git a/tests/test_losses.py b/tests/test_losses.py
+index c5ea9d1..8ba8ffc 100644
+--- a/tests/test_losses.py
++++ b/tests/test_losses.py
+@@ -144,5 +144,65 @@ def test_ex(self):
+         self.assertAlmostEqual(3.04143, l.item(), places=5)
+ 
+ 
++class TestPairwiseDistLoss(unittest.TestCase):
++    """
++    Tests for pairwise distance loss
++    """
++
++    def setUp(self) -> None:
++        self.rng = np.random.default_rng(1234)
++        self.input = torch.from_numpy(self.rng.random(size=(128, 48, 3)))
++        self.target = torch.from_numpy(self.rng.random(size=(128, 48, 3)))
++        self.lengths = torch.from_numpy(self.rng.integers(low=1, high=48, size=(128,)))
++
++    def test_shift_invariance(self):
++        """Test that loss does not change under shift"""
++        l = losses.pairwise_dist_loss(self.input, self.target)
++        l_shift = losses.pairwise_dist_loss(self.input + 1, self.target + 100)
++        self.assertAlmostEqual(l.item(), l_shift.item(), places=5)
++
++    def test_length_masking_eq(self):
++        """Test that loss correctly ignores values beyond the length mask"""
++        l_ref = losses.pairwise_dist_loss(self.input, self.target, self.lengths)
++        input_mutated = self.input.clone()
++        for i, l in enumerate(self.lengths):
++            input_mutated[i, l:] = -100.0  # Mutate the input
++        l_masked = losses.pairwise_dist_loss(input_mutated, self.target, self.lengths)
++        self.assertAlmostEqual(l_ref.item(), l_masked.item(), places=5)
++
++    def test_length_masking_neq(self):
++        """Test that mutating values within the length mask changes loss"""
++        l_ref = losses.pairwise_dist_loss(self.input, self.target, self.lengths)
++        input_mutated = self.input.clone()
++        for i, l in enumerate(self.lengths):
++            idx = self.rng.integers(low=0, high=l, size=1)
++            input_mutated[i, idx] = -99.0
++        l_mut = losses.pairwise_dist_loss(input_mutated, self.target, self.lengths)
++        self.assertNotAlmostEqual(l_ref.item(), l_mut.item(), places=5)
++
++    def test_reduce_on_closer_match(self):
++        """Test that pairwise loss goes down when we have closer match"""
++
++        l_ref = losses.pairwise_dist_loss(self.input, self.target, self.lengths)
++        # Adjust target to be somewhat closer to input
++        target_mutated = self.target.clone()
++        for i, l in enumerate(self.lengths):
++            idx = self.rng.integers(low=0, high=l, size=1)
++            target_mutated[i, idx] = self.input[i, idx]
++        l_new = losses.pairwise_dist_loss(self.input, target_mutated, self.lengths)
++        self.assertLess(l_new.item(), l_ref.item())
++    
++    def test_zero_on_identical(self):
++        """Test that pairwise loss is zero when inputs are identical (up to shift)"""
++        l_zero = losses.pairwise_dist_loss(self.input, self.input + 99.9, self.lengths)
++        self.assertAlmostEqual(l_zero.item(), 0.0, places=5)
++    
++    def test_symmetric(self):
++        """Test that pairwise loss is symmetric"""
++        l = losses.pairwise_dist_loss(self.input, self.target, self.lengths)
++        l_sym = losses.pairwise_dist_loss(self.target, self.input, self.lengths)
++        self.assertAlmostEqual(l.item(), l_sym.item(), places=5)
++
++
+ if __name__ == "__main__":
+     unittest.main()

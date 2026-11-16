@@ -1,0 +1,2062 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index f2bda88b..39ebb64c 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -40,6 +40,7 @@ jobs:
+         pip install pytest-xdist
+         pip install pytest-cov
+         pip install optax
++        pip install netCDF4
+     - name: Test with pytest and generate coverage report
+       run: |
+         JAX_ENABLE_X64=1 pytest -n auto --cov=jax_md --cov-report=xml --cov-report=term --cov-config=setup.cfg
+diff --git a/README.md b/README.md
+index 37bf8893..b5eee16b 100644
+--- a/README.md
++++ b/README.md
+@@ -53,6 +53,7 @@ To get started playing around with JAX MD check out the following colab notebook
+ - [Meta Optimization](https://colab.research.google.com/github/google/jax-md/blob/main/notebooks/meta_optimization.ipynb)
+ - [Swap Monte Carlo (Cargese Summer School)](https://colab.research.google.com/github/google/jax-md/blob/main/notebooks/cargese_swap_mc.ipynb)
+ - [Implicit Differentiation](https://colab.research.google.com/github/google/jax-md/blob/main/notebooks/implicit_differentiation.ipynb)
++- [Athermal Linear Elasticity](https://colab.research.google.com/github/google/jax-md/blob/main/notebooks/athermal_linear_elasticity.ipynb)
+ 
+ You can install JAX MD locally with pip,
+ ```
+diff --git a/docs/jax_md.elasticity.rst b/docs/jax_md.elasticity.rst
+new file mode 100644
+index 00000000..158e40df
+--- /dev/null
++++ b/docs/jax_md.elasticity.rst
+@@ -0,0 +1,19 @@
++Elasticity Routines
++=====================
++
++.. default-role:: code
++.. automodule:: jax_md.elasticity
++
++Primary Functions
++-------------------
++.. autofunction:: athermal_moduli
++
++Helper Functions
++------------------
++.. autofunction:: tensor_to_mandel
++.. autofunction:: mandel_to_tensor
++.. autofunction:: extract_elements
++.. autofunction:: extract_isotropic_moduli
++
++
++
+diff --git a/jax_md/__init__.py b/jax_md/__init__.py
+index 5d2cfe4b..a13361c1 100644
+--- a/jax_md/__init__.py
++++ b/jax_md/__init__.py
+@@ -18,6 +18,7 @@
+ from jax_md import simulate
+ from jax_md import smap
+ from jax_md import partition
++from jax_md import elasticity
+ from jax_md import dataclasses
+ from jax_md import nn
+ from jax_md import interpolate
+diff --git a/jax_md/elasticity.py b/jax_md/elasticity.py
+new file mode 100644
+index 00000000..87d80729
+--- /dev/null
++++ b/jax_md/elasticity.py
+@@ -0,0 +1,575 @@
++"""Code to calculate the elastic modulus tensor for athermal systems.
++
++  The elastic modulus tensor describes a material's response to different 
++  boundary deformations. Specifically, for a small deformation given by a 
++  symmetric strain tensor e, the change in energy is
++    U / V^0 = U^0/V^0 + s^0_{ij} e_{ji} + (1/2) C_{ijkl} e_{ij} e_{kl} + ...
++  where V^0 is the volume, U^0 is the initial energy, s^0 is the residual stress
++  tensor of the undeformed system, and C is the elastic modulus tensor. C is
++  a fourth-rank tensor of shape (dimension,dimension,dimension,dimension), with
++  the following symmetries.
++  
++    Minor symmetries:
++      C_ijkl = C_jikl = C_ijlk
++
++    Major symmetries:
++      C_ijkl = C_lkij
++
++  The minor symmetries are also reflected in the symmetric nature
++  of stress and strain tensors:
++    s_ij = s_ji
++    e_ij = e_ji
++
++  In general, there are 21 independent elastic constants in 3 dimension (6 in 2
++  dimensions). While systems with additional symmetries (e.g. isotropic,
++  orthotropic, etc.) can be expressed with fewer constants, we do not assume any
++  such additional symmetries.
++
++  At zero temperature, the response of every particle to a deformation can be 
++  calculated explicitly to linear order, enabling the exact calculation of 
++  the elastic modulus tensor without the need of any finite differences or any
++  approximations.
++
++"""
++
++
++
++
++from functools import partial
++from typing import Dict, Callable, Union
++from absl import logging
++
++import jax
++import jax.numpy as jnp
++import jax.scipy as jsp
++from jax import jit, lax, grad, vmap, jacfwd, jacrev, jvp
++
++from jax_md import quantity
++from jax_md.util import Array
++from jax_md.util import f32
++from jax_md.util import f64
++
++def _get_strain_tensor_list(dim, dtype) -> Array:
++  if dim == 2:
++    strain_tensors = jnp.array([[[1, 0],[0, 0]],
++                                [[0, 0],[0, 1]],
++                                [[0, 1],[1, 0]],
++                                [[1, 0],[0, 1]],
++                                [[1, 1],[1, 0]],
++                                [[0, 1],[1, 1]]], dtype=dtype)
++  elif dim == 3:
++    strain_tensors = jnp.array([[[1, 0, 0], [0, 0, 0], [0, 0, 0]],
++                                [[0, 0, 0], [0, 1, 0], [0, 0, 0]],
++                                [[0, 0, 0], [0, 0, 0], [0, 0, 1]],
++                                [[0, 0, 0], [0, 0, 1], [0, 1, 0]],
++                                [[0, 0, 1], [0, 0, 0], [1, 0, 0]],
++                                [[0, 1, 0], [1, 0, 0], [0, 0, 0]],
++                                [[0, 0, 0], [0, 1, 0], [0, 0, 1]],
++                                [[1, 0, 0], [0, 0, 0], [0, 0, 1]],
++                                [[1, 0, 0], [0, 1, 0], [0, 0, 0]],
++                                [[1, 0, 0], [0, 0, 1], [0, 1, 0]],
++                                [[1, 0, 1], [0, 0, 0], [1, 0, 0]],
++                                [[1, 1, 0], [1, 0, 0], [0, 0, 0]],
++                                [[0, 0, 0], [0, 1, 1], [0, 1, 0]],
++                                [[0, 0, 1], [0, 1, 0], [1, 0, 0]],
++                                [[0, 1, 0], [1, 1, 0], [0, 0, 0]],
++                                [[0, 0, 0], [0, 0, 1], [0, 1, 1]],
++                                [[0, 0, 1], [0, 0, 0], [1, 0, 1]],
++                                [[0, 1, 0], [1, 0, 0], [0, 0, 1]],
++                                [[0, 0, 1], [0, 0, 1], [1, 1, 0]],
++                                [[0, 1, 0], [1, 0, 1], [0, 1, 0]],
++                                [[0, 1, 1], [1, 0, 0], [1, 0, 0]]], dtype=dtype)
++  else:
++    raise AssertionError('not implemented for {} dimensions'.format(dim))
++  return strain_tensors
++
++def _convert_responses_to_elastic_constants(response_all: Array) -> Array:
++  if response_all.shape[0] == 6:
++    cxxxx = response_all[0]
++    cyyyy = response_all[1]
++    cxyxy = 0.25 * response_all[2]
++    cxxyy = 0.5  * (response_all[3] - cxxxx - cyyyy)
++    cxxxy = 0.25 * (response_all[4] - 4 * cxyxy - cxxxx)
++    cyyxy = 0.25 * (response_all[5] - 4 * cxyxy - cyyyy)
++
++    C = jnp.array(
++        [[[[cxxxx, cxxxy], [cxxxy, cxxyy]],
++          [[cxxxy, cxyxy], [cxyxy, cyyxy]]],
++         [[[cxxxy, cxyxy], [cxyxy, cyyxy]],
++          [[cxxyy, cyyxy], [cyyxy, cyyyy]]]])
++
++  elif response_all.shape[0] == 21: 
++    cxxxx = response_all[0];
++    cyyyy = response_all[1];
++    czzzz = response_all[2];
++    cyzyz = response_all[3] / 4.;
++    cxzxz = response_all[4] / 4.;
++    cxyxy = response_all[5] / 4.;
++    cyyzz = (response_all[6] - cyyyy - czzzz) / 2.;
++    cxxzz = (response_all[7] - cxxxx - czzzz) / 2.;
++    cxxyy = (response_all[8] - cxxxx - cyyyy) / 2.;
++    cxxyz = (response_all[9] - cxxxx - 4. * cyzyz) / 4.;
++    cxxxz = (response_all[10] - cxxxx - 4. * cxzxz) / 4.;
++    cxxxy = (response_all[11] - cxxxx - 4. * cxyxy) / 4.;
++    cyyyz = (response_all[12] - cyyyy - 4. * cyzyz) / 4.;
++    cyyxz = (response_all[13] - cyyyy - 4. * cxzxz) / 4.;
++    cyyxy = (response_all[14] - cyyyy - 4. * cxyxy) / 4.;
++    czzyz = (response_all[15] - czzzz - 4. * cyzyz) / 4.;
++    czzxz = (response_all[16] - czzzz - 4. * cxzxz) / 4.;
++    czzxy = (response_all[17] - czzzz - 4. * cxyxy) / 4.;
++    cyzxz = (response_all[18] - 4. * cyzyz - 4. * cxzxz) / 8.;
++    cyzxy = (response_all[19] - 4. * cyzyz - 4. * cxyxy) / 8.;
++    cxzxy = (response_all[20] - 4. * cxzxz - 4. * cxyxy) / 8.;
++
++    C = jnp.array(
++         [[[[cxxxx, cxxxy, cxxxz],
++            [cxxxy, cxxyy, cxxyz],
++            [cxxxz, cxxyz, cxxzz]],
++           [[cxxxy, cxyxy, cxzxy],
++            [cxyxy, cyyxy, cyzxy],
++            [cxzxy, cyzxy, czzxy]],
++           [[cxxxz, cxzxy, cxzxz],
++            [cxzxy, cyyxz, cyzxz],
++            [cxzxz, cyzxz, czzxz]]],
++          [[[cxxxy, cxyxy, cxzxy],
++            [cxyxy, cyyxy, cyzxy],
++            [cxzxy, cyzxy, czzxy]],
++           [[cxxyy, cyyxy, cyyxz],
++            [cyyxy, cyyyy, cyyyz],
++            [cyyxz, cyyyz, cyyzz]],
++           [[cxxyz, cyzxy, cyzxz],
++            [cyzxy, cyyyz, cyzyz],
++            [cyzxz, cyzyz, czzyz]]],
++          [[[cxxxz, cxzxy, cxzxz],
++            [cxzxy, cyyxz, cyzxz],
++            [cxzxz, cyzxz, czzxz]],
++           [[cxxyz, cyzxy, cyzxz],
++            [cyzxy, cyyyz, cyzyz],
++            [cyzxz, cyzyz, czzyz]],
++           [[cxxzz, czzxy, czzxz],
++            [czzxy, cyyzz, czzyz],
++            [czzxz, czzyz, czzzz]]]])
++  else:
++    raise AssertionError('response_all has incorrect shape')
++  return C
++
++def athermal_moduli(energy_fn: Callable[..., Array], 
++                    tether_strength: float=1e-10,
++                    gradient_check: Array=None, 
++                    cg_tol: float=1e-7,
++                    check_convergence: bool=False
++                    ) -> Callable[..., Array]:
++  """ Setup calculation of elastic modulus tensor.
++
++  Args:
++    energy_fn: A function that computes the energy of the system. This
++      function must take as an argument `perturbation` which perturbes the
++      box shape. Any energy function constructed using `smap` or in `energy.py`
++      with a standard space will satisfy this property. 
++    tether_strength: scalar. Strength of the "tether" applied to each particle, 
++      which can be necessary to make the Hessian matrix non-singular. Solving
++      for the non-affine response of each particle requires that the Hessian is
++      positive definite. However, there can often be zero modes (eigenvectors of
++      the Hessian with zero eigenvalue) that do not couple to the boundary, and 
++      therefore do not affect the elastic constants despite the zero eigenvalue.
++      The most common example is the global translational modes. To solve for
++      the non-affine response, we consider the "tethered Hessian"
++        H + tether_strength * I, 
++      where I is the identity matrix and tether_strength is a small constant.
++    gradient_check: None or scalar. If not None, a check will be performed 
++      to guarantee that the maximum component of the gradient is less than
++      gradient_check. In other words, that
++        jnp.amax(jnp.abs(grad(energy_fn)(R, box=box))) < gradient_check == True
++      NOTE: JAX currently does not support proper runtime error handling.
++      Therefore, if this check fails, the calculation will return an array
++      of jnp.nan's. It is the users responsibility, if they want to use this
++      check, to then ensure that the returned array is not full of nans.
++    cg_tol: scalar. Tolorance used when solving for the non-affine response.
++    check_convergence: bool. If true, calculate_EMT will return a boolean
++      flag specifiying if the cg solve routine converged to the desired
++      tolorance. The default is False, but convergence checking is highly
++      recommended especially when using 32-bit precision data.
++  
++  Return: A function to calculate the elastic modulus tensor
++
++  """
++
++  def calculate_emt(R: Array,
++                    box: Array, 
++                    **kwargs) -> Array:
++    """Calculate the elastic modulus tensor.
++
++    energy_fn(R) corresponds to the state around which we are expanding
++      
++    Args:
++      R: array of shape (N,dimension) of particle positions. This does not
++        generalize to arbitrary dimensions and is only implemented for
++          dimension == 2
++          dimension == 3
++      box: A box specifying the shape of the simulation volume. Used to infer
++        the volume of the unit cell.
++    
++    Return: C or the tuple (C,converged)
++      where C is the Elastic modulus tensor as an array of shape (dimension,
++      dimension,dimension,dimension) that respects the major and minor 
++      symmetries, and converged is a boolean flag (see above).
++
++    """
++    if not (R.shape[-1] == 2 or R.shape[-1] == 3):
++      raise AssertionError('Only implemented for 2d and 3d systems.')
++
++    if R.dtype is not jnp.dtype('float64'):
++      logging.warning('Elastic modulus calculations can sometimes lose '
++                      'precision when not using 64-bit precision.')
++
++    dim = R.shape[-1]
++
++    def setup_energy_fn_general(strain_tensor):
++      I = jnp.eye(dim, dtype=R.dtype)
++      @jit
++      def energy_fn_general(R, gamma):
++        perturbation = I + gamma * strain_tensor
++        return energy_fn(R, perturbation=perturbation, **kwargs)
++      return energy_fn_general
++    
++    def get_affine_response(strain_tensor):
++      energy_fn_general = setup_energy_fn_general(strain_tensor)
++      d2U_dRdgamma = jacfwd(jacrev(energy_fn_general,argnums=0),argnums=1)(R,0.)
++      d2U_dgamma2  = jacfwd(jacrev(energy_fn_general,argnums=1),argnums=1)(R,0.)
++      return d2U_dRdgamma, d2U_dgamma2
++
++    strain_tensors = _get_strain_tensor_list(dim, R.dtype)
++    d2U_dRdgamma_all,d2U_dgamma2_all = vmap(get_affine_response)(strain_tensors)
++
++    #Solve the system of equations.
++    energy_fn_Ronly = partial(energy_fn, **kwargs)
++    def hvp(f, primals, tangents):
++      return jvp(grad(f), primals, tangents)[1]
++    def hvp_specific_with_tether(v):
++      return hvp(energy_fn_Ronly, (R,), (v,)) + tether_strength * v
++    
++    non_affine_response_all = jsp.sparse.linalg.cg(
++        vmap(hvp_specific_with_tether), 
++        d2U_dRdgamma_all, 
++        tol=cg_tol
++        )[0]
++    #The above line should be functionally equivalent to:
++    #H0=hessian(energy_fn)(R, box=box, **kwargs).reshape(R.size,R.size) \
++    #    + tether_strength * jnp.identity(R.size)
++    #non_affine_response_all = jnp.transpose(jnp.linalg.solve(
++    #   H0, 
++    #   jnp.transpose(d2U_dRdgamma_all))
++    #   )
++
++    residual = jnp.linalg.norm(vmap(hvp_specific_with_tether)(
++        non_affine_response_all) - d2U_dRdgamma_all
++      )
++    converged = residual / jnp.linalg.norm(d2U_dRdgamma_all) < cg_tol
++
++    response_all = d2U_dgamma2_all - jnp.einsum("nij,nij->n", 
++                                                d2U_dRdgamma_all, 
++                                                non_affine_response_all)
++
++    vol_0 = quantity.volume(dim, box)
++    response_all = response_all / vol_0
++    C = _convert_responses_to_elastic_constants(response_all)
++    
++    # JAX does not allow proper runtime error handling in jitted function. 
++    # Instead, if the user requests a gradient check and the check fails,
++    # we convert C into jnp.nan's. While this doesn't raise an exception,
++    # it at least is very "loud". 
++    if gradient_check is not None:
++      maxgrad = jnp.amax(jnp.abs(grad(energy_fn)(R, **kwargs)))
++      C = lax.cond(maxgrad > gradient_check, 
++                   lambda _: jnp.nan * C, 
++                   lambda _: C, 
++                   None)
++    
++    if check_convergence: 
++      return C, converged
++    else:
++      return C
++
++  return calculate_emt
++
++
++def _get_mandel_mapping_weight(dim, dtype):
++  if dim == 2:
++    m_map  = jnp.array([[0,0],[1,1],[0,1]], dtype=jnp.int8)
++    weight = jnp.array([1,1,jnp.sqrt(2)], dtype=dtype)
++    return m_map, weight
++  elif dim == 3:
++    m_map  = jnp.array([[0,0],[1,1],[2,2],[1,2],[0,2],[0,1]], dtype=jnp.int8)
++    weight = jnp.array([1,1,1,jnp.sqrt(2),jnp.sqrt(2),jnp.sqrt(2)], dtype=dtype)
++    return m_map, weight
++  else:
++    raise AssertionError('dim must be 2 or 3')
++
++def tensor_to_mandel(T: Array) -> Array:
++  """ Convert a tensor to Mandel notation.
++
++  Mandel notation is a way to represent symmetric second-rank tensors and
++  fourth-rank tensors with minor symmetries in a reduced form. Pairs of indices
++  are combined as follows:
++      
++      For tensors of shape (2,2) or (2,2,2,2):
++      tensor indices        Mandel indices
++      0,0 -------------->   0
++      1,1 -------------->   1
++      0,1 or 1,0 ------->   2
++
++      For tensors of shape (3,3) or (3,3,3,3):
++      tensor indices        Mandel indices
++      0,0 -------------->   0
++      1,1 -------------->   1
++      2,2 -------------->   2
++      1,2 or 2,1 ------->   3
++      0,2 or 2,0 ------->   4
++      0,1 or 1,0 ------->   5
++  
++  If mandel_index(i,j) performs the above index mapping, then the input T and 
++  output M satisfy
++    M[mandel_index(i,j)] = T[i,j] * w
++  or
++    M[mandel_index(i,j), mandel_index(k,l)] = T[i,j,k,l] * w(i,j) * w(k,l)
++  where
++    w(i,j) = 1       if i==j
++           = sqrt(2) if i!=j 
++  is a weight that is used to ensure proper contraction rules. Here (and only 
++  here) we do not assume major symmetries in fourth-rank tensors.
++
++  Args:
++    T: Array with 4 possible shapes:
++      1. T.shape == (2,2)
++         Convert a symmetric array of shape (2,2) to an array of shape (3,)
++      2. T.shape == (3,3)
++         Convert a symmetric array of shape (3,3) to an array of shape (6,)
++      3. T.shape == (2,2,2,2)
++         Convert a tensor of shape (2,2,2,2) with minor symmetries to an array
++         of shape (3,3)
++      4. T.shape == (3,3,3,3)
++         Convert a tensor of shape (3,3,3,3) with minor symmetries to an array
++         of shape (6,6)
++  
++  Output: Array of shape (3,), (6,), (3,3), or (6,6)
++
++  see: https://sbrisard.github.io/janus/mandel.html (accessed 21 April, 2021)
++  """
++  dim = T.shape[0]
++  if not (dim ==2 or dim == 3):
++    raise AssertionError('dim must be 2 or 3')
++  
++  rank = len(T.shape)
++  if not (rank == 2 or rank == 4):
++    raise AssertionError('T must have rank 2 or 4')
++  
++  m_map, weight = _get_mandel_mapping_weight(dim, T.dtype)
++  
++  if rank == 2:
++    extract = lambda idx, w: T[idx[0], idx[1]] * w
++    M = vmap(extract, in_axes=(0,0))(m_map, weight)
++  else:
++    extract = lambda idx0, idx1, w0, w1: T[
++        idx0[0], idx0[1], idx1[0], idx1[1]
++        ] * w0 * w1
++    M = vmap(
++          vmap(extract, 
++            in_axes=(0,None,0,None)), 
++          in_axes=(None,0,None,0))(m_map, m_map, weight, weight)
++  return M
++
++def mandel_to_tensor(M: Array) -> Array:
++  """ Perform the inverse of M = tensor_to_mandel(T).
++
++  Args:
++    M: Array of shape (3,), (6,), (3,3), or (6,6)
++  
++  Output: Array of shape (2,2), (3,3), (2,2,2,2), or (3,3,3,3)
++  """
++  mandel_dim = M.shape[0]
++  if not (mandel_dim == 3 or mandel_dim == 6):
++    raise AssertionError('M.shape[0] must be 3 or 6')
++  
++  rank = len(M.shape)
++  if not (rank == 1 or rank == 2):
++    raise AssertionError('T must have rank 1 or 2')
++
++  def mandel_index(i, j):
++    return lax.cond(i==j, 
++                    lambda ij: ij[0], 
++                    lambda ij: mandel_dim-ij[0]-ij[1], 
++                    (i,j))
++
++  if mandel_dim == 3:
++    dimension = 2
++  else:
++    dimension = 3
++
++  tensor_range = jnp.arange(dimension)
++  _, weight = _get_mandel_mapping_weight(dimension, M.dtype)
++
++  if rank == 1:
++    def extract(i, j):
++      idx = mandel_index(i, j)
++      return M[idx] / weight[idx]
++    T = vmap(
++          vmap(extract, 
++            in_axes=(0,None)), 
++          in_axes=(None,0))(tensor_range, tensor_range)
++  else:
++    def extract(i, j, k, l):
++      idx0 = mandel_index(i, j)
++      idx1 = mandel_index(k, l)
++      return M[idx0, idx1] / (weight[idx0] * weight[idx1])
++    T = vmap(
++          vmap(
++            vmap(
++              vmap(extract, 
++                in_axes=(0,None,None,None)), 
++              in_axes=(None,0,None,None)), 
++            in_axes=(None,None,0,None)), 
++          in_axes=(None,None,None,0))(tensor_range, 
++                                      tensor_range, 
++                                      tensor_range, 
++                                      tensor_range)
++  return T
++
++
++
++@partial(jit,static_argnums=(1,))
++def _extract_elements(C, as_dict):
++  if C.shape[0] == 2:
++    indices = ( [0, 1, 0, 0, 0, 0],
++                [0, 1, 1, 0, 0, 1],
++                [0, 1, 0, 1, 0, 1],
++                [0, 1, 1, 1, 1, 1])
++    clist = C[ indices ] 
++    if as_dict:
++      names = ['cxxxx','cyyyy','cxyxy','cxxyy','cxxxy','cyyxy']
++      return dict(zip(names, clist))
++    else:
++      return clist
++
++  elif C.shape[0] == 3:
++    indices = ( [0, 1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0],
++                [0, 1, 2, 2, 2, 1, 1, 0, 0, 0, 0, 0, 1, 2, 1, 2, 2, 1, 2, 1, 1],
++                [0, 1, 2, 1, 0, 0, 2, 2, 1, 1, 0, 0, 1, 1, 1, 2, 2, 2, 1, 1, 0],
++                [0, 1, 2, 2, 2, 1, 2, 2, 1, 2, 2, 1, 2, 1, 1, 2, 2, 2, 2, 2, 2])
++    clist = C[ indices ] 
++    if as_dict:
++      names = ['cxxxx','cyyyy','czzzz','cyzyz','cxzxz','cxyxy','cyyzz','cxxzz',
++               'cxxyy','cxxyz','cxxxz','cxxxy','cyyyz','cyyxz','cyyxy','czzyz',
++               'czzxz','czzxy','cyzxz','cyzxy','cxzxy']
++      return dict(zip(names, clist))
++    else:
++      return clist
++  else:
++    raise AssertionError('C has wrong shape')
++
++def extract_elements(C: Array) -> Dict:
++  """ Convert an elastic modulus tensor into a list of unique elements.
++      
++      In 2d, these are:
++      cxxxx,cyyyy,cxyxy,cxxyy,cxxxy,cyyxy
++
++      In 3d, these are:
++      cxxxx,cyyyy,czzzz,cyzyz,cxzxz,cxyxy,cyyzz,cxxzz,cxxyy,cxxyz,cxxxz,cxxxy,
++      cyyyz,cyyxz,cyyxy,czzyz,czzxz,czzxy,cyzxz,cyzxy,cxzxy
++
++  Args:
++    C: A previously calculated elastic modulus tensor represented as an 
++      array of shape (spatial_dimension,spatial_dimension,spatial_dimension,
++      spatial_dimension), where spatial_dimension is either 2 or 3. C must 
++      satisfy both the major and minor symmetries, but this is not checked.
++  Return: a dict of the 6 (21) unique elastic constants in 2 (3) dimensions.
++  """
++  return _extract_elements(C,True)
++
++def extract_isotropic_moduli(C: Array) -> Dict:
++  """ Extract commonly used isotropic constants. 
++
++  There are a number of important constants used to describe the linear 
++  elastic behavior of isotropic systems, including the bulk modulud, B, 
++  the shear modulus, G, the longitudinal modulus, M, the Young's modulus,
++  E, and the Poisson's ratio, nu. This convenience function extracts them
++  from an elastic modulus tensor C.
++
++  Angle averaged quantities: While these quantities are defined for
++  isotropic systems, one can still define an "angle-averaged shear
++  modulus", for example, that averages over all possible shear
++  deformations. This can be useful for systems that are statistically
++  isotropic but where a particular realization is slightly anisotropic.
++  The precise definitions are as follows:
++
++  First, we define the "response", R, to a certain strain tensor e to be
++    R = 2 * (U / V^0 - U^0/V^0 - s^0_{ij} e_{ji}) = C_{ijkl} e_{ij} e_{kl}
++
++  Bulk modulus, B:
++  This is the response to the rotationally invariant strain tensor:
++      e = (1/2) * ( 1 0 )     or      e = (1/3) * ( 1 0 0 )
++                  ( 0 1 )                         ( 0 1 0 )
++                                                  ( 0 0 1 )
++  
++  Shear modulus, G:
++  This is the response to the strain tensor:
++      e = (1/2) * ( 0 1 )     or      e = (1/2) * ( 0 1 0 )
++                  ( 1 0 )                         ( 1 0 0 )
++                                                  ( 0 0 0 )
++  averaged over all possible orientations. For perfectly isotropic
++  systems, it should be equal to C[0,1,0,1].
++
++  Longitudinal modulus, M:
++  This is the response to the strain tensor:
++      e = ( 1 0 )     or      e = ( 1 0 0 )
++          ( 0 0 )                 ( 0 0 0 )
++                                  ( 0 0 0 )
++  averaged over all possible orientations. For perfectly isotropic
++  systems, it should be equal to C[0,0,0,0].
++
++  Young's modulus, E:
++  This is a measure of tensile stiffness and is calculated a using well-
++  known expression in terms of B and G.
++
++  Poisson's ratio:
++  This is a measure of deformations in directions perpendicular to an
++  applied load and is calculated a using well-known expression in terms 
++  of B and G.
++  
++  Args:
++    C: A previously calculated elastic modulus tensor represented as an 
++      array of shape (spatial_dimension,spatial_dimension,spatial_dimension,
++      spatial_dimension), where spatial_dimension is either 2 or 3. C must 
++      satisfy both the major and minor symmetries, but this is not checked.
++  
++  Return: a dictionary containing the elastic constants.
++
++  """
++  if C.shape[0] == 2:
++    cxxxx,cyyyy,cxyxy,cxxyy,cxxxy,cyyxy = _extract_elements(C,False)
++    B = (cxxxx + cyyyy + 2. * cxxyy) / 4.
++    G = (4. * cxyxy + cxxxx + cyyyy - 2. * cxxyy) / 8.
++    M = B + G
++    E = 4 * B * G / (B + G)
++    nu = (B - G) / (B + G)
++    
++  elif C.shape[0] == 3:
++    cxxxx,cyyyy,czzzz,cyzyz,cxzxz,cxyxy,cyyzz,cxxzz,cxxyy, \
++    cxxyz,cxxxz,cxxxy,cyyyz,cyyxz,cyyxy,czzyz,czzxz,czzxy, \
++    cyzxz,cyzxy,cxzxy = _extract_elements(C,False)
++    B = (cxxxx + 2 * cxxyy + 2 * cxxzz + cyyyy + 2 * cyyzz + czzzz) / 9.
++    G = (cxxxx - cxxyy - cxxzz + 3 * cxyxy + 3 * cxzxz + cyyyy - cyyzz \
++         + 3 * cyzyz + czzzz) / 15.
++    M = B + 4 * G / 3
++    E = 9 * B * G / (3 * B + G)
++    nu = (3 * B - 2 * G) / (2 * (3 * B + G))
++  else:
++    raise AssertionError('C has incorrect shape')
++
++  return {'B':B, 'G':G, 'M':M, 'E':E, 'nu':nu}
++
++
++
++
++
++
++
+diff --git a/jax_md/test_util.py b/jax_md/test_util.py
+index 00a314be..8bc46fc0 100644
+--- a/jax_md/test_util.py
++++ b/jax_md/test_util.py
+@@ -14,6 +14,8 @@
+ 
+ """Defines testing utility functions."""
+ 
++import netCDF4 as nc
++
+ import jax.test_util as jtu
+ import jax.numpy as jnp
+ import numpy as onp
+@@ -53,6 +55,42 @@ def load_silica_data() -> jnp.ndarray:
+     filename = '/google3/third_party/py/jax_md/tests/data/silica_positions.npy'
+     return _load_silica_data(filename)
+ 
++def _load_elasticity_test_data(fn, spatial_dimension, dtype, index):
++  ds = nc.Dataset(fn)
++  cijkl = jnp.array(ds.variables['Cijkl'][index], dtype=dtype)
++  R = jnp.array(ds.variables['pos'][index], dtype=dtype)
++  R = jnp.reshape(R, (R.shape[0]//spatial_dimension,spatial_dimension))
++  sigma = 2. * jnp.array(ds.variables['rad'][index], dtype=dtype)
++  box = jnp.array(ds.variables['box'][index], dtype=dtype)
++  box = jnp.reshape(box, (spatial_dimension,spatial_dimension))
++  return cijkl, R, sigma, box
++
++def load_elasticity_test_data(spatial_dimension, low_pressure, dtype, index):
++  try:
++    if low_pressure:
++      if spatial_dimension == 2:
++        fn = 'tests/data/2d_polyuniform_N64_Lp-4.0.nc'
++      else:
++        fn = 'tests/data/3d_bi_N128_Lp-4.0.nc'
++    else:
++      if spatial_dimension == 2:
++        fn = 'tests/data/2d_polyuniform_N64_Lp-1.0.nc'
++      else:
++        fn = 'tests/data/3d_bi_N128_Lp-1.0.nc'
++    return _load_elasticity_test_data(fn, spatial_dimension, dtype, index)
++  except FileNotFoundError:
++    if low_pressure:
++      if spatial_dimension == 2:
++        fn = '/google3/third_party/py/jax_md/tests/data/2d_polyuniform_N64_Lp-4.0.nc'
++      else:
++        fn = '/google3/third_party/py/jax_md/tests/data/3d_bi_N128_Lp-4.0.nc'
++    else:
++      if spatial_dimension == 2:
++        fn = '/google3/third_party/py/jax_md/tests/data/2d_polyuniform_N64_Lp-1.0.nc'
++      else:
++        fn = '/google3/third_party/py/jax_md/tests/data/3d_bi_N128_Lp-1.0.nc'
++    return _load_elasticity_test_data(fn, spatial_dimension, dtype, index)
++
+ 
+ @dataclasses.dataclass
+ class JammedTestState:
+diff --git a/notebooks/athermal_linear_elasticity.ipynb b/notebooks/athermal_linear_elasticity.ipynb
+new file mode 100644
+index 00000000..cb4dfb93
+--- /dev/null
++++ b/notebooks/athermal_linear_elasticity.ipynb
+@@ -0,0 +1,878 @@
++{
++  "nbformat": 4,
++  "nbformat_minor": 0,
++  "metadata": {
++    "colab": {
++      "name": "Athermal_Linear_Elasticity.ipynb",
++      "private_outputs": true,
++      "provenance": [],
++      "authorship_tag": "ABX9TyM/GbW9R93ZAZ0O2STRpfJ4",
++      "include_colab_link": true
++    },
++    "kernelspec": {
++      "name": "python3",
++      "display_name": "Python 3"
++    },
++    "language_info": {
++      "name": "python"
++    },
++    "accelerator": "GPU"
++  },
++  "cells": [
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "view-in-github",
++        "colab_type": "text"
++      },
++      "source": [
++        "<a href=\"https://colab.research.google.com/github/google/jax-md/blob/main/notebooks/athermal_linear_elasticity.ipynb\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "jV9fYS55Vvml",
++        "cellView": "form"
++      },
++      "source": [
++        "#@title Imports and utility code\n",
++        "!pip install jax-md\n",
++        "\n",
++        "import numpy as onp\n",
++        "\n",
++        "import jax.numpy as jnp\n",
++        "from jax.config import config\n",
++        "config.update('jax_enable_x64', True)\n",
++        "\n",
++        "from jax import random\n",
++        "from jax import jit, lax, grad, vmap\n",
++        "import jax.scipy as jsp\n",
++        "\n",
++        "from jax_md import space, energy, smap, minimize, util, elasticity, quantity\n",
++        "from jax_md.colab_tools import renderer\n",
++        "\n",
++        "f32 = jnp.float32\n",
++        "f64 = jnp.float64\n",
++        "\n",
++        "from functools import partial\n",
++        "\n",
++        "import matplotlib\n",
++        "import matplotlib.pyplot as plt\n",
++        "plt.rcParams.update({'font.size': 16})\n",
++        "\n",
++        "def format_plot(x, y):  \n",
++        "  plt.grid(True)\n",
++        "  plt.xlabel(x, fontsize=20)\n",
++        "  plt.ylabel(y, fontsize=20)\n",
++        "  \n",
++        "def finalize_plot(shape=(1, 0.7)):\n",
++        "  plt.gcf().set_size_inches(\n",
++        "    shape[0] * 1.5 * plt.gcf().get_size_inches()[1], \n",
++        "    shape[1] * 1.5 * plt.gcf().get_size_inches()[1])\n",
++        "  \n",
++        "\n",
++        "def run_minimization_while(energy_fn, R_init, shift, max_grad_thresh = 1e-12, max_num_steps=1000000, **kwargs):\n",
++        "  init,apply=minimize.fire_descent(jit(energy_fn), shift, **kwargs)\n",
++        "  apply = jit(apply)\n",
++        "\n",
++        "  @jit\n",
++        "  def get_maxgrad(state):\n",
++        "    return jnp.amax(jnp.abs(state.force))\n",
++        "\n",
++        "  @jit\n",
++        "  def cond_fn(val):\n",
++        "    state, i = val\n",
++        "    return jnp.logical_and(get_maxgrad(state) > max_grad_thresh, i<max_num_steps)\n",
++        "\n",
++        "  @jit\n",
++        "  def body_fn(val):\n",
++        "    state, i = val\n",
++        "    return apply(state), i+1\n",
++        "\n",
++        "  state = init(R_init)\n",
++        "  state, num_iterations = lax.while_loop(cond_fn, body_fn, (state, 0))\n",
++        "\n",
++        "  return state.position, get_maxgrad(state), num_iterations\n",
++        "\n",
++        "def run_minimization_while_neighbor_list(energy_fn, neighbor_fn, R_init, shift,  \n",
++        "                                         max_grad_thresh = 1e-12, max_num_steps = 1000000, \n",
++        "                                         step_inc = 1000, verbose = False, **kwargs):\n",
++        "  nbrs = neighbor_fn.allocate(R_init)\n",
++        "\n",
++        "  init,apply=minimize.fire_descent(jit(energy_fn), shift, **kwargs)\n",
++        "  apply = jit(apply)\n",
++        "\n",
++        "  @jit\n",
++        "  def get_maxgrad(state):\n",
++        "    return jnp.amax(jnp.abs(state.force))\n",
++        "\n",
++        "  @jit\n",
++        "  def body_fn(state_nbrs, t):\n",
++        "    state, nbrs = state_nbrs\n",
++        "    nbrs = neighbor_fn.update(state.position, nbrs)\n",
++        "    state = apply(state, neighbor=nbrs)\n",
++        "    return (state, nbrs), 0\n",
++        "  \n",
++        "  state = init(R_init, neighbor=nbrs)\n",
++        "  \n",
++        "  step = 0\n",
++        "  while step < max_num_steps:\n",
++        "    if verbose:\n",
++        "      print('minimization step {}'.format(step))\n",
++        "    rtn_state, _ = lax.scan(body_fn, (state, nbrs), step + jnp.arange(step_inc))\n",
++        "    new_state, nbrs = rtn_state\n",
++        "    # If the neighbor list overflowed, rebuild it and repeat part of \n",
++        "    # the simulation.\n",
++        "    if nbrs.did_buffer_overflow:\n",
++        "      print('Buffer overflow.')\n",
++        "      nbrs = neighbor_fn.allocate(state.position)\n",
++        "    else:\n",
++        "      state = new_state\n",
++        "      step += step_inc\n",
++        "      if get_maxgrad(state) <= max_grad_thresh:\n",
++        "        break\n",
++        "\n",
++        "  if verbose:\n",
++        "    print('successfully finished {} steps.'.format(step*step_inc))\n",
++        "\n",
++        "  return state.position, get_maxgrad(state), nbrs, step\n",
++        "\n",
++        "def run_minimization_scan(energy_fn, R_init, shift, num_steps=5000, **kwargs):\n",
++        "  init,apply=minimize.fire_descent(jit(energy_fn), shift, **kwargs)\n",
++        "  apply = jit(apply)\n",
++        "\n",
++        "  @jit\n",
++        "  def scan_fn(state, i):\n",
++        "    return apply(state), 0.\n",
++        "\n",
++        "  state = init(R_init)\n",
++        "  state, _ = lax.scan(scan_fn,state,jnp.arange(num_steps))\n",
++        "\n",
++        "  return state.position, jnp.amax(jnp.abs(state.force))\n",
++        "\n",
++        "key = random.PRNGKey(0)\n"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "G843BQDFBZ7z"
++      },
++      "source": [
++        "#Linear elasticity in athermal systems\n",
++        "\n",
++        "## The elastic modulus tensor\n",
++        "\n",
++        "An global affine deformation is given to lowest order by a symmetric strain tensor $\\epsilon$, which transforms any vector $r$ according to\n",
++        "\\begin{equation}\n",
++        "r \\rightarrow (1 + \\epsilon) \\cdot r. \n",
++        "\\end{equation}\n",
++        "Note that in $d$ dimensions, the strain tensor has $d(d + 1)/2$ independent elements. Now, when a mechanically stable system (i.e. a system at a local energy minimum where there is zero net force on every particle) is subject to an affine deformation, it usually does not remain in mechanical equilibrium. Therefore, there is a secondary, nonaffine response that returns the system to mechanical equilibrium, though usually at a different energy than the undeformed state. \n",
++        "\n",
++        "The change of energy can be written to quadratic order as\n",
++        "\\begin{equation}\n",
++        "\\frac{ \\Delta U}{V^0} = \\sigma^0_{ij}\\epsilon_{ji} + \\frac 12 C_{ijkl} \\epsilon_{ij} \\epsilon_{kl} + O\\left( \\epsilon^3 \\right)\n",
++        "\\end{equation}\n",
++        "where $C_{ijkl}$ is the $d × d × d × d$ elastic modulus tensor, $\\sigma^0$ is the $d × d$ symmetric stress tensor describing residual stresses in the initial state, and $V^0$ is the volume of the initial state. The symmetries of \u0005$\\epsilon_{ij}$ imply the following: \n",
++        "\\begin{equation}\n",
++        "C_{ijkl} = C_{jikl} = C_{ijlk} = C_{klij}\n",
++        "\\end{equation}\n",
++        "When no further symmetries are assumed, the number of independent elastic constants becomes $\\frac 18 d(d + 1)(d^2 + d + 2)$, which is 6 in two dimensions and 21 in three dimensions.\n",
++        "\n",
++        "\n",
++        "##Linear response to an external force\n",
++        "\n",
++        "Consider a set of $N$ particles in $d$ dimensions with positions $R_0$. Using $u \\equiv R - R_0$ and assuming fixed boundary conditions, we can expand the energy about $R_0$:\n",
++        "\\begin{equation}\n",
++        "U = U^0 - F^0 u + \\frac 12 u H^0 u + O(u^3),\n",
++        "\\end{equation}\n",
++        "where $U^0$ is the energy at $R_0$, $F^0$ is the force, $F^0_\\mu \\equiv \\left. \\frac {\\partial U}{\\partial u_\\mu} \\right |_{u=0}$, and $H^0$ is the Hessian, $H^0 \\equiv \\left. \\frac{ \\partial^2 U}{\\partial u_\\mu \\partial u_\\nu}\\right|_{u=0}$. \n",
++        "Note that here we are expanding in terms of the particle positions, where as above we were expanding in the global strain degrees of freedom.\n",
++        "If we assume that $R_0$ corresponds to a local energy minimum, then $F^0=0$. Dropping higher order terms, we have a system of coupled harmonic oscillators given by\n",
++        "\\begin{equation}\n",
++        "\\Delta U \\equiv U - U^0 = \\frac 12 u H^0 u.\n",
++        "\\end{equation}\n",
++        "This is independent of the form or details of $U$. \n",
++        "\n",
++        "Hooke's law for this system gives the net force $f$ as a result of displacing the particles by $u$: \n",
++        "\\begin{equation}\n",
++        "f = -H^0 u.\n",
++        "\\end{equation}\n",
++        "Thus, if an *external* force $f_\\mathrm{ext}$ is applied, the particles will respond so that the total force is zero, i.e. $f = -f_\\mathrm{ext}$. This response is obtained by solving for $u$:\n",
++        "\\begin{equation}\n",
++        "u = (H^0)^{-1} f_\\mathrm{ext}.\n",
++        "\\end{equation}\n",
++        "\n",
++        "\n",
++        "## Response to an affine strain\n",
++        "\n",
++        "Now consider a strain tensor $\\epsilon = \\tilde \\epsilon \\gamma$, where $\\gamma$ is a scalar and will be used to explicitly take the limit of small strain for fixed $\\tilde \\epsilon$. Importantly, the strain tensor represents a deformation of the underlying space that the particles live in and thus is a degree of freedom that is independent of the $Nd$ particle degrees of freedom. Therefore, knowing the particle positions $R$ is not sufficient to describe the energy, we also need to know $\\gamma$ to specify the correct boundary conditions:\n",
++        "\\begin{equation}\t\n",
++        "U = U(R, \\gamma).\n",
++        "\\end{equation}\n",
++        "\n",
++        "We now have a system with $Nd+1$ variables $\\{R, \\gamma\\}$ that, like before, form a set of coupled harmonic oscillators. We can describe this using the so-called \"generalized Hessian\" matrix of second derivatives of the energy with respect to both $R$ and $\\gamma$. Specifically, Hooke's law reads \n",
++        "\\begin{equation}\n",
++        "  \\left( \\begin{array}{ ccccc|c}\n",
++        "\t&&&&&\\\\\n",
++        "\t&&H^0 &&& -\\Xi \\\\\n",
++        "\t&&&&& \\\\ \\hline\n",
++        "\t&&-\\Xi^T &&&\\frac{\\partial ^2U}{\\partial \\gamma^2}\n",
++        "\t\\end{array}\\right) \n",
++        "  \\left( \\begin{array}{ c}\n",
++        "\t\\\\\n",
++        "\tu \\\\\n",
++        "\t\\\\ \\hline\n",
++        "\t\\gamma\n",
++        "\t\\end{array}\\right) \n",
++        "  =\n",
++        "  \\left( \\begin{array}{ c}\n",
++        "\t\\\\\n",
++        "\t0 \\\\\n",
++        "\t\\\\ \\hline\n",
++        "\t\\tilde \\sigma\n",
++        "\t\\end{array}\\right),\n",
++        "\\end{equation}\n",
++        "\n",
++        "where $u = R - R_0$ is the displacement of every particle, $\\Xi = -\\frac{ \\partial^2 U}{\\partial R \\partial \\gamma}$, and $\\tilde \\sigma$ is the induced stress caused by the deformation. (If there is prestress in the system, i.e. $\\sigma^0 = \\frac{\\partial U}{\\partial \\gamma} \\neq 0$, the total stress is $\\sigma = \\sigma^0 + \\tilde \\sigma$.) In this equation, $\\gamma$ is held fixed and the zero in the top of the right-hand-side imposes force balance after the deformation and resulting non-affine displacement of every particle. The non-affine displacement itself, $u$, and the induced stress $\\sigma$, are both unknown but can be solved for. First, the non-affine response is \n",
++        "\\begin{equation}\n",
++        "u = (H^0)^{-1} \\Xi \\; \\gamma,\n",
++        "\\end{equation}\n",
++        "where we note that in the limit of small $\\gamma$, the force induced on every particle due to the affine deformation is $\\Xi \\; \\gamma$. Second, the induced stress is\n",
++        "\\begin{equation}\n",
++        "\\tilde \\sigma = \\frac{\\partial ^2U}{\\partial \\gamma^2} \\gamma - \\Xi^T u = \\left(\\frac{\\partial ^2U}{\\partial \\gamma^2} - \\Xi^T (H^0)^{-1} \\Xi  \\right) \\gamma.\n",
++        "\\end{equation}\n",
++        "\n",
++        "Similarly, the change in energy is \n",
++        "\\begin{equation}\n",
++        "\\frac{\\Delta U}{V^0} = \\sigma^0 \\gamma + \\frac 1{2V^0} \\left(\\frac{\\partial ^2U}{\\partial \\gamma^2} - \\Xi^T (H^0)^{-1} \\Xi  \\right) \\gamma^2,\n",
++        "\\end{equation}\n",
++        "where $\\sigma^0$ is the prestress in the system per unit volume. Comparing this to the above definition of the the elastic modulus tensor, we see that the elastic constant associated with the deformation $\\tilde \\epsilon$ is \n",
++        "\\begin{equation}\n",
++        "C(\\tilde \\epsilon) = \\frac 1{V^0} \\left( \\frac{\\partial^2 U}{\\partial \\gamma^2} - \\Xi^T (H^0)^{-1} \\Xi \\right).\n",
++        "\\end{equation}\n",
++        "\n",
++        "$C(\\tilde \\epsilon)$ is related to $C_{ijkl}$ by summing $C(\\tilde \\epsilon) = C_{ijkl}\\tilde \\epsilon_{ij} \\tilde \\epsilon_{kl}$. So, if $\\tilde \\epsilon_{ij} = \\delta_{0i}\\delta_{0j}$, then $C_{0000} = C(\\tilde \\epsilon)$.\n",
++        "\n",
++        "The internal code in `jax_md.elasticity` repeats this calculation for different $\\tilde \\epsilon$ to back out the different independent elastic constants. "
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "I2CGpXh_oJn1"
++      },
++      "source": [
++        "#First example\n"
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "vqpinbjgoPcq"
++      },
++      "source": [
++        "As a first example, let's consider a 3d system of 128 soft spheres. The elastic modulus tensor is only defined for systems that are at a local energy minimum, so we start by minimizing the energy."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "Vj9Jug6VX6CU"
++      },
++      "source": [
++        "N = 128\n",
++        "dimension = 3\n",
++        "\n",
++        "box_size = quantity.box_size_at_number_density(N, 1.4, dimension)\n",
++        "displacement, shift = space.periodic(box_size)\n",
++        "\n",
++        "energy_fn = energy.soft_sphere_pair(displacement)\n",
++        "\n",
++        "key, split = random.split(key)\n",
++        "R_init = random.uniform(split, (N,dimension), minval=0.0, maxval=box_size, dtype=f64)\n",
++        "\n",
++        "R, max_grad, niters = run_minimization_while(energy_fn, R_init, shift)\n",
++        "print('Minimized the energy in {} minimization steps and reached a final \\\n",
++        "maximum gradient of {}'.format(niters, max_grad))"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "3fDHQPOJpCpR"
++      },
++      "source": [
++        "We can now calculate the elastic modulus tensor"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "ZNhv06zemnq7"
++      },
++      "source": [
++        "emt_fn = jit(elasticity.athermal_moduli(energy_fn, check_convergence=True))\n",
++        "C, converged = emt_fn(R,box_size)\n",
++        "print(converged)"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "0yNSd35ym2gt"
++      },
++      "source": [
++        "The elastic modulus tensor gives a quantitative prediction for how the energy should change if we deform the system according to a strain tensor\n",
++        "\\begin{equation}\n",
++        "\\frac{ \\Delta U}{V^0} = \\sigma^0\\epsilon + \\frac 12 \\epsilon C  \\epsilon + O\\left(\\epsilon^3\\right)\n",
++        "\\end{equation}\n",
++        "To test this, we define $\\epsilon = \\tilde \\epsilon \\gamma$ for a randomly chosen strain tensor $\\tilde \\epsilon$ and for $\\gamma << 1$. Ignoring terms of order $\\gamma^3$ and higher, we have\n",
++        "\\begin{equation}\n",
++        "\\frac{ \\Delta U}{V^0} - \\sigma^0\\epsilon = \\left[\\frac 12 \\tilde \\epsilon C  \\tilde \\epsilon \\right] \\gamma^2\n",
++        "\\end{equation}\n",
++        "Thus, we can test our calculation of $C$ by plotting $\\frac{ \\Delta U}{V^0} - \\sigma^0\\epsilon$ as a function of $\\gamma$ for our randomly chosen $\\tilde \\epsilon$ and comparing it to the line $\\left[\\frac 12 \\tilde \\epsilon C  \\tilde \\epsilon \\right] \\gamma^2$. \n",
++        "\n",
++        "First, generate a random $\\tilde \\epsilon$ and calculate $U$ for different $\\gamma$. "
++      ]
++    },
++    {
++      "cell_type": "code",
++      "source": [
++        "key, split = random.split(key)\n",
++        "#Pick a random (symmetric) strain tensor\n",
++        "strain_tensor = random.uniform(split, (dimension,dimension), minval=-1, maxval=1, dtype=f64)\n",
++        "strain_tensor = (strain_tensor + strain_tensor.T) / 2.0\n",
++        "\n",
++        "#Define a function to calculate the energy at a given strain\n",
++        "def get_energy_at_strain(gamma, strain_tensor, R_init, box):\n",
++        "  R_init = space.transform(space.inverse(box),R_init)\n",
++        "  new_box = jnp.matmul(jnp.eye(strain_tensor.shape[0]) + gamma * strain_tensor, box)\n",
++        "  displacement, shift = space.periodic_general(new_box, fractional_coordinates=True)\n",
++        "  energy_fn = energy.soft_sphere_pair(displacement, sigma=1.0)\n",
++        "  R_final, _, _ = run_minimization_while(energy_fn, R_init, shift)\n",
++        "  return energy_fn(R_final)\n",
++        "\n",
++        "gammas = jnp.logspace(-7,-4,50)\n",
++        "Us = vmap(get_energy_at_strain, in_axes=(0,None,None,None))(gammas, strain_tensor, R, box_size * jnp.eye(dimension))"
++      ],
++      "metadata": {
++        "id": "fJEA-2GJmfqe"
++      },
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "rrdW64I5m2gu"
++      },
++      "source": [
++        "Plot $\\frac{ \\Delta U}{V^0} - \\sigma^0\\epsilon$ and $\\left[\\frac 12 \\tilde \\epsilon C  \\tilde \\epsilon \\right] \\gamma^2$ as functinos of $\\gamma$. While there may be disagreements for very small $\\gamma$ due to numerical precision or at large $\\gamma$ due to higher-order terms becoming relevant, there should be a region of quantitative agreement."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "dmQknH3Am2gu"
++      },
++      "source": [
++        "U_0 = energy_fn(R)\n",
++        "stress_0 = -quantity.stress(energy_fn, R, box_size)\n",
++        "V_0 = quantity.volume(dimension, box_size)\n",
++        "\n",
++        "#Plot \\Delta E/V - sigma*epsilon\n",
++        "y1 = (Us - U_0)/V_0 - gammas * jnp.einsum('ij,ji->',stress_0,strain_tensor)\n",
++        "plt.plot(jnp.abs(gammas), y1, lw=3, label=r'$\\Delta U/V^0 - \\sigma^0 \\epsilon$')\n",
++        "\n",
++        "#Plot 0.5 * epsilon*C*epsilon\n",
++        "y2 = 0.5 * jnp.einsum('ij,ijkl,kl->',strain_tensor, C, strain_tensor) * gammas**2\n",
++        "plt.plot(jnp.abs(gammas), y2, ls='--', lw=3, label=r'$(1/2) \\epsilon C \\epsilon$')\n",
++        "\n",
++        "plt.xscale('log')\n",
++        "plt.yscale('log')\n",
++        "plt.legend()\n",
++        "format_plot('$\\gamma$','')\n",
++        "finalize_plot()"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "4A8tolWEWrWG"
++      },
++      "source": [
++        "To test the accuracy of this agreement, we first define:\n",
++        "\\begin{equation}\n",
++        "T(\\gamma) = \\frac{ \\Delta U}{V^0} - \\sigma^0\\epsilon - \\frac 12 \\epsilon C  \\epsilon \\sim O\\left(\\gamma^3\\right)\n",
++        "\\end{equation}\n",
++        "which should be proportional to $\\gamma^3$ for small $\\gamma$ (note that this expected scaling should break down when the y-axis approaches machine precision). This is a prediction of scaling only, so we plot a line proportional to $\\gamma^3$ to compare the slopes."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "XsP1pAdym2gu"
++      },
++      "source": [
++        "#Plot the difference, which should scales as gamma**3\n",
++        "plt.plot(jnp.abs(gammas), jnp.abs(y1-y2), label=r'$T(\\gamma)$')\n",
++        "#Plot gamma**3 for reference\n",
++        "plt.plot(jnp.abs(gammas), jnp.abs(gammas**3), 'black', label=r'slope = $\\gamma^3$ (for reference)')\n",
++        "\n",
++        "plt.xscale('log')\n",
++        "plt.yscale('log')\n",
++        "plt.legend()\n",
++        "format_plot('$\\gamma$','')\n",
++        "finalize_plot()"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "u7P_x42IbOjh"
++      },
++      "source": [
++        "Save `C` for later testing."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "uOuUSb5abMQU"
++      },
++      "source": [
++        "C_3d = C"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "-aYUGyGfXB7L"
++      },
++      "source": [
++        "#Example with neighbor lists"
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "oRE8khNHaNEZ"
++      },
++      "source": [
++        "As a second example, consider a much larger systems that is implemented using neighbor lists."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "Js-SZSq_XLe3"
++      },
++      "source": [
++        "N = 5000\n",
++        "dimension = 2\n",
++        "\n",
++        "box_size = quantity.box_size_at_number_density(N, 1.3, dimension)\n",
++        "box = box_size * jnp.eye(dimension)\n",
++        "displacement, shift = space.periodic_general(box, fractional_coordinates=True)\n",
++        "\n",
++        "sigma = jnp.array([[1.0, 1.2], [1.2, 1.4]])\n",
++        "N_2 = int(N / 2)\n",
++        "species = jnp.where(jnp.arange(N) < N_2, 0, 1)\n",
++        "\n",
++        "neighbor_fn, energy_fn = energy.soft_sphere_neighbor_list(\n",
++        "    displacement, box_size, species=species, sigma=sigma, dr_threshold = 0.1, \n",
++        "    fractional_coordinates = True)\n",
++        "\n",
++        "key, split = random.split(key)\n",
++        "R_init = random.uniform(split, (N,dimension), minval=0.0, maxval=1.0, dtype=f64) \n",
++        "\n",
++        "R, max_grad, nbrs, niters = run_minimization_while_neighbor_list(energy_fn, neighbor_fn, R_init, shift)\n",
++        "print('Minimized the energy in {} minimization steps and reached a final \\\n",
++        "maximum gradient of {}'.format(niters, max_grad))"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "deztGVVbaabY"
++      },
++      "source": [
++        "We have to pass the neighbor list to `emt_fn`."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "9nrB5kFdXLe4"
++      },
++      "source": [
++        "emt_fn = jit(elasticity.athermal_moduli(energy_fn, check_convergence=True))\n",
++        "C, converged = emt_fn(R,box,neighbor=nbrs)\n",
++        "print(converged)"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "Pii0IZbTax9d"
++      },
++      "source": [
++        "We can time the calculation of the compiled function."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "SlmS8jKdZo3L"
++      },
++      "source": [
++        "%timeit emt_fn(R,box,neighbor=nbrs)"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "NUs4WJKGbjFb"
++      },
++      "source": [
++        "Repeat the same tests as above. NOTE: this may take a few minutes. "
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "i59zcQyVbjFb"
++      },
++      "source": [
++        "key, split = random.split(key)\n",
++        "#Pick a random (symmetric) strain tensor\n",
++        "strain_tensor = random.uniform(split, (dimension,dimension), minval=-1, maxval=1, dtype=f64)\n",
++        "strain_tensor = (strain_tensor + strain_tensor.T) / 2.0\n",
++        "\n",
++        "def get_energy_at_strain(gamma, strain_tensor, R_init, box):\n",
++        "  new_box = jnp.matmul(jnp.eye(strain_tensor.shape[0]) + gamma * strain_tensor, box)\n",
++        "  displacement, shift = space.periodic_general(new_box, fractional_coordinates=True)\n",
++        "\n",
++        "  neighbor_fn, energy_fn = energy.soft_sphere_neighbor_list(\n",
++        "    displacement, box_size, species=species, sigma=sigma, dr_threshold = 0.1, \n",
++        "    fractional_coordinates = True, capacity_multiplier = 1.5)\n",
++        "  \n",
++        "  R_final, _, nbrs, _ = run_minimization_while_neighbor_list(energy_fn, neighbor_fn, R_init, shift)\n",
++        "  return energy_fn(R_final, neighbor=nbrs)\n",
++        "\n",
++        "gammas = jnp.logspace(-7,-3,20)\n",
++        "Us = jnp.array([ get_energy_at_strain(gamma, strain_tensor, R, box) for gamma in gammas])"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "zKmA6ufub9ej"
++      },
++      "source": [
++        "U_0 = energy_fn(R, neighbor=nbrs)\n",
++        "stress_0 = -quantity.stress(energy_fn, R, box, neighbor=nbrs)\n",
++        "V_0 = quantity.volume(dimension, box)\n",
++        "\n",
++        "#Plot \\Delta E/V - sigma*epsilon\n",
++        "y1 = (Us - U_0)/V_0 - gammas * jnp.einsum('ij,ji->',stress_0,strain_tensor)\n",
++        "plt.plot(jnp.abs(gammas), y1, lw=3, label=r'$\\Delta U/V^0 - \\sigma^0 \\epsilon$')\n",
++        "\n",
++        "#Plot 0.5 * epsilon*C*epsilon\n",
++        "y2 = 0.5 * jnp.einsum('ij,ijkl,kl->',strain_tensor, C, strain_tensor) * gammas**2\n",
++        "plt.plot(jnp.abs(gammas), y2, ls='--', lw=3, label=r'$(1/2) \\epsilon C \\epsilon$')\n",
++        "\n",
++        "plt.xscale('log')\n",
++        "plt.yscale('log')\n",
++        "plt.legend()\n",
++        "format_plot('$\\gamma$','')\n",
++        "finalize_plot()"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "IFm9NDnlb9eu"
++      },
++      "source": [
++        "#Plot the difference, which should scales as gamma**3\n",
++        "plt.plot(jnp.abs(gammas), jnp.abs(y1-y2), label=r'$T(\\gamma)$')\n",
++        "#Plot gamma**3 for reference\n",
++        "plt.plot(jnp.abs(gammas), jnp.abs(gammas**3), 'black', label=r'slope = $\\gamma^3$ (for reference)')\n",
++        "\n",
++        "plt.xscale('log')\n",
++        "plt.yscale('log')\n",
++        "plt.legend()\n",
++        "format_plot('$\\gamma$','')\n",
++        "finalize_plot()"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "OTX4lbZxcwiR"
++      },
++      "source": [
++        "Save `C` for later testing."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "i7qPHWPdcqI_"
++      },
++      "source": [
++        "C_2d = C"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "FDbvyKBRc3gG"
++      },
++      "source": [
++        "#Mandel notation"
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "47eZOiJ0dQwv"
++      },
++      "source": [
++        "Mandel notation is a way to represent symmetric second-rank tensors and fourth-rank tensors with so-called \"minor symmetries\", i.e. $T_{ijkl} = T_{ijlk} = T_{jilk}$. The idea is to map pairs of indices so that $(i,i) \\rightarrow i$ and $(i,j) \\rightarrow K - i - j$ for $i\\neq j$, where $K = d(d+1)/2$ is the number of independent pairs $(i,j)$ for tensors with $d$ elements along each axis. Thus, second-rank tensors become first-rank tensors, and fourth-rank tensors become second-rank tensors, according to:\n",
++        "\n",
++        "\\begin{align}\n",
++        "M_{m(i,j)} &= T_{ij} w(i,j) \\\\\n",
++        "M_{m(i,j),m(k,l)} &= T_{ijkl} w(i,j) w(k,l).\n",
++        "\\end{align}\n",
++        "\n",
++        "Here, $m(i,j)$ is the mapping function described above, and w(i,j) is a weight that preserves summation rules and is given by \n",
++        "\\begin{align}\n",
++        "w(i,j) = \\delta_{ij} + \\sqrt{2} (\\delta_{ij}-1).\n",
++        "\\end{align}\n",
++        "\n",
++        "We can convert strain tensors, stress tensors, and elastic modulus tensors to and from Mandel notation using the functions `elasticity.tensor_to_mandel` and `elasticity.mandel_to_tensor`. "
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "74mi2rRary1x"
++      },
++      "source": [
++        "First, lets copy one of the previously calculated elastic modulus tensors and define a random strain tensor."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "_Q2ADqqTr9BW"
++      },
++      "source": [
++        "#This can be 2 or 3 depending on which of the above solutions has been calculated\n",
++        "dimension = 3 \n",
++        "if dimension == 2:\n",
++        "  C = C_2d\n",
++        "else:\n",
++        "  C = C_3d\n",
++        "key, split = random.split(key)\n",
++        "e = random.uniform(key, (dimension,dimension), minval=-1, maxval=1, dtype=f64)\n",
++        "e = (e + e.T)/2."
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "4fWFbBRHsRDc"
++      },
++      "source": [
++        "Convert `e` and `C` to Mental notation"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "A2FdUi2VsVyS"
++      },
++      "source": [
++        "e_m = jit(elasticity.tensor_to_mandel)(e)\n",
++        "C_m = jit(elasticity.tensor_to_mandel)(C)\n",
++        "print(e_m)\n",
++        "print(C_m)"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "cY0tAkOSsr4z"
++      },
++      "source": [
++        "Using \"bar\" notation to represent Mandel vectors and matrices, we have\n",
++        "\\begin{equation}\n",
++        "\\frac{ \\Delta U}{V^0} = \\bar \\sigma_i^0 \\bar\\epsilon_i + \\frac 12 \\bar \\epsilon_i \\bar C_{ij} \\bar\\epsilon_j + O\\left(\\bar \\epsilon^3\\right)\n",
++        "\\end{equation}\n",
++        "We can explicity test that the sums are equivalent to the sums involving the original tensors"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "_Q01qyWbt6tD"
++      },
++      "source": [
++        "sum_m = jnp.einsum('i,ij,j->',e_m, C_m, e_m)\n",
++        "sum_t = jnp.einsum('ij,ijkl,kl->',e, C, e)\n",
++        "print('Relative error is {}, which should be very close to 0'.format((sum_t-sum_m)/sum_t))"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "z8ATImecuLlc"
++      },
++      "source": [
++        "Finally, we can convert back to the full tensors and check that they are unchanged."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "iXACa-5LuSZQ"
++      },
++      "source": [
++        "C_new = jit(elasticity.mandel_to_tensor)(C_m)\n",
++        "print('Max error in C is {}, which should be very close to 0.'.format(jnp.max(jnp.abs(C-C_new))))\n",
++        "\n",
++        "e_new = jit(elasticity.mandel_to_tensor)(e_m)\n",
++        "print('Max error in e is {}, which should be very close to 0.'.format(jnp.max(jnp.abs(e-e_new))))"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "TJZxZJ8HuvX9"
++      },
++      "source": [
++        "# Isotropic elastic constants\n"
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "KnaNTFv-BOnJ"
++      },
++      "source": [
++        "The calculation of the elastic modulus tensor does not make any assumptions about the underlying symmetries in the material. However, for isotropic systems, only two constants are needed to completely describe the elastic behavior. These are often taken to be the bulk modulus, $B$, and the shear modulus, $G$, or the Young's modulus, $E$, and the Poisson's ratio, $\\nu$. The function `elasticity.extract_isotropic_moduli` extracts these values, as well as the longitudinal modulus, $M$, from an elastic modulus tensor. \n",
++        "\n",
++        "Importantly, since there is not guarantee that `C` is calculated from a truely isotropic systems, these are \"orientation-averaged\" values. For example, there are many directions in which you can shear a system, and the shear modulus that is returned represents and average over all these orientations. This can be an effective way to average over small fluctuations in an \"almost isotropic\" system, but the values lose their typical meaning when the systems is highly anisotropic."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "bNSEpYgRvIVV"
++      },
++      "source": [
++        "elasticity.extract_isotropic_moduli(C)"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "Lj7R9GiTvPYX"
++      },
++      "source": [
++        "# Gradients"
++      ]
++    },
++    {
++      "cell_type": "markdown",
++      "metadata": {
++        "id": "ul9jimRTErq6"
++      },
++      "source": [
++        "The calculation of the elastic modulus tensor is fully differentiable:"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "c1KyRCgbvROa"
++      },
++      "source": [
++        "def setup(N,dimension,key):\n",
++        "  box_size = quantity.box_size_at_number_density(N, 1.4, dimension)\n",
++        "  box = box_size * jnp.eye(dimension)\n",
++        "  displacement, shift = space.periodic_general(box, fractional_coordinates=True)\n",
++        "  R_init = random.uniform(key, (N,dimension), minval=0.0, maxval=1.0, dtype=f64)\n",
++        "\n",
++        "  def run(sigma):\n",
++        "    energy_fn = energy.soft_sphere_pair(displacement, sigma=sigma)\n",
++        "    R, max_grad = run_minimization_scan(energy_fn, R_init, shift, num_steps=1000)\n",
++        "    emt_fn = jit(elasticity.athermal_moduli(energy_fn))\n",
++        "    C = emt_fn(R,box)\n",
++        "    return elasticity.extract_isotropic_moduli(C)['G']\n",
++        "  return run\n",
++        "\n",
++        "key, split = random.split(key)\n",
++        "N = 50\n",
++        "dimension = 2\n",
++        "run = setup(N, dimension, split)"
++      ],
++      "execution_count": null,
++      "outputs": []
++    },
++    {
++      "cell_type": "code",
++      "metadata": {
++        "id": "4Le-PsexwdCJ"
++      },
++      "source": [
++        "sigma = jnp.linspace(1.0,1.4,N)\n",
++        "print(run(sigma))\n",
++        "print(grad(run)(sigma))"
++      ],
++      "execution_count": null,
++      "outputs": []
++    }
++  ]
++}
+diff --git a/tests/data/2d_polyuniform_N64_Lp-1.0.nc b/tests/data/2d_polyuniform_N64_Lp-1.0.nc
+new file mode 100644
+index 00000000..d3adca3f
+Binary files /dev/null and b/tests/data/2d_polyuniform_N64_Lp-1.0.nc differ
+diff --git a/tests/data/2d_polyuniform_N64_Lp-4.0.nc b/tests/data/2d_polyuniform_N64_Lp-4.0.nc
+new file mode 100644
+index 00000000..cf62d1d5
+Binary files /dev/null and b/tests/data/2d_polyuniform_N64_Lp-4.0.nc differ
+diff --git a/tests/data/3d_bi_N128_Lp-1.0.nc b/tests/data/3d_bi_N128_Lp-1.0.nc
+new file mode 100644
+index 00000000..749b7225
+Binary files /dev/null and b/tests/data/3d_bi_N128_Lp-1.0.nc differ
+diff --git a/tests/data/3d_bi_N128_Lp-4.0.nc b/tests/data/3d_bi_N128_Lp-4.0.nc
+new file mode 100644
+index 00000000..72f983c3
+Binary files /dev/null and b/tests/data/3d_bi_N128_Lp-4.0.nc differ
+diff --git a/tests/elasticity_test.py b/tests/elasticity_test.py
+new file mode 100644
+index 00000000..f2da41f5
+--- /dev/null
++++ b/tests/elasticity_test.py
+@@ -0,0 +1,458 @@
++# Copyright 2019 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for google3.third_party.py.jax_md.dynamics."""
++
++import numpy as onp
++
++from absl.testing import absltest
++from absl.testing import parameterized
++
++from jax.config import config as jax_config
++from jax import random
++from jax import jit
++from jax import lax
++from jax import grad
++import jax.numpy as np
++
++from jax import test_util as jtu
++
++from jax_md import space
++from jax_md import energy 
++from jax_md import minimize
++from jax_md import quantity
++from jax_md import elasticity
++from jax_md import test_util
++from jax_md.util import *
++
++jax_config.parse_flags_with_absl()
++jax_config.enable_omnistaging()
++FLAGS = jax_config.FLAGS
++
++PARTICLE_COUNT = 64
++NUM_SAMPLES = 2 
++SPATIAL_DIMENSION = [2, 3]
++LOWPRESSURE = [True, False]
++
++if FLAGS.jax_enable_x64:
++  DTYPE = [f32, f64]
++else:
++  DTYPE = [f32]
++
++def run_minimization_while(energy_fn, 
++                           R_init, 
++                           shift, 
++                           max_grad_thresh = 1e-12, 
++                           max_num_steps=1000000, 
++                           **kwargs):
++  init,apply=minimize.fire_descent(jit(energy_fn), shift, **kwargs)
++  apply = jit(apply)
++
++  @jit
++  def get_maxgrad(state):
++    return jnp.amax(jnp.abs(state.force))
++
++  @jit
++  def cond_fn(val):
++    state, i = val
++    return jnp.logical_and(get_maxgrad(state) > max_grad_thresh, 
++                           i<max_num_steps)
++
++  @jit
++  def body_fn(val):
++    state, i = val
++    return apply(state), i+1
++
++  state = init(R_init)
++  state, num_iterations = lax.while_loop(cond_fn, body_fn, (state, 0))
++
++  return state.position, get_maxgrad(state), num_iterations
++
++
++class ElasticityTest(jtu.JaxTestCase):
++  # pylint: disable=g-complex-comprehension
++  
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}_lowpressure={}'.format(
++            dim, dtype.__name__, low_pressure),
++          'spatial_dimension': dim,
++          'dtype': dtype,
++          'low_pressure': low_pressure
++      } for dim in SPATIAL_DIMENSION 
++        for dtype in DTYPE 
++        for low_pressure in LOWPRESSURE))
++  def test_EMT_from_db_basic(self, spatial_dimension, dtype, low_pressure):
++    if spatial_dimension == 2:
++      N = 64
++    else:
++      N = 128
++
++    if dtype == jnp.float32:
++      max_grad_thresh = 1e-5
++      atol = 1e-4
++      rtol = 1e-3
++    else:
++      max_grad_thresh = 1e-10
++      atol = 1e-8
++      rtol = 1e-5
++
++    for index in range(NUM_SAMPLES):
++      cijkl, R, sigma, box = test_util.load_elasticity_test_data(
++          spatial_dimension, low_pressure, dtype, index) 
++      R = space.transform(box, R)
++      box = box[0,0]
++
++      displacement, shift = space.periodic(box)
++      energy_fn = energy.soft_sphere_pair(displacement, sigma=sigma)
++      assert( jnp.max(jnp.abs(grad(energy_fn)(R))) < max_grad_thresh )
++
++      EMT_fn = jit(elasticity.athermal_moduli(energy_fn,check_convergence=True))
++      C, converged = EMT_fn(R,box)
++      assert( C.dtype == dtype )
++      assert( C.shape == (spatial_dimension,spatial_dimension,
++        spatial_dimension,spatial_dimension) )
++      if converged:
++        self.assertAllClose(cijkl,elasticity._extract_elements(C,False), 
++            atol=atol, rtol=rtol)
++        
++        #make sure the symmetries are there
++        self.assertAllClose(C, jnp.einsum("ijkl->jikl", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->ijlk", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->lkij", C))
++  
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}_lowpressure={}'.format(dim, 
++            dtype.__name__, low_pressure),
++          'spatial_dimension': dim,
++          'dtype': dtype,
++          'low_pressure': low_pressure
++      } for dim in SPATIAL_DIMENSION 
++        for dtype in DTYPE 
++        for low_pressure in LOWPRESSURE))
++  def test_EMT_from_db_pgeneral(self, spatial_dimension, dtype, low_pressure):
++    if spatial_dimension == 2:
++      N = 64
++    else:
++      N = 128
++
++    if dtype == jnp.float32:
++      max_grad_thresh = 1e-5
++      atol = 1e-4
++      rtol = 1e-3
++    else:
++      max_grad_thresh = 1e-10
++      atol = 1e-8
++      rtol = 1e-5
++
++    for index in range(NUM_SAMPLES):
++      cijkl, R, sigma, box = test_util.load_elasticity_test_data(
++          spatial_dimension, low_pressure, dtype, index) 
++      R = space.transform(box, R)
++
++      displacement, shift = space.periodic_general(box, 
++          fractional_coordinates=False)
++      energy_fn = energy.soft_sphere_pair(displacement, sigma=sigma)
++      assert( jnp.max(jnp.abs(grad(energy_fn)(R))) < max_grad_thresh )
++
++      EMT_fn = jit(elasticity.athermal_moduli(energy_fn,check_convergence=True))
++      C, converged = EMT_fn(R,box)
++      assert( C.dtype == dtype )
++      assert( C.shape == (spatial_dimension,spatial_dimension,
++        spatial_dimension,spatial_dimension) )
++      if converged:
++        self.assertAllClose(cijkl,elasticity._extract_elements(C,False), 
++            atol=atol, rtol=rtol)
++        
++        #make sure the symmetries are there
++        self.assertAllClose(C, jnp.einsum("ijkl->jikl", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->ijlk", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->lkij", C))
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}_lowpressure={}'.format(dim, 
++            dtype.__name__, low_pressure),
++          'spatial_dimension': dim,
++          'dtype': dtype,
++          'low_pressure': low_pressure
++      } for dim in SPATIAL_DIMENSION 
++        for dtype in DTYPE 
++        for low_pressure in LOWPRESSURE))
++  def test_EMT_from_db_fraccoord(self, spatial_dimension, dtype, low_pressure):
++    if spatial_dimension == 2:
++      N = 64
++    else:
++      N = 128
++
++    if dtype == jnp.float32:
++      max_grad_thresh = 1e-5
++      atol = 1e-4
++      rtol = 1e-3
++    else:
++      max_grad_thresh = 1e-10
++      atol = 1e-8
++      rtol = 1e-5
++
++    for index in range(NUM_SAMPLES):
++      cijkl, R, sigma, box = test_util.load_elasticity_test_data(
++          spatial_dimension, low_pressure, dtype, index) 
++
++      displacement, shift = space.periodic_general(box, 
++          fractional_coordinates=True)
++      energy_fn = energy.soft_sphere_pair(displacement, sigma=sigma)
++      assert( jnp.max(jnp.abs(grad(energy_fn)(R))) < max_grad_thresh )
++
++      EMT_fn = jit(elasticity.athermal_moduli(energy_fn,check_convergence=True))
++      C, converged = EMT_fn(R,box)
++      assert( C.dtype == dtype )
++      assert( C.shape == (spatial_dimension,spatial_dimension,
++        spatial_dimension,spatial_dimension) )
++      if converged:
++        self.assertAllClose(cijkl,elasticity._extract_elements(C,False), 
++            atol=atol, rtol=rtol)
++        
++        #make sure the symmetries are there
++        self.assertAllClose(C, jnp.einsum("ijkl->jikl", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->ijlk", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->lkij", C))
++
++      
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}_lowpressure={}'.format(dim, 
++            dtype.__name__, low_pressure),
++          'spatial_dimension': dim,
++          'dtype': dtype,
++          'low_pressure': low_pressure
++      } for dim in SPATIAL_DIMENSION 
++        for dtype in DTYPE 
++        for low_pressure in LOWPRESSURE))
++  def test_EMT_from_db_dynamic(self, spatial_dimension, dtype, low_pressure):
++    if spatial_dimension == 2:
++      N = 64
++    else:
++      N = 128
++
++    if dtype == jnp.float32:
++      max_grad_thresh = 1e-5
++      atol = 1e-4
++      rtol = 1e-3
++    else:
++      max_grad_thresh = 1e-10
++      atol = 1e-8
++      rtol = 1e-5
++
++    for index in range(NUM_SAMPLES):
++      cijkl, R, sigma, box = test_util.load_elasticity_test_data(
++          spatial_dimension, low_pressure, dtype, index) 
++      R = space.transform(box, R)
++      box = box[0,0]
++
++      displacement, shift = space.periodic(box)
++      #Below we use the wrong sigma, so we must pass it dynamically
++      energy_fn = energy.soft_sphere_pair(displacement, sigma=1.0) 
++      maxgrad = jnp.max(jnp.abs(grad(energy_fn)(R, sigma=sigma))) 
++      assert( maxgrad < max_grad_thresh )
++
++      EMT_fn = jit(elasticity.athermal_moduli(energy_fn,check_convergence=True))
++      C, converged = EMT_fn(R,box,sigma=sigma)
++      assert( C.dtype == dtype )
++      assert( C.shape == (spatial_dimension,spatial_dimension,
++        spatial_dimension,spatial_dimension) )
++      if converged:
++        self.assertAllClose(cijkl,elasticity._extract_elements(C,False), 
++            atol=atol, rtol=rtol)
++        
++        #make sure the symmetries are there
++        self.assertAllClose(C, jnp.einsum("ijkl->jikl", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->ijlk", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->lkij", C))
++
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}_lowpressure={}'.format(dim, 
++            dtype.__name__, low_pressure),
++          'spatial_dimension': dim,
++          'dtype': dtype,
++          'low_pressure': low_pressure
++      } for dim in SPATIAL_DIMENSION 
++      for dtype in DTYPE 
++      for low_pressure in LOWPRESSURE))
++  def test_EMT_from_db_nbrlist(self, spatial_dimension, dtype, low_pressure):
++    if spatial_dimension == 2:
++      N = 64
++    else:
++      N = 128
++
++    if dtype == jnp.float32:
++      max_grad_thresh = 1e-5
++      atol = 1e-4
++      rtol = 1e-3
++    else:
++      max_grad_thresh = 1e-10
++      atol = 1e-8
++      rtol = 1e-5
++
++    for index in range(NUM_SAMPLES):
++      cijkl, R, sigma, box = test_util.load_elasticity_test_data(
++          spatial_dimension, low_pressure, dtype, index) 
++
++      displacement, shift = space.periodic_general(box, 
++          fractional_coordinates=True)
++      neighbor_fn, energy_fn = energy.soft_sphere_neighbor_list(
++          displacement, box, sigma=sigma, fractional_coordinates=True)
++      nbrs = neighbor_fn.allocate(R)
++      assert( jnp.max(jnp.abs(grad(energy_fn)(R, nbrs))) < max_grad_thresh )
++
++      EMT_fn = jit(elasticity.athermal_moduli(energy_fn,check_convergence=True))
++      C, converged = EMT_fn(R,box,neighbor=nbrs)
++      assert( C.dtype == dtype )
++      assert( C.shape == (spatial_dimension,spatial_dimension,
++        spatial_dimension,spatial_dimension) )
++      if converged:
++        self.assertAllClose(cijkl,elasticity._extract_elements(C,False), 
++            atol=atol, rtol=rtol)
++        
++        #make sure the symmetries are there
++        self.assertAllClose(C, jnp.einsum("ijkl->jikl", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->ijlk", C))
++        self.assertAllClose(C, jnp.einsum("ijkl->lkij", C))
++
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in DTYPE))
++  def test_mandel(self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    for _ in range(NUM_SAMPLES):
++      key, split = random.split(key, 2)
++      
++      if spatial_dimension == 2:
++        C = jnp.array(
++            [[[[ 1.13172135,  0.00230386],
++               [ 0.00230386,  0.55599847]],
++
++              [[ 0.00230386,  0.39732675],
++               [ 0.39732675, -0.01848658]]],
++
++
++             [[[ 0.00230386,  0.39732675],
++               [ 0.39732675, -0.01848658]],
++
++              [[ 0.55599847, -0.01848658],
++               [-0.01848658,  1.14191721]]]],
++              dtype = dtype)
++      else:
++        C = jnp.array(
++            [[[[ 6.02440072e-01, -3.81092776e-02, -5.43015909e-02],
++               [-3.81092776e-02,  5.29322888e-01, -2.06230517e-02],
++               [-5.43015909e-02, -2.06230517e-02,  2.66616858e-01]],
++
++              [[-3.81092776e-02,  1.27745712e-01,  8.22006563e-03],
++               [ 1.27745712e-01,  3.85350327e-02, -1.06514552e-02],
++               [ 8.22006563e-03, -1.06514552e-02, -3.45478902e-02]],
++
++              [[-5.43015909e-02,  8.22006563e-03,  1.12683315e-01],
++               [ 8.22006563e-03,  3.89981105e-02,  3.45578275e-02],
++               [ 1.12683315e-01,  3.45578275e-02,  1.15577485e-02]]],
++
++
++             [[[-3.81092776e-02,  1.27745712e-01,  8.22006563e-03],
++               [ 1.27745712e-01,  3.85350327e-02, -1.06514552e-02],
++               [ 8.22006563e-03, -1.06514552e-02, -3.45478902e-02]],
++
++              [[ 5.29322888e-01,  3.85350327e-02,  3.89981105e-02],
++               [ 3.85350327e-02,  6.67240460e-01, -3.73405057e-04],
++               [ 3.89981105e-02, -3.73405057e-04,  5.27227690e-01]],
++
++              [[-2.06230517e-02, -1.06514552e-02,  3.45578275e-02],
++               [-1.06514552e-02, -3.73405057e-04,  2.17405756e-01],
++               [ 3.45578275e-02,  2.17405756e-01, -1.62693657e-02]]],
++
++
++             [[[-5.43015909e-02,  8.22006563e-03,  1.12683315e-01],
++               [ 8.22006563e-03,  3.89981105e-02,  3.45578275e-02],
++               [ 1.12683315e-01,  3.45578275e-02,  1.15577485e-02]],
++
++              [[-2.06230517e-02, -1.06514552e-02,  3.45578275e-02],
++               [-1.06514552e-02, -3.73405057e-04,  2.17405756e-01],
++               [ 3.45578275e-02,  2.17405756e-01, -1.62693657e-02]],
++
++              [[ 2.66616858e-01, -3.45478902e-02,  1.15577485e-02],
++               [-3.45478902e-02,  5.27227690e-01, -1.62693657e-02],
++               [ 1.15577485e-02, -1.62693657e-02,  5.45653623e-01]]]],
++              dtype = dtype)
++
++      e = random.uniform(split, (spatial_dimension,spatial_dimension), 
++          minval=-1, maxval=1, dtype=dtype)
++      e = (e + e.T) / 2.0
++      
++      e_m = elasticity.tensor_to_mandel(e)
++      C_m = elasticity.tensor_to_mandel(C) 
++      
++      sum_m = jnp.einsum('i,ij,j->',e_m, C_m, e_m)
++      sum_t = jnp.einsum('ij,ijkl,kl->',e, C, e)
++
++      self.assertAllClose(sum_m, sum_t)
++
++      self.assertAllClose(e, elasticity.mandel_to_tensor(e_m))
++      self.assertAllClose(C, elasticity.mandel_to_tensor(C_m))
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++if __name__ == '__main__':
++  absltest.main()
++
++
++
++
++
++
++
++
++
++
++
++
++

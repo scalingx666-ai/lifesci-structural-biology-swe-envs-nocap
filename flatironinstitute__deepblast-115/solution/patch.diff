@@ -1,0 +1,168 @@
+diff --git a/deepblast/alignment.py b/deepblast/alignment.py
+index d9b3661..f632882 100644
+--- a/deepblast/alignment.py
++++ b/deepblast/alignment.py
+@@ -2,17 +2,20 @@
+ import torch.nn as nn
+ from deepblast.nw_cuda import NeedlemanWunschDecoder as NWDecoderCUDA
+ from deepblast.nw import NeedlemanWunschDecoder as NWDecoderNumba
++from deepblast.sw_cuda import SmithWatermanDecoder as SWDecoderCUDA
++from deepblast.sw import SmithWatermanDecoder as SWDecoderNumba
+ from deepblast.embedding import StackedRNN, StackedCNN
+ from deepblast.dataset.utils import unpack_sequences
+ 
+ import torch.nn.functional as F
+ 
+ 
+-
+-class NeedlemanWunschAligner(nn.Module):
++class NeuralAligner(nn.Module):
+ 
+     def __init__(self, n_alpha, n_input, n_units, n_embed,
+-                 n_layers=2, dropout=0, lm=None, layer_type='cnn', device='gpu'):
++                 n_layers=2, dropout=0, lm=None, layer_type='cnn',
++                 alignment_mode='needleman-wunch',
++                 device='gpu'):
+         """ NeedlemanWunsch Alignment model
+ 
+         Parameters
+@@ -38,9 +41,8 @@ def __init__(self, n_alpha, n_input, n_units, n_embed,
+         -----
+         This only works on GPU at the moment.
+         """
+-        super(NeedlemanWunschAligner, self).__init__()
++        super(NeuralAligner, self).__init__()
+         assert lm is not None
+-
+         self.lm = lm
+ 
+         if n_layers > 1:
+@@ -62,10 +64,19 @@ def __init__(self, n_alpha, n_input, n_units, n_embed,
+             self.match_embedding = nn.Linear(n_embed, n_embed)
+             self.gap_embedding = nn.Linear(n_embed, n_embed)
+ 
+-        if device == 'gpu':
+-            self.nw = NWDecoderCUDA(operator='softmax')
++        if alignment_mode == 'needleman-wunch':
++            if device == 'gpu':
++                self.ddp = NWDecoderCUDA(operator='softmax')
++            else:
++                self.ddp = NWDecoderNumba(operator='softmax')
++        elif alignment_mode == 'smith-waterman':
++            if device == 'gpu':
++                self.ddp = SWDecoderCUDA(operator='softmax')
++            else:
++                self.ddp = SWDecoderNumba(operator='softmax')
+         else:
+-            self.nw = NWDecoderNumba(operator='softmax')
++            raise NotImplementedError(
++                'Alignment_mode {alignment_mode} not implemented.')
+ 
+     def blosum_factor(self, x):
+         """ Computes factors for blosum parameters using a single sequence
+@@ -110,7 +121,7 @@ def forward(self, x, order):
+             # Obtain theta through an inner product across latent dimensions
+             theta = F.softplus(torch.einsum('bid,bjd->bij', zx, zy))
+             A = F.logsigmoid(torch.einsum('bid,bjd->bij', gx, gy))
+-            aln = self.nw.decode(theta, A)
++            aln = self.ddp.decode(theta, A)
+             return aln, theta, A
+ 
+     def score(self, x, order, mask):
+@@ -122,7 +133,7 @@ def score(self, x, order, mask):
+             # Obtain theta through an inner product across latent dimensions
+             theta = F.softplus(torch.einsum('bid,bjd->bij', zx, zy))
+             A = F.logsigmoid(torch.einsum('bid,bjd->bij', gx, gy))
+-            ascore = self.nw(theta, A)
++            ascore = self.ddp(theta, A)
+             return ascore
+ 
+     def traceback(self, x, order):
+@@ -152,9 +163,9 @@ def traceback(self, x, order):
+             gap = F.logsigmoid(torch.einsum('bid,bjd->bij', gx, gy))
+             B, _, _ = match.shape
+             for b in range(B):
+-                aln = self.nw.decode(
++                aln = self.ddp.decode(
+                     match[b, :xlen[b], :ylen[b]].unsqueeze(0),
+                     gap[b, :xlen[b], :ylen[b]].unsqueeze(0)
+                 )
+-                decoded = self.nw.traceback(aln.squeeze())
++                decoded = self.ddp.traceback(aln.squeeze())
+                 yield decoded, aln
+diff --git a/deepblast/trainer.py b/deepblast/trainer.py
+index e519d39..6b4c0eb 100644
+--- a/deepblast/trainer.py
++++ b/deepblast/trainer.py
+@@ -9,7 +9,7 @@
+ from torch.optim.lr_scheduler import (
+     CosineAnnealingLR, CosineAnnealingWarmRestarts, StepLR, CyclicLR)
+ import pytorch_lightning as pl
+-from deepblast.alignment import NeedlemanWunschAligner
++from deepblast.alignment import NeuralAligner
+ from deepblast.dataset import TMAlignDataset
+ from deepblast.dataset.utils import (
+     decode, states2edges, collate_f, test_collate_f,
+@@ -44,8 +44,10 @@ def __init__(self, batch_size=20,
+                  train_pairs=None,
+                  valid_pairs=None,
+                  visualization_fraction=1.0,
+-                 device='gpu'
++                 device='gpu',
++                 alignment_mode='needleman-wunch'
+       ):
++
+         super(DeepBLAST, self).__init__()
+         self.save_hyperparameters(ignore=['lm'])
+         assert tokenizer is not None
+@@ -67,11 +69,12 @@ def __init__(self, batch_size=20,
+         n_units = self.hparams.hidden_dim
+         n_layers = self.hparams.layers
+         dropout = self.hparams.dropout
+-
+-        self.aligner = NeedlemanWunschAligner(
++        self.aligner = NeuralAligner(
+             n_input, n_units, n_embed, n_layers, dropout=dropout, lm=lm,
++            alignment_mode=alignment_mode,
+             device=device)
+ 
++
+     def align(self, x, y):
+         x_code = get_sequence(x, self.tokenizer)[0].to(self.device)
+         y_code = get_sequence(y, self.tokenizer)[0].to(self.device)
+@@ -391,6 +394,13 @@ def add_model_specific_args(parent_parser):
+                 'WARNING: this option is deprecated, use at your own risk.'
+             )
+         )
++        parser.add_argument(
++            '--mode', default=False, required=False, type=str,
++            help=(
++                'Aligment mode. Choices include `needleman-wunch`, '
++                '`smith-waterman`, or `gotoh`.'
++            )
++        )
+         parser.add_argument(
+             '--finetune',
+             help=('Perform finetuning of language model.'),
+diff --git a/scripts/deepblast-mali-align b/scripts/deepblast-mali-align
+index 81ddcd1..b1e7ec4 100644
+--- a/scripts/deepblast-mali-align
++++ b/scripts/deepblast-mali-align
+@@ -19,7 +19,8 @@ def main(args):
+         args.pretrain_path, do_lower_case=False)
+     lm = T5EncoderModel.from_pretrained(args.pretrain_path)
+     model = DeepBLAST.load_from_checkpoint(
+-        args.load_from_checkpoint, lm=lm, tokenizer=tokenizer)
++        args.load_from_checkpoint, lm=lm, tokenizer=tokenizer,
++        alignment_mode=args.alignment_mode)
+ 
+     if args.accelerator == 'gpu':
+         model = model.cuda()
+@@ -39,6 +40,7 @@ def main(args):
+ if __name__ == '__main__':
+     parser = argparse.ArgumentParser(add_help=False)
+     parser.add_argument('--accelerator', type=str, default='cpu')
++    parser.add_argument('--alignment-mode', type=str, default='needleman-wunsch')
+     parser.add_argument('--load-from-checkpoint', type=str, default=None)
+     parser.add_argument('--input-mali-dir', type=str, default=None,
+                         help="Root directory for Mali PDB files.")

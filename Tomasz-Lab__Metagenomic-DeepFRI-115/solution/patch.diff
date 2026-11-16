@@ -1,0 +1,366 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ea94ee6..95769db 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ [Unreleased]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.2.0...HEAD
+ 
++### Fixed
++
++- `align_contact_map` returning an asymmetric map for one-directional template contacts
++- runs aborting when a PDB template cannot be downloaded or parsed - the template is now skipped with a warning
++- MMseqs2 results with a single hit, no hits or numeric-like identifiers - identifiers stay strings and empty results keep their header
++- `search-databases` failing on unexpected keyword arguments
++
+ ## [1.2.0] - 2026-08-10
+ 
+ [1.2.0]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.10...v1.2.0
+diff --git a/mDeepFRI/cli.py b/mDeepFRI/cli.py
+index 275dae2..99c26d0 100644
+--- a/mDeepFRI/cli.py
++++ b/mDeepFRI/cli.py
+@@ -304,8 +304,9 @@ def generate_config(weights_path, version):
+ @search_options
+ @click.pass_context
+ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+-                     min_length, max_length, min_bits, max_eval, min_ident,
+-                     min_coverage, top_k, overwrite, threads, skip_pdb,
++                     min_length, max_length, mmseqs_min_bitscore,
++                     mmseqs_max_evalue, mmseqs_min_identity,
++                     mmseqs_min_coverage, top_k, overwrite, threads, skip_pdb,
+                      tmpdir):
+     """
+     Hierarchically search FoldComp databases for similar proteins with
+@@ -322,12 +323,10 @@ def search_databases(ctx, input, output, db_path, mmseqs_sensitivity,
+                                  databases=db_path,
+                                  output_path=output,
+                                  mmseqs_sensitivity=mmseqs_sensitivity,
+-                                 min_seq_len=min_length,
+-                                 max_seq_len=max_length,
+-                                 min_bits=min_bits,
+-                                 max_eval=max_eval,
+-                                 min_ident=min_ident,
+-                                 min_coverage=min_coverage,
++                                 min_bits=mmseqs_min_bitscore,
++                                 max_eval=mmseqs_max_evalue,
++                                 min_ident=mmseqs_min_identity,
++                                 min_coverage=mmseqs_min_coverage,
+                                  top_k=top_k,
+                                  skip_pdb=skip_pdb,
+                                  overwrite=overwrite,
+diff --git a/mDeepFRI/contact_map_utils.pyx b/mDeepFRI/contact_map_utils.pyx
+index 9237e56..24d78f3 100644
+--- a/mDeepFRI/contact_map_utils.pyx
++++ b/mDeepFRI/contact_map_utils.pyx
+@@ -113,5 +113,6 @@ cpdef cnp.ndarray[DTYPE_t, ndim=2] align_contact_map(str query_alignment,
+ 
+                 if q_res_i != -1 and q_res_j != -1:
+                     output_view[q_res_i, q_res_j] = 1
++                    output_view[q_res_j, q_res_i] = 1
+ 
+     return output_map
+diff --git a/mDeepFRI/mmseqs.py b/mDeepFRI/mmseqs.py
+index 3e89a32..8f6b4c0 100644
+--- a/mDeepFRI/mmseqs.py
++++ b/mDeepFRI/mmseqs.py
+@@ -44,6 +44,7 @@
+ 
+ MMSEQS_PATH = Path(mDeepFRI.__path__[0]).parent / "mmseqs" / "bin" / "mmseqs"
+ FOLDCOMP_PATH = Path(mDeepFRI.__path__[0]).parent / "foldcomp_bin"
++STRING_COLUMNS = ("query", "target", "query_file", "database_file")
+ 
+ 
+ @dataclass
+@@ -205,6 +206,32 @@ def _convertalis(query_db: str,
+         f"--format-output {args} --threads {threads}")
+ 
+ 
++def _read_results_tsv(filepath: str) -> np.recarray:
++    """
++    Read an MMseqs2 results table with a header row.
++
++    Identifiers and paths are kept as strings, all other columns are
++    parsed as floats.
++
++    Args:
++        filepath (str): Path to TSV file.
++
++    Returns:
++        np.recarray: One record per row; empty if the table has no rows.
++    """
++    with open(filepath, newline="", encoding="utf-8") as f:
++        reader = csv.reader(f, delimiter="\t")
++        names = next(reader)
++        rows = [row for row in reader if row]
++
++    columns = list(zip(*rows)) or [()] * len(names)
++    arrays = [
++        np.array(column, dtype=str if name in STRING_COLUMNS else float)
++        for name, column in zip(names, columns)
++    ]
++    return np.rec.fromarrays(arrays, names=names)
++
++
+ class MMseqsResult(np.recarray):
+     """
+     Class for handling MMseqs2 search results. The results are stored in a TSV file.
+@@ -288,15 +315,19 @@ def save(self, filepath, filetype: Literal["tsv", "npz"] = "tsv"):
+         if self.query_fasta:
+             query_col = np.array([self.query_fasta] * len(self.result_arr),
+                                  dtype="U")
+-            self.result_arr = rfn.append_fields(self.result_arr, "query_file",
+-                                                query_col)
++            self.result_arr = rfn.append_fields(self.result_arr,
++                                                "query_file",
++                                                query_col,
++                                                usemask=False)
+ 
+         # append database column to the result array
+         if self.database:
+             db_col = np.array([self.database] * len(self.result_arr),
+                               dtype="U")
+             self.result_arr = rfn.append_fields(self.result_arr,
+-                                                "database_file", db_col)
++                                                "database_file",
++                                                db_col,
++                                                usemask=False)
+ 
+         if filetype == "tsv":
+             with open(filepath, "w", newline="") as f:
+@@ -367,7 +398,7 @@ def select_top_k(query, db, k=30):
+         try:
+             final_table = np.concatenate(top_k)
+         except ValueError:
+-            final_table = np.empty(0, dtype=None)
++            final_table = self.result_arr[:0]
+ 
+         return MMseqsResult(final_table, self.query_fasta, self.database)
+ 
+@@ -442,11 +473,7 @@ def from_mmseqs_result(cls,
+                 >>> result = MMseqsResult.from_mmseqs_result("path/to/file.tsv")
+         """
+ 
+-        result_arr = np.genfromtxt(filepath,
+-                                   delimiter="\t",
+-                                   encoding="utf-8",
+-                                   names=True,
+-                                   dtype=None)
++        result_arr = _read_results_tsv(filepath)
+         return cls(result_arr, query_fasta, database)
+ 
+     @classmethod
+@@ -466,11 +493,7 @@ def from_best_matches(cls, filepath: str) -> 'MMseqsResult':
+                 >>> result = MMseqsResult.from_best_matches("path/to/file.tsv")
+         """
+ 
+-        result_arr = np.genfromtxt(filepath,
+-                                   delimiter="\t",
+-                                   encoding="utf-8",
+-                                   names=True,
+-                                   dtype=None)
++        result_arr = _read_results_tsv(filepath)
+         try:
+             query_file = np.unique(result_arr["query_file"])[0]
+         except IndexError:
+diff --git a/mDeepFRI/pdb.py b/mDeepFRI/pdb.py
+index 184e69f..230f49f 100644
+--- a/mDeepFRI/pdb.py
++++ b/mDeepFRI/pdb.py
+@@ -80,12 +80,16 @@ def get_pdb_structure(pdb_id: str,
+     Returns:
+         str: PDB structure in mmCIF format as a string.
+ 
++    Raises:
++        requests.RequestException: If the structure cannot be downloaded.
+     """
+ 
+     pdb_http = "https://files.rcsb.org/view/{pdb_id}.cif"
+     pdb_id = pdb_id.lower()
+     url = pdb_http.format(pdb_id=pdb_id)
+-    structure = requests.get(url).text
++    response = requests.get(url, timeout=60)
++    response.raise_for_status()
++    structure = response.text
+     if save_directory:
+         with open(save_directory / f"{pdb_id}.cif", "w") as f:
+             f.write(structure)
+@@ -110,19 +114,18 @@ def get_pdb_seq_coords(
+         Tuple[str, np.ndarray]: A tuple containing a sequence and coordinates of a protein chain.
+     """
+     pdb_id, chain = pdb_id_chain.split("_")
+-    structure = get_pdb_structure(pdb_id, save_directory=save_directory)
+ 
+     try:
++        structure = get_pdb_structure(pdb_id, save_directory=save_directory)
+         sequence, coords = extract_residues_coordinates(structure,
+                                                         chain=chain,
+                                                         filetype="mmcif")
+-    except KeyError as e:
++    except (requests.RequestException, KeyError, ValueError) as e:
+         sequence, coords = None, None
+         pdb_id = pdb_id.upper()
+         warnings.warn(
+             f"Error extracting residues and coordinates for PDB ID {pdb_id}[Chain {chain}] - "
+-            f"non-standard residue {str(e)} present; {query_name} alignment skipped."
+-        )
++            f"{e!r}; {query_name} alignment skipped.")
+ 
+     return sequence, coords
+ 
+diff --git a/mDeepFRI/tests/__init__.py b/mDeepFRI/tests/__init__.py
+index f97cedb..f48aff5 100644
+--- a/mDeepFRI/tests/__init__.py
++++ b/mDeepFRI/tests/__init__.py
+@@ -1,13 +1,21 @@
+-from . import (test_alignment, test_bio_utils, test_install, test_mmseqs,
+-               test_pdb, test_predict, test_utils)
++from . import (test_alignment, test_bio_utils, test_cli, test_conctact_map,
++               test_contact_map_utils, test_go2cog_mapping, test_install,
++               test_mmseqs, test_pdb, test_pipeline_regression, test_predict,
++               test_utils, test_vocabulary_mismatch)
+ 
+ 
+ def load_tests(loader, suite, pattern):
+     suite.addTests(loader.loadTestsFromModule(test_alignment))
+     suite.addTests(loader.loadTestsFromModule(test_bio_utils))
++    suite.addTests(loader.loadTestsFromModule(test_cli))
++    suite.addTests(loader.loadTestsFromModule(test_conctact_map))
++    suite.addTests(loader.loadTestsFromModule(test_contact_map_utils))
++    suite.addTests(loader.loadTestsFromModule(test_go2cog_mapping))
+     suite.addTests(loader.loadTestsFromModule(test_install))
+     suite.addTests(loader.loadTestsFromModule(test_mmseqs))
+     suite.addTests(loader.loadTestsFromModule(test_pdb))
++    suite.addTests(loader.loadTestsFromModule(test_pipeline_regression))
+     suite.addTests(loader.loadTestsFromModule(test_predict))
+     suite.addTests(loader.loadTestsFromModule(test_utils))
++    suite.addTests(loader.loadTestsFromModule(test_vocabulary_mismatch))
+     return suite
+diff --git a/mDeepFRI/tests/test_cli.py b/mDeepFRI/tests/test_cli.py
+index 6ccc95c..8ef2d49 100644
+--- a/mDeepFRI/tests/test_cli.py
++++ b/mDeepFRI/tests/test_cli.py
+@@ -1,4 +1,6 @@
+ import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
+ 
+ from click.testing import CliRunner
+ 
+@@ -30,3 +32,14 @@ def test_predict_function_custom_mapping_option(self):
+         result = self.runner.invoke(main, ["predict-function", "--help"])
+         self.assertEqual(result.exit_code, 0)
+         self.assertIn("--custom-mapping", result.output)
++
++    def test_search_databases(self):
++        """Test that search-databases runs a PDB100 search."""
++        query = Path(__file__).parent / "data" / "small_query.faa"
++        with TemporaryDirectory() as output:
++            result = self.runner.invoke(
++                main, ["search-databases", "-i",
++                       str(query), "-o", output])
++            self.assertEqual(result.exit_code, 0, result.exception)
++            self.assertTrue(
++                (Path(output) / "pdb100_230517_results.tsv").exists())
+diff --git a/mDeepFRI/tests/test_mmseqs.py b/mDeepFRI/tests/test_mmseqs.py
+index 36e056c..01478bf 100644
+--- a/mDeepFRI/tests/test_mmseqs.py
++++ b/mDeepFRI/tests/test_mmseqs.py
+@@ -172,5 +172,44 @@ def tearDown(self):
+             Path(self.out_npz).unlink()
+ 
+ 
++class TestMMseqsResultRoundTrip(unittest.TestCase):
++    header = "query\ttarget\tfident\tqcov\ttcov\tevalue\tbits\n"
++
++    def setUp(self):
++        self.temp_dir = TemporaryDirectory()
++        self.search_tsv = Path(self.temp_dir.name) / "search.tsv"
++        self.best_tsv = Path(self.temp_dir.name) / "best.tsv"
++
++    def tearDown(self):
++        self.temp_dir.cleanup()
++
++    def round_trip(self, rows):
++        self.search_tsv.write_text(self.header + "".join(rows))
++        result = MMseqsResult.from_mmseqs_result(self.search_tsv, "query.faa",
++                                                 "database")
++        result.find_best_matches(k=1).save(self.best_tsv)
++        return MMseqsResult.from_best_matches(self.best_tsv)
++
++    def test_numeric_like_ids_stay_strings(self):
++        best = self.round_trip([
++            "007\t1e5\t0.9\t1.0\t1.0\t1e-10\t150\n",
++            "2\t3\t0.8\t1.0\t1.0\t1e-10\t120\n",
++        ])
++        self.assertCountEqual(best["query"].tolist(), ["007", "2"])
++        self.assertCountEqual(best["target"].tolist(), ["1e5", "3"])
++
++    def test_single_hit(self):
++        best = self.round_trip(["seq1\ttarget1\t0.9\t1.0\t1.0\t1e-10\t150\n"])
++        self.assertEqual(len(best), 1)
++        self.assertEqual(best.query_fasta, Path("query.faa").resolve())
++
++    def test_no_hits(self):
++        best = self.round_trip([])
++        self.assertEqual(len(best), 0)
++        self.assertEqual(
++            self.best_tsv.read_text().splitlines()[0],
++            self.header.rstrip("\n") + "\tquery_file\tdatabase_file")
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/mDeepFRI/tests/test_pdb.py b/mDeepFRI/tests/test_pdb.py
+index 4670233..0526afc 100644
+--- a/mDeepFRI/tests/test_pdb.py
++++ b/mDeepFRI/tests/test_pdb.py
+@@ -1,7 +1,13 @@
+ import pathlib
+ import unittest
++from unittest import mock
+ 
+-from mDeepFRI.pdb import create_pdb_mmseqs
++import requests
++
++from mDeepFRI.pdb import create_pdb_mmseqs, get_pdb_seq_coords
++
++STRUCTURE = pathlib.Path(
++    __file__).parent / "data" / "AF-A0A3B4WVX2-F1-model_v6.cif"
+ 
+ 
+ class TestPDB(unittest.TestCase):
+@@ -10,3 +16,33 @@ def test_create_pdb_mmseqs(self):
+ 
+         self.assertTrue(pathlib.Path(pdb100.sequence_db).exists())
+         self.assertTrue(pathlib.Path(pdb100.mmseqs_db).exists())
++
++
++class TestGetPDBSeqCoords(unittest.TestCase):
++    def setUp(self):
++        self.structure = STRUCTURE.read_text()
++
++    def test_extracts_chain(self):
++        with mock.patch("mDeepFRI.pdb.get_pdb_structure",
++                        return_value=self.structure):
++            sequence, coords = get_pdb_seq_coords("1abc_A", "query")
++
++        self.assertEqual(len(sequence), len(coords))
++
++    def test_missing_chain_is_skipped(self):
++        with mock.patch("mDeepFRI.pdb.get_pdb_structure",
++                        return_value=self.structure):
++            with self.assertWarns(UserWarning):
++                result = get_pdb_seq_coords("1abc_Z", "query")
++
++        self.assertEqual(result, (None, None))
++
++    def test_failed_download_is_skipped(self):
++        response = mock.Mock()
++        response.raise_for_status.side_effect = requests.HTTPError(
++            "404 Client Error")
++        with mock.patch("mDeepFRI.pdb.requests.get", return_value=response):
++            with self.assertWarns(UserWarning):
++                result = get_pdb_seq_coords("0zzz_A", "query")
++
++        self.assertEqual(result, (None, None))

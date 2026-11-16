@@ -1,0 +1,328 @@
+diff --git a/.requirements/base.in b/.requirements/base.in
+index b25fd397a..24fc69054 100644
+--- a/.requirements/base.in
++++ b/.requirements/base.in
+@@ -2,13 +2,15 @@ pandas<2.0.0
+ biopandas>=0.5.1
+ biopython
+ bioservices>=1.10.0
++cpdb-protein==0.2.0
++cython
+ deepdiff
+ loguru
+ looseversion
+ matplotlib>=3.4.3
+ multipledispatch
+ networkx
+-numpy<1.24.0
++numpy
+ pandas
+ plotly
+ pydantic
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0d1a46f05..f0dcf3330 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -82,6 +82,7 @@ https://github.com/a-r-j/graphein/pull/334
+ 
+ #### Other Changes
+ 
++-   Uses [`cpdb`](https://github.com/a-r-j/CPDB) as default PDB file parser for improved performance. [#323](https://github.com/a-r-j/graphein/pull/323).
+ -   Adds transform composition to FoldComp Dataset [#312](https://github.com/a-r-j/graphein/pull/312)
+ -   Adds entry point for biopandas dataframes in `graphein.protein.tensor.io.protein_to_pyg`. [#310](https://github.com/a-r-j/graphein/pull/310)
+ -   Adds support for `.ent` files to `graphein.protein.graphs.read_pdb_to_dataframe`. [#310](https://github.com/a-r-j/graphein/pull/310)
+diff --git a/graphein/protein/graphs.py b/graphein/protein/graphs.py
+index 0003e6604..b8988147f 100644
+--- a/graphein/protein/graphs.py
++++ b/graphein/protein/graphs.py
+@@ -15,6 +15,7 @@
+ from pathlib import Path
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+ 
++import cpdb
+ import networkx as nx
+ import numpy as np
+ import pandas as pd
+@@ -109,9 +110,13 @@ def read_pdb_to_dataframe(
+             or path.endswith(".pdb.gz")
+             or path.endswith(".ent")
+         ):
+-            atomic_df = PandasPdb().read_pdb(path)
++            atomic_df = cpdb.parse(path)
+         elif path.endswith(".mmtf") or path.endswith(".mmtf.gz"):
+             atomic_df = PandasMmtf().read_mmtf(path)
++            atomic_df = atomic_df.get_model(model_index)
++            atomic_df = pd.concat(
++                [atomic_df.df["ATOM"], atomic_df.df["HETATM"]]
++            )
+         elif (
+             path.endswith(".cif")
+             or path.endswith(".cif.gz")
+@@ -119,22 +124,27 @@ def read_pdb_to_dataframe(
+             or path.endswith(".mmcif.gz")
+         ):
+             atomic_df = PandasMmcif().read_mmcif(path)
++            atomic_df = atomic_df.get_model(model_index)
++            atomic_df = atomic_df.convert_to_pandas_pdb()
++            atomic_df = pd.concat(
++                [atomic_df.df["ATOM"], atomic_df.df["HETATM"]]
++            )
+         else:
+             raise ValueError(
+                 f"File {path} must be either .pdb(.gz), .mmtf(.gz), .(mm)cif(.gz) or .ent, not {path.split('.')[-1]}"
+             )
+     elif uniprot_id is not None:
+-        atomic_df = PandasPdb().fetch_pdb(
+-            uniprot_id=uniprot_id, source="alphafold2-v3"
+-        )
++        atomic_df = cpdb.parse(uniprot_id=uniprot_id)
+     else:
+-        atomic_df = PandasPdb().fetch_pdb(pdb_code)
+-    atomic_df = atomic_df.get_model(model_index)
+-    if len(atomic_df.df["ATOM"]) == 0:
++        atomic_df = cpdb.parse(pdb_code=pdb_code)
++
++    if "model_idx" in atomic_df.columns:
++        atomic_df = atomic_df.loc[atomic_df["model_idx"] == model_index]
++
++    if len(atomic_df) == 0:
+         raise ValueError(f"No model found for index: {model_index}")
+-    if isinstance(atomic_df, PandasMmcif):
+-        atomic_df = atomic_df.convert_to_pandas_pdb()
+-    return pd.concat([atomic_df.df["ATOM"], atomic_df.df["HETATM"]])
++
++    return atomic_df
+ 
+ 
+ def label_node_id(
+diff --git a/graphein/protein/utils.py b/graphein/protein/utils.py
+index 490a9e396..380a99ecd 100644
+--- a/graphein/protein/utils.py
++++ b/graphein/protein/utils.py
+@@ -16,6 +16,7 @@
+ from urllib.request import urlopen
+ 
+ import networkx as nx
++import numpy as np
+ import pandas as pd
+ import requests
+ import wget
+@@ -25,6 +26,30 @@
+ 
+ from .resi_atoms import BACKBONE_ATOMS, RESI_THREE_TO_1
+ 
++pdb_df_columns = [
++    "record_name",
++    "atom_number",
++    "blank_1",
++    "atom_name",
++    "alt_loc",
++    "residue_name",
++    "blank_2",
++    "chain_id",
++    "residue_number",
++    "insertion",
++    "blank_3",
++    "x_coord",
++    "y_coord",
++    "z_coord",
++    "occupancy",
++    "b_factor",
++    "blank_4",
++    "segment_id",
++    "element_symbol",
++    "charge",
++    "line_idx",
++]
++
+ 
+ class ProteinGraphConfigurationError(Exception):
+     """
+@@ -418,12 +443,27 @@ def save_graph_to_pdb(
+     :type gz: bool
+     """
+     ppd = PandasPdb()
+-    atom_df = filter_dataframe(
+-        g.graph["pdb_df"], "record_name", ["ATOM"], boolean=True
+-    )
+-    hetatm_df = filter_dataframe(
+-        g.graph["pdb_df"], "record_name", ["HETATM"], boolean=True
+-    )
++
++    df = g.graph["pdb_df"].copy()
++    # format charge correctly
++    df.charge = pd.to_numeric(df.charge, errors="coerce")
++
++    # Add blank columns
++    blank_cols = [
++        "blank_1",
++        "blank_2",
++        "blank_3",
++        "blank_4",
++        "segment_id",
++    ]
++    for col in blank_cols:
++        if col not in df.columns:
++            df[col] = ""
++    df["line_idx"] = list(range(1, len(df) + 1))
++    df = df[pdb_df_columns]
++    atom_df = filter_dataframe(df, "record_name", ["ATOM"], boolean=True)
++    hetatm_df = filter_dataframe(df, "record_name", ["HETATM"], boolean=True)
++
+     if atoms:
+         ppd.df["ATOM"] = atom_df
+     if hetatms:
+@@ -448,9 +488,22 @@ def save_pdb_df_to_pdb(
+     :param gz: Whether to gzip the file. Defaults to ``False``.
+     :type gz: bool
+     """
++    df = df.copy()
++    # format charge correctly
++    df.charge = pd.to_numeric(df.charge, errors="coerce")
++    df.alt_loc = df.alt_loc.fillna(" ")
++    blank_cols = ["blank_1", "blank_2", "blank_3", "blank_4", "segment_id"]
++    for col in blank_cols:
++        if col not in df.columns:
++            df[col] = ""
++    df["line_idx"] = list(range(1, len(df) + 1))
++    df = df[pdb_df_columns]
++
+     atom_df = filter_dataframe(df, "record_name", ["ATOM"], boolean=True)
+     hetatm_df = filter_dataframe(df, "record_name", ["HETATM"], boolean=True)
++
+     ppd = PandasPdb()
++
+     if atoms:
+         ppd.df["ATOM"] = atom_df
+     if hetatms:
+@@ -481,12 +534,21 @@ def save_rgroup_df_to_pdb(
+     :type gz: bool
+     """
+     ppd = PandasPdb()
+-    atom_df = filter_dataframe(
+-        g.graph["rgroup_df"], "record_name", ["ATOM"], boolean=True
+-    )
+-    hetatm_df = filter_dataframe(
+-        g.graph["rgroup_df"], "record_name", ["HETATM"], boolean=True
+-    )
++    df = g.graph["rgroup_df"].copy()
++
++    # format charge correctly
++    df.charge = pd.to_numeric(df.charge, errors="coerce")
++
++    blank_cols = ["blank_1", "blank_2", "blank_3", "blank_4", "segment_id"]
++    for col in blank_cols:
++        if col not in df.columns:
++            df[col] = [""] * len(df)
++    df["line_idx"] = list(range(1, len(df) + 1))
++    df = df[pdb_df_columns]
++
++    atom_df = filter_dataframe(df, "record_name", ["ATOM"], boolean=True)
++    hetatm_df = filter_dataframe(df, "record_name", ["HETATM"], boolean=True)
++
+     if atoms:
+         ppd.df["ATOM"] = atom_df
+     if hetatms:
+diff --git a/tests/protein/tensor/test_data.py b/tests/protein/tensor/test_data.py
+index 142bcd955..8cbea8771 100644
+--- a/tests/protein/tensor/test_data.py
++++ b/tests/protein/tensor/test_data.py
+@@ -16,5 +16,5 @@
+ def test_save_and_load_protein():
+     a = Protein().from_pdb_code("4hhb")
+     torch.save(a, "4hhb.pt")
+-    b = torch.load("4hhb.pt")
++    b = torch.load("4hhb.pt", weights_only=False)
+     assert a == b
+diff --git a/tests/protein/tensor/test_reconstruction.py b/tests/protein/tensor/test_reconstruction.py
+index e9e7f2f1a..7aa83fd49 100644
+--- a/tests/protein/tensor/test_reconstruction.py
++++ b/tests/protein/tensor/test_reconstruction.py
+@@ -30,4 +30,3 @@ def test_dist_mat_to_coords():
+         assert torch.allclose(d, torch.cdist(X, X), atol=1e-4)
+         X_aligned = kabsch(X, coords)
+         assert torch.allclose(coords, X_aligned, atol=1e-4)
+-        return coords, X, X_aligned
+diff --git a/tests/protein/test_graphs.py b/tests/protein/test_graphs.py
+index 6b913f47f..80da555f8 100644
+--- a/tests/protein/test_graphs.py
++++ b/tests/protein/test_graphs.py
+@@ -439,7 +439,10 @@ def test_alt_loc_exclusion():
+     ):
+         config.alt_locs = opt
+         g = construct_graph(config=config, pdb_code="2VVI")
+-        assert np.array_equal(g.nodes[node_id]["coords"], expected_coords)
++        assert np.array_equal(
++            g.nodes[node_id]["coords"],
++            np.array(expected_coords, dtype=np.float32),
++        )
+ 
+ 
+ def test_alt_loc_inclusion():
+diff --git a/tests/protein/test_utils.py b/tests/protein/test_utils.py
+index 8d6aa9303..3b26282fd 100644
+--- a/tests/protein/test_utils.py
++++ b/tests/protein/test_utils.py
+@@ -27,11 +27,24 @@ def test_save_graph_to_pdb():
+     # Check file exists
+     assert os.path.isfile("/tmp/test_graph.pdb")
+ 
+-    # Check for equivalence between saved and existing DFs.
+-    # We drop the line_idx columns as these will be renumbered
++    graph_df = (
++        g.graph["pdb_df"]
++        .drop(
++            [
++                "node_id",
++                "residue_id",
++            ],
++            axis=1,
++        )
++        .reset_index(drop=True)
++    )
++
++    a.reset_index(drop=True, inplace=True)
++    a = a[graph_df.columns]  # Reorder columns
++
+     assert_frame_equal(
+-        a.drop(["line_idx"], axis=1),
+-        g.graph["pdb_df"].drop(["line_idx", "node_id", "residue_id"], axis=1),
++        a,
++        graph_df,
+     )
+     h = construct_graph(path="/tmp/test_graph.pdb")
+ 
+@@ -48,10 +61,17 @@ def test_save_pdb_df_to_pdb():
+     # Check file exists
+     assert os.path.isfile("/tmp/test_graph.pdb")
+ 
+-    # We drop the line_idx columns as these will be renumbered
+     assert_frame_equal(
+-        a.drop(["line_idx"], axis=1),
+-        g.graph["pdb_df"].drop(["line_idx", "node_id", "residue_id"], axis=1),
++        a,
++        g.graph["pdb_df"]
++        .drop(
++            [
++                "node_id",
++                "residue_id",
++            ],
++            axis=1,
++        )
++        .reset_index(drop=True),
+     )
+ 
+     # Now check for raw, unprocessed DF
+@@ -73,10 +93,10 @@ def test_save_rgroup_df_to_pdb():
+ 
+     # We drop the line_idx columns as these will be renumbered
+     assert_frame_equal(
+-        a.drop(["line_idx"], axis=1),
++        a,
+         filter_dataframe(
+             g.graph["rgroup_df"], "record_name", ["HETATM"], False
+-        ).drop(["line_idx", "node_id", "residue_id"], axis=1),
++        ).drop(["node_id", "residue_id"], axis=1),
+     )
+ 
+ 

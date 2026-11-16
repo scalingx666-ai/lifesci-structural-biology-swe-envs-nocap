@@ -1,0 +1,480 @@
+diff --git a/jax_md/_nn/uma/common/rotation.py b/jax_md/_nn/uma/common/rotation.py
+index 6cec4224..d40057eb 100644
+--- a/jax_md/_nn/uma/common/rotation.py
++++ b/jax_md/_nn/uma/common/rotation.py
+@@ -8,10 +8,10 @@
+ 
+ from __future__ import annotations
+ 
+-import math
+ import os
+ from typing import List, Optional, Tuple
+ 
++import e3nn_jax as e3nn
+ import jax
+ import jax.numpy as jnp
+ import numpy as np
+@@ -187,10 +187,8 @@ def compute_jacobi_matrices(lmax: int) -> List[jnp.ndarray]:
+ 
+   The Jacobi matrices are used in the computation of Wigner D-matrices
+   via the relation D = X_a @ J @ X_b @ J @ X_c where X are z-rotation
+-  matrices.
+-
+-  Note: For best compatibility with pretrained PyTorch weights, use
+-  load_jacobi_matrices_from_file() instead.
++  matrices. Each J is (-1)^l D^l(pi/2, pi/2, pi/2) in e3nn's real basis,
++  the same matrices as Jd.pt.
+ 
+   Args:
+       lmax: Maximum degree l for which to compute matrices.
+@@ -198,70 +196,10 @@ def compute_jacobi_matrices(lmax: int) -> List[jnp.ndarray]:
+   Returns:
+       List of Jacobi matrices for l = 0, 1, ..., lmax.
+   """
+-  Jd_list = []
+-
+-  for l in range(lmax + 1):
+-    J = _compute_wigner_d_small(l, np.pi / 2)
+-    Jd_list.append(jnp.array(J))
+-
+-  return Jd_list
+-
+-
+-def _compute_wigner_d_small(l: int, beta: float) -> np.ndarray:
+-  """Compute small Wigner d-matrix d^l(beta).
+-
+-  Args:
+-      l: Degree of the representation.
+-      beta: Rotation angle.
+-
+-  Returns:
+-      d-matrix of shape [2l+1, 2l+1].
+-  """
+-  if l == 0:
+-    return np.array([[1.0]])
+-
+-  size = 2 * l + 1
+-  d = np.zeros((size, size))
+-
+-  c = np.cos(beta / 2)
+-  s = np.sin(beta / 2)
+-
+-  for m in range(-l, l + 1):
+-    for mp in range(-l, l + 1):
+-      idx_m = m + l
+-      idx_mp = mp + l
+-
+-      val = 0.0
+-      s_min = max(0, m - mp)
+-      s_max = min(l + m, l - mp)
+-
+-      for s_idx in range(s_min, s_max + 1):
+-        sign = (-1) ** (mp - m + s_idx)
+-        num = (
+-          math.factorial(l + m)
+-          * math.factorial(l - m)
+-          * math.factorial(l + mp)
+-          * math.factorial(l - mp)
+-        )
+-        denom = (
+-          math.factorial(l + m - s_idx)
+-          * math.factorial(s_idx)
+-          * math.factorial(mp - m + s_idx)
+-          * math.factorial(l - mp - s_idx)
+-        )
+-        power_c = 2 * l + m - mp - 2 * s_idx
+-        power_s = mp - m + 2 * s_idx
+-
+-        term = sign * np.sqrt(num) / denom
+-        if power_c >= 0 and power_s >= 0:
+-          term *= c**power_c * s**power_s
+-        else:
+-          term = 0.0
+-        val += term
+-
+-      d[idx_m, idx_mp] = val
+-
+-  return d
++  return [
++    (-1) ** l * e3nn.Irrep(l, 1).D_from_angles(np.pi / 2, np.pi / 2, np.pi / 2)
++    for l in range(lmax + 1)
++  ]
+ 
+ 
+ def _z_rot_mat(angle: jnp.ndarray, l: int) -> jnp.ndarray:
+diff --git a/jax_md/partition.py b/jax_md/partition.py
+index 901ba940..652ded7d 100644
+--- a/jax_md/partition.py
++++ b/jax_md/partition.py
+@@ -29,7 +29,6 @@
+   Optional,
+   Dict,
+   Tuple,
+-  Generator,
+   Union,
+   Protocol,
+ )
+@@ -158,6 +157,7 @@ def _cell_dimensions(
+     box_size = float(box_size)
+ 
+   cells_per_side = onp.floor(box_size / minimum_cell_size)
++  cells_per_side = onp.where(cells_per_side < 3, 1, cells_per_side)
+   cell_size = box_size / cells_per_side
+   cells_per_side = onp.array(cells_per_side, dtype=i32)
+ 
+@@ -165,13 +165,6 @@ def _cell_dimensions(
+     if box_size.ndim == 1 or box_size.ndim == 2:
+       assert box_size.size == spatial_dimension
+       flat_cells_per_side = onp.reshape(cells_per_side, (-1,))
+-      for cells in flat_cells_per_side:
+-        if cells < 3:
+-          msg = (
+-            'Box must be at least 3x the size of the grid spacing in each '
+-            'dimension.'
+-          )
+-          raise ValueError(msg)
+       cell_count = reduce(mul, flat_cells_per_side, 1)
+     elif box_size.ndim == 0:
+       cell_count = cells_per_side**spatial_dimension
+@@ -224,22 +217,6 @@ def _compute_hash_constants(
+     raise ValueError()
+ 
+ 
+-def _neighboring_cells(dimension: int) -> Generator[onp.ndarray, None, None]:
+-  for dindex in onp.ndindex(*([3] * dimension)):
+-    yield onp.array(dindex, dtype=i32) - 1
+-
+-
+-@partial(jit, static_argnums=(0, 1))
+-def _neighboring_cells_arr(ndim: int, dist: int = 1) -> Array:
+-  return jnp.stack(
+-    [
+-      lax.broadcasted_iota(i32, [dist * 2 + 1] * ndim, d) - dist
+-      for d in range(ndim)
+-    ],
+-    axis=-1,
+-  ).reshape((-1, ndim))
+-
+-
+ def _estimate_cell_capacity(
+   position: Array,
+   box_size: Box,
+@@ -704,6 +681,9 @@ class NeighborList:
+       in cell list construction.
+     cell_list_fn: The function used to construct the cell list.
+     update_fn: A static python function used to update the neighbor list.
++    reference_box: The box when the neighbor list was constructed, as a
++      `[spatial_dim, spatial_dim]` matrix. With fractional coordinates, box
++      deformation since then is included when deciding to update.
+   """
+ 
+   idx: Array
+@@ -718,6 +698,7 @@ class NeighborList:
+   update_fn: Callable[[Array, 'NeighborList'], 'NeighborList'] = (
+     dataclasses.static_field()
+   )
++  reference_box: Array | None = None
+ 
+   def update(self, position: Array, **kwargs) -> 'NeighborList':
+     return self.update_fn(position, self, **kwargs)
+@@ -863,7 +844,8 @@ def body_fn(i, state):
+       i.e. the transpose of ASE's `cell`.
+     r_cutoff: A scalar specifying the neighborhood radius.
+     dr_threshold: A scalar specifying the maximum distance particles can move
+-      before rebuilding the neighbor list.
++      before rebuilding the neighbor list. With fractional coordinates, a box
++      that shrinks after a rebuild uses up part of this distance.
+     capacity_multiplier: A floating point scalar specifying the fractional
+       increase in maximum neighborhood occupancy we allocate compared with the
+       maximum in the example positions.
+@@ -921,10 +903,12 @@ def cell_list_candidate_fn(
+     N, dim = positionShape
+     cell_capacity = cl_id_buffer.shape[dim]
+     buf_shape = cl_id_buffer.shape[:dim]
+-    n_shifts = 3**dim
++    widths = [3 if c >= 3 else 1 for c in buf_shape[::-1]]
++    n_shifts = math.prod(widths)
+ 
+     cells_per_side = jnp.array(buf_shape[::-1], i32)
+-    shifts = _neighboring_cells_arr(dim)
++    shifts = jnp.array(list(onp.ndindex(*widths)), i32)
++    shifts = shifts - jnp.array(widths, i32) // 2
+     shifted = particle_cell_id[:, None, :] + shifts[None, :, :]
+     shifted = jnp.mod(shifted, cells_per_side[None, None, :])
+ 
+@@ -1052,7 +1036,9 @@ def neighbor_fn(position_and_error, max_occupancy=None):
+             )
+             cell_size = _fractional_cell_size(_box, cutoff)
+             _box = 1.0
+-          if jnp.all(jnp.asarray(cell_size) < _box / 3.0):
++          if jnp.ndim(_box) < 2 and jnp.any(
++            jnp.asarray(cell_size) < _box / 3.0
++          ):
+             cl_fn = cell_list(_box, cell_size, capacity_multiplier)
+             cl = cl_fn.allocate(position, extra_capacity=extra_capacity)
+         else:
+@@ -1107,6 +1093,14 @@ def neighbor_fn(position_and_error, max_occupancy=None):
+           max_occupancy = capacity_limit
+       idx = idx[:, :max_occupancy]
+       update_fn = neighbor_list_fn if neighbors is None else neighbors.update_fn
++      reference_box = None
++      if neighbors is None or neighbors.reference_box is not None:
++        reference_box = lax.stop_gradient(
++          jnp.asarray(kwargs.get('box', box), position.dtype)
++        )
++        if reference_box.ndim < 2:
++          dim = position.shape[-1]
++          reference_box = jnp.eye(dim, dtype=position.dtype) * reference_box
+       return NeighborList(
+         idx,
+         position,
+@@ -1117,6 +1111,7 @@ def neighbor_fn(position_and_error, max_occupancy=None):
+         cell_size,
+         cl_fn,
+         update_fn,
++        reference_box=reference_box,
+       )  # pytype: disable=wrong-arg-count
+ 
+     nbrs = neighbors
+@@ -1150,8 +1145,24 @@ def neighbor_fn(position_and_error, max_occupancy=None):
+ 
+     d = partial(metric_sq, **kwargs)
+     d = vmap(d)
++    dR_sq = d(position, nbrs.reference_position)
++    rebuild = jnp.any(dR_sq > threshold_sq)
++    if (
++      'box' in kwargs
++      and fractional_coordinates
++      and nbrs.reference_box is not None
++    ):
++      new_box = lax.stop_gradient(jnp.asarray(kwargs['box'], position.dtype))
++      if new_box.ndim < 2:
++        dim = position.shape[-1]
++        new_box = jnp.eye(dim, dtype=position.dtype) * new_box
++      min_stretch = jnp.linalg.svd(
++        new_box @ jnp.linalg.inv(nbrs.reference_box), compute_uv=False
++      )[-1]
++      threshold = (min_stretch * cutoff - r_cutoff) / 2
++      rebuild = (threshold <= 0) | jnp.any(dR_sq > threshold**2)
+     return lax.cond(
+-      jnp.any(d(position, nbrs.reference_position) > threshold_sq),
++      rebuild,
+       (position, nbrs.error),
+       partial(neighbor_fn, max_occupancy=nbrs.max_occupancy),
+       nbrs,
+diff --git a/jax_md/rigid_body.py b/jax_md/rigid_body.py
+index 10f00558..bfb1b93d 100644
+--- a/jax_md/rigid_body.py
++++ b/jax_md/rigid_body.py
+@@ -654,6 +654,7 @@ def _(state, dt: float, kT: float, gamma: 'RigidBody'):
+ 
+   M = 4 / jnp.sum(1 / I, axis=-1)
+   Q = orientation.position.vec
++  Q = Q / jnp.linalg.norm(Q, axis=-1, keepdims=True)
+   P = MOMENTUM_PERMUTATION
+ 
+   # First evaluate PI term
+@@ -666,15 +667,15 @@ def _(state, dt: float, kT: float, gamma: 'RigidBody'):
+   Pi_mean = jnp.einsum('nij,nj->ni', Pi_mean, Pi)
+ 
+   # Then evaluate Q term
+-  Pi_var = 0
++  xi = random.normal(orientation_key, (Q.shape[0], 3), dtype=Q.dtype)
++  Pi_noise = 0
+   for l in range(3):
+     scale = jnp.sqrt(
+       4 * kT * I[:, l] * (1 - jnp.exp(-M * G * dt / (2 * I[:, l])))
+     )
+-    Pi_var += (scale[:, None] * P[l](Q)) ** 2
++    Pi_noise += scale[:, None] * xi[:, [l]] * P[l](Q)
+ 
+-  momentum_dist = simulate.Normal(Pi_mean, Pi_var)
+-  new_momentum = Quaternion(momentum_dist.sample(orientation_key))
++  new_momentum = Quaternion(Pi_mean + Pi_noise)
+   orientation = orientation.set(momentum=new_momentum)
+ 
+   return merge_center_and_orientation(rest.set(rng=key), center, orientation)
+diff --git a/jax_md/simulate.py b/jax_md/simulate.py
+index d73a9143..4885e34b 100644
+--- a/jax_md/simulate.py
++++ b/jax_md/simulate.py
+@@ -513,9 +513,9 @@ def backward_loop_fn(p_xi_new, m):
+     scale = jnp.exp(-delta_8 * p_xi[1] / Q[1]) if M > 0 else f32(1)
+     p_xi = p_xi.at[0].set(scale * (scale * p_xi[0] + delta_4 * G))
+ 
+-    scale = jnp.exp(-delta_2 * p_xi[0] / Q[0])
+-    KE = KE * scale ** f32(2)
+-    P = tree_map(lambda p: p * scale, P)
++    scale_m1 = jnp.expm1(-delta_2 * p_xi[0] / Q[0])
++    KE = KE + KE * scale_m1 * (f32(2) + scale_m1)
++    P = tree_map(lambda p: p + p * scale_m1, P)
+ 
+     xi = xi + delta_2 * p_xi / Q
+ 
+@@ -1002,14 +1002,14 @@ def exp_iL1(box, R, V, V_b, **kwargs):
+     x_2 = x / 2
+     sinhV = sinhx_x(x_2)  # jnp.sinh(x_2) / x_2
+     return shift_fn(
+-      R, R * (jnp.exp(x) - 1) + dt * V * jnp.exp(x_2) * sinhV, box=box, **kwargs
++      R, R * jnp.expm1(x) + dt * V * jnp.exp(x_2) * sinhV, box=box, **kwargs
+     )  # pytype: disable=wrong-keyword-args
+ 
+   def exp_iL2(alpha, P, F, V_b):
+     x = alpha * V_b * dt_2
+     x_2 = x / 2
+     sinhP = sinhx_x(x_2)  # jnp.sinh(x_2) / x_2
+-    return P * jnp.exp(-x) + dt_2 * F * sinhP * jnp.exp(-x_2)
++    return P + P * jnp.expm1(-x) + dt_2 * F * sinhP * jnp.exp(-x_2)
+ 
+   def inner_step(state, **kwargs):
+     _pressure = kwargs.pop('pressure', pressure)
+diff --git a/tests/partition_test.py b/tests/partition_test.py
+index 294895d5..b04ccd2f 100644
+--- a/tests/partition_test.py
++++ b/tests/partition_test.py
+@@ -660,6 +660,61 @@ def cell(key, a, b, c, alpha, beta, gamma):
+       elif nbrs.cell_list_fn is not None:
+         self.assertTrue(jnp.any(nbrs.cell_size_too_small))
+ 
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {'testcase_name': f'_format={format.name}', 'format': format}
++      for format in partition.NeighborListFormat
++    )
++  )
++  def test_neighbor_list_short_axis_uses_cell_list(self, format):
++    N = 600
++    box = np.array([6.0, 20.0, 20.0])
++    displacement, _ = space.periodic(box)
++    R = random.uniform(random.PRNGKey(0), (N, 3)) * box
++
++    def pairs(**kwargs):
++      nbrs = partition.neighbor_list(
++        displacement, box, 2.5, 0.2, format=format, **kwargs
++      ).allocate(R)
++      idx = onp.array(nbrs.idx)
++      if format is partition.Dense:
++        i, j = onp.repeat(onp.arange(N), idx.shape[1]), idx.reshape(-1)
++      else:
++        i, j = idx
++      return nbrs, set(zip(i[j < N].tolist(), j[j < N].tolist()))
++
++    nbrs, cell_pairs = pairs()
++    _, exact_pairs = pairs(disable_cell_list=True)
++    self.assertIsNotNone(nbrs.cell_list_fn)
++    self.assertEqual(cell_pairs, exact_pairs)
++
++  def test_neighbor_list_update_after_box_change(self):
++    N = 400
++    box = 12.0 * np.eye(3)
++    displacement, _ = space.periodic_general(box)
++    metric = space.metric(displacement)
++    R = random.uniform(random.PRNGKey(0), (N, 3))
++    neighbor_fn = partition.neighbor_list(
++      displacement,
++      box,
++      2.0,
++      0.5,
++      format=partition.Sparse,
++      fractional_coordinates=True,
++      disable_cell_list=True,
++      capacity_multiplier=6.0,
++    )
++
++    for new_box in [box.at[0, 1].set(9.6), 0.6 * box]:
++      nbrs = neighbor_fn.allocate(R).update(R, box=new_box)
++      dr = onp.array(space.map_product(partial(metric, box=new_box))(R, R))
++      i, j = onp.where((dr < 2.0) & ~onp.eye(N, dtype=bool))
++      expected = set(zip(i.tolist(), j.tolist()))
++      idx_i, idx_j = onp.array(nbrs.idx)
++      found = set(zip(idx_i[idx_i < N].tolist(), idx_j[idx_i < N].tolist()))
++      self.assertFalse(nbrs.did_buffer_overflow)
++      self.assertTrue(expected <= found)
++
+ 
+ if __name__ == '__main__':
+   absltest.main()
+diff --git a/tests/rigid_body_test.py b/tests/rigid_body_test.py
+index 333bb3ae..c55b1512 100644
+--- a/tests/rigid_body_test.py
++++ b/tests/rigid_body_test.py
+@@ -669,11 +669,6 @@ def shape_energy_fn(points):
+     jtu.check_grads(shape_energy_fn, (shape.points,), 1, atol=5e-4, rtol=5e-4)
+ 
+   def test_shape_derivative_3d(self):
+-    # This test currently fails on CPU due to Issue #10877
+-    # https://github.com/google/jax/issues/10877
+-    if jax.default_backend() == 'cpu':
+-      self.skipTest('Shape derivatives are broken on CPU in three-dimensions.')
+-
+     def shape_energy_fn(points):
+       body = rigid_body.RigidBody(
+         jnp.array([[0.0, 0.0, 0.0], [0.5, 0.25, 0.15]]),
+@@ -707,8 +702,11 @@ def shape_energy_fn(points):
+         [0.5, 0.5, -0.5],
+         [0.5, 0.5, 0.5],
+       ]
+-    ) * jnp.array([[1.0, 1.1, 1.2]])
+-    jtu.check_grads(shape_energy_fn, (points,), 1, modes='rev')
++    ) * jnp.array([[1.05, 1.1, 1.2]])
++    rotation = jax.scipy.linalg.expm(
++      jnp.array([[0.0, -0.3, 0.2], [0.3, 0.0, -0.1], [-0.2, 0.1, 0.0]])
++    )
++    jtu.check_grads(shape_energy_fn, (points @ rotation.T,), 1, modes='rev')
+ 
+   @parameterized.named_parameters(
+     test_util.cases_from_list(
+@@ -1182,6 +1180,37 @@ def test_fire_3d_multispecies(self, dtype):
+     self.assertTrue(energy_fn(state.position) < 12.0)
+     self.assertTrue(state.position.center.dtype == dtype)
+ 
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {'testcase_name': f'_dtype={dtype.__name__}', 'dtype': dtype}
++      for dtype in DTYPE
++    )
++  )
++  def test_langevin_rotational_noise_per_axis(self, dtype):
++    N = 10000
++    kT = 1.3
++    key, pos_key, quat_key = random.split(random.PRNGKey(0), 3)
++    body = rigid_body.RigidBody(
++      random.uniform(pos_key, (N, 3), dtype=dtype),
++      rand_quat(random.split(quat_key, N), dtype),
++    )
++    shape = rigid_body.point_union_shape(
++      rigid_body.tetrahedron.points * jnp.array([[1.0, 2.0, 3.0]], dtype),
++      rigid_body.tetrahedron.masses,
++    )
++    _, shift = space.free()
++    energy_fn = lambda body, **kwargs: jnp.sum(0.0 * body.center)
++    gamma = rigid_body.RigidBody(1e5, 1e5)
++    init_fn, _ = simulate.nvt_langevin(energy_fn, shift, 1e-3, kT, gamma)
++    state = init_fn(key, body, mass=shape.mass())
++    state = simulate.stochastic_step(state, 1e-3, kT, gamma)
++
++    L = rigid_body.conjugate_momentum_to_angular_momentum(
++      state.position.orientation, state.momentum.orientation
++    )
++    ke = jnp.mean(L**2 / (2 * state.mass.orientation), axis=0)
++    self.assertAllClose(ke, jnp.full((3,), kT / 2, dtype), rtol=0.05, atol=0)
++
+   @parameterized.named_parameters(
+     test_util.cases_from_list(
+       {
+diff --git a/tests/tpu_test.py b/tests/tpu_test.py
+index a176bcbe..62c524b5 100644
+--- a/tests/tpu_test.py
++++ b/tests/tpu_test.py
+@@ -297,9 +297,8 @@ def do_sim(i, state):
+     def jmd_step_fn(state, i):
+       return jmd_apply_fn(state), i
+ 
+-    jax.config.update('jax_numpy_rank_promotion', 'warn')
+-    new_jmd_state, _ = lax.scan(jmd_step_fn, jmd_state, np.arange(steps))
+-    jax.config.update('jax_numpy_rank_promotion', 'raise')
++    with jax.numpy_rank_promotion('warn'):
++      new_jmd_state, _ = lax.scan(jmd_step_fn, jmd_state, np.arange(steps))
+ 
+     # compare outputs
+     grid_positions, grid_aux = tpu.from_grid(

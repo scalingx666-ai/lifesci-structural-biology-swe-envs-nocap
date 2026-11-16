@@ -1,0 +1,181 @@
+diff --git a/main_pipeline.py b/main_pipeline.py
+index 770b9d4..1a62564 100644
+--- a/main_pipeline.py
++++ b/main_pipeline.py
+@@ -4,8 +4,6 @@
+ import os
+ import shutil
+ 
+-from Bio import SeqIO
+-
+ from CONFIG.FOLDER_STRUCTURE import QUERY_PATH, WORK_PATH, FINISHED_PATH, DEFAULT_NAME, MERGED_SEQUENCES, TASK_CONFIG, \
+     JOB_CONFIG, ALIGNMENTS, MMSEQS_SEARCH_RESULTS, PROJECT_CONFIG
+ 
+@@ -15,6 +13,7 @@
+ 
+ from metagenomic_deepfri import metagenomic_deepfri
+ from utils.elapsed_time_logger import ElapsedTimeLogger
++from utils.faa_file_io import load_faa_file, write_faa_file
+ from utils.pipeline_utils import find_target_database, load_deepfri_config
+ from utils.utils import create_unix_timestamp_folder, merge_files_binary, search_files_in_paths, chunks, parse_input_paths
+ 
+@@ -117,11 +116,10 @@ def split_task_into_jobs(task_work_path):
+     assert task_work_path / TASK_CONFIG, f"Missing {task_work_path / TASK_CONFIG}"
+     parallel_jobs = json.load(open(task_work_path / TASK_CONFIG))["n_parallel_jobs"]
+ 
+-    with open(task_work_path / MERGED_SEQUENCES, "r") as f:
+-        query_records = [record for record in SeqIO.parse(f, "fasta")]
++    query_records = load_faa_file(task_work_path / MERGED_SEQUENCES)
+     jobs_records = chunks(query_records, parallel_jobs)
+ 
+-    print(f"Dividing {len(query_records)} records across {parallel_jobs}. {len(jobs_records[0])} per job")
++    print(f"Dividing {len(query_records)} records across {parallel_jobs} parallel jobs. {len(jobs_records[0])} per job")
+     for i in range(len(jobs_records)):
+         if len(jobs_records[i]) == 0:
+             continue
+@@ -130,9 +128,7 @@ def split_task_into_jobs(task_work_path):
+             shutil.rmtree(job_path)
+         job_path.mkdir()
+         os.system(f"cp {task_work_path / TASK_CONFIG} {job_path / JOB_CONFIG}")
+-        with open(job_path / "job_sequences.faa", "w") as f:
+-            for record in jobs_records[i]:
+-                f.write(f">{record.id}\n{record.seq}\n")
++        write_faa_file(jobs_records[i], job_path / "job_sequences.faa")
+ 
+ 
+ # search for job config files and start metagenomic_deepfri in parallel
+diff --git a/metagenomic_deepfri.py b/metagenomic_deepfri.py
+index 3d101d4..503de7e 100644
+--- a/metagenomic_deepfri.py
++++ b/metagenomic_deepfri.py
+@@ -1,8 +1,6 @@
+ import json
+ import os.path
+ 
+-from Bio import SeqIO
+-
+ from DeepFRI.deepfrier import Predictor
+ 
+ from CONFIG.FOLDER_STRUCTURE import SEQ_ATOMS_DATASET_PATH, ATOMS, JOB_CONFIG
+@@ -11,6 +9,7 @@
+ from CPP_lib.libAtomDistanceIO import load_aligned_contact_map
+ 
+ from utils.elapsed_time_logger import ElapsedTimeLogger
++from utils.faa_file_io import load_faa_file
+ from utils.pipeline_utils import find_target_database, load_deepfri_config
+ from utils.run_mmseqs_search import run_mmseqs_search
+ from utils.search_alignments import search_alignments
+@@ -42,8 +41,8 @@ def load_and_verify_job_data(job_path, pipeline_config):
+     query_file = query_files[0]
+     if len(query_files) > 1:
+         print(f"{job_path} contains more than one .faa file. Only {query_file} will be processed. {query_files[1:]} will be discarded")
+-    with open(query_file, "r") as f:
+-        query_seqs = {record.id: record.seq for record in SeqIO.parse(f, "fasta")}
++
++    query_seqs = {record.id: record.seq for record in load_faa_file(query_file)}
+     assert len(query_seqs) > 0, f"{query_file} does not contain protein sequences that SeqIO can parse."
+     print(f"Found total of {len(query_seqs)} protein sequences in {query_file}")
+ 
+diff --git a/utils/encode_sequence_ids.py b/utils/encode_sequence_ids.py
+new file mode 100644
+index 0000000..6cda34c
+--- /dev/null
++++ b/utils/encode_sequence_ids.py
+@@ -0,0 +1,23 @@
++import hashlib
++
++from utils.faa_file_io import load_faa_file, write_faa_file
++
++
++def hash_sequence_id(seq_id: str):
++    return hashlib.sha256(bytes(seq_id, encoding='utf-8')).hexdigest()
++
++
++def encode_faa_ids(path):
++    seq_records = load_faa_file(path)
++    hash_lookup_dict = {}
++
++    for i in range(len(seq_records)):
++        seq_id_hash = hash_sequence_id(seq_records[i].id)
++        while seq_id_hash in hash_lookup_dict.keys():
++            seq_id_hash = hash_sequence_id(seq_records[i].id+"1")
++        hash_lookup_dict[seq_id_hash] = seq_records[i].id
++        seq_records[i].id = seq_id_hash
++
++    faa_hashed_ids_path = str(path) + ".hashed_ids"
++    write_faa_file(seq_records, faa_hashed_ids_path)
++    return faa_hashed_ids_path, hash_lookup_dict
+diff --git a/utils/faa_file_io.py b/utils/faa_file_io.py
+new file mode 100644
+index 0000000..384cce0
+--- /dev/null
++++ b/utils/faa_file_io.py
+@@ -0,0 +1,25 @@
++import dataclasses
++
++
++@dataclasses.dataclass
++class SeqRecord:
++    id: str
++    seq: str
++
++
++def load_faa_file(file):
++    seq_records = []
++    with open(file, "r") as f:
++        for line in f:
++            if line.startswith(">"):
++                seq_id = line[1:].replace("\n", "")
++                seq_records.append(SeqRecord(id=seq_id, seq=""))
++            else:
++                seq_records[-1].seq += line.replace("\n", "")
++    return seq_records
++
++
++def write_faa_file(seq_records, path):
++    with open(path, "w") as f:
++        for seq_record in seq_records:
++            f.write(f">{seq_record.id}\n{seq_record.seq}\n")
+diff --git a/utils/run_mmseqs_search.py b/utils/run_mmseqs_search.py
+index cbc28ad..4255042 100644
+--- a/utils/run_mmseqs_search.py
++++ b/utils/run_mmseqs_search.py
+@@ -1,6 +1,7 @@
+ import pandas as pd
+ 
+ from CONFIG.FOLDER_STRUCTURE import MMSEQS_SEARCH_RESULTS
++from utils.encode_sequence_ids import encode_faa_ids
+ from utils.mmseqs_utils import mmseqs_createdb, mmseqs_search, mmseqs_convertalis
+ 
+ MMSEQS_COLUMN_NAMES = ["query", "target", "identity", "alignment_length", "mismatches", "gap_openings", "query_start",
+@@ -10,12 +11,22 @@
+ def run_mmseqs_search(query_file, target_db, job_path):
+     output_file = job_path / MMSEQS_SEARCH_RESULTS
+ 
+-    if not output_file.exists():
+-        query_db = job_path / 'queryDB'
+-        mmseqs_createdb(query_file, query_db)
+-        
+-        result_db = job_path / 'search_resultDB'
+-        mmseqs_search(query_db, target_db, result_db)
+-        mmseqs_convertalis(query_db, target_db, result_db, output_file)
++    if output_file.exists():
++        return pd.read_csv(output_file, sep="\t", names=MMSEQS_COLUMN_NAMES)
+ 
+-    return pd.read_csv(output_file, sep="\t", names=MMSEQS_COLUMN_NAMES)
++    faa_hashed_ids_path, hash_lookup_dict = encode_faa_ids(query_file)
++
++    query_db = job_path / 'queryDB'
++    mmseqs_createdb(faa_hashed_ids_path, query_db)
++
++    result_db = job_path / 'search_resultDB'
++    mmseqs_search(query_db, target_db, result_db)
++
++    hashed_output_file = str(output_file) + ".hashed_ids"
++    mmseqs_convertalis(query_db, target_db, result_db, hashed_output_file)
++
++    output = pd.read_csv(hashed_output_file, sep="\t", names=MMSEQS_COLUMN_NAMES)
++    output["query"] = output["query"].map(hash_lookup_dict)
++
++    output.to_csv(output_file, sep="\t", index=False, header=False)
++    return output

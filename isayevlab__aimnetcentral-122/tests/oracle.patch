@@ -1,0 +1,142 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 49298e0..9eda17a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ 
+ ### Fixed
+ 
++- Treated the module tree, not metadata, as ground truth when detecting embedded long-range modules, so an artifact whose metadata flag contradicts its own contents still gets a long-range neighbor list (issue #118, third pass). The previous fix consulted the module tree only when `metadata is None`; the shipped `wb97m_cpcm_v2_0.pt` carries a metadata dict declaring `has_embedded_lr=False` and `has_embedded_d3ts=False` while holding an `outputs.d3bj` submodule, so the detection helper was correct and never reached — `lr` stayed False and every system above `nb_threshold` raised `KeyError: ['_dftd3', '_lr']` (measured: 119 atoms works, 125 fails). `_has_embedded_dispersion` carried the same gate, so correcting only `has_embedded_lr` left `cutoff_lr` at `inf` and turned the `KeyError` into a `[125, 8.4e17]` allocation overflow; both now inspect the module tree unconditionally. A wrong flag can only ever cause a _missing_ long-range list, never a spurious one. Energies below `nb_threshold` are unchanged bit-for-bit. Note the existing `model_yaml`/`has_embedded_d3ts` artifact cross-check does not catch this case, which carries a D3BJ rather than a D3TS module.
+ - Excluded the local weight cache (`aimnet/calculators/assets/`) from wheels and sdists explicitly, instead of relying on hatchling's `.gitignore` handling.
+ - Fixed embedded-LR models failing with `KeyError: nbmat_lr` on every flattened evaluation (molecules above `nb_threshold` on CUDA, any size on CPU, PBC, or Hessians): when metadata declared `has_embedded_lr` but neither dispersion nor Coulomb could be identified, the calculator built no long-range neighbor list at all despite resolving an all-pairs `cutoff_lr` for exactly that case. The shared LR list is now built with that cutoff (issue #118).
+ - Detected embedded long-range modules from the module tree for pre-metadata artifacts: a model carrying a D3TS, DFTD3/D3BJ, or LRCoulomb submodule but no metadata dict previously had `lr=False`, so no LR neighbor list was built and flattened evaluations failed with `KeyError: nbmat_lr` (issue #118, reopened case).
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 9e49c33..49fa633 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -248,13 +248,22 @@ def __init__(
+             self.external_dftd3 = self.external_dftd3.to(self.device)
+ 
+         # Determine if model has long-range modules (embedded or external).
+-        # Metadata is authoritative when present; pre-metadata artifacts fall
+-        # back to module-tree inspection (issue #118: an embedded-D3TS model
+-        # without a metadata dict must still get an LR neighbor list).
+-        if metadata is not None:
+-            has_embedded_lr = metadata.get("has_embedded_lr", False)
+-        else:
+-            has_embedded_lr = self._detect_embedded_lr_modules()
++        #
++        # The module tree is ground truth and metadata is a hint, NOT the other
++        # way round. Treating a present metadata dict as authoritative fixed
++        # only the metadata-absent half of #118: the shipped wb97m_cpcm_v2_0.pt
++        # DOES carry a metadata dict, and that dict says has_embedded_lr=False
++        # and has_embedded_d3ts=False while the module tree carries
++        # `outputs.d3bj` and has_externalizable_dftd3() returns True. Believing
++        # it left lr=False, so no LR neighbor list was built and D3BJ.forward
++        # raised KeyError on the flattened path -- i.e. every system above
++        # nb_threshold (measured: 119 atoms works, 125 fails).
++        #
++        # A stale or wrong flag can only ever cause a missing neighbor list,
++        # never a spurious one, so OR-ing is safe in the direction that matters.
++        has_embedded_lr = (
++            bool(metadata.get("has_embedded_lr", False)) if metadata is not None else False
++        ) or self._detect_embedded_lr_modules()
+         self.lr = (
+             hasattr(self.model, "cutoff_lr")
+             or self.external_coulomb is not None
+@@ -544,10 +553,18 @@ def _has_embedded_dispersion(self) -> bool:
+         bool
+             True if model has embedded dispersion module (D3TS or legacy DFTD3).
+         """
++        # Module tree first, and unconditionally: a model that CARRIES a
++        # dispersion module needs a finite D3 cutoff whatever its metadata
++        # says. wb97m_cpcm_v2_0.pt declares has_embedded_d3ts=False while
++        # holding `outputs.d3bj`; believing the flag left cutoff_lr at inf, and
++        # the naive neighbor list then tried to allocate a [125, 8.4e17] matrix
++        # ("Storage size calculation overflowed") on the flattened path.
++        if has_d3ts(self.model) or has_externalizable_dftd3(self.model):
++            return True
++
+         meta = self.metadata
+         if meta is None:
+-            # Pre-metadata artifact: fall back to module-tree inspection.
+-            return has_d3ts(self.model) or has_externalizable_dftd3(self.model)
++            return False
+ 
+         # Authoritative path (new conversions): explicit D3TS flag.
+         if "has_embedded_d3ts" in meta:
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index c00ec8a..78ade50 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -2436,3 +2436,70 @@ def test_metadataless_embedded_dispersion_model_gets_lr_nblist():
+         assert "nbmat_dftd3" in data
+     finally:
+         delattr(model, "d3ts")
++
++
++def test_metadata_flag_contradicting_module_tree_still_gets_lr_nblist():
++    """Issue #118, third pass: the flag is PRESENT and WRONG.
++
++    The previous fix consulted the module tree only when ``metadata is None``,
++    which fixed the metadata-absent half. The shipped ``wb97m_cpcm_v2_0.pt``
++    is the other half: it carries a metadata dict declaring
++    ``has_embedded_lr=False`` and ``has_embedded_d3ts=False`` while holding an
++    ``outputs.d3bj`` submodule, so ``_detect_embedded_lr_modules()`` was
++    correct and never called -- ``lr`` stayed False, no LR neighbor list was
++    built, and every system above ``nb_threshold`` raised
++    ``KeyError: ['_dftd3', '_lr']``.
++
++    Both ``has_embedded_lr`` and ``_has_embedded_dispersion`` must consult the
++    module tree unconditionally. Fixing only the first replaces the KeyError
++    with ``cutoff_lr = inf`` and a "Storage size calculation overflowed"
++    allocation in the naive neighbor list.
++
++    A wrong flag can only ever cause a MISSING long-range neighbor list, never
++    a spurious one, so trusting the module tree is safe in the direction that
++    matters.
++    """
++    donor = AIMNet2Calculator("aimnet2", device="cpu")
++    model = donor.model
++    model.d3ts = torch.nn.Identity()
++    # A metadata dict that actively denies what the module tree carries.
++    # Field-for-field the shape dumped from the shipped wb97m_cpcm_v2_0.pt,
++    # so the test fails for the reason it names rather than for a missing
++    # required key.
++    model._metadata = {
++        "format_version": 2,
++        "cutoff": 5.0,
++        "needs_coulomb": False,
++        "needs_dispersion": False,
++        "coulomb_mode": "none",
++        "coulomb_sr_rc": None,
++        "coulomb_sr_envelope": None,
++        "d3_params": None,
++        "has_embedded_lr": False,
++        "has_embedded_d3ts": False,
++        "family": None,
++        "supports_charged_systems": None,
++    }
++    try:
++        calc = AIMNet2Calculator(model, device="cpu")
++        assert calc.metadata is not None, "the flag is present -- that is the point"
++        assert calc.metadata["has_embedded_lr"] is False
++        assert calc._has_embedded_dispersion(), "module tree must win over the flag"
++        assert calc.lr
++        # Not inf: the D3 branch of the cutoff chain must be reached, or the
++        # naive neighbor list allocates an absurd matrix.
++        assert calc.cutoff_lr == calc._default_dftd3_cutoff
++        assert calc._nblist_lr is not None
++
++        n = 16
++        coord = torch.zeros(n, 3)
++        coord[:, 0] = torch.arange(n, dtype=torch.float32) * 1.5
++        data = {"coord": coord, "mol_idx": torch.zeros(n, dtype=torch.long)}
++        calc._max_mol_size = n
++        data = calc.make_nbmat(data)
++        assert "nbmat_lr" in data
++        assert "nbmat_dftd3" in data
++    finally:
++        delattr(model, "d3ts")
++        if hasattr(model, "_metadata"):
++            del model._metadata

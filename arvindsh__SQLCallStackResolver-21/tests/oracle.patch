@@ -1,0 +1,1220 @@
+diff --git a/Engine/DiaUtil.cs b/Engine/DiaUtil.cs
+index 0877103..7cfb673 100644
+--- a/Engine/DiaUtil.cs
++++ b/Engine/DiaUtil.cs
+@@ -62,12 +62,17 @@ public DiaUtil(string pdbName)
+                     (uint) sym.length,
+                     out IDiaEnumLineNumbers enumLineNums);
+ 
++                Marshal.ReleaseComObject(sym);
++
+                 if (enumLineNums.count > 0)
+                 {
+                     // this PDB has at least 1 function with source info, so end the search
+                     HasSourceInfo = true;
++
+                     break;
+                 }
++
++                Marshal.ReleaseComObject(enumLineNums);
+             }
+         }
+ 
+diff --git a/Engine/StackResolver.cs b/Engine/StackResolver.cs
+index 31628c8..d5de4b5 100644
+--- a/Engine/StackResolver.cs
++++ b/Engine/StackResolver.cs
+@@ -77,6 +77,9 @@ public class StackResolver : IDisposable
+         /// </summary>
+         public string StatusMessage;
+ 
++        /// <summary>
++        /// Internal counter used to implement progress reporting
++        /// </summary>
+         private int globalCounter = 0;
+ 
+         private bool cancelRequested = false;
+@@ -160,6 +163,7 @@ private string LoadDllsIfApplicable(string callstack, bool recurse, List<string>
+         /// return the information as equivalent XML
+         /// </summary>
+         /// <param name="xelFiles">List of paths to XEL files to read</param>
++        /// <param name="bucketize">Boolean, whether to combine identical callstack patterns into the same "bucket"</param>
+         /// <returns>A tuple with the count of events and XML equivalent of the histogram corresponding to these events</returns>
+         public Tuple<int, string> ExtractFromXEL(string[] xelFiles, bool bucketize)
+         {
+@@ -480,13 +484,17 @@ private static List<string> EnumModuleNames(string[] callStack)
+         /// <param name="callStackLines">Call stack string</param>
+         /// <param name="includeSourceInfo">Whether to include source / line info</param>
+         /// <param name="relookupSource">Boolean used to control if we attempt to relookup source information</param>
++        /// <param name="includeOffsets">Boolean, whether to include function offsets (in decimal) in the output</param>
++        /// <param name="showInlineFrames">Boolean, whether to include inline frames (requires private PDBs) in the output</param>
+         /// <returns></returns>
+         private string ResolveSymbols(Dictionary<string, 
+             DiaUtil> _diautils, 
+             string[] callStackLines,
+             bool includeSourceInfo,
+             bool relookupSource,
+-            bool includeOffsets)
++            bool includeOffsets,
++            bool showInlineFrames
++            )
+         {
+             var finalCallstack = new StringBuilder();
+ 
+@@ -520,8 +528,8 @@ private string ResolveSymbols(Dictionary<string,
+                         {
+                             for (uint tmpOrdinal = 0; tmpOrdinal < matchedSyms.count; tmpOrdinal++)
+                             {
+-                                IDiaSymbol a = matchedSyms.Item(tmpOrdinal);
+-                                var rva = a.relativeVirtualAddress;
++                                IDiaSymbol tmpSym = matchedSyms.Item(tmpOrdinal);
++                                var rva = tmpSym.relativeVirtualAddress;
+ 
+                                 string offsetString = matchAlreadySymbolized.Groups["offset"].Value;
+                                 int numberBase = offsetString.ToUpperInvariant().StartsWith("0X", StringComparison.CurrentCulture) ? 16 : 10;
+@@ -531,16 +539,8 @@ private string ResolveSymbols(Dictionary<string,
+ 
+                                 myDIAsession.findLinesByRVA(rva, 0, out IDiaEnumLineNumbers enumLineNums);
+ 
+-                                string tmpsourceInfo = string.Empty;
+-
+-                                // only if we found line number information should we append to output
+-                                if (enumLineNums.count > 0)
+-                                {
+-                                    tmpsourceInfo = string.Format(CultureInfo.CurrentCulture,
+-                                        "({0}:{1})",
+-                                        enumLineNums.Item(0).sourceFile.fileName,
+-                                        enumLineNums.Item(0).lineNumber);
+-                                }
++                                string tmpsourceInfo = GetSourceInfo(enumLineNums,
++                                    _diautils[matchAlreadySymbolized.Groups["module"].Value].HasSourceInfo);
+ 
+                                 if (tmpOrdinal > 0)
+                                 {
+@@ -553,7 +553,11 @@ private string ResolveSymbols(Dictionary<string,
+                                     matchAlreadySymbolized.Groups["symbolizedfunc"].Value,
+                                     includeOffsets ? "+" + offsetString : string.Empty,
+                                     tmpsourceInfo);
++
++                                Marshal.ReleaseComObject(tmpSym);
+                             }
++
++                            Marshal.ReleaseComObject(matchedSyms);
+                         }
+                         else
+                         {
+@@ -578,7 +582,8 @@ private string ResolveSymbols(Dictionary<string,
+                             matchedModuleName, 
+                             match.Groups["offset"].Value,
+                             includeSourceInfo,
+-                            includeOffsets
++                            includeOffsets,
++                            showInlineFrames
+                             );
+ 
+                         if (!string.IsNullOrEmpty(processedFrame))
+@@ -635,6 +640,99 @@ private bool TryObtainModuleOffset(ulong virtAddress, out string moduleName, out
+             return true;
+         }
+ 
++        /// <summary>
++        /// Internal helper function to return the symbolized frame text (not including source info)
++        /// </summary>
++        /// <param name="moduleName">Module name for the current frame</param>
++        /// <param name="mysym">DIA symbol object being "symbolized"</param>
++        /// <param name="useUndecorateLogic">Whether to "undecorate" the symbol name - required for public PDBs</param>
++        /// <param name="includeOffset">Boolean, whether to include the offset within the function in the output</param>
++        /// <param name="displacement">Integer offset into the function</param>
++        /// <returns></returns>
++        private static string GetSymbolizedFrame(string moduleName,
++            IDiaSymbol mysym,
++            bool useUndecorateLogic,
++            bool includeOffset,
++            int displacement
++            )
++        {
++            string funcname2;
++
++            if (!useUndecorateLogic)
++            {
++                funcname2 = mysym.name;
++            }
++            else
++            {
++                // refer https://msdn.microsoft.com/en-us/library/kszfk0fs.aspx
++                // UNDNAME_NAME_ONLY == 0x1000: Gets only the name for primary declaration; returns just [scope::]name. Expands template params. 
++                mysym.get_undecoratedNameEx(0x1000, out funcname2);
++
++                // catch-all / fallback
++                if (string.IsNullOrEmpty(funcname2))
++                {
++                    funcname2 = mysym.name;
++                }
++            }
++
++            string offsetStr = string.Empty;
++
++            if (includeOffset)
++            {
++                offsetStr = string.Format(CultureInfo.CurrentCulture,
++                    "+{0}",
++                    displacement);
++            }
++
++            return string.Format(CultureInfo.CurrentCulture,
++                "{0}!{1}{2}",
++                moduleName,
++                funcname2,
++                offsetStr);
++        }
++
++        /// <summary>
++        /// Internal helper function to obtain source information for given symbol
++        /// </summary>
++        /// <param name="enumLineNums">Input object enumerating line number(s)</param>
++        /// <param name="pdbHasSourceInfo">Boolean, whether the PDB for this module has source info</param>
++        /// <returns></returns>
++        private static string GetSourceInfo(IDiaEnumLineNumbers enumLineNums,
++            bool pdbHasSourceInfo)
++        {
++            var sbOutput = new StringBuilder();
++
++            // only if we found line number information should we append to output 
++            if (enumLineNums.count > 0)
++            {
++                for (uint tmpOrdinal = 0; tmpOrdinal < enumLineNums.count; tmpOrdinal++)
++                {
++                    if (tmpOrdinal > 0)
++                    {
++                        sbOutput.Append(" -- WARN: multiple matches -- ");
++                    }
++
++                    sbOutput.Append(string.Format(CultureInfo.CurrentCulture,
++                        "({0}:{1})",
++                        enumLineNums.Item(tmpOrdinal).sourceFile.fileName,
++                        enumLineNums.Item(tmpOrdinal).lineNumber));
++
++                    Marshal.FinalReleaseComObject(enumLineNums.Item(tmpOrdinal));
++                }
++            }
++            else
++            {
++                if (pdbHasSourceInfo)
++                {
++                    sbOutput.Append("-- WARN: unable to find source info --");
++                }
++            }
++
++            Marshal.FinalReleaseComObject(enumLineNums);
++
++            return sbOutput.ToString();
++        }
++
+         /// <summary>
+         /// This is the most important function in this whole utility! It uses DIA to lookup the symbol based on RVA offset
+         /// It also looks up line number information if available and then formats all of this information for returning to caller
+@@ -644,13 +742,16 @@ private bool TryObtainModuleOffset(ulong virtAddress, out string moduleName, out
+         /// <param name="offset">RVA offset within the module</param>
+         /// <param name="includeSourceInfo">Whether to include source / line info</param>
+         /// <param name="includeOffset">Whether to include func offset in output</param>
++        /// <param name="showInlineFrames">Boolean, whether to include inline frames in the output</param>
+         /// <returns></returns>
+         private string ProcessFrameModuleOffset(Dictionary<string, 
+-            DiaUtil> _diautils, 
++            DiaUtil> _diautils,
+             string moduleName, 
+             string offset,
+             bool includeSourceInfo,
+-            bool includeOffset)
++            bool includeOffset,
++            bool showInlineFrames
++            )
+         {
+             bool useUndecorateLogic = false;
+ 
+@@ -725,85 +826,126 @@ private string ProcessFrameModuleOffset(Dictionary<string,
+                 return null;
+             }
+ 
+-            // we are now just using the name property instead of calling the undecorated name function
+-            string funcname2;
++            // try to find if we have source and line number info and include it based on the param
++            string sourceInfo = string.Empty;
+ 
+-            if (!useUndecorateLogic)
++            var pdbHasSourceInfo = _diautils[moduleName].HasSourceInfo;
++
++            if (includeSourceInfo)
+             {
+-                funcname2 = mysym.name;
++                _diautils[moduleName]._IDiaSession.findLinesByRVA(rva, 0, out IDiaEnumLineNumbers enumLineNums);
++
++                sourceInfo = GetSourceInfo(enumLineNums,
++                    pdbHasSourceInfo
++                    );
+             }
+-            else
+-            {
+-                // refer https://msdn.microsoft.com/en-us/library/kszfk0fs.aspx
+-                // UNDNAME_NAME_ONLY == 0x1000: Gets only the name for primary declaration; returns just [scope::]name. Expands template params. 
+-                mysym.get_undecoratedNameEx(0x1000, out funcname2);
+ 
+-                // catch-all / fallback
+-                if (string.IsNullOrEmpty(funcname2))
+-                {
+-                    funcname2 = mysym.name;
+-                }
++            var symbolizedFrame = GetSymbolizedFrame(moduleName,
++                mysym,
++                useUndecorateLogic,
++                includeOffset,
++                displacement);
++
++            // Process inline functions, but only if private PDBs are in use
++            string inlineFrameAndSourceInfo = string.Empty;
++            if (showInlineFrames && pdbHasSourceInfo)
++            {
++                inlineFrameAndSourceInfo = ProcessInlineFrames(
++                    moduleName,
++                    useUndecorateLogic,
++                    includeOffset,
++                    includeSourceInfo,
++                    rva,
++                    mysym,
++                    pdbHasSourceInfo
++                    );
+             }
+ 
+-            string offsetStr = string.Empty;
++            result = (inlineFrameAndSourceInfo + symbolizedFrame + "\t" + sourceInfo).Trim();
+ 
+-            if (includeOffset)
++            // make sure we cleanup COM allocations for the resolved sym
++            Marshal.FinalReleaseComObject(mysym);
++
++            this.rwLockCachedSymbols.EnterWriteLock();
++            if (!this.cachedSymbols.ContainsKey(symKey))
+             {
+-                offsetStr = string.Format(CultureInfo.CurrentCulture,
+-                    "+{0}",
+-                    displacement);
++                this.cachedSymbols.Add(symKey, result);
+             }
++            this.rwLockCachedSymbols.ExitWriteLock();
+ 
+-            // try to find if we have source and line number info and include it based on the param
+-            string sourceInfo = string.Empty;
++            return result;
++        }
+ 
+-            if (includeSourceInfo)
++        /// <summary>
++        /// Internal helper function to find any inline frames at a given RVA
++        /// </summary>
++        /// <param name="moduleName">Module name for current frame</param>
++        /// <param name="useUndecorateLogic">Whether to "undecorate" the symbol (public symbols only)</param>
++        /// <param name="includeOffset">Boolean, whether to include function offset in output</param>
++        /// <param name="includeSourceInfo">Boolean, whether to include source info in output</param>
++        /// <param name="rva">Relative Virtual Address at which potential inline frames need to be looked up</param>
++        /// <param name="parentSym">The parent DIA symbol object to use for inline frame lookup</param>
++        /// <param name="pdbHasSourceInfo">Boolean, whether the PDB for this module has source info</param>
++        /// <returns></returns>
++        private static string ProcessInlineFrames(
++            string moduleName,
++            bool useUndecorateLogic,
++            bool includeOffset,
++            bool includeSourceInfo,
++            uint rva,
++            IDiaSymbol parentSym,
++            bool pdbHasSourceInfo
++            )
++        {
++            var sbInline = new StringBuilder();
++
++            try
+             {
+-                _diautils[moduleName]._IDiaSession.findLinesByRVA(rva, 0, out IDiaEnumLineNumbers enumLineNums);
++                var inlineRVA = rva - 1;
+ 
+-                // only if we found line number information should we append to output 
+-                if (enumLineNums.count > 0)
+-                {
+-                    for (uint tmpOrdinal = 0; tmpOrdinal < enumLineNums.count; tmpOrdinal++)
+-                    {
+-                        if (tmpOrdinal > 0)
+-                        {
+-                            sourceInfo += " -- WARN: multiple matches -- ";
+-                        }
++                parentSym.findInlineFramesByRVA(
++                    inlineRVA,
++                    out IDiaEnumSymbols enumInlinees);
+ 
+-                        sourceInfo += string.Format(CultureInfo.CurrentCulture,
+-                            "({0}:{1})",
+-                            enumLineNums.Item(0).sourceFile.fileName,
+-                            enumLineNums.Item(0).lineNumber);
+-                    }
+-                }
+-                else
++                foreach (IDiaSymbol inlineFrame in enumInlinees)
+                 {
+-                    if (_diautils[moduleName].HasSourceInfo)
++                    var inlineeOffset = (int)(rva - inlineFrame.relativeVirtualAddress);
++
++                    sbInline.Append("(Inline Function) ");
++                    sbInline.Append(GetSymbolizedFrame(
++                        moduleName,
++                        inlineFrame,
++                        useUndecorateLogic,
++                        includeOffset,
++                        inlineeOffset
++                        ));
++
++                    if (includeSourceInfo)
+                     {
+-                        sourceInfo = "-- WARN: unable to find source info --";
++                        inlineFrame.findInlineeLinesByRVA(
++                        inlineRVA,
++                        0,
++                        out IDiaEnumLineNumbers enumLineNums);
++
++                        sbInline.Append("\t");
++                        sbInline.Append(GetSourceInfo(enumLineNums,
++                            pdbHasSourceInfo
++                            ));
+                     }
+-                }
+-            }
+ 
+-            // make sure we cleanup COM allocations for the resolved sym
+-            Marshal.FinalReleaseComObject(mysym);
++                    Marshal.ReleaseComObject(inlineFrame);
+ 
+-            result = string.Format(CultureInfo.CurrentCulture,
+-                "{0}!{1}{2}\t{3}",
+-                moduleName,
+-                funcname2,
+-                offsetStr,
+-                sourceInfo).Trim();
++                    sbInline.AppendLine();
++                }
+ 
+-            this.rwLockCachedSymbols.EnterWriteLock();
+-            if (!this.cachedSymbols.ContainsKey(symKey))
++                Marshal.ReleaseComObject(enumInlinees);
++            }
++            catch (COMException)
+             {
+-                this.cachedSymbols.Add(symKey, result);
++                sbInline.AppendLine(" -- WARN: Unable to process inline frames");
+             }
+-            this.rwLockCachedSymbols.ExitWriteLock();
+ 
+-            return result;
++            return sbInline.ToString();
+         }
+ 
+         /// <summary>
+@@ -878,12 +1020,16 @@ public bool ProcessBaseAddresses(string baseAddressesString)
+         /// It is VERY important to specify the PDB search paths correctly, because there is no 'signature' information available 
+         /// to match the PDB in any automatic way.
+         /// </summary>
+-        /// <param name="_diautils"></param>
+-        /// <param name="rootPaths"></param>
+-        /// <param name="recurse"></param>
+-        /// <param name="moduleNames"></param>
++        /// <param name="_diautils">Internal dictionary object to hold cached instances of the PDB map</param>
++        /// <param name="rootPaths">Symbol search paths</param>
++        /// <param name="recurse">Boolean, whether to recursively search for matching PDBs</param>
++        /// <param name="moduleNames">List of modules to search PDBs for</param>
+         /// <param name="cachePDB">Cache a copy of PDBs into %TEMP%\SymCache</param>
+-        private static bool LocateandLoadPDBs(Dictionary<string, DiaUtil> _diautils, string rootPaths, bool recurse, List<string> moduleNames, bool cachePDB)
++        private static bool LocateandLoadPDBs(Dictionary<string, DiaUtil> _diautils,
++            string rootPaths,
++            bool recurse,
++            List<string> moduleNames,
++            bool cachePDB)
+         {
+             // loop through each module, trying to find matched PDB files
+             var splitRootPaths = rootPaths.Split(';');
+@@ -949,6 +1095,9 @@ private static bool LocateandLoadPDBs(Dictionary<string, DiaUtil> _diautils, str
+         /// <param name="includeSourceInfo">This is used to control whether source information is included (in the case that private PDBs are available)</param>
+         /// <param name="relookupSource">Boolean used to control if we attempt to relookup source information</param>
+         /// <param name="includeOffsets">Whether to output func offsets or not as part of output</param>
++        /// <param name="showInlineFrames">Boolean, whether to resolve and show inline frames in the output</param>
++        /// <param name="cachePDB">Boolean, whether to cache PDBs locally</param>
++        /// <param name="outputFilePath">File path, used if output is directly written to a file</param>
+         /// <returns></returns>
+         public string ResolveCallstacks(string inputCallstackText, 
+             string symPath, 
+@@ -959,6 +1108,7 @@ public string ResolveCallstacks(string inputCallstackText,
+             bool includeSourceInfo,
+             bool relookupSource,
+             bool includeOffsets,
++            bool showInlineFrames,
+             bool cachePDB,
+             string outputFilePath)
+         {
+@@ -1116,6 +1266,7 @@ public string ResolveCallstacks(string inputCallstackText,
+                     framesOnSingleLine = framesOnSingleLine,
+                     includeOffsets = includeOffsets,
+                     includeSourceInfo = includeSourceInfo,
++                    showInlineFrames = showInlineFrames,
+                     listOfCallStacks = listOfCallStacks,
+                     numThreads = numThreads,
+                     relookupSource = relookupSource,
+@@ -1274,7 +1425,9 @@ private void ProcessCallStack(Object obj)
+                         callStackLines,
+                         tp.includeSourceInfo,
+                         tp.relookupSource,
+-                        tp.includeOffsets);
++                        tp.includeOffsets,
++                        tp.showInlineFrames
++                        );
+                 }
+                 else
+                 {
+@@ -1301,8 +1454,8 @@ private void ProcessCallStack(Object obj)
+         /// <summary>
+         /// This method generates a PowerShell script to automate download of matched PDBs from the public symbol server.
+         /// </summary>
+-        /// <param name="dllSearchPath"></param>
+-        /// <param name="recurse"></param>
++        /// <param name="dllSearchPath">Search path for DLLs</param>
++        /// <param name="recurse">Boolean, whether to recursively search for DLLs</param>
+         /// <returns></returns>
+         public static List<Symbol> GetSymbolDetailsForBinaries(List<string> dllPaths, bool recurse)
+         {
+diff --git a/Engine/ThreadParams.cs b/Engine/ThreadParams.cs
+index a750960..0306344 100644
+--- a/Engine/ThreadParams.cs
++++ b/Engine/ThreadParams.cs
+@@ -43,6 +43,7 @@ internal class ThreadParams
+         internal bool searchDLLRecursively;
+         internal bool framesOnSingleLine;
+         internal bool includeSourceInfo;
++        internal bool showInlineFrames;
+         internal bool relookupSource;
+         internal bool includeOffsets;
+         internal int numThreads;
+diff --git a/GUI/MainForm.Designer.cs b/GUI/MainForm.Designer.cs
+index 40019cd..1f27feb 100644
+--- a/GUI/MainForm.Designer.cs
++++ b/GUI/MainForm.Designer.cs
+@@ -99,6 +99,7 @@ private void InitializeComponent()
+             this.cancelButton = new System.Windows.Forms.ToolStripDropDownButton();
+             this.formToolTip = new System.Windows.Forms.ToolTip(this.components);
+             this.genericSaveFileDlg = new System.Windows.Forms.SaveFileDialog();
++            this.showInlineFrames = new System.Windows.Forms.CheckBox();
+             ((System.ComponentModel.ISupportInitialize)(this.splitContainer2)).BeginInit();
+             this.splitContainer2.Panel1.SuspendLayout();
+             this.splitContainer2.Panel2.SuspendLayout();
+@@ -119,7 +120,7 @@ private void InitializeComponent()
+             this.splitContainer2.Dock = System.Windows.Forms.DockStyle.Fill;
+             this.splitContainer2.FixedPanel = System.Windows.Forms.FixedPanel.Panel2;
+             this.splitContainer2.Location = new System.Drawing.Point(0, 0);
+-            this.splitContainer2.Margin = new System.Windows.Forms.Padding(2);
++            this.splitContainer2.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.splitContainer2.Name = "splitContainer2";
+             this.splitContainer2.Orientation = System.Windows.Forms.Orientation.Horizontal;
+             // 
+@@ -134,16 +135,15 @@ private void InitializeComponent()
+             this.splitContainer2.Panel2.Controls.Add(this.groupBox2);
+             this.splitContainer2.Panel2.Controls.Add(this.groupBox1);
+             this.splitContainer2.Panel2.Controls.Add(this.ResolveCallStackButton);
+-            this.splitContainer2.Size = new System.Drawing.Size(979, 673);
+-            this.splitContainer2.SplitterDistance = 355;
+-            this.splitContainer2.SplitterWidth = 3;
++            this.splitContainer2.Size = new System.Drawing.Size(1305, 828);
++            this.splitContainer2.SplitterDistance = 510;
+             this.splitContainer2.TabIndex = 30;
+             // 
+             // splitContainer1
+             // 
+             this.splitContainer1.Dock = System.Windows.Forms.DockStyle.Fill;
+             this.splitContainer1.Location = new System.Drawing.Point(0, 0);
+-            this.splitContainer1.Margin = new System.Windows.Forms.Padding(2);
++            this.splitContainer1.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.splitContainer1.Name = "splitContainer1";
+             // 
+             // splitContainer1.Panel1
+@@ -153,9 +153,8 @@ private void InitializeComponent()
+             // splitContainer1.Panel2
+             // 
+             this.splitContainer1.Panel2.Controls.Add(this.finalOutput);
+-            this.splitContainer1.Size = new System.Drawing.Size(979, 355);
+-            this.splitContainer1.SplitterDistance = 324;
+-            this.splitContainer1.SplitterWidth = 3;
++            this.splitContainer1.Size = new System.Drawing.Size(1305, 510);
++            this.splitContainer1.SplitterDistance = 431;
+             this.splitContainer1.TabIndex = 30;
+             // 
+             // callStackInput
+@@ -163,12 +162,12 @@ private void InitializeComponent()
+             this.callStackInput.AllowDrop = true;
+             this.callStackInput.Dock = System.Windows.Forms.DockStyle.Fill;
+             this.callStackInput.Location = new System.Drawing.Point(0, 0);
+-            this.callStackInput.Margin = new System.Windows.Forms.Padding(2);
++            this.callStackInput.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.callStackInput.MaxLength = 999999999;
+             this.callStackInput.Multiline = true;
+             this.callStackInput.Name = "callStackInput";
+             this.callStackInput.ScrollBars = System.Windows.Forms.ScrollBars.Both;
+-            this.callStackInput.Size = new System.Drawing.Size(324, 355);
++            this.callStackInput.Size = new System.Drawing.Size(431, 510);
+             this.callStackInput.TabIndex = 8;
+             this.callStackInput.Text = resources.GetString("callStackInput.Text");
+             this.callStackInput.WordWrap = false;
+@@ -179,12 +178,12 @@ private void InitializeComponent()
+             // 
+             this.finalOutput.Dock = System.Windows.Forms.DockStyle.Fill;
+             this.finalOutput.Location = new System.Drawing.Point(0, 0);
+-            this.finalOutput.Margin = new System.Windows.Forms.Padding(2);
++            this.finalOutput.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.finalOutput.MaxLength = 999999999;
+             this.finalOutput.Multiline = true;
+             this.finalOutput.Name = "finalOutput";
+             this.finalOutput.ScrollBars = System.Windows.Forms.ScrollBars.Both;
+-            this.finalOutput.Size = new System.Drawing.Size(652, 355);
++            this.finalOutput.Size = new System.Drawing.Size(870, 510);
+             this.finalOutput.TabIndex = 8;
+             this.finalOutput.WordWrap = false;
+             // 
+@@ -195,19 +194,21 @@ private void InitializeComponent()
+             this.groupBox4.Controls.Add(this.BinaryPathPicker);
+             this.groupBox4.Controls.Add(this.binaryPaths);
+             this.groupBox4.Controls.Add(this.label2);
+-            this.groupBox4.Location = new System.Drawing.Point(11, 237);
++            this.groupBox4.Location = new System.Drawing.Point(15, 292);
++            this.groupBox4.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
+             this.groupBox4.Name = "groupBox4";
+-            this.groupBox4.Size = new System.Drawing.Size(957, 43);
++            this.groupBox4.Padding = new System.Windows.Forms.Padding(4, 4, 4, 4);
++            this.groupBox4.Size = new System.Drawing.Size(1276, 53);
+             this.groupBox4.TabIndex = 33;
+             this.groupBox4.TabStop = false;
+             this.groupBox4.Text = "SPECIAL CASES";
+             // 
+             // GetPDBDnldScript
+             // 
+-            this.GetPDBDnldScript.Location = new System.Drawing.Point(710, 13);
+-            this.GetPDBDnldScript.Margin = new System.Windows.Forms.Padding(2);
++            this.GetPDBDnldScript.Location = new System.Drawing.Point(947, 16);
++            this.GetPDBDnldScript.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.GetPDBDnldScript.Name = "GetPDBDnldScript";
+-            this.GetPDBDnldScript.Size = new System.Drawing.Size(242, 24);
++            this.GetPDBDnldScript.Size = new System.Drawing.Size(323, 30);
+             this.GetPDBDnldScript.TabIndex = 13;
+             this.GetPDBDnldScript.Text = "Generate PDB download script";
+             this.GetPDBDnldScript.UseVisualStyleBackColor = true;
+@@ -216,20 +217,20 @@ private void InitializeComponent()
+             // DLLrecurse
+             // 
+             this.DLLrecurse.AutoSize = true;
+-            this.DLLrecurse.Location = new System.Drawing.Point(505, 16);
+-            this.DLLrecurse.Margin = new System.Windows.Forms.Padding(2);
++            this.DLLrecurse.Location = new System.Drawing.Point(673, 20);
++            this.DLLrecurse.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.DLLrecurse.Name = "DLLrecurse";
+-            this.DLLrecurse.Size = new System.Drawing.Size(201, 17);
++            this.DLLrecurse.Size = new System.Drawing.Size(264, 21);
+             this.DLLrecurse.TabIndex = 10;
+             this.DLLrecurse.Text = "Search for DLLs and EXE recursively";
+             this.DLLrecurse.UseVisualStyleBackColor = true;
+             // 
+             // BinaryPathPicker
+             // 
+-            this.BinaryPathPicker.Location = new System.Drawing.Point(476, 15);
+-            this.BinaryPathPicker.Margin = new System.Windows.Forms.Padding(2);
++            this.BinaryPathPicker.Location = new System.Drawing.Point(635, 18);
++            this.BinaryPathPicker.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.BinaryPathPicker.Name = "BinaryPathPicker";
+-            this.BinaryPathPicker.Size = new System.Drawing.Size(25, 19);
++            this.BinaryPathPicker.Size = new System.Drawing.Size(33, 23);
+             this.BinaryPathPicker.TabIndex = 20;
+             this.BinaryPathPicker.Text = "...";
+             this.BinaryPathPicker.UseVisualStyleBackColor = true;
+@@ -237,19 +238,18 @@ private void InitializeComponent()
+             // 
+             // binaryPaths
+             // 
+-            this.binaryPaths.Location = new System.Drawing.Point(196, 15);
+-            this.binaryPaths.Margin = new System.Windows.Forms.Padding(2);
++            this.binaryPaths.Location = new System.Drawing.Point(261, 18);
++            this.binaryPaths.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.binaryPaths.Name = "binaryPaths";
+-            this.binaryPaths.Size = new System.Drawing.Size(276, 20);
++            this.binaryPaths.Size = new System.Drawing.Size(367, 22);
+             this.binaryPaths.TabIndex = 9;
+             // 
+             // label2
+             // 
+             this.label2.AutoSize = true;
+-            this.label2.Location = new System.Drawing.Point(5, 17);
+-            this.label2.Margin = new System.Windows.Forms.Padding(2, 0, 2, 0);
++            this.label2.Location = new System.Drawing.Point(7, 21);
+             this.label2.Name = "label2";
+-            this.label2.Size = new System.Drawing.Size(187, 13);
++            this.label2.Size = new System.Drawing.Size(252, 17);
+             this.label2.TabIndex = 8;
+             this.label2.Text = "Specify Path(s) to SQL Server binaries";
+             this.formToolTip.SetToolTip(this.label2, "Only need to do this if you are dealing with incomplete stacks collected by -T365" +
+@@ -260,11 +260,11 @@ private void InitializeComponent()
+             // 
+             this.groupBox3.Controls.Add(this.BucketizeXEL);
+             this.groupBox3.Controls.Add(this.LoadXELButton);
+-            this.groupBox3.Location = new System.Drawing.Point(11, 74);
+-            this.groupBox3.Margin = new System.Windows.Forms.Padding(2);
++            this.groupBox3.Location = new System.Drawing.Point(15, 91);
++            this.groupBox3.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.groupBox3.Name = "groupBox3";
+-            this.groupBox3.Padding = new System.Windows.Forms.Padding(2);
+-            this.groupBox3.Size = new System.Drawing.Size(957, 52);
++            this.groupBox3.Padding = new System.Windows.Forms.Padding(3, 2, 3, 2);
++            this.groupBox3.Size = new System.Drawing.Size(1276, 64);
+             this.groupBox3.TabIndex = 32;
+             this.groupBox3.TabStop = false;
+             this.groupBox3.Text = "STEP 1: Either directly paste raw callstack(s) in textbox above, or import XEL fi" +
+@@ -275,10 +275,10 @@ private void InitializeComponent()
+             this.BucketizeXEL.AutoSize = true;
+             this.BucketizeXEL.Checked = true;
+             this.BucketizeXEL.CheckState = System.Windows.Forms.CheckState.Checked;
+-            this.BucketizeXEL.Location = new System.Drawing.Point(249, 23);
+-            this.BucketizeXEL.Margin = new System.Windows.Forms.Padding(2);
++            this.BucketizeXEL.Location = new System.Drawing.Point(332, 28);
++            this.BucketizeXEL.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.BucketizeXEL.Name = "BucketizeXEL";
+-            this.BucketizeXEL.Size = new System.Drawing.Size(508, 17);
++            this.BucketizeXEL.Size = new System.Drawing.Size(676, 21);
+             this.BucketizeXEL.TabIndex = 22;
+             this.BucketizeXEL.Text = "Aggregate similar callstacks from XEL (generally leave checked unless you need in" +
+     "dividual event data)";
+@@ -286,10 +286,10 @@ private void InitializeComponent()
+             // 
+             // LoadXELButton
+             // 
+-            this.LoadXELButton.Location = new System.Drawing.Point(8, 15);
+-            this.LoadXELButton.Margin = new System.Windows.Forms.Padding(2);
++            this.LoadXELButton.Location = new System.Drawing.Point(11, 18);
++            this.LoadXELButton.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.LoadXELButton.Name = "LoadXELButton";
+-            this.LoadXELButton.Size = new System.Drawing.Size(228, 30);
++            this.LoadXELButton.Size = new System.Drawing.Size(304, 37);
+             this.LoadXELButton.TabIndex = 15;
+             this.LoadXELButton.Text = "Select XEL files and import callstacks";
+             this.LoadXELButton.UseVisualStyleBackColor = true;
+@@ -303,11 +303,11 @@ private void InitializeComponent()
+             this.groupBox2.Controls.Add(this.pdbRecurse);
+             this.groupBox2.Controls.Add(this.pdbPaths);
+             this.groupBox2.Controls.Add(this.label1);
+-            this.groupBox2.Location = new System.Drawing.Point(11, 130);
+-            this.groupBox2.Margin = new System.Windows.Forms.Padding(2);
++            this.groupBox2.Location = new System.Drawing.Point(15, 160);
++            this.groupBox2.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.groupBox2.Name = "groupBox2";
+-            this.groupBox2.Padding = new System.Windows.Forms.Padding(2);
+-            this.groupBox2.Size = new System.Drawing.Size(957, 53);
++            this.groupBox2.Padding = new System.Windows.Forms.Padding(3, 2, 3, 2);
++            this.groupBox2.Size = new System.Drawing.Size(1276, 65);
+             this.groupBox2.TabIndex = 31;
+             this.groupBox2.TabStop = false;
+             this.groupBox2.Text = "STEP 2: Either use preset symbol downloads or set custom PDB search paths";
+@@ -315,10 +315,10 @@ private void InitializeComponent()
+             // cachePDB
+             // 
+             this.cachePDB.AutoSize = true;
+-            this.cachePDB.Location = new System.Drawing.Point(807, 22);
+-            this.cachePDB.Margin = new System.Windows.Forms.Padding(2);
++            this.cachePDB.Location = new System.Drawing.Point(1076, 27);
++            this.cachePDB.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.cachePDB.Name = "cachePDB";
+-            this.cachePDB.Size = new System.Drawing.Size(87, 17);
++            this.cachePDB.Size = new System.Drawing.Size(109, 21);
+             this.cachePDB.TabIndex = 33;
+             this.cachePDB.Text = "Cache PDBs";
+             this.formToolTip.SetToolTip(this.cachePDB, "This option will copy PDBs from the paths specified to the %TEMP%\\SymCache folder" +
+@@ -327,10 +327,10 @@ private void InitializeComponent()
+             // 
+             // selectSQLPDB
+             // 
+-            this.selectSQLPDB.Location = new System.Drawing.Point(7, 19);
+-            this.selectSQLPDB.Margin = new System.Windows.Forms.Padding(2);
++            this.selectSQLPDB.Location = new System.Drawing.Point(9, 23);
++            this.selectSQLPDB.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.selectSQLPDB.Name = "selectSQLPDB";
+-            this.selectSQLPDB.Size = new System.Drawing.Size(283, 25);
++            this.selectSQLPDB.Size = new System.Drawing.Size(377, 31);
+             this.selectSQLPDB.TabIndex = 32;
+             this.selectSQLPDB.Text = "Use public PDBs for a known SQL Server build";
+             this.selectSQLPDB.UseVisualStyleBackColor = true;
+@@ -338,10 +338,10 @@ private void InitializeComponent()
+             // 
+             // PDBPathPicker
+             // 
+-            this.PDBPathPicker.Location = new System.Drawing.Point(619, 22);
+-            this.PDBPathPicker.Margin = new System.Windows.Forms.Padding(2);
++            this.PDBPathPicker.Location = new System.Drawing.Point(825, 27);
++            this.PDBPathPicker.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.PDBPathPicker.Name = "PDBPathPicker";
+-            this.PDBPathPicker.Size = new System.Drawing.Size(25, 19);
++            this.PDBPathPicker.Size = new System.Drawing.Size(33, 23);
+             this.PDBPathPicker.TabIndex = 29;
+             this.PDBPathPicker.Text = "...";
+             this.PDBPathPicker.UseVisualStyleBackColor = true;
+@@ -352,34 +352,34 @@ private void InitializeComponent()
+             this.pdbRecurse.AutoSize = true;
+             this.pdbRecurse.Checked = true;
+             this.pdbRecurse.CheckState = System.Windows.Forms.CheckState.Checked;
+-            this.pdbRecurse.Location = new System.Drawing.Point(648, 22);
+-            this.pdbRecurse.Margin = new System.Windows.Forms.Padding(2);
++            this.pdbRecurse.Location = new System.Drawing.Point(864, 27);
++            this.pdbRecurse.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.pdbRecurse.Name = "pdbRecurse";
+-            this.pdbRecurse.Size = new System.Drawing.Size(158, 17);
++            this.pdbRecurse.Size = new System.Drawing.Size(207, 21);
+             this.pdbRecurse.TabIndex = 28;
+             this.pdbRecurse.Text = "Search for PDBs recursively";
+             this.pdbRecurse.UseVisualStyleBackColor = true;
+             // 
+             // pdbPaths
+             // 
+-            this.pdbPaths.Location = new System.Drawing.Point(380, 21);
+-            this.pdbPaths.Margin = new System.Windows.Forms.Padding(2);
++            this.pdbPaths.Location = new System.Drawing.Point(507, 26);
++            this.pdbPaths.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.pdbPaths.Name = "pdbPaths";
+-            this.pdbPaths.Size = new System.Drawing.Size(235, 20);
++            this.pdbPaths.Size = new System.Drawing.Size(312, 22);
+             this.pdbPaths.TabIndex = 27;
+             // 
+             // label1
+             // 
+             this.label1.AutoSize = true;
+-            this.label1.Location = new System.Drawing.Point(294, 24);
+-            this.label1.Margin = new System.Windows.Forms.Padding(2, 0, 2, 0);
++            this.label1.Location = new System.Drawing.Point(392, 30);
+             this.label1.Name = "label1";
+-            this.label1.Size = new System.Drawing.Size(82, 13);
++            this.label1.Size = new System.Drawing.Size(109, 17);
+             this.label1.TabIndex = 26;
+             this.label1.Text = "Path(s) to PDBs";
+             // 
+             // groupBox1
+             // 
++            this.groupBox1.Controls.Add(this.showInlineFrames);
+             this.groupBox1.Controls.Add(this.outputFilePathPicker);
+             this.groupBox1.Controls.Add(this.outputFilePath);
+             this.groupBox1.Controls.Add(this.label3);
+@@ -388,21 +388,21 @@ private void InitializeComponent()
+             this.groupBox1.Controls.Add(this.EnterBaseAddresses);
+             this.groupBox1.Controls.Add(this.includeOffsets);
+             this.groupBox1.Controls.Add(this.RelookupSource);
+-            this.groupBox1.Location = new System.Drawing.Point(11, 2);
+-            this.groupBox1.Margin = new System.Windows.Forms.Padding(2);
++            this.groupBox1.Location = new System.Drawing.Point(15, 2);
++            this.groupBox1.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.groupBox1.Name = "groupBox1";
+-            this.groupBox1.Padding = new System.Windows.Forms.Padding(2);
+-            this.groupBox1.Size = new System.Drawing.Size(957, 68);
++            this.groupBox1.Padding = new System.Windows.Forms.Padding(3, 2, 3, 2);
++            this.groupBox1.Size = new System.Drawing.Size(1276, 84);
+             this.groupBox1.TabIndex = 30;
+             this.groupBox1.TabStop = false;
+             this.groupBox1.Text = "STEP 0: Input and output options";
+             // 
+             // outputFilePathPicker
+             // 
+-            this.outputFilePathPicker.Location = new System.Drawing.Point(918, 18);
+-            this.outputFilePathPicker.Margin = new System.Windows.Forms.Padding(2);
++            this.outputFilePathPicker.Location = new System.Drawing.Point(1224, 22);
++            this.outputFilePathPicker.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.outputFilePathPicker.Name = "outputFilePathPicker";
+-            this.outputFilePathPicker.Size = new System.Drawing.Size(25, 19);
++            this.outputFilePathPicker.Size = new System.Drawing.Size(33, 23);
+             this.outputFilePathPicker.TabIndex = 32;
+             this.outputFilePathPicker.Text = "...";
+             this.outputFilePathPicker.UseVisualStyleBackColor = true;
+@@ -410,29 +410,28 @@ private void InitializeComponent()
+             // 
+             // outputFilePath
+             // 
+-            this.outputFilePath.Location = new System.Drawing.Point(625, 17);
+-            this.outputFilePath.Margin = new System.Windows.Forms.Padding(2);
++            this.outputFilePath.Location = new System.Drawing.Point(833, 21);
++            this.outputFilePath.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.outputFilePath.Name = "outputFilePath";
+-            this.outputFilePath.Size = new System.Drawing.Size(289, 20);
++            this.outputFilePath.Size = new System.Drawing.Size(384, 22);
+             this.outputFilePath.TabIndex = 31;
+             // 
+             // label3
+             // 
+             this.label3.AutoSize = true;
+-            this.label3.Location = new System.Drawing.Point(462, 20);
+-            this.label3.Margin = new System.Windows.Forms.Padding(2, 0, 2, 0);
++            this.label3.Location = new System.Drawing.Point(616, 25);
+             this.label3.Name = "label3";
+-            this.label3.Size = new System.Drawing.Size(159, 13);
++            this.label3.Size = new System.Drawing.Size(209, 17);
+             this.label3.TabIndex = 30;
+             this.label3.Text = "OUTPUT: Redirect output to file";
+             // 
+             // FramesOnSingleLine
+             // 
+             this.FramesOnSingleLine.AutoSize = true;
+-            this.FramesOnSingleLine.Location = new System.Drawing.Point(7, 17);
+-            this.FramesOnSingleLine.Margin = new System.Windows.Forms.Padding(2);
++            this.FramesOnSingleLine.Location = new System.Drawing.Point(9, 21);
++            this.FramesOnSingleLine.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.FramesOnSingleLine.Name = "FramesOnSingleLine";
+-            this.FramesOnSingleLine.Size = new System.Drawing.Size(229, 17);
++            this.FramesOnSingleLine.Size = new System.Drawing.Size(301, 21);
+             this.FramesOnSingleLine.TabIndex = 23;
+             this.FramesOnSingleLine.Text = "INPUT: Callstack frames are in a single line";
+             this.formToolTip.SetToolTip(this.FramesOnSingleLine, "Required if copy-pasting XE callstack from SSMS");
+@@ -443,20 +442,20 @@ private void InitializeComponent()
+             this.IncludeLineNumbers.AutoSize = true;
+             this.IncludeLineNumbers.Checked = true;
+             this.IncludeLineNumbers.CheckState = System.Windows.Forms.CheckState.Checked;
+-            this.IncludeLineNumbers.Location = new System.Drawing.Point(653, 41);
+-            this.IncludeLineNumbers.Margin = new System.Windows.Forms.Padding(2);
++            this.IncludeLineNumbers.Location = new System.Drawing.Point(806, 50);
++            this.IncludeLineNumbers.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.IncludeLineNumbers.Name = "IncludeLineNumbers";
+-            this.IncludeLineNumbers.Size = new System.Drawing.Size(272, 17);
++            this.IncludeLineNumbers.Size = new System.Drawing.Size(270, 21);
+             this.IncludeLineNumbers.TabIndex = 16;
+-            this.IncludeLineNumbers.Text = "OUTPUT: Show source info (needs private symbols)";
++            this.IncludeLineNumbers.Text = "OUTPUT: Source lines (private PDBs)";
+             this.IncludeLineNumbers.UseVisualStyleBackColor = true;
+             // 
+             // EnterBaseAddresses
+             // 
+-            this.EnterBaseAddresses.Location = new System.Drawing.Point(308, 17);
+-            this.EnterBaseAddresses.Margin = new System.Windows.Forms.Padding(2);
++            this.EnterBaseAddresses.Location = new System.Drawing.Point(411, 21);
++            this.EnterBaseAddresses.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.EnterBaseAddresses.Name = "EnterBaseAddresses";
+-            this.EnterBaseAddresses.Size = new System.Drawing.Size(145, 38);
++            this.EnterBaseAddresses.Size = new System.Drawing.Size(193, 47);
+             this.EnterBaseAddresses.TabIndex = 3;
+             this.EnterBaseAddresses.Text = "INPUT: Specify base addresses for modules";
+             this.formToolTip.SetToolTip(this.EnterBaseAddresses, "Required for working with XEL files and hex address-only callstacks");
+@@ -466,21 +465,21 @@ private void InitializeComponent()
+             // includeOffsets
+             // 
+             this.includeOffsets.AutoSize = true;
+-            this.includeOffsets.Location = new System.Drawing.Point(462, 41);
+-            this.includeOffsets.Margin = new System.Windows.Forms.Padding(2);
++            this.includeOffsets.Location = new System.Drawing.Point(616, 50);
++            this.includeOffsets.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.includeOffsets.Name = "includeOffsets";
+-            this.includeOffsets.Size = new System.Drawing.Size(187, 17);
++            this.includeOffsets.Size = new System.Drawing.Size(173, 21);
+             this.includeOffsets.TabIndex = 17;
+-            this.includeOffsets.Text = "OUTPUT: Include function offsets";
++            this.includeOffsets.Text = "OUTPUT: Func offsets";
+             this.includeOffsets.UseVisualStyleBackColor = true;
+             // 
+             // RelookupSource
+             // 
+             this.RelookupSource.AutoSize = true;
+-            this.RelookupSource.Location = new System.Drawing.Point(7, 38);
+-            this.RelookupSource.Margin = new System.Windows.Forms.Padding(2);
++            this.RelookupSource.Location = new System.Drawing.Point(9, 47);
++            this.RelookupSource.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.RelookupSource.Name = "RelookupSource";
+-            this.RelookupSource.Size = new System.Drawing.Size(302, 17);
++            this.RelookupSource.Size = new System.Drawing.Size(398, 21);
+             this.RelookupSource.TabIndex = 16;
+             this.RelookupSource.Text = "INPUT: Re-lookup source (rare case, needs private PDBs)";
+             this.RelookupSource.UseVisualStyleBackColor = true;
+@@ -488,10 +487,10 @@ private void InitializeComponent()
+             // ResolveCallStackButton
+             // 
+             this.ResolveCallStackButton.Font = new System.Drawing.Font("Microsoft Sans Serif", 8.25F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+-            this.ResolveCallStackButton.Location = new System.Drawing.Point(11, 187);
+-            this.ResolveCallStackButton.Margin = new System.Windows.Forms.Padding(2);
++            this.ResolveCallStackButton.Location = new System.Drawing.Point(15, 230);
++            this.ResolveCallStackButton.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.ResolveCallStackButton.Name = "ResolveCallStackButton";
+-            this.ResolveCallStackButton.Size = new System.Drawing.Size(957, 45);
++            this.ResolveCallStackButton.Size = new System.Drawing.Size(1276, 55);
+             this.ResolveCallStackButton.TabIndex = 29;
+             this.ResolveCallStackButton.Text = "STEP 3: Resolve callstacks!";
+             this.ResolveCallStackButton.UseVisualStyleBackColor = true;
+@@ -504,9 +503,10 @@ private void InitializeComponent()
+             this.statusLabel,
+             this.progressBar,
+             this.cancelButton});
+-            this.statusStrip1.Location = new System.Drawing.Point(0, 647);
++            this.statusStrip1.Location = new System.Drawing.Point(0, 798);
+             this.statusStrip1.Name = "statusStrip1";
+-            this.statusStrip1.Size = new System.Drawing.Size(979, 26);
++            this.statusStrip1.Padding = new System.Windows.Forms.Padding(1, 0, 19, 0);
++            this.statusStrip1.Size = new System.Drawing.Size(1305, 30);
+             this.statusStrip1.TabIndex = 31;
+             this.statusStrip1.Text = "statusStrip1";
+             // 
+@@ -514,7 +514,7 @@ private void InitializeComponent()
+             // 
+             this.statusLabel.AutoSize = false;
+             this.statusLabel.Name = "statusLabel";
+-            this.statusLabel.Size = new System.Drawing.Size(700, 21);
++            this.statusLabel.Size = new System.Drawing.Size(700, 24);
+             this.statusLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+             // 
+             // progressBar
+@@ -522,7 +522,7 @@ private void InitializeComponent()
+             this.progressBar.Alignment = System.Windows.Forms.ToolStripItemAlignment.Right;
+             this.progressBar.AutoSize = false;
+             this.progressBar.Name = "progressBar";
+-            this.progressBar.Size = new System.Drawing.Size(75, 20);
++            this.progressBar.Size = new System.Drawing.Size(100, 22);
+             // 
+             // cancelButton
+             // 
+@@ -533,22 +533,35 @@ private void InitializeComponent()
+             this.cancelButton.ImageTransparentColor = System.Drawing.Color.Magenta;
+             this.cancelButton.Name = "cancelButton";
+             this.cancelButton.ShowDropDownArrow = false;
+-            this.cancelButton.Size = new System.Drawing.Size(100, 24);
++            this.cancelButton.Size = new System.Drawing.Size(100, 28);
+             this.cancelButton.Text = "Cancel";
+             this.cancelButton.TextImageRelation = System.Windows.Forms.TextImageRelation.TextBeforeImage;
+             this.cancelButton.Visible = false;
+             this.cancelButton.Click += new System.EventHandler(this.cancelButton_Click);
+             // 
++            // showInlineFrames
++            // 
++            this.showInlineFrames.AutoSize = true;
++            this.showInlineFrames.Checked = true;
++            this.showInlineFrames.CheckState = System.Windows.Forms.CheckState.Checked;
++            this.showInlineFrames.Location = new System.Drawing.Point(1093, 50);
++            this.showInlineFrames.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
++            this.showInlineFrames.Name = "showInlineFrames";
++            this.showInlineFrames.Size = new System.Drawing.Size(176, 21);
++            this.showInlineFrames.TabIndex = 33;
++            this.showInlineFrames.Text = "OUTPUT: Inline frames";
++            this.showInlineFrames.UseVisualStyleBackColor = true;
++            // 
+             // MainForm
+             // 
+-            this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
++            this.AutoScaleDimensions = new System.Drawing.SizeF(8F, 16F);
+             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
+             this.AutoSize = true;
+-            this.ClientSize = new System.Drawing.Size(979, 673);
++            this.ClientSize = new System.Drawing.Size(1305, 828);
+             this.Controls.Add(this.statusStrip1);
+             this.Controls.Add(this.splitContainer2);
+             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
+-            this.Margin = new System.Windows.Forms.Padding(2);
++            this.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+             this.Name = "MainForm";
+             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
+             this.Text = "SQLCallstackResolver (http://aka.ms/sqlstack)";
+@@ -616,5 +629,6 @@ private void InitializeComponent()
+         private System.Windows.Forms.SaveFileDialog genericSaveFileDlg;
+         private System.Windows.Forms.ToolStripProgressBar progressBar;
+         private System.Windows.Forms.ToolStripDropDownButton cancelButton;
++        private System.Windows.Forms.CheckBox showInlineFrames;
+     }
+ }
+diff --git a/GUI/MainForm.cs b/GUI/MainForm.cs
+index ce1a725..9c8631e 100644
+--- a/GUI/MainForm.cs
++++ b/GUI/MainForm.cs
+@@ -157,6 +157,7 @@ private void ResolveCallstacks_Click(object sender, EventArgs e)
+                     IncludeLineNumbers.Checked,
+                     RelookupSource.Checked,
+                     includeOffsets.Checked,
++                    showInlineFrames.Checked,
+                     cachePDB.Checked,
+                     outputFilePath.Text
+                     );
+diff --git a/GUI/MainForm.resx b/GUI/MainForm.resx
+index c7ef4d4..1994f9b 100644
+--- a/GUI/MainForm.resx
++++ b/GUI/MainForm.resx
+@@ -160,7 +160,7 @@ sqllang.dll+0x00000000002C1A80
+   <data name="cancelButton.Image" type="System.Drawing.Bitmap, System.Drawing" mimetype="application/x-microsoft.net.object.bytearray.base64">
+     <value>
+         iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8
+-        YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAIDSURBVDhPpZLrS5NhGMb3j4SWh0oRQVExD4gonkDpg4hG
++        YQUAAAAJcEhZcwAAEnQAABJ0Ad5mH3gAAAIDSURBVDhPpZLrS5NhGMb3j4SWh0oRQVExD4gonkDpg4hG
+         YKxG6WBogkMZKgPNCEVJFBGdGETEvgwyO9DJE5syZw3PIlPEE9pgBCLZ5XvdMB8Ew8gXbl54nuf63dd9
+         0OGSnwCahxbPRNPAPMw9Xpg6ZmF46kZZ0xSKzJPIrhpDWsVnpBhGkKx3nAX8Pv7z1zg8OoY/cITdn4fw
+         bf/C0kYAN3Ma/w3gWfZL5kzTKBxjWyK2DftwI9tyMYCZKXbNHaD91bLYJrDXsYbrWfUKwJrPE9M2M1Oc
+diff --git a/Tests/Tests.cs b/Tests/Tests.cs
+index 1b35df3..a39d946 100644
+--- a/Tests/Tests.cs
++++ b/Tests/Tests.cs
+@@ -65,6 +65,7 @@ public void BlockResolution()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Equal("KERNELBASE!SignalObjectAndWait+147716", ret.Trim());
+@@ -95,6 +96,7 @@ public void OrdinalBasedSymbol()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Equal("sqldk!SOS_Scheduler::SwitchContext+941", ret.Trim());
+@@ -120,6 +122,7 @@ public void RegularSymbolHexOffset()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 var expectedSymbol = "sqldk!MemoryClerkInternal::AllocatePagesWithFailureMode+644";
+@@ -154,6 +157,7 @@ public void RegularSymbolVirtualAddress()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 var expectedSymbol = "sqldk!Spinlock<244,2,1>::SpinToAcquireWithExponentialBackoff+349";
+@@ -315,6 +319,7 @@ public void RegularSymbolHexOffsetNoOutputOffset()
+                     false,
+                     false,
+                     false,
++                    false,
+                     null);
+ 
+                 var expectedSymbol = "sqldk!MemoryClerkInternal::AllocatePagesWithFailureMode";
+@@ -372,6 +377,7 @@ public void SymbolFileCaching()
+                     false,
+                     false,
+                     false,
++                    false,
+                     true,
+                     null);
+ 
+@@ -430,6 +436,7 @@ public void SourceInformation()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Equal(
+@@ -463,6 +470,7 @@ public void SourceInformationLineInfoOff()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Equal(
+@@ -497,6 +505,7 @@ public void RelookupSourceInformation()
+                     true,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Equal(
+@@ -569,6 +578,7 @@ public void ImportBinResolveXELEvents()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Contains(
+@@ -644,6 +654,7 @@ public void SingleLineCallStack()
+                     false,
+                     true,
+                     false,
++                    false,
+                     null);
+ 
+                 Assert.Equal(
+@@ -675,5 +686,79 @@ public void SingleLineCallStack()
+                     symres.Trim());
+             }
+         }
++
++        /// <summary>
++        /// Test for inline frame resolution.
++        /// This test uses symbols for a Windows Driver Kit module, Wdf01000.sys,
++        /// because private PDBs for that module are legitimately available on the
++        /// Microsoft public symbols servers.
++        /// https://github.com/microsoft/Windows-Driver-Frameworks/releases if interested.
++        /// </summary>
++        [Fact]
++        public void InlineFrameResolution()
++        {
++            using (var csr = new StackResolver())
++            {
++                var pdbPath = @"..\..\Tests\TestCases\SourceInformation";
++
++                var ret = csr.ResolveCallstacks(
++                    "Wdf01000+17f27",
++                    pdbPath,
++                    false,
++                    null,
++                    false,
++                    false,
++                    true,
++                    false,
++                    true,
++                    true,
++                    false,
++                    null);
++
++                Assert.Equal(
++                    @"(Inline Function) Wdf01000!Mx::MxLeaveCriticalRegion+12	(minkernel\wdf\framework\shared\inc\primitives\km\MxGeneralKm.h:198)
++(Inline Function) Wdf01000!FxWaitLockInternal::ReleaseLock+62	(minkernel\wdf\framework\shared\inc\private\common\FxWaitLock.hpp:305)
++(Inline Function) Wdf01000!FxEnumerationInfo::ReleaseParentPowerStateLock+62	(minkernel\wdf\framework\shared\inc\private\common\FxPkgPnp.hpp:510)
++Wdf01000!FxPkgPnp::PowerPolicyCanChildPowerUp+143	(minkernel\wdf\framework\shared\inc\private\common\FxPkgPnp.hpp:4127)",
++                    ret.Trim());
++            }
++        }
++
++        /// <summary>
++        /// Test for inline frame resolution without source lines included
++        /// This test uses symbols for a Windows Driver Kit module, Wdf01000.sys,
++        /// because private PDBs for that module are legitimately available on the
++        /// Microsoft public symbols servers.
++        /// https://github.com/microsoft/Windows-Driver-Frameworks/releases if interested.
++        /// </summary>
++        [Fact]
++        public void InlineFrameResolutionNoSourceInfo()
++        {
++            using (var csr = new StackResolver())
++            {
++                var pdbPath = @"..\..\Tests\TestCases\SourceInformation";
++
++                var ret = csr.ResolveCallstacks(
++                    "Wdf01000+17f27",
++                    pdbPath,
++                    false,
++                    null,
++                    false,
++                    false,
++                    false,
++                    false,
++                    true,
++                    true,
++                    false,
++                    null);
++
++                Assert.Equal(
++                    @"(Inline Function) Wdf01000!Mx::MxLeaveCriticalRegion+12
++(Inline Function) Wdf01000!FxWaitLockInternal::ReleaseLock+62
++(Inline Function) Wdf01000!FxEnumerationInfo::ReleaseParentPowerStateLock+62
++Wdf01000!FxPkgPnp::PowerPolicyCanChildPowerUp+143",
++                    ret.Trim());
++            }
++        }
+     }
+ }

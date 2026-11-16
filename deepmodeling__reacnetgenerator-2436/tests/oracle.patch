@@ -1,0 +1,1277 @@
+diff --git a/docs/guide/report.md b/docs/guide/report.md
+index e61b9a97b..d7d582856 100644
+--- a/docs/guide/report.md
++++ b/docs/guide/report.md
+@@ -23,7 +23,7 @@ You can load it through the <a href="../report.html" target="_blank">web page lo
+ suffix: `.species`
+ 
+ This text file stores the number of each species in each time step.
+-One can read this file thorugh the Python method {meth}`reacnetgenerator.tools.read_species <reacnetgenerator.tools.read_species>`.
++One can read this file through the Python method {meth}`reacnetgenerator.tools.read_species <reacnetgenerator.tools.read_species>`.
+ Note that when [HMM](hmm.md) is enabled, information in this file may not be accurate.
+ 
+ ## Molecule file
+@@ -34,6 +34,25 @@ This file contains information of each molecule.
+ In each line, the first column is its SMILES.
+ The second column is the atomic index (starts from 0) of atoms.
+ The last column shows all the bonds in the molecule.
++This file always keeps the historical three-column format.
++
++## Molecule timeline file
++
++suffix: `.molecules.csv`
++
++This optional CSV file is written when `--show-molecule-time`,
++`--molecule-frame`, or `--molecule-timestep` is enabled. It contains one row per
++molecule occurrence in an analyzed frame, with the following columns:
++
++```text
++Timestep,Species,AtomIDs,BondIDs
++```
++
++Rows are sorted by `Timestep`. `Timestep` is the original timestep value from
++the input trajectory. `AtomIDs` and `BondIDs` are semicolon-separated lists.
++Bond IDs use `atom1-atom2-order` labels. The
++`--molecule-frame` and `--molecule-timestep` filters limit the CSV rows to
++selected frames or timesteps.
+ 
+ ## Route file
+ 
+@@ -51,9 +70,24 @@ Atom {idx}: {time} {SMILES} -> {time} {SMILES} -> ...
+ suffix: `.reaction`, `.reactionabcd`
+ 
+ `.reaction` shows the frequency of the reaction $\ce{A -> B}$ while `.reactionabcd` shows the frequency of the reaction $\ce{A + B -> C + D}$.
+-One can read this file thorugh the Python method {meth}`reacnetgenerator.tools.read_reactions <reacnetgenerator.tools.read_reactions>`.
++One can read these files through the Python method {meth}`reacnetgenerator.tools.read_reactions <reacnetgenerator.tools.read_reactions>`.
+ Note that $\ce{A + B -> C + D}$ information may be not accurate when [HMM](hmm.md) is enabled.
+ 
++## Reaction event file
++
++suffix: `.reactionevent.csv`
++
++This optional CSV file is written when `--reaction-event` is enabled. It contains
++one row per reaction event detected between two adjacent analyzed frames:
++
++```text
++Timestep_Index,Reactant,Product
++```
++
++`Timestep_Index` is the analyzed transition index. A value of `0` means the
++reaction was detected between analyzed frames 0 and 1. `Reactant` and `Product`
++use the same species names as the reaction summary files.
++
+ ## Reaction matrix file
+ 
+ suffix: `.table`
+diff --git a/reacnetgenerator/_path.py b/reacnetgenerator/_path.py
+index b5a68c592..6fefd625f 100644
+--- a/reacnetgenerator/_path.py
++++ b/reacnetgenerator/_path.py
+@@ -18,10 +18,16 @@
+    and Machine Intelligence 2004, 26, 1367-1372.
+ """
+ 
++import csv
++import heapq
+ import itertools
++import os
+ import re
++import shutil
++import tempfile
+ from abc import ABCMeta, abstractmethod
+ from collections import Counter, defaultdict
++from contextlib import ExitStack
+ 
+ import networkx as nx
+ import networkx.algorithms.isomorphism as iso
+@@ -34,12 +40,90 @@
+     SharedRNGData,
+     WriteBuffer,
+     bytestolist,
++    get_timestep_value,
+     listtostirng,
+     read_compressed_block,
+     run_mp,
+ )
+ 
+ 
++class _MoleculeTimelineSpool:
++    def __init__(self, filename, buffer_rows=10000, max_open_chunks=64):
++        self.filename = filename
++        self.buffer_rows = max(1, int(buffer_rows))
++        self.max_open_chunks = max(2, int(max_open_chunks))
++        output_dir = os.path.dirname(os.path.abspath(filename))
++        self.tempdir = tempfile.mkdtemp(prefix=".molecule-timeline-", dir=output_dir)
++        self.paths = []
++        self.buffer = []
++        self.n_chunks = 0
++
++    def append(self, row):
++        self.buffer.append(row)
++        if len(self.buffer) >= self.buffer_rows:
++            self.flush()
++
++    def extend(self, rows):
++        for row in rows:
++            self.append(row)
++
++    def flush(self):
++        if not self.buffer:
++            return
++        self.buffer.sort(key=self._sortkey)
++        path = self._newpath()
++        with open(path, "w", newline="") as f:
++            csv.writer(f).writerows(self.buffer)
++        self.paths.append(path)
++        self.buffer = []
++
++    def write(self):
++        self.flush()
++        self.paths = self._mergechunks(self.paths)
++        with open(self.filename, "w", newline="") as timeline_file:
++            timeline_writer = csv.writer(timeline_file)
++            timeline_writer.writerow(["Timestep", "Species", "AtomIDs", "BondIDs"])
++            timeline_writer.writerows(self._itermergedrows(self.paths))
++
++    def close(self):
++        shutil.rmtree(self.tempdir, ignore_errors=True)
++
++    @staticmethod
++    def _sortkey(row):
++        return int(row[0])
++
++    def _newpath(self):
++        path = os.path.join(self.tempdir, f"{self.n_chunks}.csv")
++        self.n_chunks += 1
++        return path
++
++    def _mergechunks(self, paths):
++        while len(paths) > self.max_open_chunks:
++            merged_paths = []
++            for i in range(0, len(paths), self.max_open_chunks):
++                group = paths[i : i + self.max_open_chunks]
++                if len(group) == 1:
++                    merged_paths.append(group[0])
++                    continue
++                path = self._newpath()
++                with open(path, "w", newline="") as f:
++                    csv.writer(f).writerows(self._itermergedrows(group))
++                for old_path in group:
++                    os.remove(old_path)
++                merged_paths.append(path)
++            paths = merged_paths
++        return paths
++
++    def _itermergedrows(self, paths):
++        if not paths:
++            return
++        with ExitStack() as stack:
++            readers = []
++            for path in paths:
++                readers.append(csv.reader(stack.enter_context(open(path, newline=""))))
++            yield from heapq.merge(*readers, key=self._sortkey)
++
++
+ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
+     runHMM: bool
+     N: int
+@@ -48,6 +132,7 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
+     originfilename: str
+     hmmfilename: str
+     moleculefilename: str
++    moleculetimelinefilename: str
+     moleculetemp2filename: str
+     atomroutefilename: str
+     nproc: int
+@@ -56,7 +141,12 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
+     selectatoms: list
+     split: int
+     miso: int
++    timestep: dict
++    printmoleculetime: bool
++    moleculeframes: list
++    moleculetimesteps: list
+     mname: np.ndarray
++    _moleculetimelinebufferrows: int = 10000
+ 
+     def __init__(self, rng):
+         SharedRNGData.__init__(
+@@ -70,6 +160,7 @@ def __init__(self, rng):
+                 "originfilename",
+                 "hmmfilename",
+                 "moleculefilename",
++                "moleculetimelinefilename",
+                 "moleculetemp2filename",
+                 "atomroutefilename",
+                 "nproc",
+@@ -78,9 +169,17 @@ def __init__(self, rng):
+                 "selectatoms",
+                 "split",
+                 "miso",
++                "timestep",
++                "printmoleculetime",
++                "moleculeframes",
++                "moleculetimesteps",
+             ],
+             ["mname", "atomnames", "allmoleculeroute", "splitmoleculeroute"],
+         )
++        self._moleculeframefilter = self._getmoleculefilterset(self.moleculeframes)
++        self._moleculetimestepfilter = self._getmoleculefilterset(
++            self.moleculetimesteps
++        )
+ 
+     @staticmethod
+     def getstype(rng):
+@@ -172,9 +271,11 @@ def _printatomroute(self, atomeach, timeaxis=None):
+         """For analysis without HMM, we may not need to use np.unique."""
+         with WriteBuffer(
+             open(
+-                self.atomroutefilename
+-                if timeaxis is None
+-                else f"{self.atomroutefilename}.{timeaxis}",
++                (
++                    self.atomroutefilename
++                    if timeaxis is None
++                    else f"{self.atomroutefilename}.{timeaxis}"
++                ),
+                 "w",
+             ),
+             sep="\n",
+@@ -192,9 +293,11 @@ def _printatomroute(self, atomeach, timeaxis=None):
+                 start=1,
+                 unordered=False,
+                 total=self.N,
+-                desc="Collect reaction paths"
+-                if timeaxis is None
+-                else f"Collect reaction paths {timeaxis}",
++                desc=(
++                    "Collect reaction paths"
++                    if timeaxis is None
++                    else f"Collect reaction paths {timeaxis}"
++                ),
+                 unit="atom",
+             )
+             for ii, (moleculeroute, routestr) in enumerate(results):
+@@ -278,6 +381,93 @@ def _getatomsandbonds(self, line):
+         bonds = [[*pair, level] for pair, level in zip(pairs, levels)]
+         return atoms, bonds
+ 
++    def _getmoleculeframes(self, line):
++        return np.array(bytestolist(line[-1]), dtype=int)
++
++    def _needmoleculetimeline(self):
++        return (
++            self.printmoleculetime
++            or self._moleculeframefilter is not None
++            or self._moleculetimestepfilter is not None
++        )
++
++    def _getmoleculeframesandtimesteps(self, line, need_timesteps=True):
++        if not self._needmoleculetimeline():
++            return None, None
++        frames = self._getmoleculeframes(line)
++        timesteps = (
++            self._getmoleculetimesteps(frames)
++            if need_timesteps
++            and (self.printmoleculetime or self._moleculetimestepfilter is not None)
++            else None
++        )
++        return frames, timesteps
++
++    def _getmoleculetimesteps(self, frames):
++        return [get_timestep_value(self.timestep[int(frame)]) for frame in frames]
++
++    @staticmethod
++    def _hasmoleculefilter(values):
++        return values is not None and len(values) > 0
++
++    @classmethod
++    def _getmoleculefilterset(cls, values):
++        return set(values) if cls._hasmoleculefilter(values) else None
++
++    def _shouldprintmoleculetimelinerow(self, frame, timestep):
++        if (
++            self._moleculeframefilter is not None
++            and int(frame) not in self._moleculeframefilter
++        ):
++            return False
++        return not (
++            self._moleculetimestepfilter is not None
++            and int(timestep) not in self._moleculetimestepfilter
++        )
++
++    def _formatmoleculename(self, name, atoms, bonds):
++        return listtostirng((name, atoms, bonds), sep=(" ", ";", ","))
++
++    @staticmethod
++    def _formatmoleculeatomids(atoms):
++        return ";".join(str(atom) for atom in atoms)
++
++    @staticmethod
++    def _formatmoleculebondids(bonds):
++        return ";".join("-".join(str(item) for item in bond) for bond in bonds)
++
++    def _getmoleculetimelinerows(self, name, atoms, bonds, frames, timesteps):
++        assert frames is not None
++        atom_ids = self._formatmoleculeatomids(atoms)
++        bond_ids = self._formatmoleculebondids(bonds)
++        if timesteps is None:
++            frame_timestep_pairs = (
++                (frame, get_timestep_value(self.timestep[int(frame)]))
++                for frame in frames
++            )
++        else:
++            frame_timestep_pairs = zip(frames, timesteps)
++        for frame, timestep in frame_timestep_pairs:
++            timestep = int(timestep)
++            if self._shouldprintmoleculetimelinerow(frame, timestep):
++                yield (timestep, name, atom_ids, bond_ids)
++
++    def _writemoleculetimeline(self, rows):
++        if not self._needmoleculetimeline():
++            return
++        timeline = self._openmoleculetimelinespool()
++        try:
++            timeline.extend(rows)
++            timeline.write()
++        finally:
++            timeline.close()
++
++    def _openmoleculetimelinespool(self):
++        return _MoleculeTimelineSpool(
++            self.moleculetimelinefilename,
++            buffer_rows=self._moleculetimelinebufferrows,
++        )
++
+ 
+ class _CollectMolPaths(_CollectPaths):
+     """VF2 is used to identify isomers.
+@@ -291,29 +481,49 @@ def _printmoleculename(self):
+         em = iso.numerical_edge_match(["atom", "level"], ["None", 1])
+         # idx for unknown SMILES
+         self.n_unknown = 0
+-        with (
+-            WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
+-            open(self.moleculetemp2filename, "rb") as ft,
+-        ):
+-            for line in tqdm(
+-                itertools.zip_longest(*[read_compressed_block(ft)] * 4),
+-                total=self.hmmit,
+-                desc="Indentify isomers",
+-                unit="molecule",
+-                disable=None,
++        timeline = (
++            self._openmoleculetimelinespool() if self._needmoleculetimeline() else None
++        )
++        try:
++            with (
++                WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
++                open(self.moleculetemp2filename, "rb") as ft,
+             ):
+-                atoms, bonds = self._getatomsandbonds(line)
+-                molecule = Molecule(self, atoms, bonds)
+-                for isomer in d[str(molecule)]:
+-                    if isomer.isomorphic(molecule, em):
+-                        molecule.smiles = isomer.smiles
+-                        break
+-                else:
+-                    d[str(molecule)].append(molecule)
+-                mname.append(molecule.smiles)
+-                fm.append(
+-                    listtostirng((molecule.smiles, atoms, bonds), sep=(" ", ";", ","))
+-                )
++                for line in tqdm(
++                    itertools.zip_longest(*[read_compressed_block(ft)] * 4),
++                    total=self.hmmit,
++                    desc="Indentify isomers",
++                    unit="molecule",
++                    disable=None,
++                ):
++                    atoms, bonds = self._getatomsandbonds(line)
++                    frames, timesteps = self._getmoleculeframesandtimesteps(
++                        line, need_timesteps=False
++                    )
++                    molecule = Molecule(self, atoms, bonds)
++                    for isomer in d[str(molecule)]:
++                        if isomer.isomorphic(molecule, em):
++                            molecule.smiles = isomer.smiles
++                            break
++                    else:
++                        d[str(molecule)].append(molecule)
++                    mname.append(molecule.smiles)
++                    fm.append(self._formatmoleculename(molecule.smiles, atoms, bonds))
++                    if timeline is not None:
++                        timeline.extend(
++                            self._getmoleculetimelinerows(
++                                molecule.smiles,
++                                atoms,
++                                bonds,
++                                frames,
++                                timesteps,
++                            )
++                        )
++            if timeline is not None:
++                timeline.write()
++        finally:
++            if timeline is not None:
++                timeline.close()
+         self.mname = np.array(mname)
+ 
+ 
+@@ -325,67 +535,83 @@ def _printmoleculename(self):
+         name_mapping_graph = defaultdict(dict)
+         em = iso.numerical_edge_match(["atom", "level"], ["None", 1])
+         self.n_unknown = 0
+-        with (
+-            WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
+-            open(self.moleculetemp2filename, "rb") as ft,
+-        ):
+-            results = run_mp(
+-                self.nproc,
+-                func=self._calmoleculeSMILESname,
+-                l=read_compressed_block(ft),
+-                unordered=False,
+-                nlines=4,
+-                total=self.hmmit,
+-                desc="Indentify isomers",
+-                unit="molecule",
+-            )
+-            for name, atoms, bonds in results:
+-                if name is None:
+-                    # SMILES failed, fallback to VF2 identify isomers
+-                    molecule = Molecule(self, atoms, bonds)
++        timeline = (
++            self._openmoleculetimelinespool() if self._needmoleculetimeline() else None
++        )
++        try:
++            with (
++                WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
++                open(self.moleculetemp2filename, "rb") as ft,
++            ):
++                results = run_mp(
++                    self.nproc,
++                    func=self._calmoleculeSMILESname,
++                    l=read_compressed_block(ft),
++                    unordered=False,
++                    nlines=4,
++                    total=self.hmmit,
++                    desc="Indentify isomers",
++                    unit="molecule",
++                )
++                for name, atoms, bonds, frames in results:
++                    if name is None:
++                        # SMILES failed, fallback to VF2 identify isomers
++                        molecule = Molecule(self, atoms, bonds)
+ 
+-                    # directly raise ValueError to save time
+-                    def _raise_anyway(*args, **kwargs):
+-                        raise ValueError("Maximum BFS search size exceeded.")
++                        # directly raise ValueError to save time
++                        def _raise_anyway(*args, **kwargs):
++                            raise ValueError("Maximum BFS search size exceeded.")
+ 
+-                    molecule._convertSMILES = _raise_anyway
+-                    for isomer in d[str(molecule)]:
+-                        if isomer.isomorphic(molecule, em):
+-                            molecule.smiles = isomer.smiles
+-                            break
+-                    else:
+-                        d[str(molecule)].append(molecule)
+-                    name = molecule.smiles
+-                if self.miso > 0:
+-                    if name in name_mapping:
+-                        name = name_mapping[name]
+-                    else:
+-                        # check if the name is isomorphic to the previous molecules
+-                        molecule = Molecule(self, atoms, bonds)
+-                        # the formula should be the same
+-                        mng = name_mapping_graph[molecule.name]
+-                        for isomer, mol in mng.items():
+-                            if mol.isomorphic(molecule, em):
+-                                # use the previous SMILES
+-                                name_mapping[name] = isomer
+-                                name = isomer
++                        molecule._convertSMILES = _raise_anyway
++                        for isomer in d[str(molecule)]:
++                            if isomer.isomorphic(molecule, em):
++                                molecule.smiles = isomer.smiles
+                                 break
+                         else:
+-                            mng[name] = molecule
+-                            name_mapping[name] = name
+-                mname.append(name)
+-                fm.append(listtostirng((name, atoms, bonds), sep=(" ", ";", ",")))
++                            d[str(molecule)].append(molecule)
++                        name = molecule.smiles
++                    if self.miso > 0:
++                        if name in name_mapping:
++                            name = name_mapping[name]
++                        else:
++                            # check if the name is isomorphic to the previous molecules
++                            molecule = Molecule(self, atoms, bonds)
++                            # the formula should be the same
++                            mng = name_mapping_graph[molecule.name]
++                            for isomer, mol in mng.items():
++                                if mol.isomorphic(molecule, em):
++                                    # use the previous SMILES
++                                    name_mapping[name] = isomer
++                                    name = isomer
++                                    break
++                            else:
++                                mng[name] = molecule
++                                name_mapping[name] = name
++                    mname.append(name)
++                    fm.append(self._formatmoleculename(name, atoms, bonds))
++                    if timeline is not None:
++                        timeline.extend(
++                            self._getmoleculetimelinerows(
++                                name, atoms, bonds, frames, None
++                            )
++                        )
++            if timeline is not None:
++                timeline.write()
++        finally:
++            if timeline is not None:
++                timeline.close()
+         self.mname = np.array(mname)
+ 
+     def _calmoleculeSMILESname(self, item):
+         line = item
+         atoms, bonds = self._getatomsandbonds(line)
++        frames, _ = self._getmoleculeframesandtimesteps(line, need_timesteps=False)
+         try:
+             name = self.convertSMILES(atoms, bonds)
+         except ValueError:
+             # fallback to VF2
+             name = None
+-        return name, atoms, bonds
++        return name, atoms, bonds, frames
+ 
+ 
+ class Molecule:
+diff --git a/reacnetgenerator/_reaction.py b/reacnetgenerator/_reaction.py
+index 4e46cf2aa..08635b8ef 100644
+--- a/reacnetgenerator/_reaction.py
++++ b/reacnetgenerator/_reaction.py
+@@ -3,12 +3,19 @@
+ # cython: linetrace=True
+ """Reactions finder."""
+ 
++import csv
+ from collections import Counter, defaultdict
+ 
+ import numpy as np
+ 
+ from .dps import dps_reaction  # type:ignore
+-from .utils import SharedRNGData, WriteBuffer, bytestolist, listtobytes, run_mp
++from .utils import (
++    SharedRNGData,
++    WriteBuffer,
++    bytestolist,
++    listtobytes,
++    run_mp,
++)
+ 
+ 
+ class ReactionsFinder(SharedRNGData):
+@@ -18,27 +25,67 @@ class ReactionsFinder(SharedRNGData):
+     step: int
+     mname: np.ndarray
+     reactionabcdfilename: str
++    reactioneventfilename: str
++    printreactionevent: bool
+     nproc: int
+ 
+     def __init__(self, rng):
+         SharedRNGData.__init__(
+-            self, rng, ["step", "mname", "reactionabcdfilename", "nproc"], []
++            self,
++            rng,
++            [
++                "step",
++                "mname",
++                "reactionabcdfilename",
++                "reactioneventfilename",
++                "printreactionevent",
++                "nproc",
++            ],
++            [],
+         )
+ 
+     def findreactions(self, atomeach, conflict):
+         allreactions = []
+         # atomeach j, atomeach j+1, conflict j, conflict j+1
+-        givenarray = zip(atomeach[:-1], atomeach[1:], conflict[:-1], conflict[1:])
++        if self.printreactionevent:
++            givenarray = (
++                listtobytes((i, *x))
++                for i, x in enumerate(
++                    zip(atomeach[:-1], atomeach[1:], conflict[:-1], conflict[1:])
++                )
++            )
++        else:
++            givenarray = (
++                listtobytes(x)
++                for x in zip(atomeach[:-1], atomeach[1:], conflict[:-1], conflict[1:])
++            )
+         results = run_mp(
+             self.nproc,
+             func=self._getstepreaction,
+-            l=[listtobytes(x) for x in givenarray],
++            l=givenarray,
++            unordered=not self.printreactionevent,
+             total=self.step - 1,
+             desc="Analyze reactions (A+B->C+D)",
+             unit="timestep",
+         )
+-        for networks in results:
+-            allreactions.extend(networks)
++        if self.printreactionevent:
++            with open(self.reactioneventfilename, "w", newline="") as f_event:
++                event_writer = csv.writer(f_event)
++                event_writer.writerow(["Timestep_Index", "Reactant", "Product"])
++                for events in results:
++                    for event in events:
++                        reaction = "->".join((event["Reactant"], event["Product"]))
++                        allreactions.append(reaction)
++                        event_writer.writerow(
++                            [
++                                event["Timestep_Index"],
++                                event["Reactant"],
++                                event["Product"],
++                            ]
++                        )
++        else:
++            for reactions in results:
++                allreactions.extend(reactions)
+         # reaction with SMILES
+         allreactionswithname = Counter(allreactions).most_common()
+         with WriteBuffer(open(self.reactionabcdfilename, "w"), sep="\n") as f:
+@@ -48,11 +95,20 @@ def findreactions(self, atomeach, conflict):
+ 
+     def _getstepreaction(self, item):
+         # atomeachj, atomeachjp1, conflictj, conflictjp1
++        # or stepidx, atomeachj, atomeachjp1, conflictj, conflictjp1
+         item = bytestolist(item)
+-        modifiedatoms = np.not_equal(item[0], item[1])
++        if self.printreactionevent:
++            stepidx = item[0]
++            atomeachj, atomeachjp1, conflictj, conflictjp1 = item[1:]
++        else:
++            stepidx = None
++            atomeachj, atomeachjp1, conflictj, conflictjp1 = item
++        modifiedatoms = np.not_equal(atomeachj, atomeachjp1)
+         # covert to dict
+         reactdict = [defaultdict(list), defaultdict(list)]
+-        for mol in np.array(item)[:, modifiedatoms].T:
++        for mol in np.array((atomeachj, atomeachjp1, conflictj, conflictjp1))[
++            :, modifiedatoms
++        ].T:
+             reactdict[0][mol[0]].append(mol[1])
+             reactdict[1][mol[1]].append(mol[0])
+             if mol[2]:
+@@ -70,11 +126,26 @@ def _getstepreaction(self, item):
+                 or self.CONFLICT in nn[1]
+             ):
+                 new_networks.append(nn)
+-        # reaction with SMILES name like A+B->C+D
+-        reactions = [self._filterspec(reaction) for reaction in new_networks]
+-        return reactions
++        if not self.printreactionevent:
++            # reaction with SMILES name like A+B->C+D
++            return [self._filterspec(reaction) for reaction in new_networks]
++        events = []
++        assert stepidx is not None
++        for reaction in new_networks:
++            reactionpair = self._filterreactionpair(reaction)
++            if reactionpair is None:
++                continue
++            reactant, product = reactionpair
++            events.append(
++                {
++                    "Timestep_Index": int(stepidx),
++                    "Reactant": reactant,
++                    "Product": product,
++                }
++            )
++        return events
+ 
+-    def _filterspec(self, reaction):
++    def _filterreactionpair(self, reaction):
+         leftname, rightname = (
+             Counter(self.mname[np.array(side) - 1]) for side in reaction
+         )
+@@ -82,8 +153,14 @@ def _filterspec(self, reaction):
+         new_leftname = leftname - rightname
+         new_rightname = rightname - leftname
+         if new_leftname and new_rightname:
+-            return "->".join(
++            return tuple(
+                 "+".join(sorted(side.elements()))
+                 for side in (new_leftname, new_rightname)
+             )
+         return None
++
++    def _filterspec(self, reaction):
++        reactionpair = self._filterreactionpair(reaction)
++        if reactionpair is None:
++            return None
++        return "->".join(reactionpair)
+diff --git a/reacnetgenerator/commandline.py b/reacnetgenerator/commandline.py
+index 8cbd34962..3d6386b35 100644
+--- a/reacnetgenerator/commandline.py
++++ b/reacnetgenerator/commandline.py
+@@ -9,6 +9,17 @@
+ from . import __version__
+ 
+ 
++def _to_command_values(value):
++    if value is None:
++        return []
++    if isinstance(value, (str, bytes)):
++        return [value]
++    try:
++        return list(value)
++    except TypeError:
++        return [value]
++
++
+ def main_parser() -> argparse.ArgumentParser:
+     """Return main parser.
+ 
+@@ -128,6 +139,39 @@ def main_parser() -> argparse.ArgumentParser:
+         type=int,
+         default=1,
+     )
++    parser.add_argument(
++        "--show-molecule-time",
++        help=(
++            "Write a molecule timeline CSV file with original timestep values, "
++            "atom IDs, and bond IDs."
++        ),
++        action="store_true",
++    )
++    parser.add_argument(
++        "--molecule-frame",
++        dest="moleculeframes",
++        help=(
++            "Only write molecule timeline CSV rows in the given analyzed frame "
++            "index/indices."
++        ),
++        nargs="+",
++        type=int,
++    )
++    parser.add_argument(
++        "--molecule-timestep",
++        dest="moleculetimesteps",
++        help=(
++            "Only write molecule timeline CSV rows in the given original "
++            "timestep value(s)."
++        ),
++        nargs="+",
++        type=int,
++    )
++    parser.add_argument(
++        "--reaction-event",
++        help="Write time-resolved reaction events to the .reactionevent.csv file.",
++        action="store_true",
++    )
+     parser.add_argument(
+         "--maxspecies",
+         help="Max number of nodes (species) in the network",
+@@ -179,9 +223,9 @@ def _commandline():
+         stepinterval=args.stepinterval,
+         split=args.split,
+         maxspecies=args.maxspecies,
+-        urls=[{"fn": url[0], "url": url[1]} for url in args.urls]
+-        if args.urls
+-        else None,
++        urls=(
++            [{"fn": url[0], "url": url[1]} for url in args.urls] if args.urls else None
++        ),
+         a=np.array(args.matrixa).reshape((2, 2)),
+         b=np.array(args.matrixb).reshape((2, 2)),
+         pbc=not args.nopbc,
+@@ -189,6 +233,10 @@ def _commandline():
+         use_ase=args.use_ase,
+         ase_cutoff_mult=args.ase_cutoff_mult,
+         custom_cutoffs=args.ase_pair_cutoffs,
++        printmoleculetime=args.show_molecule_time,
++        moleculeframes=args.moleculeframes,
++        moleculetimesteps=args.moleculetimesteps,
++        printreactionevent=args.reaction_event,
+     ).runanddraw()
+ 
+ 
+@@ -241,6 +289,18 @@ def parm2cmd(pp: dict) -> list[str]:
+     for ii in ["nproc", "selectatoms", "stepinterval", "split", "maxspecies"]:
+         if pp.get(ii, None):
+             commands.extend((f"--{ii}", str(pp[ii])))
++    if pp.get("printmoleculetime", False):
++        commands.append("--show-molecule-time")
++    moleculeframes = _to_command_values(pp.get("moleculeframes"))
++    if moleculeframes:
++        commands.append("--molecule-frame")
++        commands.extend(str(x) for x in moleculeframes)
++    moleculetimesteps = _to_command_values(pp.get("moleculetimesteps"))
++    if moleculetimesteps:
++        commands.append("--molecule-timestep")
++        commands.extend(str(x) for x in moleculetimesteps)
++    if pp.get("printreactionevent", False):
++        commands.append("--reaction-event")
+     if pp.get("use_ase", False):
+         commands.append("--use-ase")
+     if pp.get("ase_cutoff_mult", 1.2) != 1.2:
+diff --git a/reacnetgenerator/reacnetgen.py b/reacnetgenerator/reacnetgen.py
+index 96d62314d..9d689ce1f 100644
+--- a/reacnetgenerator/reacnetgen.py
++++ b/reacnetgenerator/reacnetgen.py
+@@ -106,6 +106,16 @@ class ReacNetGenerator:
+     split: int, optional, default: None
+         Split number for the time axis. For example, if set to 10, the whole trajectroy will
+         be divided into 10 parts and reactions of each part will be shown.
++    printmoleculetime: bool, optional, default: False
++        Write a molecule timeline CSV file with original timestep values, atom IDs, and bond IDs.
++    moleculeframes: list of int, optional, default: None
++        Only write molecule timeline CSV rows in the given analyzed frame indices.
++        This also enables printmoleculetime.
++    moleculetimesteps: list of int, optional, default: None
++        Only write molecule timeline CSV rows in the given original timestep values.
++        This also enables printmoleculetime.
++    printreactionevent: bool, optional, default: False
++        Write time-resolved reaction events to the reaction event CSV file.
+     a: (2,2) array_like, optional, default: [[0.999, 0.001], [0.001, 0.009]]
+         Transition matrix A of HMM parameters. It is recommended for users to choose their own
+         parameters. See the paper for details.
+@@ -132,11 +142,12 @@ def __init__(self, **kwargs: Any) -> None:
+         logger.info(doc_run)
+         logger.info(f"Version: {__version__}  Creation date: {__date__}")
+ 
+-        try:
+-            nproc = len(os.sched_getaffinity(0))
+-        except AttributeError:
++        sched_getaffinity = getattr(os, "sched_getaffinity", None)
++        if sched_getaffinity is None:
+             # macos and windows
+             nproc = os.cpu_count()
++        else:
++            nproc = len(sched_getaffinity(0))
+ 
+         # process kwargs
+         necessary_key = ["inputfiletype", "inputfilename", "atomname"]
+@@ -166,13 +177,24 @@ def __init__(self, **kwargs: Any) -> None:
+             "miso": 0,
+             "getoriginfile": False,
+             "needprintspecies": True,
++            "printmoleculetime": False,
++            "printreactionevent": False,
+             "urls": [],
+             "matrix_size": 100,
+             "use_ase": False,
+             "ase_cutoff_mult": 1.2,
+             "custom_cutoffs": None,
+         }
+-        none_key = ["selectatoms", "species", "pos", "k", "speciescenter", "cell"]
++        none_key = [
++            "selectatoms",
++            "species",
++            "pos",
++            "k",
++            "speciescenter",
++            "cell",
++            "moleculeframes",
++            "moleculetimesteps",
++        ]
+         accept_keys = [
+             "atomtype",
+             "step",
+@@ -199,6 +221,7 @@ def __init__(self, **kwargs: Any) -> None:
+         ]
+         file_key = {
+             "moleculefilename": "moname",
++            "moleculetimelinefilename": "molecules.csv",
+             "atomroutefilename": "route",
+             "reactionfilename": "reaction",
+             "tablefilename": "table",
+@@ -207,6 +230,7 @@ def __init__(self, **kwargs: Any) -> None:
+             "resultfilename": "html",
+             "jsonfilename": "json",
+             "reactionabcdfilename": "reactionabcd",
++            "reactioneventfilename": "reactionevent.csv",
+         }
+         assert set(necessary_key).issubset(set(kwargs)), (
+             "Must give neccessary key: {}".format(", ".join(necessary_key))
+@@ -225,6 +249,13 @@ def __init__(self, **kwargs: Any) -> None:
+             kwargs.setdefault(kk, f"{kwargs['inputfilename'][0]}.{file_key[kk]}")
+         for kk in nparray_key:
+             kwargs[kk] = np.array(kwargs[kk])
++        for kk in ("moleculeframes", "moleculetimesteps"):
++            kwargs[kk] = self._normalize_optional_int_filter(kwargs[kk])
++        if (
++            kwargs["moleculeframes"] is not None
++            or kwargs["moleculetimesteps"] is not None
++        ):
++            kwargs["printmoleculetime"] = True
+         if not kwargs["runHMM"]:
+             kwargs["getoriginfile"] = True
+         if kwargs["selectatoms"] is None:
+@@ -251,6 +282,20 @@ def __init__(self, **kwargs: Any) -> None:
+                     "cell must be (3,3) array_like or (3,) array_like or (9,) array_like"
+                 )
+ 
++    @staticmethod
++    def _normalize_optional_int_filter(value):
++        if value is None:
++            return None
++        if isinstance(value, np.ndarray):
++            value = value.tolist()
++        if isinstance(value, tuple):
++            value = list(value)
++        elif not isinstance(value, list):
++            value = [value]
++        if not value:
++            return None
++        return [int(x) for x in value]
++
+     def runanddraw(
+         self, run: bool = True, draw: bool = True, report: bool = True
+     ) -> None:
+diff --git a/reacnetgenerator/utils.py b/reacnetgenerator/utils.py
+index a979b3866..9a8fa22eb 100644
+--- a/reacnetgenerator/utils.py
++++ b/reacnetgenerator/utils.py
+@@ -591,6 +591,15 @@ def must_be_list(obj: Any | list[Any]) -> list[Any]:
+     return [obj]
+ 
+ 
++def get_timestep_value(timestep: Any) -> Any:
++    """Normalize stored timestep metadata to the timestep value."""
++    if isinstance(timestep, tuple):
++        timestep = timestep[-1]
++    if isinstance(timestep, np.generic):
++        return timestep.item()
++    return timestep
++
++
+ def check_zero_signal(signal: np.ndarray) -> bool:
+     """Check if the given signal contains only zeros.
+ 
+diff --git a/tests/test_reacnetgen.py b/tests/test_reacnetgen.py
+index 272e6ebb3..c829ebc0f 100644
+--- a/tests/test_reacnetgen.py
++++ b/tests/test_reacnetgen.py
+@@ -7,6 +7,7 @@
+ import json
+ import os
+ from tkinter import END, TclError
++from types import SimpleNamespace
+ 
+ import numpy as np
+ import pytest
+@@ -14,10 +15,16 @@
+ from reacnetgenerator import ReacNetGenerator
+ from reacnetgenerator._detect import _Detect
+ from reacnetgenerator._hmmfilter import _HMMFilter
+-from reacnetgenerator._path import _CollectSMILESPaths
++from reacnetgenerator._path import _CollectSMILESPaths, _MoleculeTimelineSpool
++from reacnetgenerator._reaction import ReactionsFinder
+ from reacnetgenerator.commandline import parm2cmd
+ from reacnetgenerator.gui import GUI
+-from reacnetgenerator.utils import checksha256, download_multifiles, listtobytes
++from reacnetgenerator.utils import (
++    checksha256,
++    download_multifiles,
++    get_timestep_value,
++    listtobytes,
++)
+ 
+ with open(os.path.join(os.path.dirname(__file__), "test.json")) as f:
+     test_data = json.load(f)
+@@ -166,6 +173,287 @@ def test_re_mo(self, reacnetgen_param):
+         r.atomname = np.array(["Mo", "O"])
+         assert r._re("[Mo]") == "[Mo]"
+ 
++    def test_reaction_event_details(self, tmp_path):
++        """Single reaction events should expose time-resolved CSV fields."""
++        finder = ReactionsFinder(
++            SimpleNamespace(
++                step=2,
++                mname=np.array(["A", "B", "C"]),
++                reactionabcdfilename=str(tmp_path / "out.reactionabcd"),
++                reactioneventfilename=str(tmp_path / "out.reactionevent.csv"),
++                printreactionevent=True,
++                nproc=1,
++            )
++        )
++        item = listtobytes(
++            (
++                0,
++                np.array([1, 1, 2, 2]),
++                np.array([3, 3, 3, 3]),
++                np.zeros(4, dtype=int),
++                np.zeros(4, dtype=int),
++            )
++        )
++
++        assert finder._getstepreaction(item) == [
++            {
++                "Timestep_Index": 0,
++                "Reactant": "A+B",
++                "Product": "C",
++            }
++        ]
++
++    def test_reaction_event_file_is_csv(self, tmp_path):
++        """Reaction event output should use the time-resolved CSV format."""
++        event_file = tmp_path / "out.reactionevent.csv"
++        finder = ReactionsFinder(
++            SimpleNamespace(
++                step=2,
++                mname=np.array(["A", "B", "C"]),
++                reactionabcdfilename=str(tmp_path / "out.reactionabcd"),
++                reactioneventfilename=str(event_file),
++                printreactionevent=True,
++                nproc=1,
++            )
++        )
++
++        finder.findreactions(
++            np.array([[1, 1, 2, 2], [3, 3, 3, 3]]),
++            np.zeros((2, 4), dtype=int),
++        )
++
++        assert event_file.read_text().splitlines() == [
++            "Timestep_Index,Reactant,Product",
++            "0,A+B,C",
++        ]
++
++    def test_reaction_event_default_is_off(self, tmp_path):
++        """Reaction event details should not be calculated unless requested."""
++        finder = ReactionsFinder(
++            SimpleNamespace(
++                step=2,
++                mname=np.array(["A", "B", "C"]),
++                reactionabcdfilename=str(tmp_path / "out.reactionabcd"),
++                reactioneventfilename=str(tmp_path / "out.reactionevent.csv"),
++                printreactionevent=False,
++                nproc=1,
++            )
++        )
++        item = listtobytes(
++            (
++                np.array([1, 1, 2, 2]),
++                np.array([3, 3, 3, 3]),
++                np.zeros(4, dtype=int),
++                np.zeros(4, dtype=int),
++            )
++        )
++
++        assert finder._getstepreaction(item) == ["A+B->C"]
++
++    def test_get_timestep_value(self):
++        """Stored timestep metadata should normalize to the timestep value."""
++        assert get_timestep_value((0, 100)) == 100
++        assert get_timestep_value(np.int64(100)) == 100
++        assert get_timestep_value(100) == 100
++
++    def test_molecule_time_formatting(self, tmp_path):
++        """Molecule timeline rows should be optional and filterable."""
++        reacnetgen = ReacNetGenerator(
++            inputfilename=str(tmp_path / "dummy"),
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            printmoleculetime=True,
++            moleculeframes=[2],
++        )
++        collector = _CollectSMILESPaths(reacnetgen)
++        collector.timestep = {0: 100, 1: 200, 2: 300}
++
++        frames = np.array([0, 2])
++        timesteps = collector._getmoleculetimesteps(frames)
++
++        assert timesteps == [100, 300]
++        assert reacnetgen.moleculetimelinefilename == str(
++            tmp_path / "dummy.molecules.csv"
++        )
++        assert collector._formatmoleculename("C", np.array([0, 1]), [[0, 1, 1]]) == (
++            "C 0;1 0,1,1"
++        )
++        assert collector._shouldprintmoleculetimelinerow(
++            2, 300
++        ) and not collector._shouldprintmoleculetimelinerow(0, 100)
++        timeline_rows = collector._getmoleculetimelinerows(
++            "C",
++            np.array([0, 1]),
++            [[0, 1, 1]],
++            frames,
++            timesteps,
++        )
++        collector._writemoleculetimeline(timeline_rows)
++        with open(reacnetgen.moleculetimelinefilename) as handle:
++            assert handle.read().splitlines() == [
++                "Timestep,Species,AtomIDs,BondIDs",
++                "300,C,0;1,0-1-1",
++            ]
++
++    def test_molecule_timeline_file_is_sorted_by_timestep(self, tmp_path):
++        """Molecule timeline rows should be grouped by original timestep."""
++        reacnetgen = ReacNetGenerator(
++            inputfilename=str(tmp_path / "dummy"),
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            printmoleculetime=True,
++        )
++        collector = _CollectSMILESPaths(reacnetgen)
++        collector._moleculetimelinebufferrows = 2
++
++        collector._writemoleculetimeline(
++            [
++                (300, "C", "0;1", "0-1-1"),
++                (100, "H", "2", ""),
++                (300, "O", "3", ""),
++            ]
++        )
++
++        with open(reacnetgen.moleculetimelinefilename) as handle:
++            assert handle.read().splitlines() == [
++                "Timestep,Species,AtomIDs,BondIDs",
++                "100,H,2,",
++                "300,C,0;1,0-1-1",
++                "300,O,3,",
++            ]
++
++    def test_molecule_timeline_spool_merges_chunk_batches(self, tmp_path):
++        """Large timeline files should be externally sorted in chunk batches."""
++        timeline_file = tmp_path / "timeline.molecules.csv"
++        spool = _MoleculeTimelineSpool(
++            str(timeline_file), buffer_rows=2, max_open_chunks=2
++        )
++        try:
++            spool.extend(
++                [
++                    (500, "E", "4", ""),
++                    (100, "A", "0", ""),
++                    (400, "D", "3", ""),
++                    (200, "B", "1", ""),
++                    (300, "C", "2", ""),
++                ]
++            )
++            spool.write()
++        finally:
++            spool.close()
++
++        assert timeline_file.read_text().splitlines() == [
++            "Timestep,Species,AtomIDs,BondIDs",
++            "100,A,0,",
++            "200,B,1,",
++            "300,C,2,",
++            "400,D,3,",
++            "500,E,4,",
++        ]
++
++    def test_molecule_time_filter_by_timestep(self):
++        """Molecule timeline filtering should accept original timestep values."""
++        reacnetgen = ReacNetGenerator(
++            inputfilename="dummy",
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            moleculetimesteps=[300],
++        )
++        collector = _CollectSMILESPaths(reacnetgen)
++
++        assert reacnetgen.printmoleculetime is True
++        assert collector._shouldprintmoleculetimelinerow(2, 300)
++        assert not collector._shouldprintmoleculetimelinerow(2, 200)
++
++    def test_molecule_time_filters_match_same_occurrence(self):
++        """Combined frame and timestep filters should match the same timeline row."""
++        reacnetgen = ReacNetGenerator(
++            inputfilename="dummy",
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            moleculeframes=[0],
++            moleculetimesteps=[300],
++        )
++        collector = _CollectSMILESPaths(reacnetgen)
++
++        assert not collector._shouldprintmoleculetimelinerow(0, 100)
++        assert not collector._shouldprintmoleculetimelinerow(2, 300)
++        assert collector._shouldprintmoleculetimelinerow(0, 300)
++
++        reacnetgen = ReacNetGenerator(
++            inputfilename="dummy",
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            moleculeframes=[2],
++            moleculetimesteps=[300],
++        )
++        collector = _CollectSMILESPaths(reacnetgen)
++
++        assert not collector._shouldprintmoleculetimelinerow(0, 100)
++        assert collector._shouldprintmoleculetimelinerow(2, 300)
++
++    def test_empty_molecule_filters_are_ignored(self, tmp_path):
++        """Empty frame and timestep filters should behave like omitted filters."""
++        reacnetgen = ReacNetGenerator(
++            inputfilename=str(tmp_path / "dummy"),
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            moleculeframes=[],
++            moleculetimesteps=[],
++        )
++        collector = _CollectSMILESPaths(reacnetgen)
++
++        assert reacnetgen.moleculeframes is None
++        assert reacnetgen.moleculetimesteps is None
++        assert reacnetgen.printmoleculetime is False
++        collector._writemoleculetimeline([(100, "H", "0", "")])
++        assert not (tmp_path / "dummy.molecules.csv").exists()
++
++    def test_molecule_filter_normalization_accepts_sequences(self):
++        """Tuple and array molecule filters should normalize to integer lists."""
++        reacnetgen = ReacNetGenerator(
++            inputfilename="dummy",
++            inputfiletype="lammpsbondfile",
++            atomname=["H", "O"],
++            moleculeframes=(1, 2),
++            moleculetimesteps=np.array([100, 300]),
++        )
++
++        assert reacnetgen.moleculeframes == [1, 2]
++        assert reacnetgen.moleculetimesteps == [100, 300]
++
++    def test_parm2cmd_preserves_zero_molecule_filters(self):
++        """Frame and timestep 0 are valid molecule filters."""
++        cmd = parm2cmd(
++            {
++                "inputfilename": "dummy",
++                "inputfiletype": "lammpsbondfile",
++                "atomname": ["H", "O"],
++                "moleculeframes": 0,
++                "moleculetimesteps": 0,
++            }
++        )
++
++        assert "--molecule-frame" in cmd
++        assert cmd[cmd.index("--molecule-frame") + 1] == "0"
++        assert "--molecule-timestep" in cmd
++        assert cmd[cmd.index("--molecule-timestep") + 1] == "0"
++
++    def test_parm2cmd_omits_empty_molecule_filters(self):
++        """Empty molecule filters should not emit value-requiring CLI options."""
++        cmd = parm2cmd(
++            {
++                "inputfilename": "dummy",
++                "inputfiletype": "lammpsbondfile",
++                "atomname": ["H", "O"],
++                "moleculeframes": [],
++                "moleculetimesteps": [],
++            }
++        )
++
++        assert "--molecule-frame" not in cmd
++        assert "--molecule-timestep" not in cmd
++
+ 
+ # Additional test for the auto-enable logic
+ class TestAutoEnableLogic:

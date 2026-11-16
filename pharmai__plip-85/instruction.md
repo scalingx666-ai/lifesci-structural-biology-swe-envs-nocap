@@ -1,0 +1,12 @@
+# Issue
+
+**Title:** Version 2.1.5
+
+## Description
+
+- merges changes to master that fix #80 and #84
+- adds support for multi-models
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `975b79016370`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

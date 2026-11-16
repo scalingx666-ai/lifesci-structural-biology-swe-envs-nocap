@@ -1,0 +1,202 @@
+diff --git a/docs/src/NQCDistributions/overview.md b/docs/src/NQCDistributions/overview.md
+index 72babe3be..f115063fc 100644
+--- a/docs/src/NQCDistributions/overview.md
++++ b/docs/src/NQCDistributions/overview.md
+@@ -23,9 +23,7 @@ both nuclear and electronic degrees of freedom.
+ This page describes the types that can be used to represent nuclear and electronic distributions
+ and demonstrates how they can be combined into a product distribution.
+ 
+-## Nuclear Distributions
+-
+-### DynamicalDistribution
++## Nuclear Distributions using `DynamicalDistribution`
+ 
+ When handling distributions for the nuclear degrees of freedom,
+ the [`DynamicalDistribution`](@ref) type can be used to store initial velocities and positions:
+@@ -65,10 +63,15 @@ rand(d)
+ This has generated normally distributed positions along with one of the three velocities
+ we provided.
+ 
++### Sampling the nuclear distribution
++
++To learn how to generate configurations to use with the [`DynamicalDistribution`](@ref),
++read on to the next sections about the included sampling methods.
++
+ ### VelocityBoltzmann
+ 
+ When performing equilibrium simulations it is often desirable to initialise trajectories
+-when thermal velocities.
++with thermal velocities, e.g. in combination with positions obtained from Monte Carlo sampling.
+ These can be obtained for each atom from a gaussian distribution of the appropriate
+ width, or alternatively, using the [`VelocityBoltzmann`](@ref) distribution which simplifies
+ the process.
+@@ -107,6 +110,18 @@ rand(dist)
+ These can also be given to the [`DynamicalDistribution`](@ref) since they are just
+ univariate normal distributions.
+ 
++### Nuclear distributions for Ring polymer simulations
++The components making up a `DynamicalDistribution` can all be adapted for use in Ring Polymer simulations. 
++
++For samplable components based on nuclear configurations, simply use three-dimensional arrays instead of two-dimensional ones. 
++
++Pre-defined distribution functions such as `VelocityBoltzmann` can be turned into a three-dimensional version using the `RingPolymerWrapper`:
++
++```julia
++velocity = VelocityBoltzmann(300u"K", rand(10), (3, 10))
++velocity_ring_polymer = RingPolymerWrapper(velocity, n_beads, Int[]) # RingPolymerWrapper(Distribution, number of ring-polymer beads, indices of atoms to treat classically)
++```
++
+ ## Electronic distributions
+ 
+ For nonadiabatic dynamics, the initial electronic variables must also be sampled.
+@@ -128,10 +143,23 @@ MixedState([1, 2], Diabatic())
+ These structs contain only the minimal information about the distributions, whereas the sampling
+ of the distribution is handled separately by each of the different methods.
+ 
+-## Sampling the nuclear distribution
++## Product distributions - Combining Nuclear and electronic distributions
++
++The initial nuclear and electronic states of a system can be combined in a product distribution, which can be used in place of a purely nuclear distribution for methods considering electronic dynamics.
++
++```julia
++nuclear_dist = DynamicalDistribution(velocity, position, (2, 2))
++electronic_dist = PureState(2, Adiabatic())
++
++total_dist = nuclear_dist * electronic_dist
++
++rand(total_dist.nuclear) # Returns a random nuclear configuration
++
++total_dist.electronic.state # Returns the chosen electronic state. 
++
++```
++
+ 
+-To learn how to generate configurations to use with the [`DynamicalDistribution`](@ref),
+-read on to the next sections about the included sampling methods.
+ ```@setup logging
+ runtime = round(time() - start_time; digits=2)
+ @info "...done after $runtime s."
+diff --git a/src/DynamicsMethods/IntegrationAlgorithms/mdef_baoab.jl b/src/DynamicsMethods/IntegrationAlgorithms/mdef_baoab.jl
+index f4128850a..e3a1575ad 100644
+--- a/src/DynamicsMethods/IntegrationAlgorithms/mdef_baoab.jl
++++ b/src/DynamicsMethods/IntegrationAlgorithms/mdef_baoab.jl
+@@ -9,6 +9,18 @@ using NQCDynamics: get_temperature
+ 
+ StochasticDiffEq.alg_compatible(::DiffEqBase.AbstractSDEProblem,::MDEF_BAOAB) = true
+ 
++"""
++    MDEF_BAOAB():
++    We define two types of variables structure in the cache:
++    - `MDEF_BAOABConstantCache` is used for constant variables, which are not changed during the integration.
++
++    - `MDEF_BAOABCache` is used for variables that are changed during the integration.
++
++    Generally, the mutableChahe is faster than the constant cache. 
++    
++    Mathmatically speaking, they are doing the same things. MutableCache is more well-optimize for the Julia compiler.
++"""
++
+ struct MDEF_BAOABConstantCache{uType,uEltypeNoUnits} <: StochasticDiffEq.StochasticDiffEqConstantCache
+     k::uType
+     half::uEltypeNoUnits
+@@ -28,6 +40,9 @@ struct MDEF_BAOABCache{uType,rType,vType,uTypeFlat,uEltypeNoUnits,rateNoiseType,
+     c2::Matrix{uEltypeNoUnits}
+ end
+ 
++"""
++    Insecting the inputs into a Cache structure.
++"""
+ function StochasticDiffEq.alg_cache(::MDEF_BAOAB,prob,u,ΔW,ΔZ,p,rate_prototype,noise_rate_prototype,jump_rate_prototype,uEltypeNoUnits,uBottomEltypeNoUnits,tTypeNoUnits,uprev,f,t,dt,::Type{Val{false}})
+     k = zero(rate_prototype.x[1])
+     MDEF_BAOABConstantCache(k, uEltypeNoUnits(1//2))
+@@ -52,6 +67,15 @@ function StochasticDiffEq.alg_cache(::MDEF_BAOAB,prob,u,ΔW,ΔZ,p,rate_prototype
+     MDEF_BAOABCache(tmp, utmp, dutmp, k, flatdutmp, tmp1, tmp2, gtmp, noise, half, c1, c2)
+ end
+ 
++"""
++    Initialize the the velocities du and positions u.
++
++    k : gradient of the potential energy
++
++    integrator.f.f1 : the gradient operator ---> acceleration!() in diabtic_mdef.jl
++
++"""
++
+ function StochasticDiffEq.initialize!(integrator, cache::MDEF_BAOABConstantCache)
+     @unpack t,uprev,p = integrator
+     du1 = uprev.x[1]
+@@ -68,6 +92,29 @@ function StochasticDiffEq.initialize!(integrator, cache::MDEF_BAOABCache)
+     integrator.f.f1(cache.k,du1,u1,p,t)
+ end
+ 
++"""
++    perform_step! perform a single step of BAOAB algorithm.
++
++    uprev: previous configureation(velocities and positions)
++    dt : length of time step
++    t : current time
++    k : gradient of the potential energy in terms of velocities
++    p : parameters like temperature, mass, etc.
++
++    The B and A steps are the same as Leimkuhler and Matthews (2013) and the O step is the same as Bussi and Parrinello (2007).
++
++    B and A step: https://academic.oup.com/amrx/article/2013/1/34/166771
++
++    O step : general part https://academic.oup.com/amrx/article/2013/1/34/166771
++
++             friction part https://journals.aps.org/pre/abstract/10.1103/PhysRevE.75.056707 
++                           and https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.118.256001 (supplementary material)
++
++    friction tensor Λ: https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.118.256001 (supplementary material)
++
++             
++"""
++
+ @muladd function StochasticDiffEq.perform_step!(integrator,cache::MDEF_BAOABConstantCache,f=integrator.f)
+     @unpack t,dt,sqdt,uprev,p,W = integrator
+     @unpack k, half = cache
+@@ -81,14 +128,16 @@ end
+     u2 = u1 + half*dt*du2
+ 
+     # O
+-    Λ = integrator.g(u2,p,t+dt*half)
++    Λ = integrator.g(u2,p,t+dt*half) # friction tensor
++    # noise strength: σ = square root of (temperature / mass) for each atom 
+     σ = sqrt(get_temperature(p, t+dt*half)) ./ sqrt.(repeat(p.atoms.masses; inner=ndofs(p)))
++    # eigen decomposition of Λ
+     γ, c = LAPACK.syev!('V', 'U', Λ) # symmetric eigen
+     clamp!(γ, 0, Inf)
+     c1 = diagm(exp.(-γ.*dt))
+     c2 = diagm(sqrt.(1 .- diag(c1).^2))
+-    noise = σ.*W.dW[:] / sqdt
+-    du3 = c*c1*c'*du2[:] + c*c2*c'*noise
++    noise = σ.*W.dW[:] / sqdt # W.dW[:] noise rescaled by square root of time step to make it normal distributed
++    du3 = c*c1*c'*du2[:] + c*c2*c'*noise # O step from Leimkuhler and Matthews (2013) 
+     du3 = reshape(du3, size(du2))
+ 
+     # A
+@@ -101,6 +150,12 @@ end
+     integrator.u = ArrayPartition((du, u))
+ end
+ 
++"""
++    The details of the following perform_step! using mutableChahe can be found in steps.jl in intergrationAlgorithm.
++
++    Before the checking, you are recommonded to read the function with ConstantCache input first.
++"""
++
+ @muladd function StochasticDiffEq.perform_step!(integrator,cache::MDEF_BAOABCache,f=integrator.f)
+     @unpack t,dt,sqdt,uprev,u,p,W = integrator
+     @unpack utmp, dutmp, k, half, gtmp = cache
+diff --git a/test/Dynamics/mdef_baoab.jl b/test/Dynamics/mdef_baoab.jl
+index 299afad3d..990f306a7 100644
+--- a/test/Dynamics/mdef_baoab.jl
++++ b/test/Dynamics/mdef_baoab.jl
+@@ -6,6 +6,7 @@ using DiffEqNoiseProcess
+ using DiffEqDevTools
+ using Random
+ using Logging
++# Set up the seed 
+ Random.seed!(100)
+ 
+ u0 = zeros(2,2)

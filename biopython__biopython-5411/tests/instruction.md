@@ -1,0 +1,33 @@
+# Issue
+
+**Title:** Raise ValueError for unknown formats in SeqRecord.format() #5410
+
+## Description
+
+<!--- Please read each of the following items and confirm by replacing
+ !--the [ ] with a [X] --->
+
+- [x] I hereby agree to dual licence this and any previous contributions under both
+the _Biopython License Agreement_ **AND** the _BSD 3-Clause License_.
+
+- [x] I have read the ``CONTRIBUTING.rst`` file, and declared any usage of
+Large Language Models (LLM) or generative artificial intelligence (AI) tools.
+All communications must be written by a human (unless machine-translated to
+English, accepted if declared). Biopython is currently debating a no AI policy
+(#5241) versus an AI permissive policy (#5388).
+
+- [x] I have run ``pre-commit`` locally, and understand that continuous
+integration checks will be used to confirm the Biopython unit tests and style
+checks pass with these changes.
+
+- [ ] I have added my name to the alphabetical contributors listings in the files
+``NEWS.rst`` and ``CONTRIB.rst`` as part of this pull request, am listed
+already, or do not wish to be listed. (*This acknowledgement is optional.*)
+
+- Wrap format specifier lookup in `SeqRecord.__format__` to catch `KeyError` and raise a `ValueError` with a descriptive message.
+- Add test coverage in `Tests/test_SeqRecord.py` verifying both `.format()` and f-string usage with invalid formats.
+- Code and tests were written entirely by hand.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ff5d397f5f8a`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,1488 @@
+diff --git a/README.md b/README.md
+index 47723c55..12a9964f 100644
+--- a/README.md
++++ b/README.md
+@@ -23,12 +23,12 @@ Other tools require API keys, such as paper-qa for literature searches. We recom
+ 1. Copy the `.env.example` file and rename it to `.env`: `cp .env.example .env`
+ 2. Replace the placeholder values in `.env` with your actual keys
+ 
+-## Using Streamlit Interface
++<!-- ## Using Streamlit Interface
+ If you'd like to use MDAgent via the streamlit app, make sure you have completed the steps above. Then, in your terminal, run `streamlit run st_app.py` in the project root directory.
+ 
+ From there you may upload files to use during the run. Note: the app is currently limited to uploading .pdb and .cif files, and the max size is defaulted at 200MB.
+ - To upload larger files, instead run `streamlit run st_app.py --server.maxUploadSize=some_large_number`
+-- To add different file types, you can add your desired file type to the list in the [streamlit app file](https://github.com/ur-whitelab/md-agent/blob/main/st_app.py).
++- To add different file types, you can add your desired file type to the list in the [streamlit app file](https://github.com/ur-whitelab/md-agent/blob/main/st_app.py). -->
+ 
+ 
+ ## Contributing
+diff --git a/mdagent/tools/base_tools/__init__.py b/mdagent/tools/base_tools/__init__.py
+index ea9e0725..72c405bd 100644
+--- a/mdagent/tools/base_tools/__init__.py
++++ b/mdagent/tools/base_tools/__init__.py
+@@ -7,7 +7,7 @@
+     RadiusofGyrationPerFrame,
+     RadiusofGyrationPlot,
+ )
+-from .analysis_tools.rmsd_tools import RMSDCalculator
++from .analysis_tools.rmsd_tools import ComputeLPRMSD, ComputeRMSD, ComputeRMSF
+ from .analysis_tools.sasa import SolventAccessibleSurfaceArea
+ from .analysis_tools.vis_tools import VisFunctions, VisualizeProtein
+ from .preprocess_tools.clean_tools import CleaningToolFunction
+@@ -25,6 +25,9 @@
+ 
+ __all__ = [
+     "CleaningToolFunction",
++    "ComputeLPRMSD",
++    "ComputeRMSD",
++    "ComputeRMSF",
+     "ListRegistryPaths",
+     "MapPath2Name",
+     "ModifyBaseSimulationScriptTool",
+diff --git a/mdagent/tools/base_tools/analysis_tools/__init__.py b/mdagent/tools/base_tools/analysis_tools/__init__.py
+index 13fc8203..15c6ce69 100644
+--- a/mdagent/tools/base_tools/analysis_tools/__init__.py
++++ b/mdagent/tools/base_tools/analysis_tools/__init__.py
+@@ -2,11 +2,14 @@
+ from .plot_tools import SimulationOutputFigures
+ from .ppi_tools import PPIDistance
+ from .rgy import RadiusofGyrationAverage, RadiusofGyrationPerFrame, RadiusofGyrationPlot
+-from .rmsd_tools import RMSDCalculator
++from .rmsd_tools import ComputeLPRMSD, ComputeRMSD, ComputeRMSF
+ from .sasa import SolventAccessibleSurfaceArea
+ from .vis_tools import VisFunctions, VisualizeProtein
+ 
+ __all__ = [
++    "ComputeLPRMSD",
++    "ComputeRMSD",
++    "ComputeRMSF",
+     "MomentOfInertia",
+     "PPIDistance",
+     "RadiusofGyrationAverage",
+diff --git a/mdagent/tools/base_tools/analysis_tools/ppi_tools.py b/mdagent/tools/base_tools/analysis_tools/ppi_tools.py
+index a381dcd3..7e44e042 100644
+--- a/mdagent/tools/base_tools/analysis_tools/ppi_tools.py
++++ b/mdagent/tools/base_tools/analysis_tools/ppi_tools.py
+@@ -1,7 +1,7 @@
++import itertools
+ from typing import Optional, Type
+ 
+-import MDAnalysis as mda
+-import MDAnalysis.analysis.distances as mda_dist
++import mdtraj as md
+ import numpy as np
+ from langchain.tools import BaseTool
+ from pydantic import BaseModel, Field
+@@ -12,38 +12,44 @@
+ def ppi_distance(file_path, binding_site="protein"):
+     """
+     Calculates minimum heavy-atom distance between peptide (assumed to be
+-    smallest chain) and protein. Returns average distance between these two.
++    the smallest chain) and protein, considering a specified binding site.
++    Returns the average distance between these two.
+ 
+-    Can specify binding site if given (optional)
+-    Can work with any protein-protein interaction (PPI)
++    Can work with any protein-protein interaction (PPI).
+     """
+-    # load and find smallest chain
+-    u = mda.Universe(file_path)
+-    peptide = None
+-    for chain in u.segments:
+-        if peptide is None or len(chain.residues) < len(peptide):
+-            peptide = chain.residues
+-    protein = u.select_atoms(
+-        f"({binding_site}) and not segid {peptide.segids[0]} and not name H*"
++    traj = md.load(file_path)
++    if traj.topology.n_chains == 1:
++        raise ValueError("Only one chain found. Cannot compute PPI distance.")
++
++    # get the smallest chain
++    peptide_idx = np.argmin([chain.n_residues for chain in traj.topology.chains])
++    peptide_residues = {r.index for r in traj.topology.chain(peptide_idx).residues}
++
++    # get protein residues
++    protein_atoms = traj.topology.select(
++        f"({binding_site}) and not chainid {peptide_idx}"
+     )
+-    peptide = peptide.atoms.select_atoms("not name H*")
+-    all_d = []
+-    for r in peptide.residues:
+-        distances = mda_dist.distance_array(r.atoms.positions, protein.positions)
+-        # get row, column of minimum distance
+-        i, j = np.unravel_index(distances.argmin(), distances.shape)
+-        all_d.append(distances[i, j])
+-    avg_dist = np.mean(all_d)
+-    return avg_dist
++    protein_residues = {traj.topology.atom(a).residue.index for a in protein_atoms}
++    if len(protein_residues) == 0:
++        raise ValueError("No matching residues found for the binding site.")
++
++    res_pairs = list(itertools.product(peptide_residues, protein_residues))
++    res_pairs_array = np.array(res_pairs)
++    all_d, _ = md.compute_contacts(traj, res_pairs_array, scheme="closest-heavy")
++    if all_d.size > 0:
++        avg_dist = np.mean(all_d)
++        return avg_dist
++    else:
++        raise ValueError("For unknown reason, no distances between contacts found.")
+ 
+ 
+ class PPIDistanceInputSchema(BaseModel):
+     pdb_file: str = Field(
+-        description="file with .pdb extension containing protein-protein interaction"
++        description="file ID of PDB containing protein-protein interaction"
+     )
+     binding_site: Optional[str] = Field(
+         description="""a list of selected residues as the binding site
+-        of the protein using MDAnalysis selection syntax."""
++        of the protein using MDTraj selection syntax."""
+     )
+ 
+ 
+@@ -54,9 +60,9 @@ class PPIDistance(BaseTool):
+     any protein-protein interaction. Give this tool the name of the file. The
+     tool will find the path."""
+     args_schema: Type[BaseModel] = PPIDistanceInputSchema
+-    path_registry: Optional[PathRegistry]
++    path_registry: PathRegistry | None
+ 
+-    def __init__(self, path_registry: Optional[PathRegistry]):
++    def __init__(self, path_registry=None):
+         super().__init__()
+         self.path_registry = path_registry
+ 
+@@ -70,14 +76,9 @@ def _run(self, pdb_file: str, binding_site: str = "protein"):
+             return "Failed. Error with input: PDB file must have .pdb extension"
+         try:
+             avg_dist = ppi_distance(file_path, binding_site=binding_site)
+-        except ValueError as e:
+-            return (
+-                f"Failed. ValueError: {e}. \nMake sure to provide valid PBD "
+-                "file and binding site using MDAnalysis selection syntax."
+-            )
+         except Exception as e:
+             return f"Failed. Something went wrong. {type(e).__name__}: {e}"
+-        return f"Succeeded: PPI average distance is {avg_dist}\n"
++        return f"Succeeded. PPI average distance is {avg_dist}\n"
+ 
+     def _arun(self, pdb_file: str, binding_site: str = "protein"):
+         raise NotImplementedError("This tool does not support async")
+diff --git a/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py b/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py
+index 40cc29ff..b4f960c0 100644
+--- a/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py
++++ b/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py
+@@ -1,351 +1,317 @@
+-import os
+ from typing import Optional, Type
+ 
+ import matplotlib.pyplot as plt
+-import MDAnalysis as mda
+-import numpy as np
+-import streamlit as st
++import mdtraj as md
+ from langchain.tools import BaseTool
+-from MDAnalysis.analysis import align, diffusionmap, rms
+ from pydantic import BaseModel, Field
+ 
+-from mdagent.utils import FileType, PathRegistry
++from mdagent.utils import PathRegistry, load_traj_with_ref, save_plot, save_to_csv
+ 
+-# all things related to RMSD as 'standard deviation'
+-# 1  RMSD between two protein conformations or trajectories (1D scalar value)
+-# 2. time-dependent RMSD of the whole trajectory with all or selected atoms
+-# 3. pairwise RMSD
+-# 4. RMSF - root mean square fluctuation
+ 
+-
+-class RMSDFunctions:
+-    def __init__(self, path_registry, pdb, traj, ref=None, ref_traj=None):
+-        self.path_registry = path_registry
+-        self.pdb_file = self.path_registry.get_mapped_path(pdb)
+-        self.trajectory = self.path_registry.get_mapped_path(traj)
+-        self.ref_file = self.path_registry.get_mapped_path(ref)
+-        self.ref_trajectory = self.path_registry.get_mapped_path(ref_traj)
+-
+-        # manually check for missing paths
+-        if self.pdb_file == "Name not found in path registry.":
+-            # set that file to None
+-            self.pdb_file = None
+-            self.pdb_name = None
+-        else:
+-            self.pdb_name = os.path.splitext(os.path.basename(self.pdb_file))[0]
+-        if self.trajectory == "Name not found in path registry.":
+-            self.trajectory = None
+-        if self.ref_file == "Name not found in path registry." or self.ref_file is None:
+-            self.ref_file = None
+-            self.ref_name = None
++def rmsd(path_registry, traj, ref_traj, mol_name, select="protein"):
++    """
++    Calculate the root mean square deviation (RMSD) of each selected atom.
++    Can be used for either protions or small molecules.
++    """
++    print("Calculating RMSD...")
++    msg = ""
++    idx = traj.topology.select(select)
++    if len(idx) == 0:
++        if select == "protein":
++            # sometimes it's small molecules, so no residues
++            residues = set([residue.name for residue in traj.topology.residues])
++            print(f"No atoms found for selection '{select}'. ")
++            print(f"Only residues found in the file(s) are {residues}.")
++            print("Currently trying 'all' atoms.")
++            select = "all"
++            idx = traj.topology.select("all")
+         else:
+-            self.ref_name = os.path.splitext(os.path.basename(self.ref_file))[0]
+-        if self.ref_trajectory == "Name not found in path registry.":
+-            self.ref_trajectory = None
+-        self.base_dir = "files"  # TODO: should update this to use checkpoint dir
++            raise ValueError(f"No atoms found for selection '{select}'.")
+ 
+-    def calculate_rmsd(
+-        self,
+-        rmsd_type="rmsd",
+-        selection="backbone",
+-        plot=True,
+-    ):
+-        if self.pdb_file is None:
+-            raise FileNotFoundError("PDB file is required.")
+-        self.filename = f"{rmsd_type}_{self.pdb_name}"
+-
+-        if rmsd_type == "rmsd":
+-            if self.ref_file:
+-                print("Calculating 1-D RMSD between two sets of coordinates...")
+-                st.markdown(
+-                    "Calculating 1-D RMSD between two sets of coordinates...",
+-                    unsafe_allow_html=True,
+-                )
+-                return self.compute_rmsd_2sets(selection=selection)
+-            else:
+-                print("Calculating time-dependent RMSD...")
+-                st.markdown(
+-                    "Calculating time-dependent RMSD...", unsafe_allow_html=True
+-                )
+-                return self.compute_rmsd(selection=selection, plot=plot)
+-        elif rmsd_type == "pairwise_rmsd":
+-            print("Calculating pairwise RMSD...")
+-            st.markdown("Calculating pairwise RMSD...", unsafe_allow_html=True)
+-            return self.compute_2d_rmsd(selection=selection, plot_heatmap=plot)
+-        elif rmsd_type == "rmsf":
+-            print("Calculating root mean square fluctuation (RMSF)...")
+-            st.markdown(
+-                "Calculating root mean square fluctuation (RMSF)...",
+-                unsafe_allow_html=True,
+-            )
+-            return self.compute_rmsf(selection=selection, plot=plot)
+-        else:
+-            raise ValueError(
+-                "Invalid rmsd_type. Please choose from 'rmsd', 'pairwise_rmsd', 'rmsf'"
+-            )
++    rmsd_select = md.rmsd(traj, ref_traj, atom_indices=idx)
+ 
+-    def compute_rmsd_2sets(self, selection="backbone"):
+-        # simple RMSD calculation between two different sets of protein coordinates
+-        # returns scalar value
+-        if self.trajectory and self.ref_trajectory:
+-            u = mda.Universe(self.pdb_file, self.trajectory)
+-            ref = mda.Universe(self.ref_file, self.ref_trajectory)
+-        else:
+-            u = mda.Universe(self.pdb_file)
+-            ref = mda.Universe(self.ref_file)
+-        rmsd_value = rms.rmsd(
+-            u.select_atoms(selection).positions,  # coordinates to align
+-            ref.select_atoms(selection).positions,  # reference coordinates
+-            center=True,  # subtract the center of geometry
+-            superposition=True,
+-        )  # superimpose coordinates
+-        return f"{rmsd_value}\n"
+-
+-    def compute_rmsd(self, selection="backbone", plot=True):
+-        # 1D time-dependent RMSD, gives one scalar value for each timestep
+-        if self.trajectory is None:
+-            raise FileNotFoundError(
+-                "trajectory file is required for time-dependent 1D RMSD"
+-            )
+-        u = mda.Universe(self.pdb_file, self.trajectory)
+-        R = rms.RMSD(u, select=selection)
+-        R.run()
+-
+-        # save to file
+-        time_stamp = self.path_registry.get_timestamp()
+-        csv_filename = f"{self.filename}_{time_stamp}.csv"
+-        np.savetxt(
+-            f"{self.path_registry.ckpt_records}/{csv_filename}",
+-            R.results.rmsd,
+-            fmt=["%d", "%f", "%f"],
+-            delimiter=",",
+-            header="Frame,Time,RMSD",
+-            comments="",
+-        )
+-        avg_rmsd = np.mean(R.results.rmsd[:, 2])  # rmsd values are in 3rd column
+-        final_rmsd = R.results.rmsd[-1, 2]
+-        message = (
+-            "Calculated RMSD for each timestep with respect "
+-            f"to the initial frame. Saved to {csv_filename}. "
+-        )
+-        self.path_registry.map_path(
+-            csv_filename, f"{self.path_registry.ckpt_records}/{csv_filename}", message
+-        )
+-        message += f"Average RMSD is {avg_rmsd} \u212B. "
+-        message += f"Final RMSD is {final_rmsd} \u212B.\n"
+-
+-        if plot:
+-            plt.plot(R.results.rmsd[:, 0], R.results.rmsd[:, 2], label=str(selection))
+-            plt.xlabel("Frame")
+-            plt.ylabel("RMSD ($\AA$)")
+-            plt.title("Time-Dependent RMSD")
+-            plt.legend()
+-
+-            fig_name = self.path_registry.write_file_name(
+-                type=FileType.FIGURE,
+-                fig_analysis=self.filename,
+-                file_format="png",
+-            )
+-            plt.savefig(f"{self.path_registry.ckpt_figures}/{self.filename}.png")
+-            plot_message = (
+-                f"Plotted RMSD over time for {self.pdb_name}."
+-                f" Saved to {self.filename}.png.\n"
+-            )
+-            self.path_registry.map_path(
+-                fig_name,
+-                f"{self.path_registry.ckpt_figures}/{self.filename}.png",
+-                plot_message,
+-            )
+-            message += plot_message
+-        return message
+-
+-    def compute_2d_rmsd(self, selection="backbone", plot_heatmap=True):
+-        # pairwise RMSD, also known as 2D RMSD, gives a matrix of RMSD values
+-        if self.trajectory is None:
+-            raise FileNotFoundError("trajectory file is required for pairwise RMSD")
+-        u = mda.Universe(self.pdb_file, self.trajectory)
+-        if self.ref_file and self.ref_trajectory:
+-            ref = mda.Universe(self.ref_file, self.ref_trajectory)
+-        else:
+-            ref = None
+-
+-        if ref is None:
+-            # pairwise RMSD of a trajectory to itself
+-            align.AlignTraj(u, u, select=selection, in_memory=True).run()
+-            matrix = diffusionmap.DistanceMatrix(u, select=selection).run()
+-            pairwise_matrix = matrix.results.dist_matrix
+-            x_label = y_label = "Frame"
+-        else:
+-            pairwise_matrix = np.zeros((len(u.trajectory), len(ref.trajectory)))
+-            for i, frame in enumerate(u.trajectory):
+-                r = rms.RMSD(ref, u, select=selection, ref_frame=i).run()
+-                pairwise_matrix[i] = r.results.rmsd[:, 2]
+-            x_label = f"Frame ({self.ref_name})"
+-            y_label = f"Frame ({self.pdb_name})"
+-
+-        time_stamp = self.path_registry.get_timestamp()
+-        csv_filename = f"{self.filename}_{time_stamp}.csv"
+-        np.savetxt(
+-            f"{self.path_registry.ckpt_records}/{csv_filename}",
+-            pairwise_matrix,
+-            delimiter=",",
+-        )
+-        message = f"Saved pairwise RMSD matrix to {csv_filename}.\n"
+-        self.path_registry.map_path(
+-            csv_filename, f"{self.path_registry.ckpt_records}/{csv_filename}", message
+-        )
+-        if plot_heatmap:
+-            plt.imshow(pairwise_matrix, cmap="viridis")
+-            plt.xlabel(x_label)
+-            plt.ylabel(y_label)
+-            plt.colorbar(label=r"RMSD ($\AA$)")
+-            fig_name = self.path_registry.write_file_name(
+-                type=FileType.FIGURE,
+-                fig_analysis=self.filename,
+-                file_format="png",
+-            )
+-            plt.savefig(f"{self.path_registry.ckpt_figures}/{fig_name}")
+-            plot_message = f"Plotted pairwise RMSD matrix. Saved to {fig_name}.\n"
+-            message += plot_message
+-            self.path_registry.map_path(
+-                fig_name, f"{self.path_registry.ckpt_figures}/{fig_name}", plot_message
++    if rmsd_select.shape[0] == 1:
++        # RMSD is a single value
++        return f"RMSD calculated. {rmsd_select[0]:.5f} nm"
++
++    analysis = f"rmsd_{mol_name}"
++    csv_file_id = save_to_csv(
++        path_registry,
++        rmsd_select,
++        analysis,
++        description=f"RMSD for {mol_name}",
++        header="RMSD (nm)",
++    )
++
++    # plot rmsd
++    fig, ax = plt.subplots()
++    ax.plot(rmsd_select, label=select)
++    ax.legend()
++    ax.set(
++        **{
++            "xlabel": "time",
++            "ylabel": "RMSD / nm",
++        }
++    )
++    fig_id = save_plot(path_registry, analysis, f"RMSD plot for {mol_name}")
++    plt.close()
++    msg = (
++        f"RMSD calculated and saved to csv with file ID {csv_file_id}. "
++        f"Plot saved with plot ID {fig_id}. "
++    )
++    return msg
++
++
++def rmsf(path_registry, traj, ref_traj, mol_name, select="protein"):
++    """
++    Calculate the root mean square fluctuation (RMSF) of each selected atom.
++    Usually used for proteins, but can select 'all' for small molecules.
++    """
++    print("Calculating RMSF...")
++    idx = traj.topology.select(select)
++    if len(idx) == 0:
++        residues = set([residue.name for residue in traj.topology.residues])
++        raise ValueError(
++            (
++                f"No atoms found for selection '{select}'. "
++                f"Only residues found in the file(s) are {residues}. \n"
++                "Try 'all' for small molecules. \n"
+             )
+-        return message
+-
+-    def compute_rmsf(self, selection="backbone", plot=True):
+-        # calculate RMSF (root mean square fluctuation)
+-        if self.trajectory is None:
+-            raise FileNotFoundError("trajectory file is required for RMSF")
+-        u = mda.Universe(self.pdb_file, self.trajectory)
+-
+-        # use averages as a reference for aligning
+-        average = align.AverageStructure(u, u, select=selection, ref_frame=0).run()
+-        align_ref = average.results.universe
+-        align.AlignTraj(u, align_ref, select=selection, in_memory=True).run()
+-
+-        # Compute RMSF
+-        atoms = u.select_atoms(selection)
+-        R = rms.RMSF(atoms).run()
+-        rmsf = R.results.rmsf
+-        self.process_rmsf_results(atoms, rmsf, selection=selection, plot=plot)
+-
+-    def process_rmsf_results(self, atoms, rmsf, selection="backbone", plot=True):
+-        # Save to a text file
+-        rmsf_data = np.column_stack((atoms.resids, rmsf))
+-        time_stamp = self.path_registry.get_timestamp()
+-        csv_filename = f"{self.filename}_{time_stamp}.csv"
+-        np.savetxt(
+-            f"{self.path_registry.ckpt_records}/{csv_filename}",
+-            rmsf_data,
+-            delimiter=",",
+-            header="Residue_ID,RMSF",
+-            comments="",
+-        )
+-        message = f"Saved RMSF data to {csv_filename}.\n"
+-        self.path_registry.map_path(
+-            csv_filename, f"{self.path_registry.ckpt_records}/{csv_filename}", message
+         )
+ 
+-        # Plot RMSF
+-        if plot:
+-            plt.figure(figsize=(5, 3))
+-            plt.plot(atoms.resnums, rmsf, label=str(selection))
+-            plt.xlabel("Residue Number")
+-            plt.ylabel("RMSF ($\AA$)")
+-            plt.title("Root Mean Square Fluctuation")
+-            plt.legend()
+-            fig_name = self.path_registry.write_file_name(
+-                type=FileType.FIGURE,
+-                fig_analysis=self.filename,
+-                file_format="png",
+-            )
+-            plt.savefig(f"{self.path_registry.ckpt_figures}/{fig_name}")
+-            plot_message = f"Plotted RMSF. Saved to {fig_name}.\n"
+-            message += plot_message
+-            self.path_registry.map_path(
+-                f"{self.filename}.png", f"{self.filename}.png", plot_message
+-            )
+-        return message
++    rmsf = md.rmsf(traj, ref_traj)
++    rmsf_select = rmsf[idx]
++    analysis = f"rmsf_{mol_name}"
++    csv_file_id = save_to_csv(
++        path_registry,
++        rmsf_select,
++        analysis,
++        description=f"RMSF for {mol_name}",
++        header="RMSF (nm)",
++    )
+ 
++    # plot rmsf
++    fig, ax = plt.subplots()
+ 
+-class RMSDInputSchema(BaseModel):
+-    rmsd_type: str = Field(
+-        description="""type of RMSD calculation
+-        to perform. Choose from 'rmsd', 'pairwise_rmsd', 'rmsf'.
+-        'rmsd': any 1-D root mean square deviation calculations.
+-        'pairwise_rmsd': 2D root mean square deviation calculation.
+-            pairwise RMSD matrix is computed. Either
+-            trajectory against itself or a given reference.
+-        'rmsf': root mean square fluctuation. it computes the average
+-            fluctuation for each residue for the entire trajectory.
+-        """
++    # check if whether to plot protein or all atoms
++    protein_mode = True
++    select_idx = traj.topology.select(f"{select} and name CA")
++    if len(select_idx) == 0:
++        protein_mode = False
++        select_idx = idx
++
++    xlabel = "Residue Number" if protein_mode else "Atom Number"
++    title = (
++        "RMS Fluctuation (carbon alpha)"
++        if protein_mode
++        else "RMS Fluctuation (all atoms)"
+     )
+-    pdb_file: str = Field(
+-        description="file with .pdb extension contain protein of interest"
++
++    ax.plot(select_idx, rmsf[select_idx], label=select)
++    ax.legend()
++    ax.set(
++        **{
++            "xlabel": xlabel,
++            "ylabel": "RMSF / nm",
++            "title": title,
++        }
+     )
+-    trajectory: Optional[str] = Field(
+-        None, description="trajectory file for protein of interest"
++    fig_id = save_plot(path_registry, analysis, f"RMSF plot for {mol_name}")
++    plt.close()
++    msg = (
++        f"RMSF calculated and saved to csv with file ID {csv_file_id}. "
++        f"Plot saved with plot ID {fig_id}. "
+     )
+-    ref_file: Optional[str] = Field(
+-        None, description="file with .pdb extension used as reference"
++    return msg
++
++
++def lprmsd(path_registry, traj, ref_traj, mol_name, select="protein"):
++    """
++    LP-RMSD is Linear-Programming Root-Mean-Squared Deviation.
++    It gives the global minimum of the means squared deviation using
++    3-step optimization process. More info in MDTraj docs.
++
++    Note:
++    - LPRMSD is really useful for when you have indistinguishable atoms that
++    you want to permute and calculate the minimum distance under permutations.
++    - Example: atoms with exchange symmetry like multiple water molecules.
++    """
++    print(f"Calculating LP-RMSD for with select '{select}'...")
++    idx = traj.topology.select(select)
++    if len(idx) == 0:
++        residues = set([residue.name for residue in traj.topology.residues])
++        raise ValueError(
++            (
++                f"No atoms found for selection '{select}'. "
++                f"Only residues found in the file(s) are {residues}. \n"
++                "Try 'all' for small molecules. \n"
++            )
++        )
++
++    lprmsd = md.rmsd(traj, ref_traj, atom_indices=idx)
++
++    if lprmsd.shape[0] == 1:
++        # RMSD is a single value
++        return f"Linear Programming RMSD calculated. {lprmsd[0]:.5f} nm"
++
++    csv_file_id = save_to_csv(
++        path_registry,
++        lprmsd,
++        f"lprmsd_{mol_name}",
++        description=f"LP-RMSD for {mol_name}",
++        header="LP-RMSD (nm)",
+     )
+-    ref_trajectory: Optional[str] = Field(
+-        None, description="trajectory file used as reference"
++    return f"LP-RMSD calculated and saved to csv with file ID {csv_file_id}"
++
++
++class RMSDInputSchema(BaseModel):
++    top_id: str = Field(None, description="File ID for the topology file.")
++    traj_id: Optional[str] = Field(
++        None,
++        description=(
++            "File ID for the trajectory file. "
++            "Required for RMSF. Otherwise, optional."
++        ),
+     )
+-    selection: Optional[str] = Field(
+-        None, description="""selected atoms using MDAnalysis selection syntax."""
++    ref_top_id: Optional[str] = Field(
++        None,
++        description=(
++            "File ID for the topology file as reference. "
++            "Only provide if it's different from target"
++        ),
+     )
+-    plot: Optional[bool] = Field(
++    ref_traj_id: Optional[str] = Field(
+         None,
+-        description="""Only use it to set False
+-        to disable making plots if prompted.""",
++        description=(
++            "File ID for the trajectory file as reference. "
++            "Only provide if it's different from target"
++        ),
++    )
++    select: Optional[str] = Field(
++        "protein",
++        description=(
++            "atom selection following MDTraj syntax for topology.select. "
++            "Examples are 'protein', 'backbone', 'sidechain'"
++        ),
++    )
++    mol_name: Optional[str] = Field(
++        None, description="Name of the molecule or protein."
+     )
+ 
+ 
+-class RMSDCalculator(BaseTool):
+-    name: str = "RMSDCalculator"
+-    description: str = """Useful for calculating RMSD from output files
+-    such as PDB, PSF, DCD, etc. Types of RMSD this tool can do:
+-    1. 1-D root mean square deviation (RMSD)
+-    2. 2-D or pairwise root mean square deviation (RMSD) matrix
+-    3. root mean square fluctuation (RMSF)
+-    Make sure to provide any necessary files for a chosen RMSD type."""
++class ComputeRMSD(BaseTool):
++    name: str = "ComputeRMSD"
++    description: str = (
++        "Compute root mean square deviation (RMSD) of all "
++        "conformations in target to a reference conformation."
++    )
+     args_schema: Type[BaseModel] = RMSDInputSchema
+-    path_registry: Optional[PathRegistry]
++    path_registry: PathRegistry | None
+ 
+-    def __init__(self, path_registry: Optional[PathRegistry] = None):
++    def __init__(self, path_registry=None):
+         super().__init__()
+         self.path_registry = path_registry
+ 
+     def _run(
+         self,
+-        rmsd_type: str,
+-        pdb_file: str,
+-        trajectory: Optional[str] = None,
+-        ref_file: Optional[str] = None,
+-        ref_trajectory: Optional[str] = None,
+-        selection: str = "backbone",
+-        plot: bool = True,
++        top_id,
++        traj_id=None,
++        ref_top_id=None,
++        ref_traj_id=None,
++        mol_name=None,
++        select="protein",
+     ):
+         try:
+-            rmsd = RMSDFunctions(
+-                self.path_registry, pdb_file, trajectory, ref_file, ref_trajectory
+-            )
+-            message = rmsd.calculate_rmsd(rmsd_type, selection, plot)
+-        except ValueError as e:
+-            return (
+-                f"Failed. ValueError: {e}. Make sure to provide valid PBD "
+-                "file and binding site using MDAnalysis selection syntax."
++            if mol_name is None:
++                mol_name = top_id.replace("top_sim0_", "")
++            traj, ref_traj = load_traj_with_ref(
++                self.path_registry, top_id, traj_id, ref_top_id, ref_traj_id
+             )
+-        except FileNotFoundError as e:
+-            return (
+-                f"Failed. FileNotFoundError: {e}. "
+-                "Make sure to provide all necessary files."
++            msg = rmsd(self.path_registry, traj, ref_traj, mol_name, select)
++            return f"Succeeded. {msg}"
++        except Exception as e:
++            return f"Failed. {type(e).__name__}: {e}"
++
++
++class ComputeRMSF(BaseTool):
++    name: str = "ComputeRMSF"
++    description: str = (
++        "Compute root mean square fluctuation (RMSF) of all "
++        "conformations in target to a reference conformation"
++    )
++    args_schema: Type[BaseModel] = RMSDInputSchema
++    path_registry: PathRegistry | None
++
++    def __init__(self, path_registry=None):
++        super().__init__()
++        self.path_registry = path_registry
++
++    def _run(
++        self,
++        top_id,
++        traj_id=None,
++        ref_top_id=None,
++        ref_traj_id=None,
++        mol_name=None,
++        select="protein",
++    ):
++        try:
++            if mol_name is None:
++                mol_name = top_id.replace("top_sim0_", "")
++            if ref_top_id is None or ref_top_id == top_id:  # if there's no ref
++                traj_required = True
++            else:
++                traj_required = False
++
++            traj, ref_traj = load_traj_with_ref(
++                self.path_registry,
++                top_id,
++                traj_id,
++                ref_top_id,
++                ref_traj_id,
++                traj_required=traj_required,
+             )
++            msg = rmsf(self.path_registry, traj, ref_traj, mol_name, select)
++            return f"Succeeded. {msg}"
+         except Exception as e:
+             return f"Failed. {type(e).__name__}: {e}"
+-        return "Succeeded. " + message
+ 
+-    def _arun(self, **query):
+-        """Use the tool asynchronously."""
+-        raise NotImplementedError("This tool does not support async")
++
++class ComputeLPRMSD(BaseTool):
++    name: str = "ComputeLP-RMSD"
++    description: str = (
++        # description from mdtraj docs
++        "Compute Linear-Programming Root-Mean-Squared Deviation "
++        "(LP-RMSD) of all conformations in target to a reference "
++        "conformation. The LP-RMSD is the minimum RMSD between "
++        "two sets of points, minimizing over both the rotational/"
++        "translational degrees of freedom AND the label "
++        "correspondences between points in the target and "
++        "reference conformations."
++    )
++    args_schema: Type[BaseModel] = RMSDInputSchema
++    path_registry: PathRegistry | None
++
++    def __init__(self, path_registry=None):
++        super().__init__()
++        self.path_registry = path_registry
++
++    def _run(
++        self,
++        top_id,
++        traj_id=None,
++        ref_top_id=None,
++        ref_traj_id=None,
++        mol_name=None,
++        select="protein",
++    ):
++        try:
++            if mol_name is None:
++                mol_name = top_id.replace("top_sim0_", "")
++            traj, ref_traj = load_traj_with_ref(
++                self.path_registry, top_id, traj_id, ref_top_id, ref_traj_id
++            )
++            msg = lprmsd(self.path_registry, traj, ref_traj, mol_name, select)
++            return f"Succeeded. {msg}"
++        except Exception as e:
++            return f"Failed. {type(e).__name__}: {e}"
+diff --git a/mdagent/tools/base_tools/preprocess_tools/pdb_get.py b/mdagent/tools/base_tools/preprocess_tools/pdb_get.py
+index bb22ab27..031e6885 100644
+--- a/mdagent/tools/base_tools/preprocess_tools/pdb_get.py
++++ b/mdagent/tools/base_tools/preprocess_tools/pdb_get.py
+@@ -4,6 +4,7 @@
+ import streamlit as st
+ from langchain.tools import BaseTool
+ from rdkit import Chem
++from rdkit.Chem import AllChem
+ 
+ from mdagent.utils import FileType, PathRegistry
+ 
+@@ -181,7 +182,7 @@ def small_molecule_pdb(self, mol_str: str) -> str:
+                 m = Chem.AddHs(m)
+             except Exception:
+                 pass
+-            Chem.AllChem.EmbedMolecule(m)
++            AllChem.EmbedMolecule(m)
+             file_name = f"{self.path_registry.ckpt_pdb}/{mol_name}.pdb"
+             Chem.MolToPDBFile(m, file_name)
+             print("finished writing pdb file")
+diff --git a/mdagent/tools/maketools.py b/mdagent/tools/maketools.py
+index 3006736c..49cb0cbb 100644
+--- a/mdagent/tools/maketools.py
++++ b/mdagent/tools/maketools.py
+@@ -9,6 +9,9 @@
+ 
+ from .base_tools import (
+     CleaningToolFunction,
++    ComputeLPRMSD,
++    ComputeRMSD,
++    ComputeRMSF,
+     ListRegistryPaths,
+     ModifyBaseSimulationScriptTool,
+     MomentOfInertia,
+@@ -19,7 +22,6 @@
+     RadiusofGyrationPerFrame,
+     RadiusofGyrationPlot,
+     RDFTool,
+-    RMSDCalculator,
+     Scholar2ResultLLM,
+     SetUpandRunFunction,
+     SimulationOutputFigures,
+@@ -49,16 +51,18 @@ def make_all_tools(
+     # add base tools
+     base_tools = [
+         CleaningToolFunction(path_registry=path_instance),
++        ComputeLPRMSD(path_registry=path_instance),
++        ComputeRMSD(path_registry=path_instance),
++        ComputeRMSF(path_registry=path_instance),
+         ListRegistryPaths(path_registry=path_instance),
+         MomentOfInertia(path_registry=path_instance),
+-        ProteinName2PDBTool(path_registry=path_instance),
+         PackMolTool(path_registry=path_instance),
+         PPIDistance(path_registry=path_instance),
++        ProteinName2PDBTool(path_registry=path_instance),
+         RadiusofGyrationAverage(path_registry=path_instance),
+         RadiusofGyrationPerFrame(path_registry=path_instance),
+         RadiusofGyrationPlot(path_registry=path_instance),
+         RDFTool(path_registry=path_instance),
+-        RMSDCalculator(path_registry=path_instance),
+         SetUpandRunFunction(path_registry=path_instance),
+         SimulationOutputFigures(path_registry=path_instance),
+         SmallMolPDB(path_registry=path_instance),
+diff --git a/mdagent/utils/__init__.py b/mdagent/utils/__init__.py
+index 61cd83fb..fc3eaf7d 100644
+--- a/mdagent/utils/__init__.py
++++ b/mdagent/utils/__init__.py
+@@ -1,12 +1,14 @@
+-from .data_handling import load_single_traj, save_to_csv
++from .data_handling import load_single_traj, load_traj_with_ref, save_plot, save_to_csv
+ from .makellm import _make_llm
+ from .path_registry import FileType, PathRegistry
+ from .set_ckpt import SetCheckpoint
+ 
+ __all__ = [
+-    "_make_llm",
+     "load_single_traj",
++    "load_traj_with_ref",
++    "save_plot",
+     "save_to_csv",
++    "_make_llm",
+     "FileType",
+     "PathRegistry",
+     "SetCheckpoint",
+diff --git a/mdagent/utils/data_handling.py b/mdagent/utils/data_handling.py
+index eb52bd12..f5abea75 100644
+--- a/mdagent/utils/data_handling.py
++++ b/mdagent/utils/data_handling.py
+@@ -1,12 +1,20 @@
+ import os
++import warnings
+ 
++import matplotlib.pyplot as plt
+ import mdtraj as md
+ import numpy as np
+ 
+-from .path_registry import PathRegistry
++from .path_registry import FileType, PathRegistry
+ 
+ 
+-def load_single_traj(path_registry, top_fileid, traj_fileid=None, traj_required=False):
++def load_single_traj(
++    path_registry,
++    top_fileid,
++    traj_fileid=None,
++    traj_required=False,
++    ignore_warnings=False,
++):
+     """
+     Load a single trajectory file using mdtraj. Check for file IDs in the path registry.
+ 
+@@ -28,6 +36,14 @@ def load_single_traj(path_registry, top_fileid, traj_fileid=None, traj_required=
+ 
+     if traj_fileid is None:
+         if not traj_required:
++            if not ignore_warnings:
++                warnings.warn(
++                    (
++                        "Trajectory File ID is not provided but is not required; "
++                        f"loading MDTrajectory from topology {top_fileid} only."
++                    ),
++                    UserWarning,
++                )
+             return md.load(top_path)
+         else:
+             raise ValueError("Trajectory File ID is required, and it's not provided.")
+@@ -36,11 +52,31 @@ def load_single_traj(path_registry, top_fileid, traj_fileid=None, traj_required=
+         raise ValueError(
+             f"Trajectory File ID '{traj_fileid}' not found in PathRegistry."
+         )
+-
+     traj_path = path_registry.get_mapped_path(traj_fileid)
+     return md.load(traj_path, top=top_path)
+ 
+ 
++def load_traj_with_ref(
++    path_registry,
++    top_id,
++    traj_id=None,
++    ref_top_id=None,
++    ref_traj_id=None,
++    traj_required=False,
++    ignore_warnings=False,
++):
++    traj = load_single_traj(
++        path_registry, top_id, traj_id, traj_required, ignore_warnings
++    )
++    if ref_top_id is None:
++        ref_traj = traj
++    else:
++        ref_traj = load_single_traj(
++            path_registry, ref_top_id, ref_traj_id, traj_required, ignore_warnings
++        )
++    return traj, ref_traj
++
++
+ def save_to_csv(
+     path_registry, data_to_save, analysis_name, description=None, header=""
+ ):
+@@ -52,6 +88,7 @@ def save_to_csv(
+     data_to_save (np.ndarray): Data to save to a csv file.
+     analysis_name (str): Name of the analysis or data. This will be used as the file ID.
+     description (str, optional): Description of the data.
++    header (str, optional): Header for the csv file.
+ 
+     Returns:
+     str: File ID for the saved data.
+@@ -72,3 +109,22 @@ def save_to_csv(
+     path_registry.map_path(file_id, file_path, description=description)
+     print(f"Data saved to {file_path}")
+     return file_id
++
++
++def save_plot(path_registry, fig_analysis, description=None):
++    if not isinstance(path_registry, PathRegistry):
++        raise ValueError("path_registry must be an instance of PathRegistry.")
++    if plt.gcf().get_axes() == []:  # if there's no plot
++        raise ValueError("No plot detected. Failed to save.")
++
++    fig_name = path_registry.write_file_name(
++        type=FileType.FIGURE,
++        fig_analysis=fig_analysis,
++        file_format="png",
++    )
++    fig_id = path_registry.get_fileid(file_name=fig_name, type=FileType.FIGURE)
++    fig_path = f"{path_registry.ckpt_figures}/{fig_name}"
++    plt.savefig(fig_path)
++    path_registry.map_path(fig_id, fig_path, description=description)
++    print(f"Plot saved to {fig_path}")
++    return fig_id
+diff --git a/setup.py b/setup.py
+index e8be8d0b..8efb0707 100644
+--- a/setup.py
++++ b/setup.py
+@@ -22,7 +22,6 @@
+         "langchain==0.0.336",
+         "langchain_experimental",
+         "matplotlib",
+-        "MDAnalysis",
+         "nbformat",
+         "openai",
+         "outlines",
+diff --git a/tests/test_analysis/test_misc.py b/tests/test_analysis/test_misc.py
+index 704307a4..f2a6656f 100644
+--- a/tests/test_analysis/test_misc.py
++++ b/tests/test_analysis/test_misc.py
+@@ -1,15 +1,10 @@
+ import os
+-from io import StringIO
+ from unittest.mock import MagicMock, mock_open, patch
+ 
+-import MDAnalysis as mda
+-import numpy as np
+ import pytest
+ 
+ from mdagent.tools.base_tools import VisFunctions
+ from mdagent.tools.base_tools.analysis_tools.plot_tools import PlottingTools
+-from mdagent.tools.base_tools.analysis_tools.ppi_tools import ppi_distance
+-from mdagent.tools.base_tools.analysis_tools.rmsd_tools import RMSDFunctions
+ 
+ 
+ @pytest.fixture
+@@ -106,247 +101,3 @@ def test_create_notebook(path_to_cif, vis_fxns):
+     result = vis_fxns.create_notebook(path_to_cif)
+     (f"{vis_fxns.path_registry.ckpt_figures}/{path_to_cif.split('.')[0]}_vis.ipynb")
+     assert result == "Visualization Complete"
+-
+-
+-@pytest.fixture
+-def rmsd_functions(get_registry):
+-    reg = get_registry("raw", True)
+-    pdb_file = reg.get_mapped_path("ALA_123456")
+-    rmsd_functions = RMSDFunctions(reg, pdb_file, "trajectory.dcd")
+-    rmsd_functions.trajectory = "trajectory.dcd"
+-    rmsd_functions.pdb_file = pdb_file
+-    return rmsd_functions
+-
+-
+-pdb_string = """
+-ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 20.00           N
+-ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 20.00           C
+-ATOM      3  C   ALA A   1       1.458   1.527   0.000  1.00 20.00           C
+-ATOM      4  O   ALA A   1       0.000   1.527   0.000  1.00 20.00           O
+-ATOM      5  CB  ALA A   1       1.458  -0.500   1.500  1.00 20.00           C
+-ATOM      6  N   GLY B   2      -1.458   0.000   0.000  1.00 20.00           N
+-ATOM      7  CA  GLY B   2      -2.916   0.000   0.000  1.00 20.00           C
+-ATOM      8  C   GLY B   2      -2.916   1.527   0.000  1.00 20.00           C
+-ATOM      9  O   GLY B   2      -1.458   1.527   0.000  1.00 20.00           O
+-ATOM     10  N   GLY B   3      -4.374   1.527   0.000  1.00 20.00           N
+-TER
+-END
+-"""
+-pdb_file_like = StringIO(pdb_string)
+-u = mda.Universe(pdb_file_like, format="PDB")
+-
+-
+-@pytest.fixture
+-def mock_mda_universe(get_registry):
+-    # reg = get_registry("raw", True)
+-    # pdb_freg.get_mapped_path("ALA_123456")
+-    with patch(
+-        "mdagent.tools.base_tools.analysis_tools.ppi_tools.mda.Universe", return_value=u
+-    ) as mock_universe:
+-        yield mock_universe
+-
+-
+-@pytest.fixture
+-def mock_rmsd_run():
+-    mock_rmsd_results = MagicMock()
+-    mock_rmsd_results.rmsd = np.array([[0, 0.0, 0.1], [1, 10.0, 0.2]])
+-    with patch(
+-        "mdagent.tools.base_tools.analysis_tools.ppi_tools.mda.analysis.rms.RMSD",
+-        return_value=MagicMock(results=mock_rmsd_results),
+-    ) as mock:
+-        yield mock
+-
+-
+-@pytest.fixture
+-def mock_savetxt():
+-    with patch(
+-        "mdagent.tools.base_tools.analysis_tools.rmsd_tools.np.savetxt"
+-    ) as mock_savetxt:
+-        yield mock_savetxt
+-
+-
+-@pytest.fixture
+-def mock_plt_savefig():
+-    with patch("mdagent.tools.base_tools.analysis_tools.rmsd_tools.plt.savefig") as plt:
+-        yield plt
+-
+-
+-def test_ppi_distance(mock_mda_universe):
+-    file_path = "dummy_path.pdb"
+-    avg_dist = ppi_distance(file_path)
+-    assert avg_dist > 0, "Expected a positive average distance"
+-
+-
+-def test_calculate_rmsd(rmsd_functions):
+-    # Mock all related compute_* methods in rmsd_functions
+-    with patch.object(
+-        rmsd_functions, "compute_rmsd_2sets"
+-    ) as mock_compute_2sets, patch.object(
+-        rmsd_functions, "compute_rmsd"
+-    ) as mock_compute_rmsd, patch.object(
+-        rmsd_functions, "compute_2d_rmsd"
+-    ) as mock_compute_2d_rmsd, patch.object(
+-        rmsd_functions, "compute_rmsf"
+-    ) as mock_compute_rmsf:
+-        # Test rmsd_type="rmsd" with a reference file (call compute_rmsd_2sets)
+-        rmsd_functions.ref_file = "ref.pdb"
+-        rmsd_functions.calculate_rmsd(rmsd_type="rmsd")
+-        mock_compute_2sets.assert_called_once_with(selection="backbone")
+-        mock_compute_rmsd.assert_not_called()
+-        mock_compute_2d_rmsd.assert_not_called()
+-        mock_compute_rmsf.assert_not_called()
+-
+-        mock_compute_2sets.reset_mock()
+-
+-        # Test rmsd_type="rmsd" without a reference file (compute_rmsd should be called)
+-        rmsd_functions.ref_file = None
+-        rmsd_functions.calculate_rmsd(rmsd_type="rmsd")
+-        mock_compute_rmsd.assert_called_once_with(selection="backbone", plot=True)
+-        mock_compute_2sets.assert_not_called()
+-        mock_compute_2d_rmsd.assert_not_called()
+-        mock_compute_rmsf.assert_not_called()
+-
+-        mock_compute_rmsd.reset_mock()
+-
+-        # Test rmsd_type="pairwise_rmsd" (compute_2d_rmsd should be called)
+-        rmsd_functions.calculate_rmsd(rmsd_type="pairwise_rmsd")
+-        mock_compute_2d_rmsd.assert_called_once_with(
+-            selection="backbone", plot_heatmap=True
+-        )
+-        mock_compute_2sets.assert_not_called()
+-        mock_compute_rmsd.assert_not_called()
+-        mock_compute_rmsf.assert_not_called()
+-
+-        mock_compute_2d_rmsd.reset_mock()
+-
+-        # Test rmsd_type="rmsf" (compute_rmsf should be called)
+-        rmsd_functions.calculate_rmsd(rmsd_type="rmsf")
+-        mock_compute_rmsf.assert_called_once_with(selection="backbone", plot=True)
+-        mock_compute_2sets.assert_not_called()
+-        mock_compute_rmsd.assert_not_called()
+-        mock_compute_2d_rmsd.assert_not_called()
+-
+-        # Test for invalid rmsd_type (should raise ValueError)
+-        with pytest.raises(ValueError):
+-            rmsd_functions.calculate_rmsd(rmsd_type="invalid_rmsd_type")
+-
+-
+-def test_compute_rmsd_2sets(mock_mda_universe, rmsd_functions):
+-    with patch(
+-        "mdagent.tools.base_tools.analysis_tools.ppi_tools.mda.analysis.rms.rmsd",
+-        return_value=0.5,
+-    ) as mock_rmsd:
+-        result = rmsd_functions.compute_rmsd_2sets(selection="backbone")
+-        assert "0.5" in result, "RMSD value should be present in the result string"
+-        mock_mda_universe.assert_called()
+-        mock_rmsd.assert_called()
+-
+-
+-def test_compute_rmsd(mock_mda_universe, mock_rmsd_run, mock_savetxt, rmsd_functions):
+-    rmsd_functions.filename = "test_rmsd"
+-
+-    message = rmsd_functions.compute_rmsd(selection="backbone", plot=False)
+-
+-    mock_mda_universe.assert_called_once()
+-    mock_rmsd_run.assert_called_once()
+-    mock_savetxt.assert_called_once()
+-    args, kwargs = mock_savetxt.call_args
+-    assert args[0].startswith(
+-        f"{rmsd_functions.path_registry.ckpt_records}/{rmsd_functions.filename}_"
+-    ), "np.savetxt called with unexpected file name"
+-    # assert "test_rmsd.csv" in args, "Expected np.savetxt to save to correct file"
+-    assert "Average RMSD is 0.15" in message, "Expected correct average RMSD in message"
+-    assert "Final RMSD is 0.2" in message, "Expected correct final RMSD in message"
+-    assert "Saved to test_rmsd_" in message, "Expected correct save file message"
+-
+-
+-@pytest.mark.parametrize("plot_enabled", [True, False])
+-def test_compute_rmsd_plotting(
+-    plot_enabled, mock_mda_universe, mock_plt_savefig, rmsd_functions
+-):
+-    pdb_name = rmsd_functions.pdb_name
+-    rmsd_functions.filename = f"rmsd_{pdb_name}"
+-    with patch("matplotlib.pyplot.figure"), patch("matplotlib.pyplot.plot"), patch(
+-        "matplotlib.pyplot.xlabel"
+-    ), patch("matplotlib.pyplot.ylabel"), patch("matplotlib.pyplot.title"), patch(
+-        "matplotlib.pyplot.close"
+-    ):
+-        message = rmsd_functions.compute_rmsd(selection="backbone", plot=plot_enabled)
+-    if plot_enabled:
+-        mock_plt_savefig.assert_called_once()
+-        args, _ = mock_plt_savefig.call_args
+-        assert args[0].startswith(
+-            f"{rmsd_functions.path_registry.ckpt_figures}/{rmsd_functions.filename}"
+-        ), "plt.savefig called with unexpected file path"
+-        assert (
+-            f"Plotted RMSD over time for {pdb_name}."
+-            f" Saved to {rmsd_functions.filename}" in message
+-        ), "Expected correct plotting message"
+-        assert f"Saved to {rmsd_functions.filename}" in message  # csv file
+-    else:
+-        mock_plt_savefig.assert_not_called()
+-
+-
+-def test_compute_2d_rmsd(mock_mda_universe, mock_savetxt, rmsd_functions):
+-    rmsd_functions.filename = "test_pairwise_rmsd"
+-    patch_path = (
+-        "mdagent.tools.base_tools.analysis_tools.ppi_tools.mda.analysis."
+-        "diffusionmap.DistanceMatrix.run"
+-    )
+-    with patch(patch_path) as mock_distance_matrix_run:
+-        result = rmsd_functions.compute_2d_rmsd(
+-            selection="backbone", plot_heatmap=False
+-        )
+-        mock_mda_universe.assert_called()
+-        mock_distance_matrix_run.assert_called()
+-        mock_savetxt.assert_called()
+-        assert "Saved pairwise RMSD matrix" in result
+-
+-
+-@pytest.mark.parametrize("plot", [True, False])
+-def test_compute_rmsf(rmsd_functions, mock_mda_universe, plot):
+-    with patch.object(
+-        rmsd_functions, "process_rmsf_results"
+-    ) as mocked_process_rmsf_results:
+-        mocked_process_rmsf_results.return_value = None
+-        rmsd_functions.compute_rmsf(selection="backbone", plot=plot)
+-        mock_mda_universe.assert_called()
+-        mocked_process_rmsf_results.assert_called_once()
+-        args, kwargs = mocked_process_rmsf_results.call_args
+-        selection = kwargs["selection"]
+-        plot_arg = kwargs["plot"]
+-        assert selection == "backbone"
+-        assert plot_arg is plot
+-
+-
+-@pytest.mark.parametrize("plot", [True, False])
+-def test_process_rmsf_results(rmsd_functions, mock_plt_savefig, mock_savetxt, plot):
+-    rmsd_functions.filename = "test_rmsf"
+-    mock_atoms = MagicMock()
+-    mock_atoms.resids = np.arange(1, 11)
+-    mock_atoms.resnums = np.arange(1, 11)
+-    mock_rmsf_values = np.random.rand(10)
+-    with patch("matplotlib.pyplot.figure"), patch("matplotlib.pyplot.plot"), patch(
+-        "matplotlib.pyplot.xlabel"
+-    ), patch("matplotlib.pyplot.ylabel"), patch("matplotlib.pyplot.title"), patch(
+-        "matplotlib.pyplot.close"
+-    ):
+-        message = rmsd_functions.process_rmsf_results(
+-            mock_atoms, mock_rmsf_values, plot=plot
+-        )
+-    mock_savetxt.assert_called_once()
+-    args, _ = mock_savetxt.call_args
+-    assert args[0].startswith(
+-        f"{rmsd_functions.path_registry.ckpt_records}/{rmsd_functions.filename}_"
+-    ), "CSV file path passed to np.savetxt doesn't match expected pattern."
+-    assert "Saved RMSF data to" in message, "Expected save message not found in return."
+-    if plot:
+-        mock_plt_savefig.assert_called_once()
+-        savefig_args, _ = mock_plt_savefig.call_args
+-        assert savefig_args[0].startswith(
+-            f"{rmsd_functions.path_registry.ckpt_figures}/FIG_{rmsd_functions.filename}_"
+-        ), "Plot file path passed to plt.savefig doesn't match expected pattern."
+-        assert "Plotted RMSF. Saved to" in message, "Expected plot message not found."
+-
+-    else:
+-        mock_plt_savefig.assert_not_called()
+diff --git a/tests/test_analysis/test_rmsd_ppi.py b/tests/test_analysis/test_rmsd_ppi.py
+new file mode 100644
+index 00000000..eb449fbe
+--- /dev/null
++++ b/tests/test_analysis/test_rmsd_ppi.py
+@@ -0,0 +1,97 @@
++import pytest
++
++from mdagent.tools.base_tools.analysis_tools.ppi_tools import ppi_distance
++from mdagent.tools.base_tools.analysis_tools.rmsd_tools import lprmsd, rmsd, rmsf
++from mdagent.utils import load_traj_with_ref
++
++# pdb with two chains
++pdb_string = """
++ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 20.00           N
++ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 20.00           C
++ATOM      3  C   ALA A   1       1.458   1.527   0.000  1.00 20.00           C
++ATOM      4  O   ALA A   1       0.000   1.527   0.000  1.00 20.00           O
++ATOM      5  CB  ALA A   1       1.458  -0.500   1.500  1.00 20.00           C
++ATOM      6  N   GLY B   2      -1.458   0.000   0.000  1.00 20.00           N
++ATOM      7  CA  GLY B   2      -2.916   0.000   0.000  1.00 20.00           C
++ATOM      8  C   GLY B   2      -2.916   1.527   0.000  1.00 20.00           C
++ATOM      9  O   GLY B   2      -1.458   1.527   0.000  1.00 20.00           O
++ATOM     10  N   GLY B   3      -4.374   1.527   0.000  1.00 20.00           N
++TER
++END
++"""
++
++
++@pytest.fixture
++def pdb_path(get_registry):
++    reg = get_registry("raw", True)
++    file_path = f"{reg.ckpt_dir}/twochains.pdb"
++    with open(file_path, "w") as file:
++        file.write(pdb_string)
++    return file_path
++
++
++@pytest.fixture
++def get_trajs(get_registry):
++    reg = get_registry("raw", True)
++    traj, ref = load_traj_with_ref(reg, "top_sim0_butane_123456", "rec0_butane_123456")
++    return traj, ref
++
++
++def test_ppi_distance(pdb_path):
++    avg_dist = ppi_distance(pdb_path, "protein")
++    assert avg_dist > 0, "Expected a positive average distance"
++
++
++def test_ppi_distance_no_binding_residues(pdb_path):
++    with pytest.raises(
++        ValueError, match="No matching residues found for the binding site."
++    ):
++        ppi_distance(pdb_path, "residue 10000")
++
++
++def test_ppi_distance_one_chain(get_registry):
++    reg = get_registry("raw", True)
++    file_path = reg.get_mapped_path("ALA_123456")
++    with pytest.raises(
++        ValueError, match="Only one chain found. Cannot compute PPI distance."
++    ):
++        ppi_distance(file_path, "protein")
++
++
++def test_rmsd(get_registry, get_trajs):
++    reg = get_registry("raw", False)
++    traj, ref_traj = get_trajs
++    result = rmsd(reg, traj, ref_traj, mol_name="butane")
++    assert "RMSD calculated and saved" in result
++
++
++def test_rmsd_single_value(get_registry):
++    reg = get_registry("raw", True)
++    traj, ref_traj = load_traj_with_ref(
++        reg, "top_sim0_butane_123456", ignore_warnings=True
++    )
++    result = rmsd(reg, traj, ref_traj, mol_name="butane")
++    assert "RMSD calculated." in result
++
++
++def test_rmsf(
++    get_registry,
++):
++    reg = get_registry("raw", True, dynamic=True, include_hydrogens=True)
++    traj, ref = load_traj_with_ref(reg, "top_sim0_butane_123456", "rec0_butane_123456")
++    result = rmsf(reg, traj, ref, mol_name="butane", select="all")
++    assert "RMSF calculated and saved" in result
++
++
++def test_lprmsd(get_registry, get_trajs):
++    reg = get_registry("raw", False)
++    traj, ref_traj = get_trajs
++    result = lprmsd(reg, traj, ref_traj, mol_name="butane", select="all")
++    assert "LP-RMSD calculated and saved" in result
++
++
++def test_lprmsd_invalid_select(get_registry, get_trajs):
++    reg = get_registry("raw", False)
++    traj, ref_traj = get_trajs
++    with pytest.raises(ValueError, match="No atoms found for selection 'protein'."):
++        lprmsd(reg, traj, ref_traj, mol_name="butane", select="protein")
+diff --git a/tests/test_analysis/test_sasa.py b/tests/test_analysis/test_sasa.py
+index 6383a1ed..82abb593 100644
+--- a/tests/test_analysis/test_sasa.py
++++ b/tests/test_analysis/test_sasa.py
+@@ -1,3 +1,4 @@
++import warnings
+ from unittest.mock import patch
+ 
+ import numpy as np
+@@ -36,7 +37,11 @@ def test_sasa_analysis_init_success_no_traj(get_registry):
+     with patch.object(
+         registry, "get_mapped_path", wraps=registry.get_mapped_path
+     ) as mocked_get_mapped_path:
+-        analysis = SASAFunctions(registry, "top_sim0_butane_123456", mol_name="butane")
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", UserWarning)
++            analysis = SASAFunctions(
++                registry, "top_sim0_butane_123456", mol_name="butane"
++            )
+         mocked_get_mapped_path.assert_called_once()
+         assert analysis.path_registry == registry
+         assert analysis.molecule_name == "butane"
+diff --git a/tests/test_utils/test_datahandling.py b/tests/test_utils/test_datahandling.py
+index d628b9f4..54a37058 100644
+--- a/tests/test_utils/test_datahandling.py
++++ b/tests/test_utils/test_datahandling.py
+@@ -1,9 +1,16 @@
+ from unittest.mock import patch
+ 
++import matplotlib.pyplot as plt
+ import numpy as np
+ import pytest
+ 
+-from mdagent.utils import load_single_traj, save_to_csv
++from mdagent.utils import load_single_traj, load_traj_with_ref, save_plot, save_to_csv
++
++
++@pytest.fixture
++def load_single_traj_mock():
++    with patch("mdagent.utils.data_handling.load_single_traj", return_value="MockTraj"):
++        yield
+ 
+ 
+ # simple helper functions for tools
+@@ -12,7 +19,9 @@ def test_load_traj_only_topology(get_registry):
+     with patch.object(
+         registry, "get_mapped_path", wraps=registry.get_mapped_path
+     ) as mocked_get_mapped_path:
+-        traj = load_single_traj(registry, "top_sim0_butane_123456")
++        traj = load_single_traj(
++            registry, "top_sim0_butane_123456", ignore_warnings=True
++        )
+         mocked_get_mapped_path.assert_called_once()
+         assert traj is not None
+ 
+@@ -32,7 +41,7 @@ def test_load_traj_topology_and_traj(get_registry):
+ def test_load_traj_fail_top_fileid(get_registry):
+     registry = get_registry("raw", False)
+     with pytest.raises(ValueError) as exc:
+-        load_single_traj(registry, "top_invalid")
++        load_single_traj(registry, "top_invalid", ignore_warnings=True)
+     assert "Topology File ID 'top_invalid' not found" in str(exc.value)
+ 
+ 
+@@ -43,6 +52,45 @@ def test_load_traj_fail_traj_fileid(get_registry):
+     assert "Trajectory File ID 'traj_invalid' not found" in str(exc.value)
+ 
+ 
++def test_load_traj_with_ref_both(get_registry, load_single_traj_mock):
++    path_registry = get_registry("raw", False)
++    traj, ref_traj = load_traj_with_ref(
++        path_registry, "top_id", "traj_id", "ref_top_id", "ref_traj_id"
++    )
++    assert traj == "MockTraj"
++    assert ref_traj == "MockTraj"
++
++
++def test_load_traj_with_ref_only_toplogy(get_registry, load_single_traj_mock):
++    path_registry = get_registry("raw", False)
++    traj, ref_traj = load_traj_with_ref(path_registry, "top_id", ignore_warnings=True)
++    assert traj == "MockTraj"
++    assert ref_traj == "MockTraj"
++
++
++def test_save_plot_success(get_registry):
++    path_registry = get_registry("raw", False)
++    fig, ax = plt.subplots()
++    ax.plot([1, 2, 3], [1, 2, 3])  # Create a plot
++    with patch("mdagent.utils.data_handling.plt.savefig"):
++        fig_id = save_plot(path_registry, "test_data", "Test plot")
++        assert "fig0_" in fig_id
++
++
++def test_save_plot_no_plot_detected(get_registry):
++    plt.close("all")  # clear any past plots
++    path_registry = get_registry("raw", False)
++    with pytest.raises(ValueError) as excinfo:
++        save_plot(path_registry, "test_analysis")
++    assert "No plot detected" in str(excinfo.value)
++
++
++def test_save_plot_wrong_registry_type():
++    with pytest.raises(ValueError) as excinfo:
++        save_plot(None, "test_analysis")
++    assert "path_registry must be an instance" in str(excinfo.value)
++
++
+ def test_save_to_csv(get_registry):
+     registry = get_registry("raw", False)
+     data = np.array([[1, 2], [3, 4]])

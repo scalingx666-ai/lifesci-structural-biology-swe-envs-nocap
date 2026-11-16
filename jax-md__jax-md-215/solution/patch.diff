@@ -1,0 +1,1107 @@
+diff --git a/jax_md/minimize.py b/jax_md/minimize.py
+index 23000583..2bd57931 100644
+--- a/jax_md/minimize.py
++++ b/jax_md/minimize.py
+@@ -160,8 +160,8 @@ def init_fn(R: PyTree, mass: Array=1.0, **kwargs) -> FireDescentState:
+     P = tree_map(lambda x: jnp.zeros_like(x), R)
+     n_pos = jnp.zeros((), jnp.int32)
+     F = force(R, **kwargs)
+-    mass = simulate.canonicalize_mass(mass)
+-    return FireDescentState(R, P, F, mass, dt_start, alpha_start, n_pos)  # pytype: disable=wrong-arg-count
++    state = FireDescentState(R, P, F, mass, dt_start, alpha_start, n_pos)  # pytype: disable=wrong-arg-count
++    return simulate.canonicalize_mass(state)
+ 
+   def apply_fn(state: FireDescentState, **kwargs) -> FireDescentState:
+     state = nve_step_fn(state, dt=state.dt, **kwargs)
+diff --git a/jax_md/rigid_body.py b/jax_md/rigid_body.py
+index c7ed5d92..8b5d9b9a 100644
+--- a/jax_md/rigid_body.py
++++ b/jax_md/rigid_body.py
+@@ -76,7 +76,6 @@
+ KeyArray = random.KeyArray
+ NeighborListFns = partition.NeighborListFns
+ ShiftFn = space.ShiftFn
+-UpdateFn = simulate.UpdateFn
+ 
+ 
+ """Quaternion Utilities.
+@@ -443,8 +442,9 @@ def _(position: RigidBody) -> int:
+   return tree_reduce(lambda accum, x: accum + x, sizes, 0)
+ 
+ 
+-@simulate.initialize_momenta.register
+-def _(R: RigidBody, mass: RigidBody, key: Array, kT: float):
++@simulate.initialize_momenta.register(RigidBody)
++def _(state, key: Array, kT: float):
++  R, mass = state.position, state.mass
+   center_key, angular_key = random.split(key)
+ 
+   P_center = jnp.sqrt(mass.center * kT) * random.normal(center_key,
+@@ -468,22 +468,56 @@ def _(R: RigidBody, mass: RigidBody, key: Array, kT: float):
+     shape, dtype = R.orientation.shape, R.orientation.dtype
+     P_orientation = scale * random.normal(angular_key, shape, dtype=dtype)
+ 
+-  return RigidBody(P_center, P_orientation)
++  return state.set(momentum=RigidBody(P_center, P_orientation))
+ 
+ 
+-def _rigid_body_3d_update(shift_fn: ShiftFn, m_rot: int) -> UpdateFn:
+-  """A symplectic update function for 3d rigid bodies."""
+-  def com_update_fn(R, P, F, M, dt, **kwargs):
+-    return shift_fn(R, P * dt / M, **kwargs)
++class EmptyLeaf:
++  pass
++_EMPTY_LEAF = EmptyLeaf()
++
++
++def split_center_and_orientation(dc):
++  def grab_center(x):
++    if isinstance(x, RigidBody):
++      return x.center
++    return _EMPTY_LEAF
++  def grab_orientation(x):
++    if isinstance(x, RigidBody):
++      return x.orientation
++    return _EMPTY_LEAF
++  def grab_rest(x):
++    if isinstance(x, RigidBody):
++      return _EMPTY_LEAF
++    return x
++  is_rigid = lambda x: isinstance(x, RigidBody)
++  c = tree_map(grab_center, dc, is_leaf=is_rigid)
++  o = tree_map(grab_orientation, dc, is_leaf=is_rigid)
++  r = tree_map(grab_rest, dc, is_leaf=is_rigid)
++  return r, c, o
++
++
++def merge_center_and_orientation(rest, center, orientation):
++  def merge_fn(r, c, o):
++    if r is _EMPTY_LEAF:
++      return RigidBody(c, o)
++    return r
++  return tree_map_no_quat(merge_fn, rest, center, orientation)
++
+ 
++MOMENTUM_PERMUTATION = [
++  vmap(lambda q: jnp.array([-q[1], q[0], q[3], -q[2]])),
++  vmap(lambda q: jnp.array([-q[2], -q[3], q[0], q[1]])),
++  vmap(lambda q: jnp.array([-q[3], q[2], -q[1], q[0]])),
++]
++
++
++def _rigid_body_3d_position_step(state, shift_fn: ShiftFn, dt, m_rot: int,
++                                 **kwargs):
++  """A symplectic update function for 3d rigid bodies."""
+   def free_rotor(k, dt, quat, p_quat, M):
+     delta = dt / m_rot
+ 
+-    P = [
+-         vmap(lambda q: jnp.array([-q[1], q[0], q[3], -q[2]])),
+-         vmap(lambda q: jnp.array([-q[2], -q[3], q[0], q[1]])),
+-         vmap(lambda q: jnp.array([-q[3], q[2], -q[1], q[0]])),
+-    ]
++    P = MOMENTUM_PERMUTATION
+ 
+     if M.ndim == 1:
+       Mk = M[k]
+@@ -491,6 +525,7 @@ def free_rotor(k, dt, quat, p_quat, M):
+       Mk = M[:, [k]]
+     else:
+       raise NotImplementedError()
++
+     zeta = delta * jnp.einsum('ij,ij->i', p_quat, P[k](quat) / (4 * Mk))
+     zeta = zeta[:, None]
+     quat = jnp.cos(zeta) * quat + jnp.sin(zeta) * P[k](quat)
+@@ -498,84 +533,114 @@ def free_rotor(k, dt, quat, p_quat, M):
+ 
+     return quat, p_quat
+ 
+-  def quaternion_update_fn(R, P, F, M, dt, **kwargs):
++  def orientation_update(state, dt, **kwargs):
+     dt_2 = dt / 2
++    R = state.position
++    P = state.momentum
+     if not (isinstance(R, Quaternion) and isinstance(P, Quaternion)):
+       raise ValueError('For 3d rigid bodies, orientations must be quaternions.'
+                        f'Found {type(R)} for positions and {type(P)} for '
+                        'momenta.')
+     R = R.vec
+     P = P.vec
++    M = state.mass
+     for _ in range(m_rot):
+       R, P = free_rotor(2, dt_2, R, P, M)
+       R, P = free_rotor(1, dt_2, R, P, M)
+       R, P = free_rotor(0, dt, R, P, M)
+       R, P = free_rotor(1, dt_2, R, P, M)
+       R, P = free_rotor(2, dt_2, R, P, M)
+-    return Quaternion(R), Quaternion(P)
+-
+-  def update_fn(R, P, F, M, dt, **kwargs):
+-    R_cm = com_update_fn(R.center, P.center, F.center, M.center, dt, **kwargs)
+-    R_or, P_or = quaternion_update_fn(
+-      R.orientation,
+-      P.orientation,
+-      F.orientation,
+-      M.orientation,
+-      dt,
+-      **kwargs
+-    )
+-    R = dataclasses.replace(R, center=R_cm, orientation=R_or)
+-    P = dataclasses.replace(P, orientation=P_or)
+-    return R, P, F, M
+-
+-  return update_fn
+-
+-
+-def _rigid_body_2d_update(shift_fn: ShiftFn) -> UpdateFn:
++    return state.set(position=Quaternion(R), momentum=Quaternion(P))
++
++  rest, center, orientation = split_center_and_orientation(state)
++  center = simulate.position_step(center, shift_fn, dt, **kwargs)
++  orientation = orientation_update(orientation, dt, **kwargs)
++  return merge_center_and_orientation(rest, center, orientation)
++
++
++def _rigid_body_2d_position_step(state, shift_fn: ShiftFn, dt,
++                                 **kwargs):
+   """A symplectic update function for 2d rigid bodies."""
+-  def com_update_fn(R, P, F, M, dt, **kwargs):
+-    return shift_fn(R, P * dt / M, **kwargs)
++  rest, center, orientation = split_center_and_orientation(state)
++  center = simulate.position_step(center, shift_fn, dt, **kwargs)
++  orientation = simulate.position_step(orientation,
++                                       lambda r, dr, **_: r + dr, dt,
++                                       **kwargs)
++  return merge_center_and_orientation(rest, center, orientation)
++
++
++@simulate.position_step.register(RigidBody)
++def _(state, shift_fn, dt, m_rot=1, **kwargs):
++  if isinstance(state.position.orientation, Quaternion):
++    return _rigid_body_3d_position_step(state, shift_fn, dt, m_rot=m_rot,
++                                        **kwargs)
++  else:
++    return _rigid_body_2d_position_step(state, shift_fn, dt, **kwargs)
+ 
+-  def orientation_update_fn(R, P, F, M, dt, **kwargs):
+-    return R + dt * P / M
+ 
+-  def update_fn(R, P, F, M, dt, **kwargs):
+-    R_cm = com_update_fn(R.center, P.center, F.center, M.center, dt, **kwargs)
+-    R_or = orientation_update_fn(
+-      R.orientation,
+-      P.orientation,
+-      F.orientation,
+-      M.orientation,
+-      dt,
+-      **kwargs
+-    )
+-    return dataclasses.replace(R, center=R_cm, orientation=R_or), P, F, M
++@simulate.stochastic_step.register(RigidBody)
++def _(state, dt: float, kT: float, gamma: float):
++  key, center_key, orientation_key = random.split(state.rng, 3)
+ 
+-  return update_fn
++  rest, center, orientation = split_center_and_orientation(state)
+ 
++  center = simulate.stochastic_step(
++    center.set(rng=center_key),
++    dt,
++    kT,
++    gamma.center)
+ 
+-@simulate.inner_update_fn.register
+-def _(R: RigidBody, shift_fn: Callable[..., Array], m_rot=1, **unused_kwargs):
+-  if isinstance(R.orientation, Quaternion):
+-    return _rigid_body_3d_update(shift_fn, m_rot=m_rot)
+-  else:
+-    return _rigid_body_2d_update(shift_fn)
++  Pi = orientation.momentum.vec
++  I = orientation.mass
++  G = gamma.orientation
++
++  M = 4 / jnp.sum(1 / I, axis=-1)
++  Q = orientation.position.vec
++  P = MOMENTUM_PERMUTATION
++
++  # First evaluate PI term
++  Pi_mean = 0
++  for l in range(3):
++    I_l = I[:, [l], None]
++    M_l = M[:, None, None]
++    PP = P[l](Q)[:, None, :] * P[l](Q)[:, :, None]
++    Pi_mean += jnp.exp(-G * M_l * dt / (4 * I_l)) * PP
++  Pi_mean = jnp.einsum('nij,nj->ni', Pi_mean, Pi)
+ 
++  # Then evaluate Q term
++  Pi_var = 0
++  for l in range(3):
++    scale = jnp.sqrt(4 * kT * I[:, l] *
++                     (1 - jnp.exp(-M * G * dt / (2 * I[:, l]))))
++    Pi_var += (scale[:, None] * P[l](Q))**2
+ 
+-@simulate.canonicalize_mass.register
+-def _(mass: RigidBody) -> RigidBody:
++  momentum_dist = simulate.Normal(Pi_mean, Pi_var)
++  new_momentum = Quaternion(momentum_dist.sample(orientation_key))
++  orientation = orientation.set(momentum=new_momentum)
++
++  return merge_center_and_orientation(rest.set(rng=key), center, orientation)
++
++
++@simulate.canonicalize_mass.register(RigidBody)
++def _(state):
++  mass = state.mass
+   if len(mass.center) == 1:
+-    return RigidBody(mass.center[0], mass.orientation)
++    return state.set(mass=RigidBody(mass.center[0], mass.orientation))
+   elif len(mass.center) > 1:
+-    return RigidBody(mass.center[:, None], mass.orientation)
++    return state.set(mass=RigidBody(mass.center[:, None], mass.orientation))
+   raise NotImplementedError(
+     'Center of mass must be either a scalar or a vector. Found an array of '
+     f'shape {mass.center.shape}.')
+ 
+ 
+-@simulate.kinetic_energy.register
+-def _(R: RigidBody, P: RigidBody, M: RigidBody) -> Array:
+-  return kinetic_energy(R, P, M)
++@simulate.kinetic_energy.register(RigidBody)
++def _(state) -> Array:
++  return kinetic_energy(state.position, state.momentum, state.mass)
++
++
++@simulate.temperature.register(RigidBody)
++def _(state) -> Array:
++  return temperature(state.position, state.momentum, state.mass)
+ 
+ 
+ """Rigid bodies as unions of point-like particles.
+@@ -806,7 +871,8 @@ def transform(body: RigidBody, shape: RigidPointUnion) -> Array:
+ 
+ def union_to_points(body: RigidBody,
+                     shape: RigidPointUnion,
+-                    shape_species: Optional[onp.ndarray]=None
++                    shape_species: Optional[onp.ndarray]=None,
++                    **kwargs,
+                     ) -> Tuple[Array, Optional[Array]]:
+   """Transforms points in a RigidPointUnion to world space."""
+   if shape_species is None:
+diff --git a/jax_md/simulate.py b/jax_md/simulate.py
+index be05753c..5a8d08b8 100644
+--- a/jax_md/simulate.py
++++ b/jax_md/simulate.py
+@@ -66,8 +66,6 @@
+ Box = space.Box
+ 
+ ShiftFn = space.ShiftFn
+-# TODO: Get a proper type for UpdateFn.
+-UpdateFn = Callable
+ 
+ T = TypeVar('T')
+ InitFn = Callable[..., T]
+@@ -75,40 +73,58 @@
+ Simulator = Tuple[InitFn, ApplyFn]
+ 
+ 
+-"""Single Dispatch Code.
++"""Dispatch By State Code.
+ 
+-JAX MD allows for simulations to be extensible using single
+-dispatch. For those familiar with C / C++, single dispatch is essentially
+-function overloading based on the type of the first argument. For those
+-unfamiliar, single dispatch chooses which version of a function to call by
+-looking up the type of the first argument. If you are interested in setting up
+-a simulation using a different type of system you can do so in a relatively
+-light weight manner by introducing a new type for storing the state that is
+-compatible with the JAX PyTree system (we usually choose a dataclass) and then
+-overriding the four functions below.
++JAX MD allows for simulations to be extensible using a dispatch strategy where
++functions are dispatched to specific cases based on the type of state provided.
++In particular, we make decisions about which function to call based on the type
++of the position argument. For those familiar with C / C++, our dispatch code is
++essentially function overloading based on the type of the positions.
++
++If you are interested in setting up a simulation using a different type of
++system you can do so in a relatively light weight manner by introducing a new
++type for storing the state that is compatible with the JAX PyTree system
++(we usually choose a dataclass) and then overriding the functions below.
+ 
+ These extensions allow a range of simulations to be run by just changing the
+-type of the position argument. In general, the most complicated function will
+-be the `inner_update_fn` which should be induced by the Suzuki-Trotter
+-decomposition for a given simulation environment. At the moment this set of
+-extensible functions works with deterministic NVE and NVT simulation
+-environments but not NPT or stochatic ones (like Langevin or Brownian). If that
+-use-case is important to you, please raise an issue. It is likely there will be
+-an additional function lookup needed in those cases.
++type of the position argument. There are essentially two types of functions to
++be overloaded. Functions that compute physical quantities, such as the kinetic
++energy, and functions that evolve a state according to the Suzuki-Trotter
++decomposition. Specifically, one might want to override the position step,
++momentum step for deterministic and stochastic simulations or the
++`stochastic_step` for stochastic simulations (e.g Langevin).
+ """
+ 
+ 
+-@functools.singledispatch
+-def canonicalize_mass(mass: Union[Array, float]) -> Union[Array, float]:
++class dispatch_by_state:
++  """Wrap a function and dispatch based on the type of positions."""
++  def __init__(self, fn):
++    self._fn = fn
++    self._registry = {}
++
++  def __call__(self, state, *args, **kwargs):
++    if type(state.position) in self._registry:
++      return self._registry[type(state.position)](state, *args, **kwargs)
++    return self._fn(state, *args, **kwargs)
++
++  def register(self, oftype):
++    def register_fn(fn):
++      self._registry[oftype] = fn
++    return register_fn
++
++
++@dispatch_by_state
++def canonicalize_mass(state: T) -> T:
+   """Reshape mass vector for broadcasting with positions."""
++  mass = state.mass
+   if isinstance(mass, float):
+-    return mass
++    return state
+   if mass.ndim == 2 and mass.shape[1] == 1:
+-    return mass
++    return state
+   elif mass.ndim == 1:
+-    return jnp.reshape(mass, (mass.shape[0], 1))
++    return state.set(mass=jnp.reshape(mass, (mass.shape[0], 1)))
+   elif mass.ndim == 0:
+-    return mass
++    return state
+   msg = (
+       'Expected mass to be either a floating point number or a one-dimensional'
+       'ndarray. Found {}.'.format(mass)
+@@ -116,45 +132,48 @@ def canonicalize_mass(mass: Union[Array, float]) -> Union[Array, float]:
+   raise ValueError(msg)
+ 
+ 
+-@functools.singledispatch
+-def initialize_momenta(R: Array, mass: Array, key: Array, kT: float):
++@dispatch_by_state
++def initialize_momenta(state: T, key: Array, kT: float) -> T:
+   """Initialize momenta with the Maxwell-Boltzmann distribution."""
++  R, mass = state.position, state.mass
+   P = jnp.sqrt(mass * kT) * random.normal(key, R.shape, dtype=R.dtype)
+   # If simulating more than one particle, center the momentum.
+   if R.shape[0] > 1:
+     P = P - jnp.mean(P, axis=0, keepdims=True)
+-  return P
+-
+-
+-@functools.singledispatch
+-def inner_update_fn(R: Array, shift_fn: Callable[..., Array],
+-                       **unused_kwargs
+-                       ) -> UpdateFn:
+-  """Perform the inner update in the Suzuki-Trotter decomposition.
+-
+-  This function assumes that the simulation employs a factorization that looks
+-  like :math:`e^{iL_{other}dt}e^{iL_vdt/2}e^{iL_{inner}dt}e^{iL_vdt/2}e^{iL_{other}dt}`
+-  where it is assumed that :math:`e^{iL_{other}}` does not update the velocity
+-  or the position, :math:`e^{iL_vdt/2}` only updates the velocity, and
+-  :math:`e^{iL_{inner}dt}` is arbitrary. This setting covers the NVE and NVT
+-  ensemble, but not the NPT.
+-
+-  Since the inner update function is arbitrary, it takes positions, momenta,
+-  forces, and masses as input and returns a new set of positions, momenta,
+-  forces, and masses. In general, this function should be chosen to implement
+-  a factorization of the total Liouville operator for a given simulation
+-  environment given the total form above.
+-  """
+-  def update_fn(R: Array, P: Array, F: Array, M: Array, dt: float, **kwargs
+-               ) -> Tuple[Array, ...]:
+-    return (shift_fn(R, dt * P / M, **kwargs), P, F, M)
+-  return update_fn
++  return state.set(momentum=P)
++
++
++@dispatch_by_state
++def momentum_step(state: T, dt: float) -> T:
++  """Apply a single step of the time evolution operator for momenta."""
++  assert hasattr(state, 'momentum')
++  new_momentum = tree_map(lambda p, f: p + dt * f,
++                          state.momentum,
++                          state.force)
++  return state.set(momentum=new_momentum)
++
++
++@dispatch_by_state
++def position_step(state: T, shift_fn: Callable, dt: float, **kwargs) -> T:
++  """Apply a single step of the time evolution operator for positions."""
++  new_position = tree_map(lambda s_fn, r, p, m: s_fn(r, dt * p / m, **kwargs),
++                          shift_fn,
++                          state.position,
++                          state.momentum,
++                          state.mass)
++  return state.set(position=new_position)
++
++
++@dispatch_by_state
++def kinetic_energy(state: T) -> Array:
++  """Compute the kinetic energy of a state."""
++  return quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
+ 
+ 
+-@functools.singledispatch
+-def kinetic_energy(R: Array, P: Array, M: Array):
+-  """Compute the kinetic energy, possibly as a function of position."""
+-  return quantity.kinetic_energy(momentum=P, mass=M)
++@dispatch_by_state
++def temperature(state: T) -> Array:
++  """Compute the temperature of a state."""
++  return quantity.temperature(momentum=state.momentum, mass=state.mass)
+ 
+ 
+ """Deterministic Simulations
+@@ -182,31 +201,20 @@ def kinetic_energy(R: Array, P: Array, M: Array):
+ 
+ 
+ def velocity_verlet(force_fn: Callable[..., Array],
+-                    update_fn: UpdateFn,
++                    shift_fn: ShiftFn,
+                     dt: float,
+                     state: T,
+                     **kwargs) -> T:
+   """Apply a single step of velocity Verlet integration to a state."""
+   dt = f32(dt)
+   dt_2 = f32(dt / 2)
+-  dt2_2 = f32(dt ** 2 / 2)
+-
+-  R, P, F, M = state.position, state.momentum, state.force, state.mass
+-
+-  # First half step.
+-  P = tree_map(lambda p, f: p + dt_2 * f, P, F)
+-
+-  # Update positional degrees of freedom.
+-  R, P, F, M = update_fn(R, P, F, M, dt, **kwargs)
+ 
+-  # Second half step.
+-  F = force_fn(R, **kwargs)
+-  P = tree_map(lambda p, f: p + dt_2 * f, P, F)
++  state = momentum_step(state, dt_2)
++  state = position_step(state, shift_fn, dt, **kwargs)
++  state = state.set(force=force_fn(state.position, **kwargs))
++  state = momentum_step(state, dt_2)
+ 
+-  return dataclasses.replace(state,
+-                             position=R,
+-                             momentum=P,
+-                             force=F)
++  return state
+ 
+ 
+ # Constant Energy Simulations
+@@ -263,19 +271,15 @@ def nve(energy_or_force_fn, shift_fn, dt=1e-3, **sim_kwargs):
+ 
+   @jit
+   def init_fn(key, R, kT, mass=f32(1.0), **kwargs):
+-    mass = canonicalize_mass(mass)
+-    P = initialize_momenta(R, mass, key, kT)
+     force = force_fn(R, **kwargs)
+-    return NVEState(R, P, force, mass)
++    state = NVEState(R, None, force, mass)
++    state = canonicalize_mass(state)
++    return initialize_momenta(state, key, kT)
+ 
+   @jit
+   def step_fn(state, **kwargs):
+-    _dt = dt
+-    if 'dt' in kwargs:
+-      _dt = kwargs['dt']
+-      del kwargs['dt']
+-    update_fn = inner_update_fn(state.position, shift_fn, **sim_kwargs)
+-    return velocity_verlet(force_fn, update_fn, _dt, state, **kwargs)
++    _dt = kwargs.pop('dt', dt)
++    return velocity_verlet(force_fn, shift_fn, _dt, state, **kwargs)
+ 
+   return init_fn, step_fn
+ 
+@@ -570,40 +574,37 @@ def nvt_nose_hoover(energy_or_force_fn: Callable[..., Array],
+     tau = dt * 100
+   tau = f32(tau)
+ 
+-  chain_fns = nose_hoover_chain(dt, chain_length, chain_steps, sy_steps, tau)
++  thermostat = nose_hoover_chain(dt, chain_length, chain_steps, sy_steps, tau)
+ 
+   @jit
+   def init_fn(key, R, mass=f32(1.0), **kwargs):
+     _kT = kT if 'kT' not in kwargs else kwargs['kT']
+ 
+-    mass = canonicalize_mass(mass)
+-
+-    P = initialize_momenta(R, mass, key, _kT)
+-    KE = kinetic_energy(R, P, mass)
+     dof = quantity.count_dof(R)
+-    return NVTNoseHooverState(R, P, force_fn(R, **kwargs), mass,
+-                              chain_fns.initialize(dof, KE, _kT))
++
++    state = NVTNoseHooverState(R, None, force_fn(R, **kwargs), mass, None)
++    state = canonicalize_mass(state)
++    state = initialize_momenta(state, key, _kT)
++    KE = kinetic_energy(state)
++    return state.set(chain=thermostat.initialize(dof, KE, _kT))
+ 
+   @jit
+   def apply_fn(state, **kwargs):
+-    update_fn = inner_update_fn(state.position, shift_fn, **sim_kwargs)
+-
+     _kT = kT if 'kT' not in kwargs else kwargs['kT']
+ 
+     chain = state.chain
+ 
+-    chain = chain_fns.update_mass(chain, _kT)
++    chain = thermostat.update_mass(chain, _kT)
+ 
+-    p, chain = chain_fns.half_step(state.momentum, chain, _kT)
+-    state = dataclasses.replace(state, momentum=p)
++    p, chain = thermostat.half_step(state.momentum, chain, _kT)
++    state = state.set(momentum=p)
+ 
+-    state = velocity_verlet(force_fn, update_fn, dt, state, **kwargs)
++    state = velocity_verlet(force_fn, shift_fn, dt, state, **kwargs)
+ 
+-    KE = kinetic_energy(state.position, state.momentum, state.mass)
+-    chain = dataclasses.replace(chain, kinetic_energy=KE)
++    chain = chain.set(kinetic_energy=kinetic_energy(state))
+ 
+-    p, chain = chain_fns.half_step(state.momentum, chain, _kT)
+-    state = dataclasses.replace(state, momentum=p, chain=chain)
++    p, chain = thermostat.half_step(state.momentum, chain, _kT)
++    state = state.set(momentum=p, chain=chain)
+ 
+     return state
+   return init_fn, apply_fn
+@@ -626,7 +627,7 @@ def nvt_nose_hoover_invariant(energy_fn: Callable[..., Array],
+     The Hamiltonian of the extended NVT dynamics.
+   """
+   PE = energy_fn(state.position, **kwargs)
+-  KE = kinetic_energy(state.position, state.momentum, state.mass)
++  KE = kinetic_energy(state)
+ 
+   DOF = quantity.count_dof(state.position)
+   E = PE + KE
+@@ -770,10 +771,6 @@ def init_fn(key, R, box, mass=f32(1.0), **kwargs):
+ 
+     _kT = kT if 'kT' not in kwargs else kwargs['kT']
+ 
+-    mass = canonicalize_mass(mass)
+-    P = initialize_momenta(R, mass, key, kT)
+-    KE = quantity.kinetic_energy(momentum=P, mass=mass)
+-
+     # The box position is defined via pos = (1 / d) log V / V_0.
+     zero = jnp.zeros((), dtype=R.dtype)
+     one = jnp.ones((), dtype=R.dtype)
+@@ -786,16 +783,22 @@ def init_fn(key, R, box, mass=f32(1.0), **kwargs):
+       # TODO(schsam): This is necessary because of JAX issue #5849.
+       box = jnp.eye(R.shape[-1]) * box
+ 
+-    return NPTNoseHooverState(R, P, force_fn(R, box=box, **kwargs), mass, box,
+-                              box_position, box_momentum, box_mass,
+-                              barostat.initialize(1, KE_box, _kT),
+-                              thermostat.initialize(R.size, KE, _kT))  # pytype: disable=wrong-arg-count
++    state = NPTNoseHooverState(
++      R, None, force_fn(R, box=box, **kwargs),
++      mass, box, box_position, box_momentum, box_mass,
++      barostat.initialize(1, KE_box, _kT),
++      None)  # pytype: disable=wrong-arg-count
++    state = canonicalize_mass(state)
++    state = initialize_momenta(state, key, _kT)
++    KE = kinetic_energy(state)
++    return state.set(
++      thermostat=thermostat.initialize(quantity.count_dof(R), KE, _kT))
+ 
+   def update_box_mass(state, kT):
+     N, dim = state.position.shape
+     dtype = state.position.dtype
+     box_mass = jnp.array(dim * (N + 1) * kT * state.barostat.tau ** 2, dtype)
+-    return dataclasses.replace(state, box_mass=box_mass)
++    return state.set(box_mass=box_mass)
+ 
+   def box_force(alpha, vol, box_fn, position, momentum, mass, force, pressure,
+                 **kwargs):
+@@ -844,7 +847,7 @@ def inner_step(state, **kwargs):
+     P = exp_iL2(alpha, P, F, P_b)
+ 
+     R_b = R_b + P_b / M_b * dt
+-    state = dataclasses.replace(state, box_position=R_b)
++    state = state.set( box_position=R_b)
+ 
+     vol, box_fn = _npt_box_info(state)
+ 
+@@ -856,9 +859,8 @@ def inner_step(state, **kwargs):
+     G_e = box_force(alpha, vol, box_fn, R, P, M, F, _pressure, **kwargs)
+     P_b = P_b + dt_2 * G_e
+ 
+-    return dataclasses.replace(state,
+-                               position=R, momentum=P, mass=M, force=F,
+-                               box_position=R_b, box_momentum=P_b, box_mass=M_b)
++    return state.set(position=R, momentum=P, mass=M, force=F,
++                     box_position=R_b, box_momentum=P_b, box_mass=M_b)
+ 
+   def apply_fn(state, **kwargs):
+     S = state
+@@ -871,21 +873,19 @@ def apply_fn(state, **kwargs):
+     P_b, bc = barostat.half_step(S.box_momentum, bc, _kT)
+     P, tc = thermostat.half_step(S.momentum, tc, _kT)
+ 
+-    S = dataclasses.replace(S, momentum=P, box_momentum=P_b)
++    S = S.set(momentum=P, box_momentum=P_b)
+     S = inner_step(S, **kwargs)
+ 
+     KE = quantity.kinetic_energy(momentum=S.momentum, mass=S.mass)
+-    tc = dataclasses.replace(tc, kinetic_energy=KE)
++    tc = tc.set(kinetic_energy=KE)
+ 
+     KE_box = quantity.kinetic_energy(momentum=S.box_momentum, mass=S.box_mass)
+-    bc = dataclasses.replace(bc, kinetic_energy=KE_box)
++    bc = bc.set(kinetic_energy=KE_box)
+ 
+     P, tc = thermostat.half_step(S.momentum, tc, _kT)
+     P_b, bc = barostat.half_step(S.box_momentum, bc, _kT)
+ 
+-    S = dataclasses.replace(S,
+-                            thermostat=tc, barostat=bc,
+-                            momentum=P, box_momentum=P_b)
++    S = S.set(thermostat=tc, barostat=bc, momentum=P, box_momentum=P_b)
+ 
+     return S
+   return init_fn, apply_fn
+@@ -911,7 +911,7 @@ def npt_nose_hoover_invariant(energy_fn: Callable[..., Array],
+   """
+   volume, box_fn = _npt_box_info(state)
+   PE = energy_fn(state.position, box=box_fn(volume), **kwargs)
+-  KE = quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
++  KE = kinetic_energy(state)
+ 
+   DOF = state.position.size
+   E = PE + KE
+@@ -935,11 +935,24 @@ def npt_nose_hoover_invariant(energy_fn: Callable[..., Array],
+ 
+ JAX MD includes integrators for stochastic simulations of Langevin dynamics and
+ Brownian motion for systems in the NVT ensemble with a solvent.
+-
+-TODO: Make Langevin and Brownian simulations work with new `tree_map`
+-formalism.
+ """
+ 
++
++@dataclasses.dataclass
++class Normal:
++  """A simple normal distribution."""
++  mean: jnp.ndarray
++  var: jnp.ndarray
++
++  def sample(self, key):
++    mu, sigma = self.mean, jnp.sqrt(self.var)
++    return mu + sigma * random.normal(key, mu.shape ,dtype=mu.dtype)
++
++  def log_prob(self, x):
++    return (-0.5 * jnp.log(2 * jnp.pi * self.var) -
++            1 / (2 * self.var) * (x - self.mean)**2)
++
++
+ @dataclasses.dataclass
+ class NVTLangevinState:
+   """A struct containing state information for the Langevin thermostat.
+@@ -966,13 +979,24 @@ def velocity(self) -> Array:
+     return self.momentum / self.mass
+ 
+ 
+-def nvt_langevin(energy_or_force: Callable[..., Array],
+-                 shift: ShiftFn,
++@dispatch_by_state
++def stochastic_step(state: NVTLangevinState, dt:float, kT: float, gamma: float):
++  """A single stochastic step (the `O` step)."""
++  c1 = jnp.exp(-gamma * dt)
++  c2 = jnp.sqrt(kT * (1 - c1**2))
++  momentum_dist = Normal(c1 * state.momentum, c2**2 * state.mass)
++  key, split = random.split(state.rng)
++  return state.set(momentum=momentum_dist.sample(split), rng=key)
++
++
++def nvt_langevin(energy_or_force_fn: Callable[..., Array],
++                 shift_fn: ShiftFn,
+                  dt: float,
+                  kT: float,
+                  gamma: float=0.1,
+-                 center_velocity: bool=True) -> Simulator:
+-  """Simulation in the NVT ensemble using the Langevin thermostat.
++                 center_velocity: bool=True,
++                 **sim_kwargs) -> Simulator:
++  """Simulation in the NVT ensemble using the BAOAB Langevin thermostat.
+ 
+   Samples from the canonical ensemble in which the number of particles (N),
+   the system volume (V), and the temperature (T) are held constant. Langevin
+@@ -982,8 +1006,8 @@ def nvt_langevin(energy_or_force: Callable[..., Array],
+   stochastic ODE described by a friction coefficient and noise of a given
+   covariance.
+ 
+-  Our implementation follows the excellent set of lecture notes by Carlon,
+-  Laleman, and Nomidis [#carlon]_ .
++  Our implementation follows the paper [#davidcheck] by Davidchack, Ouldridge,
++  and Tretyakov.
+ 
+   Args:
+     energy_or_force: A function that produces either an energy or a force from
+@@ -1004,55 +1028,37 @@ def nvt_langevin(energy_or_force: Callable[..., Array],
+     See above.
+ 
+   .. rubric:: References
+-  .. [#carlon] E. Carlon, M. Laleman, S. Nomidis. "Molecular Dynamics Simulation."
+-    http://itf.fys.kuleuven.be/~enrico/Teaching/molecular_dynamics_2015.pdf
+-    Accessed on 06/05/2019.
++  .. [#carlon] R. L. Davidchack, T. E. Ouldridge, and M. V. Tretyakov.
++    "New Langevin and gradient thermostats for rigid body dynamics."
++    The Journal of Chemical Physics 142, 144114 (2015)
+   """
++  force_fn = quantity.canonicalize_force(energy_or_force_fn)
+ 
+-  force_fn = quantity.canonicalize_force(energy_or_force)
+-
+-  dt_2 = f32(dt / 2)
+-  dt2 = f32(dt ** 2 / 2)
+-  dt32 = f32(dt ** (3.0 / 2.0) / 2)
+-
+-  kT = f32(kT)
+-
+-  gamma = f32(gamma)
+-
+-  def init_fn(key, R, mass=f32(1), **kwargs):
+-    _kT = kT if 'kT' not in kwargs else kwargs['kT']
+-    mass = canonicalize_mass(mass)
+-
++  @jit
++  def init_fn(key, R, mass=f32(1.0), **kwargs):
++    _kT = kwargs.pop('kT', kT)
+     key, split = random.split(key)
++    force = force_fn(R, **kwargs)
++    state = NVTLangevinState(R, None, force, mass, key)
++    state = canonicalize_mass(state)
++    return initialize_momenta(state, split, _kT)
+ 
+-    P = initialize_momenta(R, mass, key, kT)
+-    return NVTLangevinState(R, P, force_fn(R, **kwargs), mass, key)  # pytype: disable=wrong-arg-count
+-
+-  def apply_fn(state, **kwargs):
+-    R, P, F, mass, key = dataclasses.astuple(state)
+-
+-    _kT = kT if 'kT' not in kwargs else kwargs['kT']
+-    N, dim = R.shape
+-
+-    key, xi_key, theta_key = random.split(key, 3)
+-    xi = random.normal(xi_key, (N, dim), dtype=R.dtype)
+-    sqrt3 = f32(jnp.sqrt(3))
+-    theta = random.normal(theta_key, (N, dim), dtype=R.dtype) / sqrt3
++  @jit
++  def step_fn(state, **kwargs):
++    _dt = kwargs.pop('dt', dt)
++    _kT = kwargs.pop('kT', kT)
++    dt_2 = _dt / 2
+ 
+-    # NOTE(schsam): We really only need to recompute sigma if the temperature
+-    # is nonconstant. @Optimization
+-    # TODO(schsam): Check that this is really valid in the case that the masses
+-    # are non identical for all particles.
+-    sigma = jnp.sqrt(f32(2) * _kT * gamma * mass)
+-    C = dt2 * (F - gamma * P) + sigma * dt32 * (xi + theta)
++    state = momentum_step(state, dt_2)
++    state = position_step(state, shift_fn, dt_2, **kwargs)
++    state = stochastic_step(state, _dt, _kT, gamma)
++    state = position_step(state, shift_fn, dt_2, **kwargs)
++    state = state.set(force=force_fn(state.position, **kwargs))
++    state = momentum_step(state, dt_2)
+ 
+-    R = shift(R, (dt * P + C) / mass, **kwargs)
+-    F_new = force_fn(R, **kwargs)
+-    P = (f32(1) - dt * gamma) * P + dt_2 * (F_new + F)
+-    P = P + sigma * jnp.sqrt(dt) * xi - gamma * C
++    return state
+ 
+-    return NVTLangevinState(R, P, F_new, mass, key)  # pytype: disable=wrong-arg-count
+-  return init_fn, apply_fn
++  return init_fn, step_fn
+ 
+ 
+ @dataclasses.dataclass
+@@ -1107,9 +1113,8 @@ def brownian(energy_or_force: Callable[..., Array],
+   dt, gamma = static_cast(dt, gamma)
+ 
+   def init_fn(key, R, mass=f32(1)):
+-    mass = canonicalize_mass(mass)
+-
+-    return BrownianState(R, mass, key)  # pytype: disable=wrong-arg-count
++    state = BrownianState(R, mass, key)
++    return canonicalize_mass(state)
+ 
+   def apply_fn(state, **kwargs):
+     _kT = kT if 'kT' not in kwargs else kwargs['kT']
+diff --git a/tests/rigid_body_test.py b/tests/rigid_body_test.py
+index 40c233df..7f3710a6 100644
+--- a/tests/rigid_body_test.py
++++ b/tests/rigid_body_test.py
+@@ -106,10 +106,7 @@ def test_nve_2d_simple(self, dtype):
+     @jit
+     def total_energy(state):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+-      return energy_fn(pos) + rigid_body.kinetic_energy(pos, mom, mass)
++      return energy_fn(pos) + simulate.kinetic_energy(state)
+ 
+     state = init_fn(key, body, 1e-3, mass=shape.mass())
+     E_initial = total_energy(state)
+@@ -157,10 +154,7 @@ def test_nve_2d_multi_shape_species(self, dtype):
+     @jit
+     def total_energy(state):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+-      return energy_fn(pos) + rigid_body.kinetic_energy(pos, mom, mass)
++      return energy_fn(pos) + simulate.kinetic_energy(state)
+ 
+     state = init_fn(key, body, 1e-3, mass=shape.mass(species))
+     E_initial = total_energy(state)
+@@ -204,10 +198,7 @@ def test_nve_2d_multi_atom_species(self, dtype):
+     @jit
+     def total_energy(state):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+-      return energy_fn(pos) + rigid_body.kinetic_energy(pos, mom, mass)
++      return energy_fn(pos) + simulate.kinetic_energy(state)
+ 
+     state = init_fn(key, body, 1e-3, mass=shape.mass())
+     E_initial = total_energy(state)
+@@ -253,11 +244,8 @@ def test_nve_2d_neighbor_list(self, dtype):
+     @jit
+     def total_energy(state, nbrs):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+       return (energy_fn(pos, neighbor=nbrs) +
+-              rigid_body.kinetic_energy(pos, mom, mass))
++              simulate.kinetic_energy(state))
+ 
+     nbrs = neighbor_fn.allocate(body)
+     state = init_fn(key, body, 1e-3, mass=shape.mass(), neighbor=nbrs)
+@@ -308,11 +296,8 @@ def test_nve_2d_neighbor_list_multi_atom_species(self, dtype):
+     @jit
+     def total_energy(state, nbrs):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+       return (energy_fn(pos, neighbor=nbrs) +
+-              rigid_body.kinetic_energy(pos, mom, mass))
++              simulate.kinetic_energy(state))
+ 
+     nbrs = neighbor_fn.allocate(body)
+     state = init_fn(key, body, 1e-3, mass=shape.mass(), neighbor=nbrs)
+@@ -370,11 +355,8 @@ def test_nve_2d_neighbor_list_multi_shape_species(self, dtype):
+     @jit
+     def total_energy(state, nbrs):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+       return (energy_fn(pos, neighbor=nbrs) +
+-              rigid_body.kinetic_energy(pos, mom, mass))
++              simulate.kinetic_energy(state))
+ 
+     nbrs = neighbor_fn.allocate(body)
+     state = init_fn(key,
+@@ -461,10 +443,7 @@ def test_nve_3d_simple(self, dtype):
+     @jit
+     def total_energy(state):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+-      return energy_fn(pos) + rigid_body.kinetic_energy(pos, mom, mass)
++      return energy_fn(pos) + simulate.kinetic_energy(state)
+ 
+     state = init_fn(key, body, 1e-3, mass=shape.mass())
+     E_initial = total_energy(state)
+@@ -516,10 +495,7 @@ def test_nve_3d_multi_shape_species(self, dtype):
+     @jit
+     def total_energy(state):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+-      return energy_fn(pos) + rigid_body.kinetic_energy(pos, mom, mass)
++      return energy_fn(pos) + simulate.kinetic_energy(state)
+ 
+     state = init_fn(key, body, 1e-3, mass=shape.mass(species))
+     E_initial = total_energy(state)
+@@ -576,10 +552,7 @@ def test_nve_3d_multi_atom_shape_species(self, dtype):
+     @jit
+     def total_energy(state):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+-      return energy_fn(pos) + rigid_body.kinetic_energy(pos, mom, mass)
++      return energy_fn(pos) + simulate.kinetic_energy(state)
+ 
+     state = init_fn(key, body, 1e-3, mass=shape.mass(species))
+     E_initial = total_energy(state)
+@@ -630,11 +603,8 @@ def test_nve_3d_neighbor_list(self, dtype):
+     @jit
+     def total_energy(state, nbrs):
+       pos = state.position
+-      mom = state.momentum
+-      mass = state.mass
+-
+       return (energy_fn(pos, neighbor=nbrs) +
+-              rigid_body.kinetic_energy(pos, mom, mass))
++              simulate.kinetic_energy(state))
+ 
+     nbrs = neighbor_fn.allocate(body)
+     state = init_fn(key, body, 1e-3, mass=shape.mass(), neighbor=nbrs)
+@@ -1153,6 +1123,98 @@ def test_fire_3d_multispecies(self, dtype):
+     self.assertTrue(energy_fn(state.position) < 12.0)
+     self.assertTrue(state.position.center.dtype==dtype)
+ 
++  @parameterized.named_parameters(test_util.cases_from_list(
++      {
++          'testcase_name': f'kT={int(kT*1e3)}_dtype={dtype.__name__}',
++          'dtype': dtype,
++          'kT': kT
++      } for dtype in DTYPE for kT in [1e-3, 5e-3, 1e-2, 1e-1]))
++  def test_nvt_3d_simple_langevin(self, dtype, kT):
++    N = PARTICLE_COUNT
++    box_size = quantity.box_size_at_number_density(N, 0.1, 3)
++
++    displacement, shift = space.periodic(box_size)
++
++    key = random.PRNGKey(0)
++
++    key, pos_key, quat_key = random.split(key, 3)
++
++    R = box_size * random.uniform(pos_key, (N, 3), dtype=dtype)
++    quat_key = random.split(quat_key, N)
++    quaternion = rand_quat(quat_key, dtype)
++
++    body = rigid_body.RigidBody(R, quaternion)
++    shape = rigid_body.point_union_shape(
++      rigid_body.tetrahedron.points * jnp.array([[1.0, 2.0, 3.0]], dtype),
++      rigid_body.tetrahedron.masses
++    )
++
++    energy_fn = rigid_body.point_energy(energy.soft_sphere_pair(displacement),
++                                        shape)
++
++    dt = 5e-4
++
++    gamma = rigid_body.RigidBody(0.1, 0.1)
++    init_fn, step_fn = simulate.nvt_langevin(energy_fn, shift, dt, kT, gamma)
++
++    step_fn = jit(step_fn)
++
++    state = init_fn(key, body, mass=shape.mass())
++
++    for i in range(DYNAMICS_STEPS):
++      state = step_fn(state)
++
++    kT_final = rigid_body.temperature(state.position, state.momentum, state.mass)
++
++    tol = 5e-4 if kT < 2e-3 else kT / 10
++    self.assertAllClose(kT_final, dtype(kT), rtol=tol, atol=tol)
++
++  @parameterized.named_parameters(test_util.cases_from_list(
++      {
++          'testcase_name': f'kT={int(kT * 1e3)}_dtype={dtype.__name__}',
++          'dtype': dtype,
++          'kT': kT
++      } for dtype in DTYPE for kT in [1e-3, 5e-3, 1e-2, 1e-1]))
++  def test_nvt_langevin_3d_multi_shape_species(self, dtype, kT):
++    N = PARTICLE_COUNT
++    box_size = quantity.box_size_at_number_density(N, 0.1, 3)
++
++    displacement, shift = space.periodic(box_size)
++
++    key = random.PRNGKey(0)
++
++    key, pos_key, quat_key = random.split(key, 3)
++
++    R = box_size * random.uniform(pos_key, (N, 3), dtype=dtype)
++    quat_key = random.split(quat_key, N)
++    quaternion = rand_quat(quat_key, dtype)
++
++    species = onp.where(onp.arange(N) < N // 2, 0, 1)
++
++    body = rigid_body.RigidBody(R, quaternion)
++    shape = rigid_body.point_union_shape(
++      rigid_body.tetrahedron.points * jnp.array([[1.0, 2.0, 3.0]], f32),
++      rigid_body.tetrahedron.masses)
++    shape = rigid_body.concatenate_shapes(rigid_body.tetrahedron, shape)
++
++    energy_fn = rigid_body.point_energy(energy.soft_sphere_pair(displacement),
++                                        shape,
++                                        species)
++
++    dt = 5e-4
++    gamma = rigid_body.RigidBody(0.1, 0.1)
++    init_fn, step_fn = simulate.nvt_langevin(energy_fn, shift, dt, kT, gamma)
++
++    step_fn = jit(step_fn)
++
++    state = init_fn(key, body, shape.mass(species))
++
++    for i in range(DYNAMICS_STEPS):
++      state = step_fn(state)
++
++    kT_final = rigid_body.temperature(state.position, state.momentum, state.mass)
++    tol = 5e-4 if kT < 2e-3 else kT / 8
++    self.assertAllClose(kT_final, dtype(kT), rtol=tol, atol=tol)
+ 
+ if __name__ == '__main__':
+   absltest.main()
+diff --git a/tests/simulate_test.py b/tests/simulate_test.py
+index 79fc91d9..e2ac45a3 100644
+--- a/tests/simulate_test.py
++++ b/tests/simulate_test.py
+@@ -35,6 +35,7 @@
+ from jax_md import test_util
+ from jax_md import partition
+ from jax_md import smap
++from jax_md import dataclasses
+ from jax_md.util import *
+ 
+ from functools import partial
+@@ -68,11 +69,6 @@
+ # pylint: disable=invalid-name
+ class SimulateTest(test_util.JAXMDTestCase):
+ 
+-  def test_canonicalize_mass(self):
+-    assert simulate.canonicalize_mass(3.0) == 3.0
+-    assert simulate.canonicalize_mass(f32(3.0)) == f32(3.0)
+-    assert simulate.canonicalize_mass(f64(3.0)) == f64(3.0)
+-
+   # pylint: disable=g-complex-comprehension
+   @parameterized.named_parameters(test_util.cases_from_list(
+       {
+@@ -451,7 +447,7 @@ def test_langevin_harmonic(self):
+     E = lambda x: jnp.sum(0.5 * alpha * x ** 2)
+     displacement, shift = space.free()
+ 
+-    N = 1000000
++    N = 100_000
+     steps = 1000
+     kT = 0.25
+     dt = 1e-4

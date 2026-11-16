@@ -1,0 +1,530 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7a0189532..b2c36ea43 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,6 @@
+ # Changelog
+ 
++- 2026-09-23: Adapted the memory estimate of the contactmap module - Issue #1699
+ - 2026-10-11: Removed the dead backwards `A23a`/`A26a` sialylation detection loops from `bondglycans.cns` - Issue #1711
+ - 2026-10-11: Updated glycans linkage scripts - Issue #1714
+ - 2026-10-11: Fixed the martinise library (libaa2cg) to make it deterministic - Issue #1657
+@@ -10,13 +11,13 @@
+ - 2026-09-18: Added `dnascan` module for mutagenesis scanning of DNA base pairs - Issue #1634
+ - 2026-09-17: Implemented worflow validation again general parameters - Issue #1693
+ - 2026-09-09: Adding missing execution modes to default.yaml - Issue #1690
+-- 2026-08-01: Fixed autotoppar/PRODRG topology generation when the unknown ligand is embedded in a larger system - Issue #1645
+ - 2026-09-02: Fixed identical seed per sampling_factor replica in flexref, mdref and emref - Issue #1685
+-- 2026-08-05: Harmonised running mode of test config files - Issue #1655
+ - 2026-08-10: Added missing improper for HYP - Issue #1662
+ - 2026-08-05: Removed identical duplicate `ANGLe` statements from `protein-allhdg5-4.param` and `protein-CG-Martini-2-2.param` - Issue #1589
++- 2026-08-05: Harmonised running mode of test config files - Issue #1655
+ - 2026-08-04: Added workflow module ordering validation - related to Issue #1530
+ - 2026-08-02: Fixed logging/warning leaks - Issue #1647
++- 2026-08-01: Fixed autotoppar/PRODRG topology generation when the unknown ligand is embedded in a larger system - Issue #1645
+ - 2026-07-31: Fixed D-amino acid detection - Issue #1636
+ - 2026-07-31: Fixed topocg issue removing ligands - Issue #1638
+ - 2026-07-27: Added `rnascan` module for mutagenesis scanning of RNA bases (mutating interface nucleotides to A, C, G, U) - Issue #1631
+diff --git a/src/haddock/libs/libutil.py b/src/haddock/libs/libutil.py
+index fb186c875..b79b1bb99 100644
+--- a/src/haddock/libs/libutil.py
++++ b/src/haddock/libs/libutil.py
+@@ -532,47 +532,114 @@ def get_available_memory() -> float:
+     """
+     Get the available system memory in GB.
+ 
+-    Get the available virtual memory in Bytes
+-    then divide it by (1024 ^ 3) to get this value in GigaBytes
+-
+     Returns
+     -------
+     float
+-        Available memory in gigabytes (GB).
++        Available physical memory in gigabytes (GB).
+     """
+     return psutil.virtual_memory().available / (1024**3)
+ 
+ 
++# Number of heavy atoms assumed when a model cannot be read at all.
++DEFAULT_HEAVY_ATOMS = 10000
++
++# `compute_distance_matrix()` calls ``squareform(pdist(coords))``: while
++# `squareform` allocates the full (N x N) matrix the condensed N(N-1)/2 array
++# returned by `pdist` is still alive, so the peak is ~1.5x the final matrix.
++DIST_MATRIX_PEAK_FACTOR = 1.5
++
++# A float64 distance matrix holds 8 bytes per entry.
++BYTES_PER_MATRIX_ENTRY = 8
++
++
++def count_heavy_atoms(path: FilePath) -> int:
++    """
++    Count the non-hydrogen atoms of a PDB file.
++
++    Mirrors the filtering done by
++    ``haddock.modules.analysis.contactmap.contmap.extract_pdb_dt()``, which
++    skips hydrogens, so that the count matches the number of coordinates that
++    actually end up in the distance matrix.
++
++    Parameters
++    ----------
++    path : FilePath
++        Path to the PDB file to parse.
++
++    Returns
++    -------
++    int
++        Number of heavy (non-hydrogen) ATOM/HETATM records.
++    """
++    # imported here because `libpdb` imports from this module
++    from haddock.libs.libpdb import slc_name
++
++    heavy_atoms = 0
++    with open(path, "r") as fhandler:
++        for line in fhandler:
++            if not line.startswith(("ATOM", "HETATM")):
++                continue
++            atname = line[slc_name].strip()
++            if not atname or atname[0] == "H":
++                continue
++            heavy_atoms += 1
++    return heavy_atoms
++
++
+ def get_necessary_memory(models: list) -> float:
+     """
+-    Estimate the memory required to compute contact maps.
++    Estimate the memory required to compute the contact map of one model.
+ 
+-    Calculates memory based on the largest model's estimated atom count.
+-    The memory estimate assumes a distance matrix of size (atoms x atoms) * 8 bytes.
++    The largest of the input models is located by its file size (a cheap
++    ``stat``), and only that one is parsed to obtain the exact number of heavy
++    atoms.  The estimate is the peak allocation of the (atoms x atoms) float64
++    distance matrix built by `compute_distance_matrix()`.
++
++    The returned value is the requirement of a *single* contact map job; the
++    caller must scale it by the number of jobs running concurrently.
+ 
+     Parameters
+     ----------
+     models : list
+-        List of model objects with file_name attribute.
++        List of `PDBFile` objects.
+ 
+     Returns
+     -------
+     float
+         Estimated memory requirement in gigabytes (GB).
+     """
+-    # Compute an approximation of the matrix size
+-    # Most models will be similar, so just use the first one
+-    try:
+-        file_size = os.path.getsize(models[0].file_name)
+-        estimated_atoms = file_size // 10
+-    except Exception:
+-        estimated_atoms = 10000
++    # `PDBFile.file_name` is a bare basename while the models of the previous
++    # step are addressed by `rel_path`, so always go through `rel_path`.
++    sizes: list[tuple[int, Path]] = []
++    for model in models:
++        path = Path(model.rel_path)
++        try:
++            sizes.append((os.path.getsize(path), path))
++        except OSError as err:
++            log.debug(f"Could not stat {path} while estimating memory: {err}")
+ 
+-    if estimated_atoms == 0:
+-        estimated_atoms = 10000
++    heavy_atoms = DEFAULT_HEAVY_ATOMS
++    if sizes:
++        _, biggest = max(sizes, key=lambda entry: entry[0])
++        try:
++            heavy_atoms = count_heavy_atoms(biggest)
++        except OSError as err:
++            log.warning(
++                f"Could not read {biggest} to estimate the memory required by "
++                f"the contact map ({err}); "
++                f"assuming {DEFAULT_HEAVY_ATOMS} heavy atoms."
++            )
++    elif models:
++        log.warning(
++            "Could not access any input model to estimate the memory required "
++            f"by the contact map; assuming {DEFAULT_HEAVY_ATOMS} heavy atoms."
++        )
+ 
+-    matrix_size_bytes = (estimated_atoms * estimated_atoms) * 8
+-    # Convert it into GigaBytes
+-    matrix_size_gb = matrix_size_bytes / (1024**3)
++    if heavy_atoms == 0:
++        heavy_atoms = DEFAULT_HEAVY_ATOMS
+ 
+-    return matrix_size_gb
++    matrix_size_bytes = (
++        DIST_MATRIX_PEAK_FACTOR * (heavy_atoms * heavy_atoms) * BYTES_PER_MATRIX_ENTRY
++    )
++    # Convert it into GigaBytes
++    return matrix_size_bytes / (1024**3)
+diff --git a/src/haddock/modules/analysis/contactmap/__init__.py b/src/haddock/modules/analysis/contactmap/__init__.py
+index d9ba3e632..2b1f8657f 100644
+--- a/src/haddock/modules/analysis/contactmap/__init__.py
++++ b/src/haddock/modules/analysis/contactmap/__init__.py
+@@ -71,33 +71,6 @@ def _run(self) -> None:
+         except AttributeError as e:
+             self.finish_with_error(e)
+ 
+-        # === IMPORTANT ================================================================
+-        # This modules uses a NxN distance matrix, this means that the memory
+-        # requirement will increase quadratically and can fail with an out-of-memory
+-        # error. Changing this behaviour would require a total re-write of the module
+-        # as of 04-2026 so instead we apply the following workaround:
+-        #  - Check what is the total size of the models (size is faster than reading)
+-        #  - Guesstimate how many atoms in total it would have based on the size
+-        #  - Calculate the expected matrix size and its memory requirements
+-        #  - Get how much memory the current host system has
+-        #  - If the system has less memory than needed, fail graciously
+-        current_memory = get_available_memory()
+-        needed_memory = get_necessary_memory(models) * self.params["ncores"]
+-        if current_memory < needed_memory:
+-            self.log(
+-                msg=(
+-                    f"Not enough memory to execute `contactmap` "
+-                    f"(needs {needed_memory:.2f}Gb has {current_memory:.2f}Gb). "
+-                    "! Skipping this module !"
+-                ),
+-                level="warning",
+-            )
+-            self.output_models = models
+-            self.export_io_models()
+-            return
+-
+-        # ==============================================================================
+-
+         # Obtain clusters
+         clusters_sets = get_clusters_sets(models)
+ 
+@@ -141,9 +114,53 @@ def _run(self) -> None:
+                 )
+                 contact_jobs.append(contmap_job)
+ 
++        # === IMPORTANT ================================================================
++        # This modules uses a NxN distance matrix, this means that the memory
++        # requirement will increase quadratically and can fail with an out-of-memory
++        # error. Changing this behaviour would require a total re-write of the module
++        # as of 04-2026 so instead we apply the following workaround:
++        #  - Find the largest input model and count its heavy atoms
++        #  - Calculate the expected matrix size and its memory requirements
++        #  - Get how much memory the current host system has
++        #  - Run as many jobs in parallel as that memory can feed, down to a single one
++        #  - Only when even one job does not fit, fail graciously
++        engine_params = self.params
++        per_job_memory = get_necessary_memory(models)
++        current_memory = get_available_memory()
++        # Each job holds one distance matrix, and at most `ncores` of them run at once
++        concurrent_jobs = min(self.params["ncores"], len(contact_jobs))
++        if current_memory < per_job_memory * concurrent_jobs:
++            # Running slower is better than not running at all, so keep only as many
++            # cores as the available memory can feed
++            affordable_jobs = int(current_memory // per_job_memory)
++            if affordable_jobs < 1:
++                self.log(
++                    msg=(
++                        f"Not enough memory to execute `contactmap` (needs "
++                        f"{per_job_memory:.2f}Gb for a single model, has "
++                        f"{current_memory:.2f}Gb). ! Skipping this module !"
++                    ),
++                    level="warning",
++                )
++                self.output_models = models
++                self.export_io_models()
++                return
++            self.log(
++                msg=(
++                    f"Not enough memory to run {concurrent_jobs} `contactmap` jobs in "
++                    f"parallel (needs {per_job_memory * concurrent_jobs:.2f}Gb has "
++                    f"{current_memory:.2f}Gb); reducing the number of cores to "
++                    f"{affordable_jobs}."
++                ),
++                level="warning",
++            )
++            engine_params = {**self.params, "ncores": affordable_jobs}
++
++        # ==============================================================================
++
+         # Find execution engine
+         exec_mode = get_analysis_exec_mode(self.params["mode"])
+-        Engine = get_engine(exec_mode, self.params)
++        Engine = get_engine(exec_mode, engine_params)
+         engine = Engine(contact_jobs)
+         engine.run()
+ 
+diff --git a/tests/test_module_contmap.py b/tests/test_module_contmap.py
+index b6bf8b38a..e714474db 100644
+--- a/tests/test_module_contmap.py
++++ b/tests/test_module_contmap.py
+@@ -1,9 +1,11 @@
+ """Test the CONTact MAP module."""
+ 
+ import os
++import shutil
+ import tempfile
+ from pathlib import Path
+ from typing import Callable
++from unittest.mock import patch
+ 
+ import numpy as np
+ import pytest
+@@ -22,6 +24,7 @@
+     ctrl_rib_chords,
+     datakey_to_colorscale,
+     extract_pdb_coords,
++    extract_pdb_dt,
+     extract_submatrix,
+     gen_contact_dt,
+     invPerm,
+@@ -36,6 +39,9 @@
+     write_res_contacts,
+ )
+ from haddock.libs.libutil import (
++    DEFAULT_HEAVY_ATOMS,
++    DIST_MATRIX_PEAK_FACTOR,
++    count_heavy_atoms,
+     get_available_memory,
+     get_necessary_memory,
+ )
+@@ -615,6 +621,11 @@ def test_make_ideogram_arc_moduloAB():
+         assert np.isclose(arc_positions[i], excpected_output[i], atol=0.0001)
+ 
+ 
++def _expected_gb(n_atoms: int) -> float:
++    """Reference formula for the peak distance-matrix allocation."""
++    return DIST_MATRIX_PEAK_FACTOR * n_atoms * n_atoms * 8 / (1024**3)
++
++
+ def test_get_available_memory():
+     """Test get_available_memory function."""
+     memory = get_available_memory()
+@@ -623,32 +634,80 @@ def test_get_available_memory():
+     assert memory > 0
+ 
+ 
++def test_count_heavy_atoms():
++    """Heavy atom count must match the atoms kept by `extract_pdb_dt`."""
++    pdb = Path(golden_data, "protprot_complex_1.pdb")
++    counted = count_heavy_atoms(pdb)
++
++    # `extract_pdb_dt` is the consumer that defines what lands in the matrix
++    pdb_dt = extract_pdb_dt(pdb)
++    from_parser = sum(
++        len(pdb_dt[chain][resid]["atoms"])
++        for chain in pdb_dt["chain_order"]
++        for resid in pdb_dt[chain]["order"]
++    )
++
++    assert counted == from_parser
++    # and no hydrogen slipped through
++    assert counted < sum(
++        1
++        for line in pdb.read_text().splitlines()
++        if line.startswith(("ATOM", "HETATM"))
++    )
++
++
+ def test_get_necessary_memory():
+-    """Test get_necessary_memory function with valid models."""
++    """Estimate must match the real matrix size of the *largest* model."""
+     models = [
++        PDBFile(Path(golden_data, "hpr_ensemble_1_haddock.pdb"), path=golden_data),
+         PDBFile(Path(golden_data, "protprot_complex_1.pdb"), path=golden_data),
+-        PDBFile(Path(golden_data, "protprot_complex_2.pdb"), path=golden_data),
+     ]
+     memory = get_necessary_memory(models)
+-    # Should return a positive float
+-    assert isinstance(memory, float)
+-    assert memory > 0
++
++    biggest = count_heavy_atoms(Path(golden_data, "protprot_complex_1.pdb"))
++    assert memory == pytest.approx(_expected_gb(biggest))
++    # a ~1800 heavy atom complex is tens of MB, not tens of GB
++    assert memory < 0.1
++
++
++def test_get_necessary_memory_uses_rel_path():
++    """Models are addressed by `rel_path`, not by the bare `file_name`.
++
++    At run time the module works from its own step folder while the models
++    live in the previous one, so `file_name` alone never resolves.
++    """
++    with tempfile.TemporaryDirectory() as tempdir:
++        prev_step = Path(tempdir, "1_prev")
++        this_step = Path(tempdir, "2_contactmap")
++        prev_step.mkdir()
++        this_step.mkdir()
++        shutil.copy(Path(golden_data, "protprot_complex_1.pdb"), prev_step)
++
++        model = PDBFile("protprot_complex_1.pdb", path=prev_step)
++
++        cwd = os.getcwd()
++        try:
++            os.chdir(this_step)
++            # the bare file name is not resolvable from here ...
++            assert not Path(model.file_name).exists()
++            # ... but the estimate must still be the real one
++            memory = get_necessary_memory([model])
++        finally:
++            os.chdir(cwd)
++
++        biggest = count_heavy_atoms(Path(prev_step, "protprot_complex_1.pdb"))
++        assert memory == pytest.approx(_expected_gb(biggest))
+ 
+ 
+ def test_get_necessary_memory_empty_list():
+     """Test get_necessary_memory with empty list."""
+-    models = []
+-    memory = get_necessary_memory(models)
++    memory = get_necessary_memory([])
+     # Should fall back to default estimate
+-    assert isinstance(memory, float)
+-    assert memory > 0
++    assert memory == pytest.approx(_expected_gb(DEFAULT_HEAVY_ATOMS))
+ 
+ 
+ def test_get_necessary_memory_invalid_files():
+-    """Test get_necessary_memory with invalid file paths."""
+-    from unittest.mock import patch
+-
+-    # Mock os.path.getsize to raise an exception
++    """Unreachable models fall back to the default estimate."""
+     with patch("os.path.getsize") as mock_getsize:
+         mock_getsize.side_effect = FileNotFoundError("File not found")
+ 
+@@ -656,22 +715,118 @@ def test_get_necessary_memory_invalid_files():
+             PDBFile(Path(golden_data, "protprot_complex_1.pdb"), path=golden_data),
+         ]
+         memory = get_necessary_memory(models)
+-        # Should fall back to default estimate
+-        assert isinstance(memory, float)
+-        assert memory > 0
++        assert memory == pytest.approx(_expected_gb(DEFAULT_HEAVY_ATOMS))
+ 
+ 
+ def test_get_necessary_memory_zero_bytes():
+-    """Test get_necessary_memory with zero-byte files."""
++    """A model without any heavy atom falls back to the default estimate."""
+     with tempfile.TemporaryDirectory() as tempdir:
+-        # Create a zero-byte file
+         zero_file = Path(tempdir, "empty.pdb")
+         zero_file.write_text("")
+ 
+-        models = [
+-            PDBFile(zero_file, path=str(zero_file.parent)),
+-        ]
++        models = [PDBFile(zero_file, path=str(zero_file.parent))]
+         memory = get_necessary_memory(models)
+-        # Should use default fallback (10000 atoms)
+-        assert isinstance(memory, float)
+-        assert memory > 0
++        assert memory == pytest.approx(_expected_gb(DEFAULT_HEAVY_ATOMS))
++
++
++####################################################
++# Testing of the memory guard in the module _run() #
++####################################################
++def _run_with_memory(contactmap, mocker, per_job: float, available: float):
++    """Run the module with a faked memory situation.
++
++    Returns the `ncores` the execution engine was handed, or None when the
++    module decided to skip itself.
++    """
++    contactmap.previous_io = MockPreviousIO()
++    mocker.patch(
++        "haddock.modules.analysis.contactmap.get_necessary_memory",
++        return_value=per_job,
++    )
++    mocker.patch(
++        "haddock.modules.analysis.contactmap.get_available_memory",
++        return_value=available,
++    )
++    exported = mocker.patch(
++        "haddock.modules.BaseHaddockModule.export_io_models",
++        return_value=None,
++    )
++    get_engine = mocker.patch(
++        "haddock.modules.analysis.contactmap.get_engine",
++    )
++
++    contactmap.params["ncores"] = 8
++    contactmap.run()
++
++    # models are always passed on to the next step, run or skip
++    assert exported.called
++    if not get_engine.called:
++        return None
++    return get_engine.call_args.args[1]["ncores"]
++
++
++def test_contactmap_memory_guard_plenty(contactmap, mocker):
++    """With memory to spare the requested `ncores` is left untouched."""
++    ncores = _run_with_memory(contactmap, mocker, per_job=0.01, available=32.0)
++    assert ncores == 8
++
++
++def test_contactmap_memory_guard_reduces_ncores(contactmap, mocker):
++    """When the jobs do not all fit, `ncores` drops to what memory can feed."""
++    # two jobs of 1Gb each requested, but only 1.5Gb to hand
++    ncores = _run_with_memory(contactmap, mocker, per_job=1.0, available=1.5)
++    assert ncores == 1
++
++
++class MockPreviousIOManyModels:
++    """Mocking class yielding enough unclustered models to saturate the cores."""
++
++    def retrieve_models(self, individualize: bool = False):
++        """Provide six unclustered models, i.e. six contact map jobs."""
++        models = []
++        for i in range(6):
++            model = PDBFile(
++                Path(golden_data, "protprot_complex_1.pdb"), path=golden_data
++            )
++            model.clt_id = None
++            model.score = float(i)
++            models.append(model)
++        return models
++
++
++def test_contactmap_memory_guard_reduces_to_intermediate(contactmap, mocker):
++    """The reduction is to the number of jobs that fit, not blindly down to 1."""
++    contactmap.previous_io = MockPreviousIOManyModels()
++    mocker.patch(
++        "haddock.modules.analysis.contactmap.get_necessary_memory",
++        return_value=0.5,
++    )
++    mocker.patch(
++        "haddock.modules.analysis.contactmap.get_available_memory",
++        return_value=1.6,
++    )
++    mocker.patch(
++        "haddock.modules.BaseHaddockModule.export_io_models",
++        return_value=None,
++    )
++    get_engine = mocker.patch("haddock.modules.analysis.contactmap.get_engine")
++
++    # 6 jobs of 0.5Gb would need 3.0Gb, only 1.6Gb is free -> 3 of them fit
++    contactmap.params["ncores"] = 8
++    contactmap.params["topX"] = 10
++    contactmap.run()
++
++    assert get_engine.call_args.args[1]["ncores"] == 3
++
++
++def test_contactmap_memory_guard_skips_when_one_job_too_big(contactmap, mocker):
++    """A single model that does not fit is the only reason left to skip."""
++    ncores = _run_with_memory(contactmap, mocker, per_job=2.0, available=1.5)
++    assert ncores is None
++
++
++def test_contactmap_memory_guard_does_not_mutate_params(contactmap, mocker):
++    """The reduction must not rewrite the user's requested `ncores`."""
++    _run_with_memory(contactmap, mocker, per_job=1.0, available=1.5)
++    # `params.cfg` is the record of what was asked for, keep it intact
++    assert contactmap.params["ncores"] == 8

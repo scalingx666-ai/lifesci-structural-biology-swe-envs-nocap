@@ -1,0 +1,254 @@
+diff --git a/src/DynamicsMethods/DynamicsMethods.jl b/src/DynamicsMethods/DynamicsMethods.jl
+index 045bfb576..3c8fbdb63 100644
+--- a/src/DynamicsMethods/DynamicsMethods.jl
++++ b/src/DynamicsMethods/DynamicsMethods.jl
+@@ -58,8 +58,6 @@ select_algorithm(::AbstractSimulation) = OrdinaryDiffEq.VCABM5()
+ "Select the default callbacks for this simulation type."
+ get_callbacks(::AbstractSimulation) = nothing
+ 
+-function set_quantum_derivative! end
+-
+ """
+     DynamicsVariables(::AbstractSimulation, args...)
+ 
+diff --git a/src/DynamicsMethods/EhrenfestMethods/EhrenfestMethods.jl b/src/DynamicsMethods/EhrenfestMethods/EhrenfestMethods.jl
+index d1440bf4e..8e8745115 100644
+--- a/src/DynamicsMethods/EhrenfestMethods/EhrenfestMethods.jl
++++ b/src/DynamicsMethods/EhrenfestMethods/EhrenfestMethods.jl
+@@ -32,10 +32,10 @@ function DynamicsMethods.motion!(du, u, sim::AbstractSimulation{<:AbstractEhrenf
+     DynamicsUtils.velocity!(dr, v, r, sim, t)
+     Calculators.update_electronics!(sim.calculator, r)
+     acceleration!(dv, v, r, sim, t, σ)
+-    set_quantum_derivative!(dσ, v, σ, sim)
++    DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim)
+ end
+ 
+-function set_quantum_derivative!(dσ, v, σ, sim::AbstractSimulation{<:AbstractEhrenfest})
++function DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim::AbstractSimulation{<:AbstractEhrenfest})
+     V = DynamicsUtils.calculate_density_matrix_propagator!(sim, v)
+     DynamicsUtils.commutator!(dσ, V, σ, sim.calculator.tmp_mat_complex1)
+     lmul!(-im, dσ)
+diff --git a/src/DynamicsMethods/IntegrationAlgorithms/IntegrationAlgorithms.jl b/src/DynamicsMethods/IntegrationAlgorithms/IntegrationAlgorithms.jl
+index e5e9d7167..a774de73d 100644
+--- a/src/DynamicsMethods/IntegrationAlgorithms/IntegrationAlgorithms.jl
++++ b/src/DynamicsMethods/IntegrationAlgorithms/IntegrationAlgorithms.jl
+@@ -14,5 +14,6 @@ using ....NonadiabaticMolecularDynamics:
+ include("mdef_baoab.jl")
+ include("bcocb.jl")
+ include("mint.jl")
++include("bcb_electronics.jl")
+ 
+ end # module
+diff --git a/src/DynamicsMethods/IntegrationAlgorithms/bcb_electronics.jl b/src/DynamicsMethods/IntegrationAlgorithms/bcb_electronics.jl
+new file mode 100644
+index 000000000..d75acf20d
+--- /dev/null
++++ b/src/DynamicsMethods/IntegrationAlgorithms/bcb_electronics.jl
+@@ -0,0 +1,92 @@
++
++struct BCBwithTsit5 <: OrdinaryDiffEq.OrdinaryDiffEqAlgorithm end
++
++OrdinaryDiffEq.isfsal(::BCBwithTsit5) = false
++
++mutable struct BCBwithTsit5Cache{uType,rType,vType,rateType,uEltypeNoUnits,T} <: OrdinaryDiffEq.OrdinaryDiffEqMutableCache
++    u::uType
++    uprev::uType
++    tmp::uType
++    rtmp::rType
++    vtmp::vType
++    k::rateType
++    cayley::Vector{Matrix{uEltypeNoUnits}}
++    tsit5cache::T
++end
++
++function OrdinaryDiffEq.alg_cache(::BCBwithTsit5,u,rate_prototype,::Type{uEltypeNoUnits},::Type{uBottomEltypeNoUnits},::Type{tTypeNoUnits},uprev,uprev2,f,t,dt,reltol,p,calck,inplace::Val{true}) where {uEltypeNoUnits,uBottomEltypeNoUnits,tTypeNoUnits}
++    σ = zero(DynamicsUtils.get_quantum_subsystem(u))
++    σrate = zero(DynamicsUtils.get_quantum_subsystem(rate_prototype))
++    σprev = zero(DynamicsUtils.get_quantum_subsystem(uprev))
++    σprev2 = zero(DynamicsUtils.get_quantum_subsystem(uprev2))
++    tsit5cache = OrdinaryDiffEq.alg_cache(OrdinaryDiffEq.Tsit5(), σ, σrate, uEltypeNoUnits, uBottomEltypeNoUnits, tTypeNoUnits, σprev, σprev2, f, t, dt, reltol, p, calck, inplace)
++    tmp = zero(u)
++    rtmp = zero(DynamicsUtils.get_positions(u))
++    vtmp = zero(DynamicsUtils.get_velocities(u))
++    k = zero(DynamicsUtils.get_positions(rate_prototype))
++    cayley = RingPolymers.cayley_propagator(p.beads, dt; half=false)
++    BCBwithTsit5Cache(u, uprev, tmp, rtmp, vtmp, k, cayley, tsit5cache)
++end
++
++function OrdinaryDiffEq.initialize!(integrator, cache::BCBwithTsit5Cache)
++
++    r = DynamicsUtils.get_positions(integrator.u)
++    v = DynamicsUtils.get_velocities(integrator.u)
++    σprev = DynamicsUtils.get_quantum_subsystem(integrator.u)
++    Calculators.update_electronics!(integrator.p.calculator, r)
++    if integrator.p.method isa DynamicsMethods.EhrenfestMethods.AbstractEhrenfest
++        DynamicsMethods.EhrenfestMethods.acceleration!(cache.k, v, r, integrator.p, integrator.t, σprev)
++    elseif integrator.p.method isa DynamicsMethods.SurfaceHoppingMethods.SurfaceHopping
++        DynamicsMethods.SurfaceHoppingMethods.acceleration!(cache.k, v, r, integrator.p, integrator.t, integrator.p.method.state)
++    end
++end
++
++@muladd function OrdinaryDiffEq.perform_step!(integrator, cache::BCBwithTsit5Cache, repeat_step=false)
++    @unpack t, dt, uprev, u, p = integrator
++    @unpack k, rtmp, vtmp, cayley = cache
++
++    rprev = DynamicsUtils.get_positions(uprev)
++    vprev = DynamicsUtils.get_velocities(uprev)
++    σprev = DynamicsUtils.get_quantum_subsystem(uprev)
++
++    copyto!(rtmp, rprev)
++
++    step_B!(vtmp, vprev, dt/2, k)
++    RingPolymers.transform_to_normal_modes!(p.beads, rtmp)
++    RingPolymers.transform_to_normal_modes!(p.beads, vtmp)
++    step_C!(vtmp, rtmp, cayley)
++    RingPolymers.transform_from_normal_modes!(p.beads, rtmp)
++    RingPolymers.transform_from_normal_modes!(p.beads, vtmp)
++
++    Calculators.update_electronics!(p.calculator, rtmp)
++    if p.method isa DynamicsMethods.EhrenfestMethods.AbstractEhrenfest
++        DynamicsMethods.EhrenfestMethods.acceleration!(k, vtmp, rtmp, p, t, σprev)
++    elseif p.method isa DynamicsMethods.SurfaceHoppingMethods.SurfaceHopping
++        DynamicsMethods.SurfaceHoppingMethods.acceleration!(k, vtmp, rtmp, p, t, p.method.state)
++    end
++    step_B!(DynamicsUtils.get_velocities(u), vtmp, dt/2, k)
++
++    copyto!(DynamicsUtils.get_positions(u), rtmp)
++
++    # Tsit5 algorithm modified for only quantum subsystem
++    @unpack a21,a31,a32,a41,a42,a43,a51,a52,a53,a54,a61,a62,a63,a64,a65,a71,a72,a73,a74,a75,a76 = cache.tsit5cache.tab
++    @unpack k1,k2,k3,k4,k5,k6,k7,tmp = cache.tsit5cache
++
++    DynamicsUtils.set_quantum_derivative!(k1, vtmp, σprev, p)
++    a = dt*a21
++    @.. tmp = σprev+a*k1
++    DynamicsUtils.set_quantum_derivative!(k2, vtmp, tmp, p)
++    @.. tmp = σprev+dt*(a31*k1+a32*k2)
++    DynamicsUtils.set_quantum_derivative!(k3, vtmp, tmp, p)
++    @.. tmp = σprev+dt*(a41*k1+a42*k2+a43*k3)
++    DynamicsUtils.set_quantum_derivative!(k4, vtmp, tmp, p)
++    @.. tmp = σprev+dt*(a51*k1+a52*k2+a53*k3+a54*k4)
++    DynamicsUtils.set_quantum_derivative!(k5, vtmp, tmp, p)
++    @.. tmp = σprev+dt*(a61*k1+a62*k2+a63*k3+a64*k4+a65*k5)
++    DynamicsUtils.set_quantum_derivative!(k6, vtmp, tmp, p)
++    @.. tmp = σprev+dt*(a71*k1+a72*k2+a73*k3+a74*k4+a75*k5+a76*k6)
++    copyto!(DynamicsUtils.get_quantum_subsystem(u), tmp)
++
++    integrator.destats.nf += 6
++
++end
+diff --git a/src/DynamicsMethods/SurfaceHoppingMethods/SurfaceHoppingMethods.jl b/src/DynamicsMethods/SurfaceHoppingMethods/SurfaceHoppingMethods.jl
+index db25dea06..f5e8e2466 100644
+--- a/src/DynamicsMethods/SurfaceHoppingMethods/SurfaceHoppingMethods.jl
++++ b/src/DynamicsMethods/SurfaceHoppingMethods/SurfaceHoppingMethods.jl
+@@ -58,10 +58,10 @@ function DynamicsMethods.motion!(du, u, sim::AbstractSimulation{<:SurfaceHopping
+     DynamicsUtils.velocity!(dr, v, r, sim, t)
+     Calculators.update_electronics!(sim.calculator, r)
+     acceleration!(dv, v, r, sim, t, sim.method.state)
+-    set_quantum_derivative!(dσ, v, σ, sim)
++    DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim)
+ end
+ 
+-function set_quantum_derivative!(dσ, v, σ, sim::AbstractSimulation{<:SurfaceHopping})
++function DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim::AbstractSimulation{<:SurfaceHopping})
+     V = DynamicsUtils.calculate_density_matrix_propagator!(sim, v)
+     DynamicsUtils.commutator!(dσ, V, σ, sim.calculator.tmp_mat_complex1)
+     lmul!(-im, dσ)
+diff --git a/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl b/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl
+index 81d12b5e1..2dfc4fd89 100644
+--- a/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl
++++ b/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl
+@@ -71,7 +71,7 @@ in the Shenvi, Tully paper (JCP 2009)
+ In IESH each electron is independent so we can loop through electrons and set the
+ derivative one at a time, in the standard way for FSSH.
+ """
+-function set_quantum_derivative!(dσ, v, σ, sim::Simulation{<:IESH})
++function DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim::Simulation{<:IESH})
+     V = sim.calculator.eigenvalues
+     d = sim.calculator.nonadiabatic_coupling
+     @views for i in axes(dσ, 2)       
+diff --git a/src/DynamicsUtils/density_matrix_dynamics.jl b/src/DynamicsUtils/density_matrix_dynamics.jl
+index a792a8451..77b8d649d 100644
+--- a/src/DynamicsUtils/density_matrix_dynamics.jl
++++ b/src/DynamicsUtils/density_matrix_dynamics.jl
+@@ -3,6 +3,8 @@ using ComponentArrays: ComponentArrays
+ using LinearAlgebra: diagm, mul!
+ using NonadiabaticMolecularDynamics: RingPolymers
+ 
++function set_quantum_derivative! end
++
+ function calculate_density_matrix_propagator!(sim::Simulation, v)
+     V = sim.method.density_propagator
+ 
+diff --git a/test/dynamics/bcbwithtsit5.jl b/test/dynamics/bcbwithtsit5.jl
+new file mode 100644
+index 000000000..75aed0faa
+--- /dev/null
++++ b/test/dynamics/bcbwithtsit5.jl
+@@ -0,0 +1,28 @@
++using Test
++using NonadiabaticMolecularDynamics
++using OrdinaryDiffEq: Tsit5
++using Random: seed!
++
++@testset "Ehrenfest" begin
++    sim = RingPolymerSimulation{Ehrenfest}(Atoms(2000), TullyModelOne(), 10; temperature=1e-3)
++    u = DynamicsVariables(sim, fill(10/2000, size(sim)), fill(-5, size(sim)) .+ randn(size(sim)), 1)
++    dt = 1.0
++
++    sol = run_trajectory(u, (0, 2000.0), sim; algorithm=DynamicsMethods.IntegrationAlgorithms.BCBwithTsit5(), output=(:population), saveat=0:10:2000, dt=dt)
++    sol1 = run_trajectory(u, (0, 2000.0), sim; algorithm=Tsit5(), output=(:population), saveat=0:10:2000)
++
++    @test sol.population ≈ sol1.population rtol=1e-2
++end
++
++@testset "FSSH" begin
++    sim = RingPolymerSimulation{FSSH}(Atoms(2000), TullyModelOne(), 10; temperature=1e-3)
++    u = DynamicsVariables(sim, fill(10/2000, size(sim)), fill(-5, size(sim)) .+ randn(size(sim)), 1)
++    dt = 1.0
++
++    seed!(1)
++    sol = run_trajectory(u, (0, 2000.0), sim; algorithm=DynamicsMethods.IntegrationAlgorithms.BCBwithTsit5(), output=(:population), saveat=0:10:2000, dt=dt, adaptive=false)
++    seed!(1)
++    sol1 = run_trajectory(u, (0, 2000.0), sim; algorithm=Tsit5(), output=(:population), saveat=0:10:2000, dt=dt, adaptive=false)
++
++    @test sol.population ≈ sol1.population rtol=1e-2
++end
+diff --git a/test/dynamics/dynamics.jl b/test/dynamics/dynamics.jl
+index 05b9079d6..8d3079e3c 100644
+--- a/test/dynamics/dynamics.jl
++++ b/test/dynamics/dynamics.jl
+@@ -6,6 +6,7 @@ using Test
+ @time @safetestset "MDEF BAOAB Tests" begin include("mdef_baoab.jl") end
+ @time @safetestset "MDEF Tests" begin include("mdef.jl") end
+ @time @safetestset "RPMDEF Tests" begin include("rpmdef.jl") end
++@time @safetestset "BCBwithTsit5 Tests" begin include("bcbwithtsit5.jl") end
+ @time @safetestset "FSSH Tests" begin include("fssh.jl") end
+ @time @safetestset "NRPMD Tests" begin include("nrpmd.jl") end
+ @time @safetestset "CMM Tests" begin include("cmm.jl") end
+diff --git a/test/dynamics/ehrenfest.jl b/test/dynamics/ehrenfest.jl
+index 74b5ea41f..623392e0d 100644
+--- a/test/dynamics/ehrenfest.jl
++++ b/test/dynamics/ehrenfest.jl
+@@ -27,7 +27,7 @@ atoms = Atoms(:H)
+ 
+     σ = DynamicsUtils.get_quantum_subsystem(u)
+     dσ = zero(σ)
+-    DynamicsMethods.EhrenfestMethods.set_quantum_derivative!(dσ, v, σ, sim)
++    DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim)
+ 
+     @testset "get_diabatic_population" begin
+         population = Estimators.diabatic_population(sim, u)
+diff --git a/test/dynamics/fssh.jl b/test/dynamics/fssh.jl
+index 72ccc1c53..c605c6834 100644
+--- a/test/dynamics/fssh.jl
++++ b/test/dynamics/fssh.jl
+@@ -31,7 +31,7 @@ atoms = Atoms(1)
+ 
+     σ = DynamicsUtils.get_quantum_subsystem(u)
+     dσ = zero(σ)
+-    SurfaceHoppingMethods.set_quantum_derivative!(dσ, v, σ, sim)
++    DynamicsUtils.set_quantum_derivative!(dσ, v, σ, sim)
+ 
+     @testset "get_diabatic_population" begin
+         population = Estimators.diabatic_population(sim, u)

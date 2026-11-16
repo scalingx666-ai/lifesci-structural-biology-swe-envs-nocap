@@ -1,0 +1,1256 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8dd0013..46ab319 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1657,6 +1657,7 @@ name = "proteinview"
+ version = "0.2.6"
+ dependencies = [
+  "anyhow",
++ "base64",
+  "clap",
+  "crossterm",
+  "image",
+diff --git a/Cargo.toml b/Cargo.toml
+index 513039f..c5a44d2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,7 @@ image = "0.25"
+ pdbtbx = { version = "0.12", features = ["rstar"] }
+ clap = { version = "4", features = ["derive"] }
+ anyhow = "1"
++base64 = "0.22"
+ reqwest = { version = "0.12", features = ["blocking"], optional = true }
+ tokio = { version = "1", features = ["rt", "macros"], optional = true }
+ 
+diff --git a/src/app.rs b/src/app.rs
+index 9cecae3..43b3200 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -32,6 +32,55 @@ impl VizMode {
+     }
+ }
+ 
++/// Rendering mode for the 3D viewport
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum RenderMode {
++    /// Braille dots - highest text-mode spatial resolution, monochrome per cell
++    Braille,
++    /// HD-quality colored braille via software rasterizer (Lambert shading,
++    /// z-buffer, depth fog).  Fast everywhere including SSH.
++    HalfBlock,
++    /// Full pixel graphics via Sixel/Kitty/iTerm2 - best quality, high bandwidth
++    FullHD,
++}
++
++impl RenderMode {
++    pub fn name(&self) -> &str {
++        match self {
++            Self::Braille => "Braille",
++            Self::HalfBlock => "HD",
++            Self::FullHD => "FullHD",
++        }
++    }
++}
++
++/// Whether the terminal session is local or over SSH.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum ConnectionType {
++    Local,
++    Ssh,
++}
++
++impl ConnectionType {
++    /// Detect whether the current session is running over SSH.
++    ///
++    /// This checks the `SSH_CLIENT`, `SSH_TTY`, and `SSH_CONNECTION`
++    /// environment variables. Note that this can produce false positives
++    /// in containers, CI environments, or VS Code Remote sessions where
++    /// these variables may be inherited. Users can override the default
++    /// render mode with `--fullhd` if detection is wrong.
++    pub fn detect() -> Self {
++        if std::env::var("SSH_CLIENT").is_ok()
++            || std::env::var("SSH_TTY").is_ok()
++            || std::env::var("SSH_CONNECTION").is_ok()
++        {
++            Self::Ssh
++        } else {
++            Self::Local
++        }
++    }
++}
++
+ /// Main application state
+ pub struct App {
+     pub protein: Protein,
+@@ -39,7 +88,7 @@ pub struct App {
+     pub color_scheme: ColorScheme,
+     pub viz_mode: VizMode,
+     pub current_chain: usize,
+-    pub hd_mode: bool,
++    pub render_mode: RenderMode,
+     pub show_help: bool,
+     pub show_ligands: bool,
+     pub show_interface: bool,
+@@ -52,10 +101,27 @@ pub struct App {
+     mesh_dirty: bool,
+     /// ratatui-image protocol picker for Sixel/Kitty/iTerm2 graphics.
+     pub picker: Picker,
++    /// Detected connection type (local vs SSH).
++    pub connection_type: ConnectionType,
++    /// Temporary warning when user enters FullHD over SSH.
++    pub ssh_hd_warning: bool,
++    /// Countdown frames to auto-dismiss the SSH HD warning (~90 frames = 3 seconds at 30fps).
++    pub ssh_hd_warning_frames: u8,
++    /// Set to `true` after a render-mode switch so the main loop can call
++    /// `terminal.clear()` before the next draw, forcing ratatui to redraw
++    /// every cell and preventing stale content from the previous mode.
++    pub needs_clear: bool,
+ }
+ 
+ impl App {
+-    pub fn new(mut protein: Protein, hd_mode: bool, term_cols: u16, term_rows: u16, picker: Picker, color_override: Option<ColorSchemeType>) -> Self {
++    pub fn new(
++        mut protein: Protein,
++        render_mode: RenderMode,
++        term_cols: u16,
++        term_rows: u16,
++        picker: Picker,
++        color_override: Option<ColorSchemeType>,
++    ) -> Self {
+         protein.center();
+         // If user explicitly requested pLDDT via CLI, trust that even if
+         // the heuristic disagrees.
+@@ -63,28 +129,35 @@ impl App {
+             || color_override == Some(ColorSchemeType::Plddt);
+         let total_residues = protein.residue_count();
+         let radius = protein.bounding_radius().max(1.0);
+-        // Dynamic zoom based on actual terminal size.
+-        // When a true graphics protocol (Sixel/Kitty/iTerm2) is available,
+-        // we render at full pixel resolution (cols*font_w x rows*font_h)
+-        // instead of the half-block resolution (cols x rows*2).  Scale the
+-        // zoom factor accordingly so the protein fills the viewport.
++
+         let vp_rows = term_rows.saturating_sub(4) as f64;
+         let vp_cols = term_cols as f64;
+         let (font_w, font_h) = picker.font_size();
+-        let has_graphics = hd_mode
+-            && picker.protocol_type() != ratatui_image::picker::ProtocolType::Halfblocks
+-            && font_w > 0
+-            && font_h > 0;
+-        let auto_zoom = if hd_mode {
+-            let (px_w, px_h) = if has_graphics {
+-                (vp_cols * font_w as f64, vp_rows * font_h as f64)
+-            } else {
+-                // Must match viewport.rs braille dimensions: cols*2, rows*4
+-                (vp_cols * 2.0, vp_rows * 4.0)
+-            };
+-            0.9 * px_w.min(px_h) / (2.0 * radius)
+-        } else {
+-            0.9 * (vp_cols * 2.0).min(vp_rows * 4.0) / (2.0 * radius)
++
++        let auto_zoom = match render_mode {
++            RenderMode::FullHD => {
++                let proto = picker.protocol_type();
++                let (px_w, px_h) = if proto != ratatui_image::picker::ProtocolType::Halfblocks
++                    && font_w > 0
++                    && font_h > 0
++                {
++                    (vp_cols * font_w as f64, vp_rows * font_h as f64)
++                } else {
++                    // Fallback to braille-like resolution
++                    (vp_cols * 2.0, vp_rows * 4.0)
++                };
++                0.9 * px_w.min(px_h) / (2.0 * radius)
++            }
++            RenderMode::HalfBlock => {
++                let px_w = vp_cols * 2.0;
++                let px_h = vp_rows * 4.0;
++                0.9 * px_w.min(px_h) / (2.0 * radius)
++            }
++            RenderMode::Braille => {
++                let px_w = vp_cols * 2.0;
++                let px_h = vp_rows * 4.0;
++                0.9 * px_w.min(px_h) / (2.0 * radius)
++            }
+         };
+         let mut camera = Camera::default();
+         camera.zoom = auto_zoom;
+@@ -102,13 +175,15 @@ impl App {
+         let color_scheme = ColorScheme::new(initial_scheme, total_residues);
+         let mesh_cache = generate_ribbon_mesh(&protein, &color_scheme);
+ 
++        let connection_type = ConnectionType::detect();
++
+         Self {
+             protein,
+             camera,
+             color_scheme,
+             viz_mode: VizMode::Cartoon,
+             current_chain: 0,
+-            hd_mode,
++            render_mode,
+             show_help: false,
+             show_ligands: true,
+             show_interface: false,
+@@ -118,6 +193,10 @@ impl App {
+             mesh_cache,
+             mesh_dirty: false,
+             picker,
++            connection_type,
++            ssh_hd_warning: false,
++            ssh_hd_warning_frames: 0,
++            needs_clear: false,
+         }
+     }
+ 
+@@ -195,30 +274,78 @@ impl App {
+ 
+     pub fn tick(&mut self) {
+         self.camera.tick();
++
++        // Tick down SSH HD warning
++        if self.ssh_hd_warning && self.ssh_hd_warning_frames > 0 {
++            self.ssh_hd_warning_frames -= 1;
++            if self.ssh_hd_warning_frames == 0 {
++                self.ssh_hd_warning = false;
++            }
++        }
+     }
+ 
+-    /// Recalculate the zoom factor based on current HD mode and terminal size.
+-    /// Call this after toggling `hd_mode` so the protein fills the viewport
++    /// Recalculate the zoom factor based on current render mode and terminal size.
++    /// Call this after changing `render_mode` so the protein fills the viewport
+     /// correctly for the new framebuffer dimensions.
+     pub fn recalculate_zoom(&mut self, term_cols: u16, term_rows: u16) {
+         let radius = self.protein.bounding_radius().max(1.0);
+         let vp_rows = term_rows.saturating_sub(4) as f64;
+         let vp_cols = term_cols as f64;
+         let (font_w, font_h) = self.picker.font_size();
+-        let has_graphics = self.hd_mode
+-            && self.picker.protocol_type() != ratatui_image::picker::ProtocolType::Halfblocks
+-            && font_w > 0
+-            && font_h > 0;
+-        if self.hd_mode {
+-            let (px_w, px_h) = if has_graphics {
+-                (vp_cols * font_w as f64, vp_rows * font_h as f64)
+-            } else {
+-                // Must match viewport.rs braille dimensions: cols*2, rows*4
+-                (vp_cols * 2.0, vp_rows * 4.0)
+-            };
+-            self.camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
++
++        let (px_w, px_h) = match self.render_mode {
++            RenderMode::FullHD => {
++                let proto = self.picker.protocol_type();
++                if proto != ratatui_image::picker::ProtocolType::Halfblocks
++                    && font_w > 0
++                    && font_h > 0
++                {
++                    (vp_cols * font_w as f64, vp_rows * font_h as f64)
++                } else {
++                    (vp_cols * 2.0, vp_rows * 4.0)
++                }
++            }
++            RenderMode::HalfBlock => (vp_cols * 2.0, vp_rows * 4.0),
++            RenderMode::Braille => (vp_cols * 2.0, vp_rows * 4.0),
++        };
++        self.camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
++    }
++
++    /// Toggle between Braille and HalfBlock (HD) mode.
++    /// Bound to `m`.
++    pub fn toggle_hd(&mut self, term_cols: u16, term_rows: u16) {
++        self.render_mode = match self.render_mode {
++            RenderMode::Braille => RenderMode::HalfBlock,
++            _ => RenderMode::Braille,
++        };
++        // Dismiss any stale SSH warning (no longer in FullHD)
++        self.ssh_hd_warning = false;
++        self.ssh_hd_warning_frames = 0;
++        self.needs_clear = true;
++        self.recalculate_zoom(term_cols, term_rows);
++    }
++
++    /// Upgrade to FullHD (Sixel/Kitty) or back to HalfBlock.
++    /// Bound to `M` (Shift+M).  Warns when entering FullHD over SSH.
++    pub fn toggle_fullhd(&mut self, term_cols: u16, term_rows: u16) {
++        self.render_mode = match self.render_mode {
++            RenderMode::FullHD => RenderMode::HalfBlock,
++            _ => RenderMode::FullHD,
++        };
++
++        self.needs_clear = true;
++
++        if self.render_mode == RenderMode::FullHD
++            && self.connection_type == ConnectionType::Ssh
++        {
++            self.ssh_hd_warning = true;
++            self.ssh_hd_warning_frames = 90;
+         } else {
+-            self.camera.zoom = 0.9 * (vp_cols * 2.0).min(vp_rows * 4.0) / (2.0 * radius);
++            // Leaving FullHD — dismiss any active SSH warning
++            self.ssh_hd_warning = false;
++            self.ssh_hd_warning_frames = 0;
+         }
++
++        self.recalculate_zoom(term_cols, term_rows);
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 18005be..7a778f5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -18,7 +18,7 @@ use crossterm::{
+ use ratatui::prelude::*;
+ use ratatui::layout::{Constraint, Direction, Layout};
+ 
+-use app::App;
++use app::{App, ConnectionType, RenderMode};
+ 
+ macro_rules! log {
+     ($file:expr, $($arg:tt)*) => {
+@@ -37,10 +37,18 @@ struct Cli {
+     /// Path to PDB or mmCIF file
+     file: Option<String>,
+ 
+-    /// Use HD pixel rendering (sixel/kitty)
+-    #[arg(long, alias = "pixel")]
++    /// Use HD rendering (HalfBlock over SSH, FullHD locally)
++    #[arg(long)]
+     hd: bool,
+ 
++    /// Force full pixel graphics (Sixel/Kitty/iTerm2) regardless of SSH
++    #[arg(long, alias = "pixel")]
++    fullhd: bool,
++
++    /// Render mode: braille, halfblock (or hd), fullhd (or pixel)
++    #[arg(long = "render", value_name = "MODE")]
++    render_mode: Option<String>,
++
+     /// Color scheme: structure, element, chain, plddt, bfactor, rainbow
+     #[arg(long, default_value = "structure")]
+     color: String,
+@@ -90,6 +98,34 @@ fn main() -> Result<()> {
+         std::fs::File::create(path).expect("cannot create log file")
+     });
+ 
++    // Detect connection type
++    let connection_type = ConnectionType::detect();
++    log!(logfile, "connection type: {:?}", connection_type);
++
++    // Determine render mode from CLI flags
++    let render_mode = if let Some(mode_str) = &cli.render_mode {
++        match mode_str.to_ascii_lowercase().as_str() {
++            "braille" => RenderMode::Braille,
++            "halfblock" | "hd" | "half-block" => RenderMode::HalfBlock,
++            "fullhd" | "pixel" | "full-hd" => RenderMode::FullHD,
++            _ => {
++                eprintln!("Warning: unknown render mode '{}', using default", mode_str);
++                RenderMode::Braille
++            }
++        }
++    } else if cli.fullhd {
++        // --fullhd / --pixel always forces FullHD regardless of SSH
++        RenderMode::FullHD
++    } else if cli.hd {
++        // --hd is SSH-aware: FullHD locally, HalfBlock over SSH
++        match connection_type {
++            ConnectionType::Local => RenderMode::FullHD,
++            ConnectionType::Ssh => RenderMode::HalfBlock,
++        }
++    } else {
++        RenderMode::Braille
++    };
++
+     // Get terminal dimensions before entering alternate screen
+     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+     log!(logfile, "terminal size: {}x{}", term_cols, term_rows);
+@@ -132,8 +168,8 @@ fn main() -> Result<()> {
+     };
+ 
+     // Create app with actual terminal dimensions for dynamic zoom
+-    let mut app = App::new(protein, cli.hd, term_cols, term_rows, picker, color_override);
+-    log!(logfile, "app created: hd={} chains={} zoom={:.2}", app.hd_mode, app.protein.chains.len(), app.camera.zoom);
++    let mut app = App::new(protein, render_mode, term_cols, term_rows, picker, color_override);
++    log!(logfile, "app created: render_mode={:?} chains={} zoom={:.2}", app.render_mode, app.protein.chains.len(), app.camera.zoom);
+ 
+     // Spawn dedicated input thread — decouples input from rendering so
+     // quit always works even when HD rendering is slow
+@@ -168,13 +204,20 @@ fn main() -> Result<()> {
+                 KeyCode::Char('s') => app.camera.pan(0.0, -1.0),
+                 KeyCode::Char('a') => app.camera.pan(-1.0, 0.0),
+                 KeyCode::Char('d') => app.camera.pan(1.0, 0.0),
+-                KeyCode::Char('r') => app.camera.reset(),
++                KeyCode::Char('r') => {
++                    let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
++                    app.camera.reset();
++                    app.recalculate_zoom(cols, rows);
++                },
+                 KeyCode::Char('c') => app.cycle_color(),
+                 KeyCode::Char('v') => app.cycle_viz_mode(),
+                 KeyCode::Char('m') => {
+-                    app.hd_mode = !app.hd_mode;
+                     let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+-                    app.recalculate_zoom(cols, rows);
++                    app.toggle_hd(cols, rows);
++                },
++                KeyCode::Char('M') => {
++                    let (cols, rows) = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
++                    app.toggle_fullhd(cols, rows);
+                 },
+                 KeyCode::Char('[') => app.prev_chain(),
+                 KeyCode::Char(']') => app.next_chain(),
+@@ -196,9 +239,16 @@ fn main() -> Result<()> {
+         // Adaptive frame skipping: if the previous draw took longer than the
+         // tick rate, skip frames proportionally.  User input always forces a
+         // redraw so the UI stays responsive.
++        //
++        // Do NOT call app.tick() during skipped frames — that would advance
++        // auto-rotate without a corresponding render, causing the protein to
++        // "jump" when rendering resumes.  Instead we just sleep and let the
++        // camera's dt-clamping handle the gap.
+         if frames_to_skip > 0 && !had_input {
+             frames_to_skip -= 1;
+-            app.tick();
++            // Reset the camera's tick timer so the next real tick doesn't see
++            // a huge accumulated dt from the skipped frames.
++            app.camera.reset_tick_timer();
+             std::thread::sleep(tick_rate);
+             continue;
+         }
+@@ -206,8 +256,20 @@ fn main() -> Result<()> {
+         // Render
+         frame_count += 1;
+         if frame_count <= 3 || frame_count % 300 == 0 {
+-            log!(logfile, "frame {} render start (hd={} viz={:?} interface={} last_draw={:?})",
+-                frame_count, app.hd_mode, app.viz_mode, app.show_interface, last_draw_duration);
++            log!(logfile, "frame {} render start (render_mode={:?} viz={:?} interface={} last_draw={:?})",
++                frame_count, app.render_mode, app.viz_mode, app.show_interface, last_draw_duration);
++        }
++
++        // After a render-mode switch, force ratatui to redraw every cell.
++        // Without this, its diff-based rendering may leave stale characters
++        // from the previous mode (e.g. braille dots under a FullHD image).
++        if app.needs_clear {
++            // Delete any Kitty graphics images that may be lingering from
++            // a previous FullHD session.  Harmless no-op if there are none.
++            let cleanup = render::kitty_png::KittyPngImage::cleanup_escape();
++            execute!(terminal.backend_mut(), crossterm::style::Print(&cleanup))?;
++            terminal.clear()?;
++            app.needs_clear = false;
+         }
+ 
+         let draw_start = Instant::now();
+@@ -268,10 +330,13 @@ fn main() -> Result<()> {
+ 
+         app.tick();
+ 
+-        // Always sleep to cap at ~30 FPS and prevent flooding stdout
+-        // (HD mode can produce ~170KB of ANSI sequences per frame; without
+-        // throttling the pty buffer fills and write() blocks, freezing the app)
+-        std::thread::sleep(tick_rate);
++        // Sleep for the remainder of the tick period to cap at ~30 FPS.
++        // Account for the time already spent drawing so the frame rate stays
++        // consistent regardless of render cost.
++        let elapsed = draw_start.elapsed();
++        if let Some(remaining) = tick_rate.checked_sub(elapsed) {
++            std::thread::sleep(remaining);
++        }
+     }
+ 
+     // Signal input thread to stop
+diff --git a/src/render/camera.rs b/src/render/camera.rs
+index 33a1039..a980c5a 100644
+--- a/src/render/camera.rs
++++ b/src/render/camera.rs
+@@ -52,15 +52,32 @@ impl Camera {
+     /// Auto-rotate speed in radians per second (~0.6 rad/s = one full turn in ~10s).
+     const AUTO_ROTATE_SPEED: f64 = 0.6;
+ 
++    /// Maximum dt (in seconds) that a single tick can apply.  This prevents
++    /// the protein from "jumping" when a frame takes longer than expected or
++    /// when frames are skipped.  At 30 FPS the nominal interval is ~0.033s;
++    /// we allow up to 2x that to accommodate occasional slow frames while
++    /// still clamping large gaps.
++    const MAX_DT: f64 = 0.066;
++
+     pub fn tick(&mut self) {
+         let now = Instant::now();
+-        let dt = now.duration_since(self.last_tick).as_secs_f64();
++        let raw_dt = now.duration_since(self.last_tick).as_secs_f64();
+         self.last_tick = now;
++        // Clamp dt so that a long gap (frame skip, slow draw, debugger pause)
++        // never produces a visible jump in auto-rotation.
++        let dt = raw_dt.min(Self::MAX_DT);
+         if self.auto_rotate {
+             self.rot_y -= Self::AUTO_ROTATE_SPEED * dt;
+         }
+     }
+ 
++    /// Reset the internal tick timer without applying any rotation.
++    /// Call this when skipping frames so the next real tick starts from a
++    /// fresh baseline rather than accumulating all the skipped time.
++    pub fn reset_tick_timer(&mut self) {
++        self.last_tick = Instant::now();
++    }
++
+     /// Project a 3D point to 2D using rotation matrices + orthographic projection
+     pub fn project(&self, x: f64, y: f64, z: f64) -> Projected {
+         // Rotation around X axis
+@@ -146,4 +163,44 @@ mod tests {
+         cam.rotate_z(1.0);
+         assert!(cam.rot_z < 0.0, "rotate_z(+1) should decrease rot_z, got {}", cam.rot_z);
+     }
++
++    #[test]
++    fn tick_clamps_large_dt() {
++        // Simulate a long gap (e.g. frame skip) by creating a camera whose
++        // last_tick is far in the past, then calling tick().  The rotation
++        // should be clamped to MAX_DT worth of movement.
++        let mut cam = Camera::default();
++        cam.auto_rotate = true;
++        // Manually set last_tick 500ms in the past (way more than MAX_DT)
++        cam.last_tick = Instant::now() - std::time::Duration::from_millis(500);
++        cam.tick();
++        // Expected rotation ≈ -AUTO_ROTATE_SPEED * MAX_DT = -0.6 * 0.066 = -0.0396
++        // Without clamping it would be -0.6 * 0.5 = -0.3
++        let expected_max = Camera::AUTO_ROTATE_SPEED * Camera::MAX_DT;
++        assert!(
++            cam.rot_y.abs() <= expected_max + 0.001,
++            "rotation should be clamped to at most {:.4} rad, got {:.4}",
++            expected_max,
++            cam.rot_y.abs()
++        );
++    }
++
++    #[test]
++    fn reset_tick_timer_prevents_jump() {
++        // After reset_tick_timer(), the next tick() should see near-zero dt
++        // and apply negligible rotation.
++        let mut cam = Camera::default();
++        cam.auto_rotate = true;
++        // Set last_tick far in the past
++        cam.last_tick = Instant::now() - std::time::Duration::from_secs(2);
++        // Reset timer (as the main loop does during frame skips)
++        cam.reset_tick_timer();
++        // Immediately tick — dt should be ~0
++        cam.tick();
++        assert!(
++            cam.rot_y.abs() < 0.001,
++            "rotation after reset_tick_timer + immediate tick should be ~0, got {}",
++            cam.rot_y
++        );
++    }
+ }
+diff --git a/src/render/framebuffer.rs b/src/render/framebuffer.rs
+index d29e6bd..e5d4193 100644
+--- a/src/render/framebuffer.rs
++++ b/src/render/framebuffer.rs
+@@ -31,7 +31,12 @@ pub struct Triangle {
+ 
+ impl Framebuffer {
+     /// Create a new framebuffer initialized to black with infinite depth.
++    ///
++    /// Width and height are clamped to at least 1 to avoid creating an empty
++    /// framebuffer where any `set_pixel` call would panic with index-out-of-bounds.
+     pub fn new(width: usize, height: usize) -> Self {
++        let width = width.max(1);
++        let height = height.max(1);
+         let n = width * height;
+         Self {
+             width,
+@@ -197,9 +202,9 @@ impl Framebuffer {
+             let t = ((d - z_min) * inv_range).clamp(0.0, 1.0);
+             let blend = t * fog_strength;
+             let c = &mut self.color[i];
+-            c[0] = (c[0] as f64 + (fog_color[0] as f64 - c[0] as f64) * blend) as u8;
+-            c[1] = (c[1] as f64 + (fog_color[1] as f64 - c[1] as f64) * blend) as u8;
+-            c[2] = (c[2] as f64 + (fog_color[2] as f64 - c[2] as f64) * blend) as u8;
++            c[0] = (c[0] as f64 + (fog_color[0] as f64 - c[0] as f64) * blend).clamp(0.0, 255.0) as u8;
++            c[1] = (c[1] as f64 + (fog_color[1] as f64 - c[1] as f64) * blend).clamp(0.0, 255.0) as u8;
++            c[2] = (c[2] as f64 + (fog_color[2] as f64 - c[2] as f64) * blend).clamp(0.0, 255.0) as u8;
+         }
+     }
+ 
+@@ -435,9 +440,9 @@ fn quantize_color(c: [u8; 3], step: u8) -> [u8; 3] {
+ /// Consecutive cells with identical (fg, bg) pairs are merged into a single
+ /// [`Span`] to reduce the number of styled segments ratatui needs to process.
+ ///
+-/// Colors are quantized (rounded to multiples of 4) before comparison so that
+-/// nearby shades get merged into longer runs, reducing terminal output size
+-/// while preserving smooth depth-fog gradients for cartoon mode.
++/// Color quantization is available via `quant_step` but currently disabled
++/// (`quant_step = 1`, a no-op).  Set it to e.g. 4 or 8 to reduce distinct
++/// colors and increase run-length merging at the expense of color precision.
+ #[cfg(test)]
+ pub fn framebuffer_to_widget(fb: &Framebuffer) -> Paragraph<'static> {
+     // Quantization step: 4 gives 64 levels per channel -- preserves smooth
+@@ -545,7 +550,10 @@ pub fn framebuffer_to_widget(fb: &Framebuffer) -> Paragraph<'static> {
+ /// per-cell (rather than per-pixel) coloring.
+ ///
+ /// Consecutive cells with the same foreground color are merged into a single
+-/// [`Span`] for performance (run-length encoding).
++/// [`Span`] for performance (run-length encoding).  Color quantization is
++/// available via `quant_step` but currently disabled (`quant_step = 1`, a
++/// no-op).  Set it to e.g. 4 or 8 to reduce distinct colors and increase
++/// run-length merging at the expense of color precision.
+ pub fn framebuffer_to_braille_widget(fb: &Framebuffer) -> Paragraph<'static> {
+     // Terminal cell grid dimensions derived from the framebuffer.
+     let term_cols = (fb.width + 1) / 2;
+diff --git a/src/render/hd.rs b/src/render/hd.rs
+index a57f209..ff9040b 100644
+--- a/src/render/hd.rs
++++ b/src/render/hd.rs
+@@ -32,6 +32,13 @@ pub fn render_hd_framebuffer(
+     let half_w = px_w as f64 / 2.0;
+     let half_h = px_h as f64 / 2.0;
+ 
++    // Scale line thickness and circle radii relative to framebuffer size.
++    // Values were tuned at ~160px wide (braille resolution) where 1.5px
++    // lines and circles look correct.  At FullHD (~640px+) we scale up
++    // proportionally.  Floor of 1.0 preserves the original look at low
++    // resolutions; ceiling of 3.0 caps growth on 4K terminals.
++    let ts = (px_w as f64 / 500.0).clamp(1.0, 3.0);
++
+     match viz_mode {
+         VizMode::Cartoon => {
+             for tri in mesh {
+@@ -53,16 +60,16 @@ pub fn render_hd_framebuffer(
+             }
+         }
+         VizMode::Backbone => {
+-            render_backbone_fb(&mut fb, protein, camera, color_scheme, half_w, half_h);
++            render_backbone_fb(&mut fb, protein, camera, color_scheme, half_w, half_h, ts);
+         }
+         VizMode::Wireframe => {
+-            render_wireframe_fb(&mut fb, protein, camera, color_scheme, half_w, half_h);
++            render_wireframe_fb(&mut fb, protein, camera, color_scheme, half_w, half_h, ts);
+         }
+     }
+ 
+     // Render small molecules as ball-and-stick overlay
+     if show_ligands {
+-        render_ligands_fb(&mut fb, protein, camera, color_scheme, half_w, half_h);
++        render_ligands_fb(&mut fb, protein, camera, color_scheme, half_w, half_h, ts);
+     }
+ 
+     // Post-pass: blend all rasterized pixels toward a cool blue-gray fog color
+@@ -105,6 +112,7 @@ fn render_backbone_fb(
+     color_scheme: &ColorScheme,
+     half_w: f64,
+     half_h: f64,
++    ts: f64,
+ ) {
+     for chain in &protein.chains {
+         let mut prev: Option<([f64; 3], [u8; 3])> = None;
+@@ -113,9 +121,9 @@ fn render_backbone_fb(
+                 let p = camera.project(ca.x, ca.y, ca.z);
+                 let px = to_pixel(p.x, p.y, p.z, half_w, half_h);
+                 let color = color_to_rgb(color_scheme.residue_color(residue, chain));
+-                fb.draw_circle_z(px[0], px[1], px[2], 2.5, color);
++                fb.draw_circle_z(px[0], px[1], px[2], 2.5 * ts, color);
+                 if let Some((prev_px, prev_color)) = prev {
+-                    fb.draw_thick_line_3d(prev_px, px, prev_color, 2.0);
++                    fb.draw_thick_line_3d(prev_px, px, prev_color, 2.0 * ts);
+                 }
+                 prev = Some((px, color));
+             }
+@@ -150,6 +158,7 @@ fn render_wireframe_fb(
+     color_scheme: &ColorScheme,
+     half_w: f64,
+     half_h: f64,
++    ts: f64,
+ ) {
+     for chain in &protein.chains {
+         for residue in &chain.residues {
+@@ -167,7 +176,7 @@ fn render_wireframe_fb(
+             // Draw small dots at atom positions so atoms are visible at bond
+             // intersections.
+             for (_, px, color) in &projected {
+-                fb.draw_circle_z(px[0], px[1], px[2], 1.5, *color);
++                fb.draw_circle_z(px[0], px[1], px[2], 1.5 * ts, *color);
+             }
+ 
+             // Intra-residue bonds (thick lines)
+@@ -176,7 +185,7 @@ fn render_wireframe_fb(
+                     let (a1, p1, c1) = &projected[i];
+                     let (a2, p2, _) = &projected[j];
+                     if atoms_bonded_3d(a1.x, a1.y, a1.z, a2.x, a2.y, a2.z) {
+-                        fb.draw_thick_line_3d(*p1, *p2, *c1, 1.5);
++                        fb.draw_thick_line_3d(*p1, *p2, *c1, 1.5 * ts);
+                     }
+                 }
+             }
+@@ -208,7 +217,7 @@ fn render_wireframe_fb(
+                 let px1 = to_pixel(p1.x, p1.y, p1.z, half_w, half_h);
+                 let px2 = to_pixel(p2.x, p2.y, p2.z, half_w, half_h);
+                 let color = color_to_rgb(color_scheme.atom_color(a1, res_curr, chain));
+-                fb.draw_thick_line_3d(px1, px2, color, 1.5);
++                fb.draw_thick_line_3d(px1, px2, color, 1.5 * ts);
+             }
+         }
+     }
+@@ -222,6 +231,7 @@ fn render_ligands_fb(
+     color_scheme: &ColorScheme,
+     half_w: f64,
+     half_h: f64,
++    ts: f64,
+ ) {
+     for ligand in &protein.ligands {
+         match ligand.ligand_type {
+@@ -231,7 +241,7 @@ fn render_ligands_fb(
+                     let p = camera.project(atom.x, atom.y, atom.z);
+                     let px = to_pixel(p.x, p.y, p.z, half_w, half_h);
+                     let color = color_to_rgb(color_scheme.ligand_atom_color(atom, ligand));
+-                    fb.draw_circle_z(px[0], px[1], px[2], 4.5, color);
++                    fb.draw_circle_z(px[0], px[1], px[2], 4.5 * ts, color);
+                 }
+             }
+             LigandType::Ligand => {
+@@ -256,7 +266,7 @@ fn render_ligands_fb(
+                         "P" => 3.0,
+                         "FE" | "Fe" | "ZN" | "Zn" | "MG" | "Mg" => 3.5,
+                         _ => 2.5,
+-                    };
++                    } * ts;
+                     fb.draw_circle_z(px[0], px[1], px[2], radius, *color);
+                 }
+ 
+@@ -266,7 +276,7 @@ fn render_ligands_fb(
+                         let (a1, p1, c1) = &projected[i];
+                         let (a2, p2, _) = &projected[j];
+                         if atoms_bonded_3d(a1.x, a1.y, a1.z, a2.x, a2.y, a2.z) {
+-                            fb.draw_thick_line_3d(*p1, *p2, *c1, 1.5);
++                            fb.draw_thick_line_3d(*p1, *p2, *c1, 1.5 * ts);
+                         }
+                     }
+                 }
+diff --git a/src/render/kitty_png.rs b/src/render/kitty_png.rs
+new file mode 100644
+index 0000000..f7cb76c
+--- /dev/null
++++ b/src/render/kitty_png.rs
+@@ -0,0 +1,232 @@
++//! Compressed Kitty graphics protocol transmitter using PNG encoding.
++//!
++//! ratatui-image sends Kitty images as raw RGBA32 base64-encoded (`f=32`),
++//! which is ~1.3MB per frame for a 640x384 render.  This module replaces
++//! that path with PNG encoding (`f=100`) which compresses protein renders
++//! (mostly black/transparent background) to roughly 5-15% of raw size.
++//!
++//! Unlike the original implementation which dumped the escape sequence into
++//! cell (0,0) and skipped everything else, this version uses Kitty's
++//! **unicode placeholder** mechanism (`U=1` + `\u{10EEEE}` with diacritics).
++//! Every cell in the render area is written to, so ratatui's diff engine
++//! properly clears old content — fixing both the braille-bleed-through and
++//! the ghost/smear effect when rotating.
++//!
++//! We use a **single fixed image ID** and transmit with `a=T,U=1` every
++//! frame.  Kitty atomically replaces the old image data when it receives a
++//! new transmission for the same ID, so there is no visible gap between
++//! frames — eliminating flicker entirely.  No delete commands are needed
++//! during normal rendering; cleanup is done only when leaving FullHD mode.
++
++use std::fmt::Write;
++use std::io::Cursor;
++
++use base64::Engine;
++use image::DynamicImage;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::widgets::Widget;
++
++/// Fixed image ID used for all Kitty PNG transmissions.  By reusing the
++/// same ID every frame with `a=T,U=1`, Kitty atomically replaces the old
++/// image data — no flicker, no delete-before-draw gap.
++const IMAGE_ID: u32 = 1;
++
++/// A ratatui `Widget` that renders a `DynamicImage` via the Kitty graphics
++/// protocol using PNG compression (`f=100`) and unicode placeholders.
++pub struct KittyPngImage {
++    transmit: String,
++    unique_id: u32,
++    area: Rect,
++}
++
++impl KittyPngImage {
++    /// Delete the Kitty image managed by this module.
++    ///
++    /// Call this when leaving FullHD mode to free Kitty-side resources and
++    /// prevent stale images from lingering in the terminal's memory.
++    /// Returns the escape sequence as a `String` that must be written to
++    /// the terminal (e.g. via stdout).
++    pub fn cleanup_escape() -> String {
++        format!("\x1b_Gq=2,a=d,d=I,i={IMAGE_ID}\x1b\\")
++    }
++
++    /// Create a new compressed Kitty image widget.
++    ///
++    /// The image is immediately PNG-encoded and base64-chunked into the
++    /// Kitty escape sequence.  Call this outside the draw closure if you
++    /// want to time encoding separately.
++    ///
++    /// Uses a single fixed image ID (`IMAGE_ID`).  Transmitting with
++    /// `a=T,U=1` for the same ID causes Kitty to atomically replace the
++    /// old image data, so there is never a visible gap between frames.
++    /// No delete commands are emitted during normal rendering.
++    pub fn new(img: &DynamicImage, area: Rect) -> Option<Self> {
++        let (w, h) = (img.width(), img.height());
++
++        // Encode as PNG.  Returns None on failure so the caller can fall
++        // back to braille instead of crashing the TUI.
++        let mut png_bytes: Vec<u8> = Vec::new();
++        if img
++            .write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
++            .is_err()
++        {
++            return None;
++        }
++
++        // Base64.
++        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
++
++        // Build Kitty escape, chunked to <=4096 base64 chars.
++        // U=1 enables virtual placement via unicode placeholders.
++        const CHARS_PER_CHUNK: usize = 4096;
++        let chunks: Vec<&str> = b64
++            .as_bytes()
++            .chunks(CHARS_PER_CHUNK)
++            .map(|c| std::str::from_utf8(c).unwrap())
++            .collect();
++        let chunk_count = chunks.len();
++
++        let mut transmit = String::with_capacity(b64.len() + chunk_count * 80);
++
++        for (i, chunk) in chunks.iter().enumerate() {
++            write!(transmit, "\x1b_Gq=2,").unwrap();
++            if i == 0 {
++                // a=T = transmit+display, f=100 = PNG, t=d = direct (inline)
++                // U=1 = use unicode placeholders for positioning
++                // Reusing IMAGE_ID causes Kitty to atomically replace the
++                // previous image — no delete needed, no flicker.
++                write!(transmit, "i={IMAGE_ID},a=T,U=1,f=100,t=d,s={w},v={h},").unwrap();
++            }
++            let more = u8::from(chunk_count > (i + 1));
++            write!(transmit, "m={more};{chunk}\x1b\\").unwrap();
++        }
++
++        Some(Self {
++            transmit,
++            unique_id: IMAGE_ID,
++            area,
++        })
++    }
++}
++
++impl Widget for KittyPngImage {
++    fn render(mut self, area: Rect, buf: &mut Buffer) {
++        // Encode the image ID as an RGB foreground color — Kitty uses this
++        // to associate placeholder characters with the transmitted image.
++        let [id_extra, id_r, id_g, id_b] = self.unique_id.to_be_bytes();
++        let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
++
++        // Cap to 297 rows — the maximum the DIACRITICS table can address.
++        // 297 rows covers terminals up to ~4700px tall at 16px font, which is plenty.
++        let full_height = area.height.min(self.area.height).min(297);
++        let full_width = area.width.min(self.area.width);
++
++        for y in 0..full_height {
++            // The transmit sequence is only written into the first row's
++            // first cell; subsequent rows just get placeholders.
++            let mut symbol = if y == 0 {
++                std::mem::take(&mut self.transmit)
++            } else {
++                String::new()
++            };
++
++            let width_usize = usize::from(full_width);
++
++            // Reserve space for: save cursor + fg color + placeholder chars
++            // + diacritics + restore cursor + repositioning.
++            symbol.reserve(id_color.len() + (width_usize * 16) + 32);
++
++            // Save cursor position, set fg color to encode image ID, then
++            // emit the first placeholder character with full diacritics
++            // (row, column=0, extra id byte).
++            write!(
++                symbol,
++                "\x1b[s{id_color}\u{10EEEE}{}{}{}",
++                diacritic(y),
++                diacritic(0),
++                diacritic(u16::from(id_extra)),
++            )
++            .unwrap();
++
++            // Emit placeholder characters for columns 1..width.
++            // These inherit the row/id diacritics from the first character;
++            // Kitty uses positional inheritance so just `\u{10EEEE}` suffices.
++            symbol.extend(std::iter::repeat_n('\u{10EEEE}', width_usize.saturating_sub(1)));
++
++            // Restore saved cursor position (including color), then move
++            // the cursor to the bottom-right of the area so ratatui's
++            // cursor tracking stays correct.
++            let right = area.width.saturating_sub(1);
++            let down = area.height.saturating_sub(1);
++            write!(symbol, "\x1b[u\x1b[{right}C\x1b[{down}B").unwrap();
++
++            // Write the assembled symbol into the first cell of this row.
++            if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
++                cell.set_symbol(&symbol);
++            }
++
++            // Mark remaining cells in this row as skip — the first cell's
++            // escape sequence already wrote placeholder characters that
++            // cover these positions.
++            for x in 1..full_width {
++                if let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) {
++                    cell.set_skip(true);
++                }
++            }
++        }
++    }
++}
++
++/// Diacritics table for Kitty unicode placeholders.
++/// From <https://sw.kovidgoyal.net/kitty/_downloads/1792bad15b12979994cd6ecc54c967a6/rowcolumn-diacritics.txt>
++/// See <https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders>
++static DIACRITICS: [char; 297] = [
++    '\u{305}', '\u{30D}', '\u{30E}', '\u{310}', '\u{312}', '\u{33D}', '\u{33E}', '\u{33F}',
++    '\u{346}', '\u{34A}', '\u{34B}', '\u{34C}', '\u{350}', '\u{351}', '\u{352}', '\u{357}',
++    '\u{35B}', '\u{363}', '\u{364}', '\u{365}', '\u{366}', '\u{367}', '\u{368}', '\u{369}',
++    '\u{36A}', '\u{36B}', '\u{36C}', '\u{36D}', '\u{36E}', '\u{36F}', '\u{483}', '\u{484}',
++    '\u{485}', '\u{486}', '\u{487}', '\u{592}', '\u{593}', '\u{594}', '\u{595}', '\u{597}',
++    '\u{598}', '\u{599}', '\u{59C}', '\u{59D}', '\u{59E}', '\u{59F}', '\u{5A0}', '\u{5A1}',
++    '\u{5A8}', '\u{5A9}', '\u{5AB}', '\u{5AC}', '\u{5AF}', '\u{5C4}', '\u{610}', '\u{611}',
++    '\u{612}', '\u{613}', '\u{614}', '\u{615}', '\u{616}', '\u{617}', '\u{657}', '\u{658}',
++    '\u{659}', '\u{65A}', '\u{65B}', '\u{65D}', '\u{65E}', '\u{6D6}', '\u{6D7}', '\u{6D8}',
++    '\u{6D9}', '\u{6DA}', '\u{6DB}', '\u{6DC}', '\u{6DF}', '\u{6E0}', '\u{6E1}', '\u{6E2}',
++    '\u{6E4}', '\u{6E7}', '\u{6E8}', '\u{6EB}', '\u{6EC}', '\u{730}', '\u{732}', '\u{733}',
++    '\u{735}', '\u{736}', '\u{73A}', '\u{73D}', '\u{73F}', '\u{740}', '\u{741}', '\u{743}',
++    '\u{745}', '\u{747}', '\u{749}', '\u{74A}', '\u{7EB}', '\u{7EC}', '\u{7ED}', '\u{7EE}',
++    '\u{7EF}', '\u{7F0}', '\u{7F1}', '\u{7F3}', '\u{816}', '\u{817}', '\u{818}', '\u{819}',
++    '\u{81B}', '\u{81C}', '\u{81D}', '\u{81E}', '\u{81F}', '\u{820}', '\u{821}', '\u{822}',
++    '\u{823}', '\u{825}', '\u{826}', '\u{827}', '\u{829}', '\u{82A}', '\u{82B}', '\u{82C}',
++    '\u{82D}', '\u{951}', '\u{953}', '\u{954}', '\u{F82}', '\u{F83}', '\u{F86}', '\u{F87}',
++    '\u{135D}', '\u{135E}', '\u{135F}', '\u{17DD}', '\u{193A}', '\u{1A17}', '\u{1A75}',
++    '\u{1A76}', '\u{1A77}', '\u{1A78}', '\u{1A79}', '\u{1A7A}', '\u{1A7B}', '\u{1A7C}',
++    '\u{1B6B}', '\u{1B6D}', '\u{1B6E}', '\u{1B6F}', '\u{1B70}', '\u{1B71}', '\u{1B72}',
++    '\u{1B73}', '\u{1CD0}', '\u{1CD1}', '\u{1CD2}', '\u{1CDA}', '\u{1CDB}', '\u{1CE0}',
++    '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}', '\u{1DC5}', '\u{1DC6}', '\u{1DC7}',
++    '\u{1DC8}', '\u{1DC9}', '\u{1DCB}', '\u{1DCC}', '\u{1DD1}', '\u{1DD2}', '\u{1DD3}',
++    '\u{1DD4}', '\u{1DD5}', '\u{1DD6}', '\u{1DD7}', '\u{1DD8}', '\u{1DD9}', '\u{1DDA}',
++    '\u{1DDB}', '\u{1DDC}', '\u{1DDD}', '\u{1DDE}', '\u{1DDF}', '\u{1DE0}', '\u{1DE1}',
++    '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}', '\u{1DE6}', '\u{1DFE}', '\u{20D0}',
++    '\u{20D1}', '\u{20D4}', '\u{20D5}', '\u{20D6}', '\u{20D7}', '\u{20DB}', '\u{20DC}',
++    '\u{20E1}', '\u{20E7}', '\u{20E9}', '\u{20F0}', '\u{2CEF}', '\u{2CF0}', '\u{2CF1}',
++    '\u{2DE0}', '\u{2DE1}', '\u{2DE2}', '\u{2DE3}', '\u{2DE4}', '\u{2DE5}', '\u{2DE6}',
++    '\u{2DE7}', '\u{2DE8}', '\u{2DE9}', '\u{2DEA}', '\u{2DEB}', '\u{2DEC}', '\u{2DED}',
++    '\u{2DEE}', '\u{2DEF}', '\u{2DF0}', '\u{2DF1}', '\u{2DF2}', '\u{2DF3}', '\u{2DF4}',
++    '\u{2DF5}', '\u{2DF6}', '\u{2DF7}', '\u{2DF8}', '\u{2DF9}', '\u{2DFA}', '\u{2DFB}',
++    '\u{2DFC}', '\u{2DFD}', '\u{2DFE}', '\u{2DFF}', '\u{A66F}', '\u{A67C}', '\u{A67D}',
++    '\u{A6F0}', '\u{A6F1}', '\u{A8E0}', '\u{A8E1}', '\u{A8E2}', '\u{A8E3}', '\u{A8E4}',
++    '\u{A8E5}', '\u{A8E6}', '\u{A8E7}', '\u{A8E8}', '\u{A8E9}', '\u{A8EA}', '\u{A8EB}',
++    '\u{A8EC}', '\u{A8ED}', '\u{A8EE}', '\u{A8EF}', '\u{A8F0}', '\u{A8F1}', '\u{AAB0}',
++    '\u{AAB2}', '\u{AAB3}', '\u{AAB7}', '\u{AAB8}', '\u{AABE}', '\u{AABF}', '\u{AAC1}',
++    '\u{FE20}', '\u{FE21}', '\u{FE22}', '\u{FE23}', '\u{FE24}', '\u{FE25}', '\u{FE26}',
++    '\u{10A0F}', '\u{10A38}', '\u{1D185}', '\u{1D186}', '\u{1D187}', '\u{1D188}', '\u{1D189}',
++    '\u{1D1AA}', '\u{1D1AB}', '\u{1D1AC}', '\u{1D1AD}', '\u{1D242}', '\u{1D243}', '\u{1D244}',
++];
++
++#[inline]
++fn diacritic(y: u16) -> char {
++    *DIACRITICS
++        .get(usize::from(y))
++        .unwrap_or(&DIACRITICS[0])
++}
+diff --git a/src/render/mod.rs b/src/render/mod.rs
+index f0dd6a0..95a975f 100644
+--- a/src/render/mod.rs
++++ b/src/render/mod.rs
+@@ -3,4 +3,5 @@ pub mod braille;
+ pub mod hd;
+ pub mod framebuffer;
+ pub mod color;
++pub mod kitty_png;
+ pub mod ribbon;
+diff --git a/src/ui/help_overlay.rs b/src/ui/help_overlay.rs
+index 85e9ee7..b64f7e0 100644
+--- a/src/ui/help_overlay.rs
++++ b/src/ui/help_overlay.rs
+@@ -6,9 +6,12 @@ use ratatui::Frame;
+ 
+ /// Render a centered help overlay
+ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
+-    // Center the popup (60x20)
+-    let popup_width = 60u16.min(area.width - 4);
+-    let popup_height = 21u16.min(area.height - 4);
++    // Center the popup (60x20) — guard against tiny terminals
++    if area.width < 10 || area.height < 10 {
++        return;
++    }
++    let popup_width = 60u16.min(area.width.saturating_sub(4));
++    let popup_height = 21u16.min(area.height.saturating_sub(4));
+     let x = (area.width - popup_width) / 2;
+     let y = (area.height - popup_height) / 2;
+     let popup_area = Rect::new(x, y, popup_width, popup_height);
+@@ -27,6 +30,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
+         Line::from(vec![Span::styled("  c          ", Style::default().fg(Color::Yellow)), Span::raw("Cycle color scheme")]),
+         Line::from(vec![Span::styled("  v          ", Style::default().fg(Color::Yellow)), Span::raw("Cycle viz mode")]),
+         Line::from(vec![Span::styled("  m          ", Style::default().fg(Color::Yellow)), Span::raw("Toggle Braille / HD")]),
++        Line::from(vec![Span::styled("  M          ", Style::default().fg(Color::Yellow)), Span::raw("Toggle HD / FullHD (Sixel/Kitty)")]),
+         Line::from(vec![Span::styled("  [ / ]      ", Style::default().fg(Color::Yellow)), Span::raw("Prev / next chain")]),
+         Line::from(vec![Span::styled("  g          ", Style::default().fg(Color::Yellow)), Span::raw("Toggle ligand visibility")]),
+         Line::from(vec![Span::styled("  Space      ", Style::default().fg(Color::Yellow)), Span::raw("Toggle auto-rotation")]),
+diff --git a/src/ui/statusbar.rs b/src/ui/statusbar.rs
+index 445e3d2..8bb44a4 100644
+--- a/src/ui/statusbar.rs
++++ b/src/ui/statusbar.rs
+@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
+ use ratatui::widgets::Paragraph;
+ use ratatui::Frame;
+ 
+-use crate::app::App;
++use crate::app::{App, ConnectionType, RenderMode, VizMode};
+ 
+ /// Render the status bar showing current mode and info
+ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
+@@ -15,12 +15,13 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
+     };
+ 
+     let res_count = app.protein.residue_count();
+-    let render_mode = if app.hd_mode { "HD" } else { "Braille" };
++    let render_mode_name = app.render_mode.name();
+ 
++    let border_fill = (area.width as usize).saturating_sub(2);
+     let status = Paragraph::new(Line::from(vec![
+-        Span::styled("├", Style::default().fg(Color::DarkGray)),
+-        Span::styled("─".repeat(area.width as usize - 2), Style::default().fg(Color::DarkGray)),
+-        Span::styled("┤", Style::default().fg(Color::DarkGray)),
++        Span::styled("\u{251c}", Style::default().fg(Color::DarkGray)),
++        Span::styled("\u{2500}".repeat(border_fill), Style::default().fg(Color::DarkGray)),
++        Span::styled("\u{2524}", Style::default().fg(Color::DarkGray)),
+     ]));
+     frame.render_widget(status, area);
+ 
+@@ -29,30 +30,56 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
+         let info_area = Rect::new(area.x, area.y + 1, area.width, 1);
+         // Build spans dynamically
+         let mut spans = vec![
+-            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
++            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
+             Span::styled(&chain_info, Style::default().fg(Color::Cyan)),
+-            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
++            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
+             Span::styled(format!("{} res ", res_count), Style::default().fg(Color::White)),
+         ];
+ 
+         if app.protein.ligand_count() > 0 {
+-            spans.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
++            spans.push(Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)));
+             spans.push(Span::styled(
+                 format!("{} ligands ", app.protein.ligand_count()),
+                 Style::default().fg(Color::Rgb(255, 0, 255)),
+             ));
+         }
+ 
++        // In Braille mode, Cartoon is silently degraded to Backbone rendering
++        // (the basic braille renderer has no triangle mesh support).  Show this
++        // honestly so the user isn't confused.
++        let viz_label = if app.render_mode == RenderMode::Braille && app.viz_mode == VizMode::Cartoon {
++            "Backbone*"
++        } else {
++            app.viz_mode.name()
++        };
++
+         spans.extend_from_slice(&[
+-            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+-            Span::styled(app.viz_mode.name(), Style::default().fg(Color::Green)),
+-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
++            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
++            Span::styled(viz_label, Style::default().fg(Color::Green)),
++            Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray)),
+             Span::styled(app.color_scheme.scheme_type.name(), Style::default().fg(Color::Yellow)),
+-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+-            Span::styled(render_mode, Style::default().fg(Color::Magenta)),
++            Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray)),
++            Span::styled(render_mode_name, Style::default().fg(Color::Magenta)),
+             Span::raw(" "),
+         ]);
+ 
++        // Show SSH indicator
++        if app.connection_type == ConnectionType::Ssh {
++            spans.push(Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)));
++            spans.push(Span::styled("SSH", Style::default().fg(Color::Rgb(255, 165, 0))));
++            spans.push(Span::raw(" "));
++        }
++
++        // Show SSH HD warning
++        if app.ssh_hd_warning {
++            spans.push(Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)));
++            spans.push(Span::styled(
++                "\u{26a0} Full HD over SSH may be slow",
++                Style::default().fg(Color::Rgb(255, 200, 0)),
++            ));
++            spans.push(Span::raw(" "));
++        }
++
+         let info = Paragraph::new(Line::from(spans));
+         frame.render_widget(info, info_area);
+     }
+diff --git a/src/ui/viewport.rs b/src/ui/viewport.rs
+index 6ec6fac..0ac8b6e 100644
+--- a/src/ui/viewport.rs
++++ b/src/ui/viewport.rs
+@@ -4,45 +4,70 @@ use ratatui::Frame;
+ use ratatui_image::picker::ProtocolType;
+ use ratatui_image::{Image, Resize};
+ 
+-use crate::app::App;
++use crate::app::{App, RenderMode};
+ use crate::render::braille;
+ use crate::render::framebuffer::framebuffer_to_braille_widget;
+ use crate::render::hd;
++use crate::render::kitty_png::KittyPngImage;
+ 
+ /// Render the main 3D viewport
+ pub fn render_viewport(frame: &mut Frame, area: Rect, app: &App) {
+-    if app.hd_mode {
+-        render_hd_viewport(frame, area, app);
+-    } else {
+-        // Normal mode uses Braille (2x4 dots per cell, higher resolution but monochrome per cell)
+-        let width = area.width as f64 * 2.0;
+-        let height = area.height as f64 * 4.0;
++    match app.render_mode {
++        RenderMode::Braille => {
++            // Braille mode: 2x4 dots per cell, higher resolution but monochrome per cell
++            let width = area.width as f64 * 2.0;
++            let height = area.height as f64 * 4.0;
++
++            let canvas = braille::render_protein(
++                &app.protein,
++                &app.camera,
++                &app.color_scheme,
++                app.viz_mode,
++                width,
++                height,
++                app.show_ligands,
++            );
++
++            frame.render_widget(canvas, area);
++        }
++        RenderMode::HalfBlock => {
++            // HalfBlock mode: render at braille resolution (2x4 per cell) through
++            // the HD rasterizer (Lambert shading, z-buffer, depth fog) and convert
++            // to colored braille characters.  This gives the same spatial resolution
++            // as the basic Braille renderer but with much higher quality shading.
++            let width = area.width as f64 * 2.0;
++            let height = area.height as f64 * 4.0;
+ 
+-        let canvas = braille::render_protein(
+-            &app.protein,
+-            &app.camera,
+-            &app.color_scheme,
+-            app.viz_mode,
+-            width,
+-            height,
+-            app.show_ligands,
+-        );
++            let fb = hd::render_hd_framebuffer(
++                &app.protein,
++                &app.camera,
++                &app.color_scheme,
++                app.viz_mode,
++                width,
++                height,
++                &app.mesh_cache,
++                app.show_ligands,
++            );
+ 
+-        frame.render_widget(canvas, area);
++            let widget = framebuffer_to_braille_widget(&fb);
++            frame.render_widget(widget, area);
++        }
++        RenderMode::FullHD => {
++            render_fullhd_viewport(frame, area, app);
++        }
+     }
+ }
+ 
+-/// Render the HD viewport using graphics protocol (Sixel/Kitty/iTerm2) when
+-/// available, falling back to half-block characters otherwise.
+-fn render_hd_viewport(frame: &mut Frame, area: Rect, app: &App) {
++/// Render the FullHD viewport using graphics protocol (Sixel/Kitty/iTerm2) when
++/// available, falling back to colored braille characters otherwise.
++fn render_fullhd_viewport(frame: &mut Frame, area: Rect, app: &App) {
+     let proto = app.picker.protocol_type();
+     let (font_w, font_h) = app.picker.font_size();
+ 
+     // Determine framebuffer pixel dimensions.
+     // With a true graphics protocol we render at full pixel resolution
+     // (cols * font_width, rows * font_height).  For the colored braille
+-    // fallback we render at braille resolution: cols*2 wide, rows*4 tall
+-    // (2 dot columns and 4 dot rows per terminal cell).
++    // fallback we render at braille resolution: cols*2 wide, rows*4 tall.
+     let (px_w, px_h) = if proto != ProtocolType::Halfblocks && font_w > 0 && font_h > 0 {
+         (
+             area.width as f64 * font_w as f64,
+@@ -55,7 +80,7 @@ fn render_hd_viewport(frame: &mut Frame, area: Rect, app: &App) {
+         )
+     };
+ 
+-    // Rasterize the 3D scene into our software framebuffer.
++    // Rasterize the 3D scene into a software framebuffer.
+     let fb = hd::render_hd_framebuffer(
+         &app.protein,
+         &app.camera,
+@@ -68,31 +93,33 @@ fn render_hd_viewport(frame: &mut Frame, area: Rect, app: &App) {
+     );
+ 
+     // If the terminal supports a real graphics protocol, convert the
+-    // framebuffer to an image and render it through ratatui-image.
+-    // Kitty supports RGBA transparency; Sixel/iTerm2 do not, so use
+-    // opaque RGB to avoid rendering artifacts on those protocols.
++    // framebuffer to an image and send it.
+     if proto != ProtocolType::Halfblocks {
+-        let dyn_img = if proto == ProtocolType::Kitty {
+-            DynamicImage::ImageRgba8(fb.to_rgba_image())
+-        } else {
+-            DynamicImage::ImageRgb8(fb.to_rgb_image())
+-        };
+-        match app.picker.new_protocol(dyn_img, area, Resize::Fit(None)) {
+-            Ok(protocol) => {
+-                let widget = Image::new(&protocol);
++        if proto == ProtocolType::Kitty {
++            // Use our custom PNG-compressed Kitty transmitter.
++            // This is ~10-20x smaller than ratatui-image's raw RGBA path,
++            // making FullHD viable over SSH.
++            let dyn_img = DynamicImage::ImageRgba8(fb.to_rgba_image());
++            if let Some(widget) = KittyPngImage::new(&dyn_img, area) {
+                 frame.render_widget(widget, area);
+                 return;
+             }
+-            Err(_) => {
+-                // Fall through to half-block rendering on error.
++            // PNG encoding failed — fall through to braille.
++        }
++
++        // Sixel/iTerm2: use ratatui-image (no PNG option for Sixel).
++        if proto != ProtocolType::Kitty {
++            let dyn_img = DynamicImage::ImageRgb8(fb.to_rgb_image());
++            if let Ok(protocol) = app.picker.new_protocol(dyn_img, area, Resize::Fit(None)) {
++                let widget = Image::new(&protocol);
++                frame.render_widget(widget, area);
++                return;
+             }
++            // Protocol error — fall through to braille.
+         }
+     }
+ 
+     // Fallback: colored braille character rendering (always works).
+-    // Each terminal cell maps to a 2x4 block of framebuffer pixels,
+-    // giving 4x the spatial resolution of half-blocks at the cost of
+-    // per-cell (rather than per-pixel) coloring.
+     let widget = framebuffer_to_braille_widget(&fb);
+     frame.render_widget(widget, area);
+ }

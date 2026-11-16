@@ -1,0 +1,434 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 90b9af9c..86643714 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,7 @@
+ 
+ #### Bugfixes
+ 
++* Fix `GraphFormatConvertor` (nx → pyg) misaligning edge features with `edge_index` on undirected graphs: `to_undirected` doubled and reordered the edges but not `kind` (left with one entry per undirected edge, in the original order). All edge features, tensor or not, now follow the symmetrized `edge_index`. `edge_index_<kind>` names now use the sorted kinds, so they no longer depend on set iteration order. Self-loop features are no longer summed, and edges without a `kind` no longer raise. Node and edge features missing on some nodes / edges no longer misalign or raise; numeric ones are `NaN` there (also for DGL). Graph-level attributes no longer replace node or edge features of the same name. Parallel edges in multigraphs are kept. No longer needs `to_undirected(..., reduce=...)`. Fix `convert_nx_to_pyg_data` flattening edge feature values (and failing on numeric ones). Fixes [#392](https://github.com/a-r-j/graphein/issues/392), [#217](https://github.com/a-r-j/graphein/issues/217)
+ * Fix `save_graph_to_pdb`, `save_pdb_df_to_pdb` and `save_rgroup_df_to_pdb` dropping atom charges. `cpdb` returns charges as written in the PDB (`"2+"`, `"1-"`), which `pd.to_numeric(..., errors="coerce")` turned into `NaN`. Charges are now written in PDB format (`2+`, `1-` in columns 79-80) rather than biopandas' float format. `save_graph_to_pdb` and `save_rgroup_df_to_pdb` now call `save_pdb_df_to_pdb`. Adds `pdb_charge_to_numeric`.
+ * Fix `add_peptide_bonds` / `add_sequence_distance_edges` and `peptide_bonds` overwriting the kinds of existing edges (they checked `G.has_edge` with loop positions instead of node IDs). [#461](https://github.com/a-r-j/graphein/pull/461)
+ * Fix `compute_chain_graph` and `compute_secondary_structure_graph` with `return_weighted_graph=True` adding edge kinds to the input graph (edge kind sets were shared rather than copied). [#461](https://github.com/a-r-j/graphein/pull/461)
+diff --git a/graphein/ml/conversion.py b/graphein/ml/conversion.py
+index 030468de..dcce55fb 100644
+--- a/graphein/ml/conversion.py
++++ b/graphein/ml/conversion.py
+@@ -14,7 +14,6 @@
+ import numpy as np
+ import torch
+ from loguru import logger as log
+-from torch_geometric.utils.undirected import to_undirected
+ 
+ from graphein.utils.dependencies import import_message
+ 
+@@ -64,6 +63,43 @@
+ """Supported verbosity levels for preserving graph features in conversion."""
+ 
+ 
++def _feature_lists(attr_dicts, keep=lambda key: True) -> dict:
++    """Returns ``{key: [value per node/edge]}`` for the keys ``keep`` accepts.
++
++    Every list has one entry per dict (``None`` where one lacks the key), so
++    features stay aligned with the nodes / ``edge_index``. Missing entries of
++    numeric features are ``NaN`` so the feature can still become a tensor.
++    """
++    attr_dicts = [{str(k): v for k, v in d.items()} for d in attr_dicts]
++    keys = sorted({k for d in attr_dicts for k in d if keep(k)})
++    features = {}
++    for key in keys:
++        values = [d.get(key) for d in attr_dicts]
++        present = next((v for v in values if v is not None), None)
++        if (
++            any(v is None for v in values)
++            and np.asarray(present).dtype.kind in "biuf"
++        ):
++            nan = np.full(np.shape(present), np.nan)
++            values = [nan if v is None else v for v in values]
++        features[key] = values
++    return features
++
++
++def _symmetrize(edge_index: torch.Tensor, num_nodes: int):
++    """Adds the reverse of each edge (except self-loops), sorted like
++    ``to_undirected``. Unlike ``to_undirected``, parallel edges are kept.
++
++    :return: Symmetrized ``edge_index`` and each edge's original position.
++    """
++    edge_id = torch.arange(edge_index.shape[1])
++    rev = edge_index[0] != edge_index[1]
++    edge_index = torch.cat([edge_index, edge_index[:, rev].flip(0)], dim=1)
++    edge_id = torch.cat([edge_id, edge_id[rev]])
++    order = torch.sort(edge_index[0] * num_nodes + edge_index[1], stable=True)
++    return edge_index[:, order.indices], edge_id[order.indices]
++
++
+ class GraphFormatConvertor:
+     """
+     Provides conversion utilities between NetworkX Graphs and geometric deep learning library destination formats.
+@@ -181,11 +217,9 @@ def convert_nx_to_dgl(self, G: nx.Graph) -> dgl.DGLGraph:
+ 
+         ## add node level feat
+ 
+-        node_dict = {}
+-        for _, feat_dict in G.nodes(data=True):
+-            for key, value in feat_dict.items():
+-                if str(key) in self.columns:
+-                    node_dict.setdefault(str(key), []).append(value)
++        node_dict = _feature_lists(
++            [d for _, d in G.nodes(data=True)], lambda k: k in self.columns
++        )
+ 
+         string_dict = {}
+         node_dict_transformed = {}
+@@ -205,14 +239,12 @@ def convert_nx_to_dgl(self, G: nx.Graph) -> dgl.DGLGraph:
+         # DGL cannot add an empty feature dict, so pass None instead
+         g.add_nodes(len(node_id), node_dict_transformed or None)
+ 
+-        edge_dict = {}
+         edge_index = torch.LongTensor(list(G.edges)).t().contiguous()
+ 
+         # add edge level features
+-        for _, _, feat_dict in G.edges(data=True):
+-            for key, value in feat_dict.items():
+-                if str(key) in self.columns:
+-                    edge_dict.setdefault(str(key), []).append(value)
++        edge_dict = _feature_lists(
++            [d for _, _, d in G.edges(data=True)], lambda k: k in self.columns
++        )
+ 
+         edge_transform_dict = {}
+         for i, j in edge_dict.items():
+@@ -246,49 +278,39 @@ def convert_nx_to_pyg(self, G: nx.Graph) -> Data:
+         G = nx.convert_node_labels_to_integers(G)
+ 
+         # Construct Edge Index
++        # G.edges() rather than G.edges: (u, v) pairs, also for multigraphs
+         edge_index = (
+-            torch.LongTensor(list(G.edges)).t().contiguous().view(2, -1)
++            torch.LongTensor(list(G.edges())).t().contiguous().view(2, -1)
+         )
+ 
+         # Add node features
+-        node_feature_names = G.nodes(data=True)[0].keys()
+-        for i, (_, feat_dict) in enumerate(G.nodes(data=True)):
+-            for key, value in feat_dict.items():
+-                key = str(key)
+-                if key in self.columns:
+-                    if i == 0:
+-                        data[key] = []
+-                    data[key].append(value)
+-
+-        # Add edge features
+-        edge_list = list(G.edges(data=True))
+-        edge_feature_names = edge_list[0][2].keys() if edge_list else []
+-        edge_feature_names = list(
+-            filter(
+-                lambda x: x in self.columns and x != "kind", edge_feature_names
++        data.update(
++            _feature_lists(
++                [d for _, d in G.nodes(data=True)], lambda k: k in self.columns
+             )
+         )
+-        for i, (_, _, feat_dict) in enumerate(G.edges(data=True)):
+-            for key, value in feat_dict.items():
+-                key = str(key)
+-                if key in self.columns or key == "kind":
+-                    if i == 0:
+-                        data[key] = []
+-                    data[key].append(value)
+-
+-        # Add graph-level features
++
++        # Add edge features, aligned with edge_index
++        edge_features = _feature_lists(
++            [d for _, _, d in G.edges(data=True)],
++            lambda k: k in self.columns or k == "kind",
++        )
++        data.update(edge_features)
++
++        # Add graph-level features, without replacing node or edge features
+         for feat_name in G.graph:
+-            if str(feat_name) in self.columns:
+-                if str(feat_name) not in node_feature_names:
+-                    data[str(feat_name)] = G.graph[feat_name]
++            if str(feat_name) in self.columns and str(feat_name) not in data:
++                data[str(feat_name)] = G.graph[feat_name]
+         if "edge_index" in self.columns:
+             data["edge_index"] = edge_index
+ 
+-        # Split edge index by edge kind
++        # Split edge index by edge kind. Kinds are sets, so sort them for a
++        # name that doesn't depend on set iteration order.
+         kind_strs = np.array(
+-            list(map(lambda x: "_".join(x), data.get("kind", [])))
++            ["_".join(sorted(k or ())) for k in data.get("kind") or []]
+         )
+-        for kind in set(kind_strs):
++        kinds = set(kind_strs) - {""}  # edges without a kind
++        for kind in kinds:
+             key = f"edge_index_{kind}"
+             if key in self.columns:
+                 mask = kind_strs == kind
+@@ -311,23 +333,26 @@ def convert_nx_to_pyg(self, G: nx.Graph) -> Data:
+ 
+         # Symmetrize if undirected
+         if not G.is_directed():
+-            # Edge index and edge features
+-            edge_index, edge_features = to_undirected(
+-                edge_index,
+-                [getattr(data, attr) for attr in edge_feature_names],
+-                data.num_nodes,
+-            )
++            # Reorder every edge feature (tensor or not, e.g. kind) to match
++            # the symmetrized edge_index.
++            edge_index, edge_id = _symmetrize(edge_index, data.num_nodes)
+             if "edge_index" in self.columns:
+                 data.edge_index = edge_index
+-            for attr, val in zip(edge_feature_names, edge_features):
+-                setattr(data, attr, val)
++            for attr in edge_features:
++                if attr not in data:
++                    continue
++                val = getattr(data, attr)
++                if isinstance(val, torch.Tensor):
++                    setattr(data, attr, val[edge_id])
++                else:
++                    setattr(data, attr, [val[i] for i in edge_id.tolist()])
+ 
+             # Edge indices of different kinds
+-            for kind in set(kind_strs):
++            for kind in kinds:
+                 key = f"edge_index_{kind}"
+                 if key in self.columns:
+-                    edge_index_kind = to_undirected(
+-                        getattr(data, key), num_nodes=data.num_nodes
++                    edge_index_kind, _ = _symmetrize(
++                        getattr(data, key), data.num_nodes
+                     )
+                     setattr(data, key, edge_index_kind)
+ 
+@@ -383,19 +408,11 @@ def convert_nx_to_pyg_data(G: nx.Graph) -> Data:
+     G = nx.convert_node_labels_to_integers(G)
+ 
+     # Construct Edge Index
+-    edge_index = torch.LongTensor(list(G.edges)).t().contiguous()
+-
+-    # Add node features
+-    for i, (_, feat_dict) in enumerate(G.nodes(data=True)):
+-        for key, value in feat_dict.items():
+-            data[str(key)] = [value] if i == 0 else data[str(key)] + [value]
+-
+-    # Add edge features
+-    for i, (_, _, feat_dict) in enumerate(G.edges(data=True)):
+-        for key, value in feat_dict.items():
+-            data[str(key)] = (
+-                list(value) if i == 0 else data[str(key)] + list(value)
+-            )
++    edge_index = torch.LongTensor(list(G.edges())).t().contiguous()
++
++    # Add node and edge features
++    data.update(_feature_lists([d for _, d in G.nodes(data=True)]))
++    data.update(_feature_lists([d for _, _, d in G.edges(data=True)]))
+ 
+     # Add graph-level features
+     for feat_name in G.graph:
+diff --git a/tests/ml/test_conversion.py b/tests/ml/test_conversion.py
+index ae54b4a1..ce9b1435 100644
+--- a/tests/ml/test_conversion.py
++++ b/tests/ml/test_conversion.py
+@@ -3,12 +3,18 @@
+ from functools import partial
+ from pathlib import Path
+ 
++import networkx as nx
+ import pytest
+ import torch
+ 
+ from graphein.ml import GraphFormatConvertor
++from graphein.ml.conversion import convert_nx_to_pyg_data
+ from graphein.protein.config import ProteinGraphConfig
+-from graphein.protein.edges.distance import add_k_nn_edges
++from graphein.protein.edges.distance import (
++    add_distance_to_edges,
++    add_k_nn_edges,
++    add_peptide_bonds,
++)
+ from graphein.protein.features.nodes.amino_acid import amino_acid_one_hot
+ from graphein.protein.graphs import construct_graph
+ 
+@@ -104,6 +110,174 @@ def test_nx_to_pyg(pdb_code):
+     assert g.is_directed() is not is_undirected(data.edge_index)
+ 
+ 
++def _multi_kind_graph():
++    """4HHB with peptide bond and kNN edges (some edges have both kinds)."""
++    config = ProteinGraphConfig(
++        edge_construction_functions=[
++            add_peptide_bonds,
++            partial(add_k_nn_edges, k=3),
++        ]
++    )
++    g = construct_graph(config=config, path=str(PDB_PATH))
++    return add_distance_to_edges(g)
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++@pytest.mark.parametrize("directed", [False, True])
++def test_nx_to_pyg_edge_features_aligned(directed):
++    """Edge features (incl. non-tensor ``kind``) follow ``edge_index``.
++
++    Regression test for #392: ``to_undirected`` doubled and reordered
++    ``edge_index`` but not ``kind``.
++    """
++    g = _multi_kind_graph()
++    if directed:
++        g = g.to_directed()
++    data = GraphFormatConvertor(
++        "nx", "pyg", columns=["edge_index", "kind", "distance", "node_id"]
++    )(g)
++
++    n_edges = data.edge_index.shape[1]
++    assert n_edges == (1 if directed else 2) * g.number_of_edges()
++    assert len(data.kind) == n_edges
++    assert data.distance.shape == torch.Size([n_edges])
++    for k, (u, v) in enumerate(data.edge_index.t().tolist()):
++        edge = g.edges[data.node_id[u], data.node_id[v]]
++        assert set(data.kind[k]) == edge["kind"]
++        assert data.distance[k].item() == pytest.approx(edge["distance"])
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_nx_to_pyg_self_loop_and_missing_kind():
++    """Self-loop features aren't doubled when symmetrizing, and edges
++    without a ``kind`` don't break the conversion."""
++    g = _multi_kind_graph()
++    n = next(iter(g.nodes))
++    g.add_edge(n, n, kind={"self"}, distance=1.5)
++    u, v = next((u, v) for u, v in g.edges if u != v)
++    del g.edges[u, v]["kind"]
++    data = GraphFormatConvertor(
++        "nx", "pyg", columns=["edge_index", "kind", "distance", "node_id"]
++    )(g)
++    loops = (data.edge_index[0] == data.edge_index[1]).nonzero().flatten()
++    assert loops.tolist() and all(
++        data.distance[i].item() == pytest.approx(1.5) for i in loops
++    )
++    assert sum(k is None for k in data.kind) == 2  # both directions of (u, v)
++
++
++class _ReverseSet(set):
++    """A set that iterates in reverse-sorted order, to make set iteration
++    order (normally hash-seed dependent) deterministic in tests."""
++
++    def __iter__(self):
++        return iter(sorted(super().__iter__(), reverse=True))
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_nx_to_pyg_edge_index_by_kind():
++    """``edge_index_<kind>`` keys use the sorted kinds, so they don't depend
++    on set iteration order."""
++    g = _multi_kind_graph()
++    for _, _, d in g.edges(data=True):
++        d["kind"] = _ReverseSet(d["kind"])
++    kinds = {"_".join(sorted(d["kind"])) for _, _, d in g.edges(data=True)}
++    assert "knn_peptide_bond" in kinds
++    data = GraphFormatConvertor(
++        "nx",
++        "pyg",
++        columns=["edge_index", "kind"] + [f"edge_index_{k}" for k in kinds],
++    )(g)
++    for kind in kinds:
++        split = getattr(data, f"edge_index_{kind}")
++        expected = sum(
++            "_".join(sorted(d["kind"])) == kind
++            for _, _, d in g.edges(data=True)
++        )
++        assert split.shape == torch.Size([2, 2 * expected])
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_convert_nx_to_pyg_data_edge_features():
++    """One entry per edge, not flattened (#217); numeric features work."""
++    g = _multi_kind_graph()
++    data = convert_nx_to_pyg_data(g)
++    edges = list(g.edges(data=True))
++    assert data.edge_index.shape == torch.Size([2, len(edges)])
++    assert len(data.kind) == len(edges)
++    for k, (_, _, d) in enumerate(edges):
++        assert data.kind[k] == d["kind"]
++        assert float(data.distance[k]) == pytest.approx(d["distance"])
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_nx_to_pyg_missing_numeric_edge_feature_is_nan():
++    """An edge without a numeric feature gets NaN; the feature stays a
++    tensor."""
++    g = _multi_kind_graph()
++    u, v = next(iter(g.edges))
++    del g.edges[u, v]["distance"]
++    data = GraphFormatConvertor(
++        "nx", "pyg", columns=["edge_index", "distance"]
++    )(g)
++    assert isinstance(data.distance, torch.Tensor)
++    assert data.distance.isnan().sum() == 2  # both directions of (u, v)
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_nx_to_pyg_graph_feature_does_not_replace_edge_feature():
++    """A graph-level attribute named like an edge feature doesn't replace
++    it."""
++    g = _multi_kind_graph()
++    g.graph["distance"] = 0.0
++    data = GraphFormatConvertor(
++        "nx", "pyg", columns=["edge_index", "distance"]
++    )(g)
++    assert data.distance.shape == torch.Size([data.edge_index.shape[1]])
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_nx_to_pyg_multigraph_keeps_parallel_edges():
++    """Parallel edges in a ``MultiGraph`` are kept, with their own
++    features."""
++    g = nx.MultiGraph()
++    g.add_edge("a", "b", kind={"x"}, distance=1.0)
++    g.add_edge("a", "b", kind={"y"}, distance=2.0)
++    g.add_edge("b", "c", kind={"x"}, distance=3.0)
++    data = GraphFormatConvertor(
++        "nx",
++        "pyg",
++        columns=["edge_index", "kind", "distance", "edge_index_x"],
++    )(g)
++    assert data.edge_index.shape == torch.Size([2, 6])
++    assert sorted(data.distance.tolist()) == [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
++    for k, d in zip(data.kind, data.distance.tolist()):
++        assert k == ({"y"} if d == 2.0 else {"x"})
++    assert data.edge_index_x.shape == torch.Size([2, 4])
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_nx_to_pyg_node_feature_missing_on_some_nodes():
++    """Node features stay aligned when only some nodes have them."""
++    g = nx.Graph()
++    g.add_node("a")
++    g.add_node("b", charge=1.0)
++    g.add_edge("a", "b")
++    data = GraphFormatConvertor("nx", "pyg", columns=["charge"])(g)
++    assert data.charge.isnan().tolist() == [True, False]
++
++
++@pytest.mark.skipif(not PYG_AVAIL, reason="PyG not installed")
++def test_convert_nx_to_pyg_data_mixed_key_types():
++    """Edge attribute keys of mixed types (str and int) are accepted."""
++    g = nx.Graph()
++    g.add_edge("a", "b", kind={"x"})
++    g.add_edge("b", "c")
++    g.edges["b", "c"][0] = 1.0
++    data = convert_nx_to_pyg_data(g)
++    assert len(data.kind) == 2
++
++
+ @pytest.mark.skipif(not DGL_AVAIL, reason="DGL not installed")
+ @pytest.mark.parametrize("verbose", ["gnn", "default", "all_info"])
+ def test_nx_to_dgl(verbose):

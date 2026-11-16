@@ -1,0 +1,406 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0b355f77..5a71e7a0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
+ - energy_key, force_key, stress_key options for `sevenn_graph_build` @thangckt
+ ### Changed
+ - Read EFS of atoms from y_* keys of .info or .arrays dict, instead of caclculator results
++### Fixed
++- [e3gnn_serial]: can continue simulation even when atom tag becomes not consecutive (removing atom dynamically) @gasplant64
++- [e3gnn_parallel]: undefined behavior when there is no atoms to send/recv (for non pbc system)
++- [e3gnn_parallel]: incorrect force/stress in some edge cases (too small simulation cell & 2 process)
++- [e3gnn_parallel]: revert commit 14851ef, now e3gnn_parallel is sane.
++- [e3gnn_*]: += instead of = when saving virial stress and forces @gasplant64
+ 
+ ## [0.9.5]
+ ### Note
+diff --git a/sevenn/pair_e3gnn/comm_brick.cpp b/sevenn/pair_e3gnn/comm_brick.cpp
+index a1931a6b..b31375dd 100644
+--- a/sevenn/pair_e3gnn/comm_brick.cpp
++++ b/sevenn/pair_e3gnn/comm_brick.cpp
+@@ -1068,7 +1068,10 @@ void CommBrick::forward_comm(PairE3GNNParallel *pair)
+     buf_send_ = reinterpret_cast<float*>(buf_send);
+     buf_recv_ = reinterpret_cast<float*>(buf_recv);
+   }
+-  if (nswap > 6) error->all(FLERR,"PairE3GNNParallel: Cell size is too small. Please use a single GPU or replicate the cell.");
++  if(!comm_preprocess_done) {
++    pair->notify_proc_ids(sendproc, recvproc);
++  }
++  if (nswap > 6) error->all(FLERR,"PairE3GNNParallel: Cell size is too small. Please use a single GPU or make a supercell");
+ 
+   for (iswap = 0; iswap < nswap; iswap++) {
+     if(sendproc[iswap] == me) continue;
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn.cpp b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+index d1ba87c1..7a9c754a 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+@@ -33,7 +33,6 @@
+ #include "neighbor.h"
+ 
+ #include "pair_e3gnn.h"
+-#include <cuda_runtime.h>
+ 
+ using namespace LAMMPS_NS;
+ 
+@@ -84,18 +83,32 @@ void PairE3GNN::compute(int eflag, int vflag) {
+     error->all(FLERR, "atomic stress is not supported\n");
+   }
+ 
++  int nlocal = list->inum; // same as nlocal
++  int *ilist = list->ilist;
++  tagint *tag = atom->tag;
++  std::unordered_map<int, int> tag_map;
++
+   if (atom->tag_consecutive() == 0) {
+-    error->all(FLERR, "Pair e3gnn requires consecutive atom IDs");
++    for (int ii = 0; ii < nlocal; ii++) {
++      const int i = ilist[ii];
++      int itag = tag[i];
++      tag_map[itag] = ii+1;
++      // printf("MODIFY setting %i => %i \n",itag, tag_map[itag] );
++    }
++  } else {
++    //Ordered which mappling required
++    for (int ii = 0; ii < nlocal; ii++) {
++        const int itag = ilist[ii]+1;
++        tag_map[itag] = ii+1;
++        // printf("normal setting %i => %i \n",itag, tag_map[itag] );
++    }
+   }
+ 
+   double **x = atom->x;
+   double **f = atom->f;
+   int *type = atom->type;
+-  int nlocal = list->inum; // same as nlocal
+   long num_atoms[1] = {nlocal};
+-  int *ilist = list->ilist;
+ 
+-  tagint *tag = atom->tag;
+   int tag2i[nlocal];
+ 
+   int *numneigh = list->numneigh;      // j loop cond
+@@ -143,7 +156,7 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   for (int ii = 0; ii < nlocal; ii++) {
+     const int i = ilist[ii];
+-    int itag = tag[i];
++    int itag = tag_map[tag[i]];
+     tag2i[itag - 1] = i;
+     const int itype = type[i];
+     node_type[itag - 1] = map[itype];
+@@ -154,13 +167,13 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   for (int ii = 0; ii < nlocal; ii++) {
+     const int i = ilist[ii];
+-    int itag = tag[i];
++    int itag = tag_map[tag[i]];
+     const int *jlist = firstneigh[i];
+     const int jnum = numneigh[i];
+ 
+     for (int jj = 0; jj < jnum; jj++) {
+       int j = jlist[jj]; // atom over pbc is different atom
+-      int jtag = tag[j]; // atom over pbs is same atom (it starts from 1)
++      int jtag = tag_map[tag[j]]; // atom over pbs is same atom (it starts from 1)
+       j &= NEIGHMASK;
+       const int jtype = type[j];
+ 
+@@ -214,20 +227,6 @@ void PairE3GNN::compute(int eflag, int vflag) {
+   std::vector<torch::IValue> input(1, input_dict);
+   auto output = model.forward(input).toGenericDict();
+ 
+-  if (print_info) {
+-    size_t free, tot;
+-    cudaMemGetInfo(&free, &tot);
+-    std::cout << "MEM use after model(MB)" << std::endl;
+-    double Mfree = static_cast<double>(free) / (1024 * 1024);
+-    double Mtot = static_cast<double>(tot) / (1024 * 1024);
+-    std::cout << "Total: " << Mtot << std::endl;
+-    std::cout << "Free: " << Mfree << std::endl;
+-    std::cout << "Used: " << Mtot - Mfree << std::endl;
+-    double Mused = Mtot - Mfree;
+-    std::cout << "Used/Nedges: " << Mused / nedges << std::endl;
+-    std::cout << "Used/Nlocal: " << Mused / nlocal << std::endl;
+-  }
+-
+   torch::Tensor total_energy_tensor =
+       output.at("inferred_total_energy").toTensor().cpu();
+   torch::Tensor force_tensor = output.at("inferred_force").toTensor().cpu();
+@@ -236,9 +235,9 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   for (int itag = 0; itag < nlocal; itag++) {
+     int i = tag2i[itag];
+-    f[i][0] = forces[itag][0];
+-    f[i][1] = forces[itag][1];
+-    f[i][2] = forces[itag][2];
++    f[i][0] += forces[itag][0];
++    f[i][1] += forces[itag][1];
++    f[i][2] += forces[itag][2];
+   }
+ 
+   if (vflag) {
+@@ -247,12 +246,12 @@ void PairE3GNN::compute(int eflag, int vflag) {
+     auto virial_stress_tensor = stress_tensor * inp_cell_volume;
+     // xy yz zx order in vasp (voigt is xx yy zz yz xz xy)
+     auto virial_stress = virial_stress_tensor.accessor<float, 1>();
+-    virial[0] = virial_stress[0];
+-    virial[1] = virial_stress[1];
+-    virial[2] = virial_stress[2];
+-    virial[3] = virial_stress[3];
+-    virial[4] = virial_stress[5];
+-    virial[5] = virial_stress[4];
++    virial[0] += virial_stress[0];
++    virial[1] += virial_stress[1];
++    virial[2] += virial_stress[2];
++    virial[3] += virial_stress[3];
++    virial[4] += virial_stress[5];
++    virial[5] += virial_stress[4];
+   }
+ 
+   if (eflag_atom) {
+@@ -300,7 +299,7 @@ void PairE3GNN::coeff(int narg, char **arg) {
+ 
+   if (strcmp(arg[0], "*") != 0 || strcmp(arg[1], "*") != 0) {
+     error->all(FLERR,
+-               "e3gnn: firt and second input of pair_coeff should be '*'");
++               "e3gnn: first and second input of pair_coeff should be '*'");
+   }
+   // expected input : pair_coeff * * pot.pth type_name1 type_name2 ...
+ 
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+index a493eb5a..1c802b3c 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+@@ -122,6 +122,10 @@ PairE3GNNParallel::PairE3GNNParallel(LAMMPS *lmp) : Pair(lmp) {
+     device_name = "CPU";
+   }
+ 
++  if (std::getenv("OFF_E3GNN_PARALLEL_CUDA_MPI")) {
++      use_cuda_mpi = false;
++  }
++
+   if (lmp->screen) {
+     if (use_gpu && !use_cuda_mpi) {
+       device_comm = torch::kCPU;
+@@ -160,26 +164,6 @@ torch::Device PairE3GNNParallel::get_cuda_device() {
+   if (print_info)
+     std::cout << world_rank << " Available # of GPUs found: " << num_gpus
+               << std::endl;
+-  if (cuda_visible == nullptr) {
+-    // assume every gpu in node is avail
+-    // believe user did right thing...
+-    // idx = rank % num_gpus;
+-    // std::cout << world_rank << " use GPU index(No CUDA_VISIBLE_DEVICES set):
+-    // " << idx << std::endl;
+-  } else {
+-    /*
+-    auto delim = ",";
+-    char *tok = std::strtok(cuda_visible, delim);
+-    std::vector<std::string> device_ids;
+-    while(tok != nullptr) {
+-      device_ids.push_back(std::string(tok));
+-      tok = std::strtok(nullptr, delim);
+-    }
+-    idx = std::stoi(device_ids[rank % device_ids.size()]);
+-    std::cout << world_rank << " use GPU index(from CUDA_VISIBLE_DEVICES): " <<
+-    idx << std::endl;
+-    */
+-  }
+   cudaError_t cuda_err = cudaSetDevice(idx);
+   if (cuda_err != cudaSuccess) {
+     std::cerr << "E3GNN: Failed to set CUDA device: "
+@@ -487,9 +471,9 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+ 
+   for (int graph_idx = 0; graph_idx < graph_indexer; graph_idx++) {
+     int i = graph_index_to_i[graph_idx];
+-    f[i][0] = forces[graph_idx][0];
+-    f[i][1] = forces[graph_idx][1];
+-    f[i][2] = forces[graph_idx][2];
++    f[i][0] += forces[graph_idx][0];
++    f[i][1] += forces[graph_idx][1];
++    f[i][2] += forces[graph_idx][2];
+   }
+ 
+   if (vflag) {
+@@ -510,12 +494,12 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+         torch::neg(torch::sum(per_atom_stress_tensor, 0));
+     auto virial_stress = virial_stress_tensor.accessor<float, 1>();
+ 
+-    virial[0] = virial_stress[0];
+-    virial[1] = virial_stress[1];
+-    virial[2] = virial_stress[2];
+-    virial[3] = virial_stress[3];
+-    virial[4] = virial_stress[5];
+-    virial[5] = virial_stress[4];
++    virial[0] += virial_stress[0];
++    virial[1] += virial_stress[1];
++    virial[2] += virial_stress[2];
++    virial[3] += virial_stress[3];
++    virial[4] += virial_stress[5];
++    virial[5] += virial_stress[4];
+   }
+ 
+   if (eflag_atom) {
+@@ -690,25 +674,33 @@ void PairE3GNNParallel::init_style() {
+ 
+ double PairE3GNNParallel::init_one(int i, int j) { return cutoff; }
+ 
++void PairE3GNNParallel::notify_proc_ids(const int *sendproc, const int *recvproc) {
++  for (int iswap = 0; iswap < 6; iswap++) {
++    this->sendproc[iswap] = sendproc[iswap];
++    this->recvproc[iswap]= recvproc[iswap];
++  }
++}
++
+ void PairE3GNNParallel::comm_preprocess() {
+   assert(!comm_preprocess_done);
+   CommBrick *comm_brick = dynamic_cast<CommBrick *>(comm);
+ 
+-  // false communication to preprocess index
+-  // result in completed comm_index_pack/unpack_forward & extra_graph_idx_map
++  // fake lammps communication call to preprocess index
++  // gives complete comm_index_pack, unpack_forward, and extra_graph_idx_map
+   comm_brick->forward_comm(this);
+ 
++  std::map<int, std::set<int>> already_met_map;
+   for (int comm_phase = 0; comm_phase < 6; comm_phase++) {
+     const int n = comm_index_pack_forward[comm_phase].size();
+-    if (n == 0) {
+-      // do nothing if self comm
+-      continue;
++    int sproc = this->sendproc[comm_phase];
++    if (already_met_map.count(sproc) == 0) {
++      already_met_map.insert({sproc, std::set<int>()});
+     }
+ 
+     // for unpack_reverse, Ignore duplicated index by 'already_met'
+     std::vector<long> &idx_map_forward = comm_index_pack_forward[comm_phase];
+     std::vector<long> &idx_map_reverse = comm_index_unpack_reverse[comm_phase];
+-    std::set<int> already_met;
++    std::set<int>& already_met = already_met_map[sproc];
+     // the last index of x_comm is used to trash unnecessary values
+     const int trash_index =
+         graph_size + static_cast<int>(extra_graph_idx_map.size()); //+ 1;
+@@ -727,19 +719,11 @@ void PairE3GNNParallel::comm_preprocess() {
+     }
+ 
+     if (use_cuda_mpi) {
+-      comm_index_pack_forward_tensor[comm_phase] =
+-          torch::from_blob(idx_map_forward.data(), idx_map_forward.size(),
+-                           INTEGER_TYPE)
+-              .to(device);
++      comm_index_pack_forward_tensor[comm_phase] = torch::from_blob(idx_map_forward.data(), idx_map_forward.size(), INTEGER_TYPE).to(device);
+ 
+       auto upmap = comm_index_unpack_forward[comm_phase];
+-      comm_index_unpack_forward_tensor[comm_phase] =
+-          torch::from_blob(upmap.data(), upmap.size(), INTEGER_TYPE).to(device);
+-
+-      comm_index_unpack_reverse_tensor[comm_phase] =
+-          torch::from_blob(idx_map_reverse.data(), idx_map_reverse.size(),
+-                           INTEGER_TYPE)
+-              .to(device);
++      comm_index_unpack_forward_tensor[comm_phase] = torch::from_blob(upmap.data(), upmap.size(), INTEGER_TYPE).to(device);
++      comm_index_unpack_reverse_tensor[comm_phase] = torch::from_blob(idx_map_reverse.data(), idx_map_reverse.size(), INTEGER_TYPE).to(device);
+     }
+   }
+   comm_preprocess_done = true;
+@@ -803,24 +787,12 @@ void PairE3GNNParallel::unpack_forward_init(int n, int first, int comm_phase) {
+ int PairE3GNNParallel::pack_forward_comm_gnn(float *buf, int comm_phase) {
+   std::vector<long> &idx_map = comm_index_pack_forward[comm_phase];
+   const int n = static_cast<int>(idx_map.size());
+-
+-  if (use_cuda_mpi) {
++  if (use_cuda_mpi && n != 0) {
+     torch::Tensor &idx_map_tensor = comm_index_pack_forward_tensor[comm_phase];
+-    auto selected =
+-        x_comm.index_select(0, idx_map_tensor); // its size is x_dim * n
++    auto selected = x_comm.index_select(0, idx_map_tensor); // its size is x_dim * n
+     cudaError_t cuda_err =
+         cudaMemcpy(buf, selected.data_ptr<float>(), (x_dim * n) * sizeof(float),
+                    cudaMemcpyDeviceToDevice);
+-
+-    // TODO: I want to remove temporary selected tensor for speed.
+-    // Code below produce wrong results. But if I change {n, x_dim} to {x_dim,
+-    // n}, get correct result. Instead, it raises a warning that the dimension
+-    // is not correct so they implicitly changed resulting tensor shape to fit
+-    // out_tensor(buf_tensor)'s dimension. How can I solve this?
+-
+-    // auto buf_tensor = torch::from_blob(buf, {n, x_dim},
+-    // FLOAT_TYPE.device(device)); // tensor wrapping of buf
+-    // at::index_select_out(buf_tensor, x_comm, 0, idx_map_tensor);
+   } else {
+     int i, j, m;
+     m = 0;
+@@ -848,11 +820,8 @@ void PairE3GNNParallel::unpack_forward_comm_gnn(float *buf, int comm_phase) {
+   std::vector<long> &idx_map = comm_index_unpack_forward[comm_phase];
+   const int n = static_cast<int>(idx_map.size());
+ 
+-  if (use_cuda_mpi) {
+-    torch::Tensor &idx_map_tensor =
+-        comm_index_unpack_forward_tensor[comm_phase];
+-    // share same memory space with existing device buffer just wrapping to
+-    // troch::Tensor
++  if (use_cuda_mpi && n != 0) {
++    torch::Tensor &idx_map_tensor = comm_index_unpack_forward_tensor[comm_phase];
+     auto buf_tensor =
+         torch::from_blob(buf, {n, x_dim}, FLOAT_TYPE.device(device));
+     x_comm.scatter_(0, idx_map_tensor.repeat_interleave(x_dim).view({n, x_dim}),
+@@ -874,13 +843,10 @@ int PairE3GNNParallel::pack_reverse_comm_gnn(float *buf, int comm_phase) {
+   std::vector<long> &idx_map = comm_index_unpack_forward[comm_phase];
+   const int n = static_cast<int>(idx_map.size());
+ 
+-  if (use_cuda_mpi) {
+-    torch::Tensor &idx_map_tensor =
+-        comm_index_unpack_forward_tensor[comm_phase];
++  if (use_cuda_mpi && n != 0) {
++    torch::Tensor &idx_map_tensor = comm_index_unpack_forward_tensor[comm_phase];
+     auto selected = x_comm.index_select(0, idx_map_tensor);
+-    cudaError_t cuda_err =
+-        cudaMemcpy(buf, selected.data_ptr<float>(), (x_dim * n) * sizeof(float),
+-                   cudaMemcpyDeviceToDevice);
++    cudaError_t cuda_err = cudaMemcpy(buf, selected.data_ptr<float>(), (x_dim * n) * sizeof(float), cudaMemcpyDeviceToDevice);
+   } else {
+     int i, j, m;
+     m = 0;
+@@ -899,7 +865,6 @@ int PairE3GNNParallel::pack_reverse_comm_gnn(float *buf, int comm_phase) {
+     std::cout << world_rank << " pack_reverse x_dim*n: " << x_dim * n
+               << std::endl;
+     double Msend = static_cast<double>(x_dim * n * 4) / (1024 * 1024);
+-    std::cout << world_rank << " send size(MB): " << Msend << "\n" << std::endl;
+   }
+   return x_dim * n;
+ }
+@@ -908,9 +873,8 @@ void PairE3GNNParallel::unpack_reverse_comm_gnn(float *buf, int comm_phase) {
+   std::vector<long> &idx_map = comm_index_unpack_reverse[comm_phase];
+   const int n = static_cast<int>(idx_map.size());
+ 
+-  if (use_cuda_mpi) {
+-    torch::Tensor &idx_map_tensor =
+-        comm_index_unpack_reverse_tensor[comm_phase];
++  if (use_cuda_mpi && n != 0) {
++    torch::Tensor &idx_map_tensor = comm_index_unpack_reverse_tensor[comm_phase];
+     auto buf_tensor =
+         torch::from_blob(buf, {n, x_dim}, FLOAT_TYPE.device(device));
+     x_comm.scatter_(0, idx_map_tensor.repeat_interleave(x_dim).view({n, x_dim}),
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.h b/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
+index 0d4c67d7..2ddf7833 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
++++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
+@@ -61,6 +61,9 @@ class PairE3GNNParallel : public Pair {
+   // to use tag_to_graph_idx inside comm methods
+   int *tag_to_graph_idx_ptr = nullptr;
+ 
++  int sendproc[6];
++  int recvproc[6];
++
+ public:
+   PairE3GNNParallel(class LAMMPS *);
+   ~PairE3GNNParallel();
+@@ -86,6 +89,7 @@ class PairE3GNNParallel : public Pair {
+   int get_x_dim();
+   bool use_cuda_mpi_();
+   bool is_comm_preprocess_done();
++  void notify_proc_ids(const int *sendproc, const int *recvproc);
+ 
+   bool print_info = false;
+   int world_rank;

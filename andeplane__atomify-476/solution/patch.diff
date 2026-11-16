@@ -1,0 +1,320 @@
+diff --git a/e2e/sweep.spec.ts b/e2e/sweep.spec.ts
+index e65d6ec7..2c5b57f3 100644
+--- a/e2e/sweep.spec.ts
++++ b/e2e/sweep.spec.ts
+@@ -2,12 +2,14 @@
+  * Variable sweep: sweep T over two values from the New Run modal, watch
+  * both runs execute sequentially, verify the runs list shows both rows with
+  * their vars under a shared sweep header, and verify the persisted
+- * run.json vars straight from IndexedDB.
++ * run.json vars and each run's log.lammps (the engine really used the
++ * override, not the script's own value) straight from IndexedDB.
+  */
+ 
+ import { test, expect } from "@playwright/test";
+ import {
+   createFastLjProject,
++  FAST_LJ_SCRIPT,
+   gotoApp,
+   readContentsRecord,
+   RUN_TIMEOUT,
+@@ -25,7 +27,13 @@ test("sweep T over two values runs sequentially and records vars", async ({
+ }) => {
+   await test.step("create a project with a parameterized script", async () => {
+     await gotoApp(page);
+-    await createFastLjProject(page, "Sweep study", "sweep-study");
++    await createFastLjProject(
++      page,
++      "Sweep study",
++      "sweep-study",
++      "in.melt",
++      `${FAST_LJ_SCRIPT}print "SWEEP_T=\${T}"\n`,
++    );
+     await page.getByTestId("editor-back").click();
+   });
+ 
+@@ -101,4 +109,20 @@ test("sweep T over two values runs sequentially and records vars", async ({
+     expect(meta1.sweepId).toBeTruthy();
+     expect(meta1.sweepId).toBe(meta2.sweepId);
+   });
++
++  await test.step("each run's log shows the swept value, not the script's", async () => {
++    for (const [runId, value] of [
++      ["run-001", "1"],
++      ["run-002", "2"],
++    ]) {
++      const record = await readContentsRecord(
++        page,
++        `sweep-study/runs/${runId}/log.lammps`,
++      );
++      expect(record).not.toBeNull();
++      const log = String(record!.content);
++      expect(log).toMatch(new RegExp(`^SWEEP_T=${value}$`, "m"));
++      expect(log).not.toContain("SWEEP_T=1.44");
++    }
++  });
+ });
+diff --git a/src/engine/RunController.test.ts b/src/engine/RunController.test.ts
+index 81f5551e..cee634d6 100644
+--- a/src/engine/RunController.test.ts
++++ b/src/engine/RunController.test.ts
+@@ -61,26 +61,22 @@ describe("prepareVarsScript", () => {
+     expect(writeFile).not.toHaveBeenCalled();
+   });
+ 
+-  it("writes the vars and wrapper files into the workdir and runs the wrapper", () => {
++  it("writes a copy with the definition lines rewritten and runs it", () => {
+     const result = prepareVarsScript(
+       {
+         workdirId: "p/runs/run-001",
+         inputScript: "in.lmp",
+         vars: { temp: 300, pressure: 1 },
+       },
+-      "run 1000\n",
++      "variable temp equal 1.44\nvariable pressure equal 0.5\nrun 1000\n",
+       { writeFile },
+     );
+ 
+     expect(result).toBe("_wrapper_in.lmp");
+     expect(writeFile.mock.calls).toEqual([
+-      [
+-        "/p/runs/run-001/_vars_in.lmp",
+-        "variable temp equal 300\nvariable pressure equal 1\n\n",
+-      ],
+       [
+         "/p/runs/run-001/_wrapper_in.lmp",
+-        "variable temp equal 300\nvariable pressure equal 1\n\nrun 1000\n",
++        "variable temp equal 300\nvariable pressure equal 1\nrun 1000\n",
+       ],
+     ]);
+   });
+@@ -194,7 +190,7 @@ describe("RunController", () => {
+     );
+     expect(engine.read(`${workdir}/in.lmp`)).toContain("suffix off");
+     expect(engine.read(`${workdir}/_wrapper_in.lmp`)).toMatch(
+-      /^variable T equal 2\n\nsuffix off/,
++      /^variable T equal 2\nsuffix off/,
+     );
+     expect(host.beginFreshRun).toHaveBeenCalledWith(
+       runWorkdirId("proj", "run-001"),
+diff --git a/src/engine/RunController.ts b/src/engine/RunController.ts
+index 0ec32c69..867a794b 100644
+--- a/src/engine/RunController.ts
++++ b/src/engine/RunController.ts
+@@ -39,6 +39,7 @@ import {
+   type RunMeta,
+ } from "../storage";
+ import { continuationScript } from "../utils/continuation";
++import { applyVariableOverrides } from "../utils/scriptVariables";
+ import {
+   injectKokkosOptIn,
+   prepareScriptForSerialStyles,
+@@ -205,9 +206,10 @@ export function prepareEngineInputs(
+ }
+ 
+ /**
+- * Builds a LAMMPS variable-injection script from a vars map, writes both the
+- * vars file and the wrapper file into the engine workdir, and returns the
+- * name of the script to execute (the input script itself without vars).
++ * Applies a run's variable overrides by writing a copy of the input script
++ * with the definition lines rewritten (applyVariableOverrides) into the
++ * engine workdir, and returns the name of the script to execute (the input
++ * script itself without vars). The project's script never changes.
+  */
+ export function prepareVarsScript(
+   run: {
+@@ -222,17 +224,11 @@ export function prepareVarsScript(
+     return run.inputScript;
+   }
+ 
+-  const varsScript =
+-    Object.entries(run.vars)
+-      .map(([name, value]) => `variable ${name} equal ${value}`)
+-      .join("\n") + "\n\n";
+-
+-  const varsFileName = `_vars_${run.inputScript}`;
+-  engine.writeFile(`/${run.workdirId}/${varsFileName}`, varsScript);
+-
+-  const wrapperScript = varsScript + inputScriptContent;
+   const wrapperFileName = `_wrapper_${run.inputScript}`;
+-  engine.writeFile(`/${run.workdirId}/${wrapperFileName}`, wrapperScript);
++  engine.writeFile(
++    `/${run.workdirId}/${wrapperFileName}`,
++    applyVariableOverrides(inputScriptContent, run.vars),
++  );
+ 
+   return wrapperFileName;
+ }
+diff --git a/src/shell/modals/NewRunModal.tsx b/src/shell/modals/NewRunModal.tsx
+index 950ed826..ff464b52 100644
+--- a/src/shell/modals/NewRunModal.tsx
++++ b/src/shell/modals/NewRunModal.tsx
+@@ -273,11 +273,9 @@ const NewRunModal = ({
+                 variable
+               </span>{" "}
+               set to a plain number in the input script appears here (derived
+-              expressions recompute automatically). Overrides are passed as{" "}
+-              <span style={{ fontFamily: MONO, color: "var(--text-2)" }}>
+-                -var
+-              </span>{" "}
+-              flags — the script itself never changes. To add or remove one,{" "}
++              expressions recompute automatically). An override replaces the
++              variable&apos;s definition line in the copy of the script each run
++              executes — your script itself never changes. To add or remove one,{" "}
+               <span
+                 onClick={onGoToFiles}
+                 style={{
+diff --git a/src/shell/runPlan.ts b/src/shell/runPlan.ts
+index b1a67eec..f7d578b6 100644
+--- a/src/shell/runPlan.ts
++++ b/src/shell/runPlan.ts
+@@ -103,8 +103,10 @@ export function buildRunPlan(
+ }
+ 
+ /**
+- * Preview of the equivalent LAMMPS invocation. Shows only the -var flags
+- * that will actually be passed (overrides + sweeps).
++ * Command-line-style summary of the run: the input script plus a `-var`
++ * entry per changed variable (overrides + sweeps). Illustrative only — no
++ * flags are passed; overrides rewrite the definition line in the run's copy
++ * of the script (applyVariableOverrides).
+  */
+ export function buildCommandPreview(
+   inputScript: string | undefined,
+diff --git a/src/utils/scriptVariables.test.ts b/src/utils/scriptVariables.test.ts
+new file mode 100644
+index 00000000..b6729f95
+--- /dev/null
++++ b/src/utils/scriptVariables.test.ts
+@@ -0,0 +1,64 @@
++import { describe, expect, it } from "vitest";
++import {
++  applyVariableOverrides,
++  linspace,
++  parseScriptVariables,
++} from "./scriptVariables";
++
++describe("parseScriptVariables", () => {
++  it("lists plain-number variables once, with line and comment label", () => {
++    const script = [
++      "variable T equal 1.44 # temperature",
++      "variable L equal $(2*v_T)",
++      "variable N equal 10",
++      "variable T equal 3",
++    ].join("\n");
++    expect(parseScriptVariables(script)).toEqual([
++      { name: "T", value: 1.44, line: 1, label: "temperature" },
++      { name: "N", value: 10, line: 3, label: undefined },
++    ]);
++  });
++});
++
++describe("applyVariableOverrides", () => {
++  it("rewrites the definition line instead of prepending", () => {
++    const script = 'variable T equal 1.44\nprint "T=${T}"\n';
++    expect(applyVariableOverrides(script, { T: 2 })).toBe(
++      'variable T equal 2\nprint "T=${T}"\n',
++    );
++  });
++
++  it("keeps indentation and the trailing comment", () => {
++    expect(
++      applyVariableOverrides("  variable T equal 1.44   # temp", { T: 0.5 }),
++    ).toBe("  variable T equal 0.5 # temp");
++  });
++
++  it("rewrites only the first definition, leaving later stages alone", () => {
++    const script = "variable T equal 1\nrun 10\nvariable T equal 3\nrun 10";
++    expect(applyVariableOverrides(script, { T: 2 })).toBe(
++      "variable T equal 2\nrun 10\nvariable T equal 3\nrun 10",
++    );
++  });
++
++  it("leaves other variables and derived expressions untouched", () => {
++    const script =
++      "variable N equal 10\nvariable T equal 1\nvariable L equal $(2*v_T)";
++    expect(applyVariableOverrides(script, { T: 4 })).toBe(
++      "variable N equal 10\nvariable T equal 4\nvariable L equal $(2*v_T)",
++    );
++  });
++
++  it("prepends a variable the script does not define", () => {
++    expect(applyVariableOverrides("run 10", { seed: 42 })).toBe(
++      "variable seed equal 42\nrun 10",
++    );
++  });
++});
++
++describe("linspace", () => {
++  it("spans from..to inclusive", () => {
++    expect(linspace(1, 2, 3)).toEqual([1, 1.5, 2]);
++    expect(linspace(1, 2, 1)).toEqual([1]);
++  });
++});
+diff --git a/src/utils/scriptVariables.ts b/src/utils/scriptVariables.ts
+index 64c46c27..39a17f6f 100644
+--- a/src/utils/scriptVariables.ts
++++ b/src/utils/scriptVariables.ts
+@@ -4,9 +4,13 @@
+  * A variable is a run parameter when it is defined with a plain numeric
+  * literal: `variable T equal 3.0`. Derived expressions
+  * (`variable Lhalf equal $(0.5*v_L)`) recompute from the overrides and are
+- * not editable themselves. Overrides work because LAMMPS ignores a
+- * `variable` command whose name is already defined — the documented pattern
+- * for command-line/-var-style defaults — so injected definitions win.
++ * not editable themselves.
++ *
++ * Overrides are applied by rewriting the definition line in the engine's
++ * copy of the script (see applyVariableOverrides). Prepending a definition
++ * would not work: LAMMPS lets a later `variable ... equal` redefine an
++ * equal-style variable (only index/loop-style ones are skipped when already
++ * defined), so the script's own line would win.
+  */
+ 
+ export interface ScriptVariable {
+@@ -31,7 +35,7 @@ export function parseScriptVariables(script: string): ScriptVariable[] {
+       return;
+     }
+     const [, name, literal, comment] = match;
+-    // Only the first definition is overridable — LAMMPS ignores later ones.
++    // Only the first definition is listed as the parameter's default.
+     if (seen.has(name)) {
+       return;
+     }
+@@ -46,6 +50,36 @@ export function parseScriptVariables(script: string): ScriptVariable[] {
+   return variables;
+ }
+ 
++/**
++ * Returns `script` with each overridden variable's first plain-number
++ * definition (the one parseScriptVariables lists) rewritten to the override
++ * value; a trailing `# comment` is kept. Later redefinitions are left alone,
++ * since they are deliberate changes inside the script (e.g. a second stage).
++ * A variable with no such definition in the script is prepended instead.
++ */
++export function applyVariableOverrides(
++  script: string,
++  vars: Record<string, number>,
++): string {
++  const found = new Set<string>();
++  const lines = script.split("\n").map((text) => {
++    const match = VARIABLE_LINE.exec(text);
++    if (!match || !Object.hasOwn(vars, match[1]) || found.has(match[1])) {
++      return text;
++    }
++    const [, name, , comment] = match;
++    found.add(name);
++    const indent = /^\s*/.exec(text)![0];
++    const suffix = comment !== undefined ? ` # ${comment.trim()}` : "";
++    return `${indent}variable ${name} equal ${vars[name]}${suffix}`;
++  });
++  const missing = Object.entries(vars)
++    .filter(([name]) => !found.has(name))
++    .map(([name, value]) => `variable ${name} equal ${value}\n`)
++    .join("");
++  return missing + lines.join("\n");
++}
++
+ /** Evenly spaced values from `from` to `to` inclusive (design's sweep rows). */
+ export function linspace(from: number, to: number, count: number): number[] {
+   const n = Math.max(1, Math.floor(count));

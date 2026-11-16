@@ -1,0 +1,158 @@
+diff --git a/e2e/lighting.spec.ts b/e2e/lighting.spec.ts
+new file mode 100644
+index 00000000..3e54c22a
+--- /dev/null
++++ b/e2e/lighting.spec.ts
+@@ -0,0 +1,61 @@
++import { expect, test } from "@playwright/test";
++import { gotoApp } from "./helpers";
++
++test("viewport lighting remains visible beyond the old light cutoff", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  const result = await page.evaluate(async () => {
++    const threePath = "/atomify/node_modules/three/build/three.module.js";
++    const lightingPath = "/atomify/src/utils/lighting.ts";
++    const THREE = await import(threePath);
++    const { applyLighting } = await import(lightingPath);
++    const renderer = new THREE.WebGLRenderer();
++    renderer.setSize(256, 256);
++    const target = new THREE.WebGLRenderTarget(256, 256);
++    const scene = new THREE.Scene();
++    const material = new THREE.MeshPhongMaterial({ color: 0x7788ff });
++    const geometry = new THREE.SphereGeometry(1, 48, 32);
++    scene.add(new THREE.Mesh(geometry, material));
++    const pointLight = new THREE.PointLight(0xffffff, 20, 200, 0.8);
++    const ambientLight = new THREE.AmbientLight(0xffffff, 0.05);
++    scene.add(pointLight, ambientLight);
++    const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 10000);
++    const sample = (distance: number) => {
++      camera.position.set(0, 0, distance);
++      camera.fov =
++        (2 *
++          Math.atan((Math.tan((35 * Math.PI) / 360) * 10) / distance) *
++          180) /
++        Math.PI;
++      camera.updateProjectionMatrix();
++      camera.lookAt(0, 0, 0);
++      pointLight.position.copy(camera.position);
++      renderer.setRenderTarget(target);
++      renderer.render(scene, camera);
++      const pixels = new Uint8Array(256 * 256 * 4);
++      renderer.readRenderTargetPixels(target, 0, 0, 256, 256, pixels);
++      let sum = 0;
++      for (let i = 0; i < pixels.length; i += 4)
++        sum += pixels[i] + pixels[i + 1] + pixels[i + 2];
++      return sum;
++    };
++    const oldNear = sample(10),
++      oldFar = sample(1000);
++    applyLighting(
++      { pointLight, ambientLight },
++      { pointLightIntensity: 20, ambientLightIntensity: 0.05 },
++    );
++    const near = sample(10),
++      far = sample(1000);
++    renderer.dispose();
++    target.dispose();
++    geometry.dispose();
++    material.dispose();
++    return { oldNear, oldFar, near, far };
++  });
++  expect(result.oldFar).toBeLessThan(result.oldNear * 0.4);
++  expect(result.far).toBeGreaterThan(result.near * 0.85);
++  expect(result.far).toBeLessThan(result.near * 1.15);
++  expect(result.near).toBeGreaterThan(10000);
++});
+diff --git a/src/containers/View.tsx b/src/containers/View.tsx
+index 63852258..592ca873 100644
+--- a/src/containers/View.tsx
++++ b/src/containers/View.tsx
+@@ -19,6 +19,8 @@ import {
+ import { createWallGroup } from "../utils/wallGeometry";
+ 
+ // Type guard for Visualizer with updateCameraPlanes method
++import { applyLighting } from "../utils/lighting";
++
+ interface VisualizerWithCameraPlanes extends Visualizer {
+   updateCameraPlanes: (box: THREE.Box3) => void;
+ }
+@@ -285,9 +287,7 @@ const View = ({ visible, pane = false }: ViewProps) => {
+       });
+ 
+       // Apply lighting settings
+-      newVisualizer.pointLight.intensity = renderSettings.pointLightIntensity;
+-      newVisualizer.ambientLight.intensity =
+-        renderSettings.ambientLightIntensity;
++      applyLighting(newVisualizer, renderSettings);
+ 
+       // Check for WebXR support and show VR button if available
+       if (navigator.xr) {
+@@ -384,8 +384,7 @@ const View = ({ visible, pane = false }: ViewProps) => {
+       }
+ 
+       // Update lighting
+-      visualizer.pointLight.intensity = renderSettings.pointLightIntensity;
+-      visualizer.ambientLight.intensity = renderSettings.ambientLightIntensity;
++      applyLighting(visualizer, renderSettings);
+ 
+       // Update camera projection mode
+       visualizer.setOrthographic(renderSettings.orthographic);
+diff --git a/src/utils/lighting.test.ts b/src/utils/lighting.test.ts
+new file mode 100644
+index 00000000..c5b17bcc
+--- /dev/null
++++ b/src/utils/lighting.test.ts
+@@ -0,0 +1,24 @@
++import { expect, it } from "vitest";
++import { AmbientLight, PointLight } from "three";
++import { applyLighting } from "./lighting";
++
++it("removes distance falloff and finite range while preserving adjustable lighting", () => {
++  const visualizer = {
++    pointLight: new PointLight(0xffffff, 20, 200, 0.8),
++    ambientLight: new AmbientLight(),
++  };
++  applyLighting(visualizer, {
++    pointLightIntensity: 20,
++    ambientLightIntensity: 0.05,
++  });
++  expect(visualizer.pointLight.distance).toBe(0);
++  expect(visualizer.pointLight.decay).toBe(0);
++  expect(visualizer.pointLight.intensity).toBe(2);
++  expect(visualizer.ambientLight.intensity).toBe(0.05);
++  applyLighting(visualizer, {
++    pointLightIntensity: 0,
++    ambientLightIntensity: 0.4,
++  });
++  expect(visualizer.pointLight.intensity).toBe(0);
++  expect(visualizer.ambientLight.intensity).toBe(0.4);
++});
+diff --git a/src/utils/lighting.ts b/src/utils/lighting.ts
+new file mode 100644
+index 00000000..fdd2a4db
+--- /dev/null
++++ b/src/utils/lighting.ts
+@@ -0,0 +1,21 @@
++import type { Visualizer } from "omovi";
++import type { RenderSettings } from "../store/settings";
++
++/** Viewport illumination must not depend on the simulation's length units. */
++export function applyLighting(
++  visualizer: Pick<Visualizer, "pointLight" | "ambientLight">,
++  settings: Pick<
++    RenderSettings,
++    "pointLightIntensity" | "ambientLightIntensity"
++  >,
++): void {
++  // The default omovi light cuts off at 200 simulation units and attenuates
++  // with distance. That makes otherwise identical systems dark at large
++  // scales. Keep its camera-facing position, but use uniform illumination.
++  visualizer.pointLight.distance = 0;
++  visualizer.pointLight.decay = 0;
++  // Retain the existing 0–40 control/storage range with a useful 0–4
++  // unattenuated intensity (default 2), rather than saturating the model.
++  visualizer.pointLight.intensity = settings.pointLightIntensity / 10;
++  visualizer.ambientLight.intensity = settings.ambientLightIntensity;
++}

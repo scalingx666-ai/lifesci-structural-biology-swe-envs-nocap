@@ -1,0 +1,948 @@
+diff --git a/.gitignore b/.gitignore
+index 923402c..f9cdf1d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -197,4 +197,26 @@ reference_pr/
+ 
+ *sandbox
+ uv.lock
+-patchr_jobs/
+\ No newline at end of file
++patchr_jobs/
++# Ninja CUDA extension build artifacts (per-environment, do not commit)
++src/protenix/model/layer_norm/.ninja_deps
++src/protenix/model/layer_norm/.ninja_log
++src/protenix/model/layer_norm/build.ninja
++src/protenix/model/layer_norm/*.o
++
++# Local working / scratch directories
++.claude/
++deepfold3-dev/
++patchr_inputs_post_fix
++scripts/predict_batch/
++
++# Per-run data caches (keep curated CSVs in data/, exclude large generated subtrees)
++data/atlas_pdb_list.txt
++data/cifs/
++data/jsons/
++data/yamls/
++data/test_1qmz/
++data/mod_test/
++
++# Auto-generated release info
++docs/RELEASE_INFO.md
+diff --git a/protenix_runner/cif_postprocess.py b/protenix_runner/cif_postprocess.py
+new file mode 100644
+index 0000000..8541f57
+--- /dev/null
++++ b/protenix_runner/cif_postprocess.py
+@@ -0,0 +1,112 @@
++# Copyright 2024 ByteDance and/or its affiliates.
++# Licensed under the Apache License, Version 2.0.
++"""
++Post-prediction enrichment of Protenix mmCIF output.
++
++Protenix's `save_structure_cif()` writes a minimal mmCIF (`_atom_site`,
++`_entity_poly`, `_entity_poly_seq`, `_chem_comp`, possibly `_struct_conn`).
++The `_entity_poly` block carries only ``(entity_id, strand_id, type)`` —
++it omits ``pdbx_seq_one_letter_code``, ``pdbx_seq_one_letter_code_can``,
++``nstd_monomer``.  ``_pdbx_struct_mod_residue`` is also missing entirely.
++
++This module enriches the prediction CIF with metadata from the template
++CIF (which carries the full entity_poly + mod_residue + struct_conn /
++chem_comp / cell / symmetry).  Mirrors the merge step we apply to the
++Boltz-2 backend, ensuring output parity between the two backends.
++"""
++from __future__ import annotations
++
++import logging
++import re
++from io import StringIO
++from pathlib import Path
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++
++_ENTITY_POLY_LOOP_RE = re.compile(
++    r"\nloop_\s*\n(?:_entity_poly\.[^\n]*\n)+"        # header block
++    r"(?:[^#_][^\n]*\n)+"                              # data rows
++    r"#",
++    re.DOTALL,
++)
++
++# A multi-line entity_poly block can include semicolon-delimited text
++# blocks (e.g. for long sequences).  This more permissive regex captures
++# the body as everything up to the first lone "#".
++_ENTITY_POLY_FULL_RE = re.compile(
++    r"\nloop_\s*\n((?:_entity_poly\.[^\n]*\n)+(?:.*?))\n#",
++    re.DOTALL,
++)
++
++
++def _extract_entity_poly_loop(cif_text: str) -> Optional[str]:
++    """Return the verbatim ``loop_ ... _entity_poly.* ... #`` block, or None."""
++    m = _ENTITY_POLY_FULL_RE.search(cif_text)
++    if not m:
++        return None
++    body = m.group(0)
++    # Trim the leading "\n" and ensure trailing "#"
++    return body.strip("\n")
++
++
++def _strip_entity_poly_loop(cif_text: str) -> str:
++    """Remove the existing ``loop_ ... _entity_poly.* ... #`` block."""
++    return _ENTITY_POLY_FULL_RE.sub("\n#", cif_text, count=1)
++
++
++def _replace_entity_poly_with_template(pred_text: str, template_text: str) -> str:
++    """Replace prediction's `_entity_poly` loop with template's richer one."""
++    template_block = _extract_entity_poly_loop(template_text)
++    if not template_block:
++        return pred_text
++    if _extract_entity_poly_loop(pred_text) is None:
++        # Nothing to replace; just append.
++        return pred_text.rstrip() + "\n" + template_block + "\n"
++    stripped = _strip_entity_poly_loop(pred_text)
++    return stripped.rstrip() + "\n" + template_block + "\n"
++
++
++def enrich_with_template_metadata(
++    pred_cif_path: str | Path,
++    template_cif_path: str | Path,
++    entry_id: Optional[str] = None,
++) -> bool:
++    """Merge template metadata into a Protenix prediction mmCIF in place.
++
++    Steps:
++      1. Boltz-style merge of struct_conn, chem_comp, cell, symmetry,
++         atom_sites, pdbx_struct_mod_residue.
++      2. Replace minimal _entity_poly loop with template's full version
++         (so pdbx_seq_one_letter_code and _can are present).
++
++    Returns True on success, False if either file is missing.
++    """
++    pred_cif_path = Path(pred_cif_path)
++    template_cif_path = Path(template_cif_path)
++    if not pred_cif_path.is_file():
++        logger.warning(f"enrich: prediction CIF not found: {pred_cif_path}")
++        return False
++    if not template_cif_path.is_file():
++        logger.warning(f"enrich: template CIF not found: {template_cif_path}")
++        return False
++
++    # Late import to keep this module importable even without boltz on path
++    # at config time.
++    from boltz.data.write.merge_cif_blocks import merge_template_blocks_into_cif
++
++    cif_text = pred_cif_path.read_text()
++    template_text = template_cif_path.read_text()
++
++    # Step 1 — boltz merge (adds mod_residue + struct_conn + chem_comp + cell
++    # + symmetry + atom_sites).
++    cif_text = merge_template_blocks_into_cif(
++        cif_text, str(template_cif_path), entry_id=entry_id
++    )
++
++    # Step 2 — replace _entity_poly with template's richer version.
++    cif_text = _replace_entity_poly_with_template(cif_text, template_text)
++
++    pred_cif_path.write_text(cif_text)
++    return True
+diff --git a/protenix_runner/inference.py b/protenix_runner/inference.py
+index 7c27362..5b89fac 100644
+--- a/protenix_runner/inference.py
++++ b/protenix_runner/inference.py
+@@ -514,21 +514,51 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
+                 )
+ 
+                 # Copy inpainting_metadata JSON to predictions dir (matching Boltz output)
++                # AND enrich prediction CIF with template metadata (mod_residue,
++                # struct_conn, chem_comp, full _entity_poly with sequence strings).
+                 for sample_entry in json_data:
+-                    if sample_entry.get("name") == sample_name:
+-                        meta_path = (
+-                            sample_entry.get("inpainting", {}).get("metadata")
++                    if sample_entry.get("name") != sample_name:
++                        continue
++                    inpainting_info = sample_entry.get("inpainting", {})
++                    meta_path = inpainting_info.get("metadata")
++                    template_cif = inpainting_info.get("template_cif")
++                    pred_dir = runner.dumper._get_dump_dir(sample_name)
++
++                    if meta_path and os.path.isfile(meta_path):
++                        dest = opjoin(
++                            pred_dir,
++                            f"inpainting_metadata_{sample_name}.json",
+                         )
+-                        if meta_path and os.path.isfile(meta_path):
+-                            dest = opjoin(
+-                                runner.dumper._get_dump_dir(sample_name),
+-                                f"inpainting_metadata_{sample_name}.json",
++                        shutil.copy2(meta_path, dest)
++                        logger.info(f"Copied inpainting metadata to {dest}")
++
++                    # Enrich every {sample_name}_model_*.cif with template metadata.
++                    if template_cif and os.path.isfile(template_cif):
++                        try:
++                            from protenix_runner.cif_postprocess import (
++                                enrich_with_template_metadata,
+                             )
+-                            shutil.copy2(meta_path, dest)
+-                            logger.info(
+-                                f"Copied inpainting metadata to {dest}"
++                        except Exception as _ex:
++                            logger.warning(
++                                f"cif_postprocess unavailable: {_ex}"
+                             )
+-                        break
++                        else:
++                            for fname in sorted(os.listdir(pred_dir)):
++                                if not fname.startswith(f"{sample_name}_model_"):
++                                    continue
++                                if not fname.endswith(".cif"):
++                                    continue
++                                cif_path = opjoin(pred_dir, fname)
++                                ok = enrich_with_template_metadata(
++                                    cif_path,
++                                    template_cif,
++                                    entry_id=sample_name,
++                                )
++                                if ok:
++                                    logger.info(
++                                        f"Enriched {fname} with template metadata"
++                                    )
++                    break
+ 
+                 t2_end = time.time()
+                 logger.info(
+diff --git a/scripts/inpainting/ccd_utils.py b/scripts/inpainting/ccd_utils.py
+index 87562eb..758fe5a 100644
+--- a/scripts/inpainting/ccd_utils.py
++++ b/scripts/inpainting/ccd_utils.py
+@@ -6,7 +6,13 @@
+ from pathlib import Path
+ from typing import Optional, Tuple
+ 
+-from .constants import STANDARD_AA_CODES, STANDARD_AA_THREE_LETTER, get_boltz_cache
++from .constants import (
++    STANDARD_AA_CODES,
++    STANDARD_AA_THREE_LETTER,
++    STANDARD_RES_ONE_LETTER,
++    STANDARD_RES_THREE_LETTER,
++    get_boltz_cache,
++)
+ 
+ 
+ def load_ccd_dict(ccd_path: Path) -> dict:
+@@ -66,8 +72,14 @@ def is_ccd_available(ccd: Optional[dict], ccd_code: str,
+ 
+ 
+ def get_non_standard_parent_from_ccd(ccd: Optional[dict], ccd_code: str) -> Optional[Tuple[str, str]]:
+-    """Get parent residue for a non-standard comp_id from CCD (ccd.pkl dict). Returns (parent_three_letter, parent_one_letter) or None."""
+-    if ccd_code in STANDARD_AA_THREE_LETTER:
++    """Get parent residue for a non-standard comp_id from CCD (ccd.pkl dict).
++
++    Returns (parent_three_letter, parent_one_letter) or None.  Accepts both
++    protein and nucleic-acid parents — previously this only recognised the
++    20 standard amino acids and silently dropped DNA/RNA parents (e.g. BRU's
++    CCD parent ``DU``).
++    """
++    if ccd_code in STANDARD_RES_THREE_LETTER:
+         return None
+ 
+     mol = load_ccd_molecule(ccd or {}, ccd_code)
+@@ -77,18 +89,8 @@ def get_non_standard_parent_from_ccd(ccd: Optional[dict], ccd_code: str) -> Opti
+     try:
+         if mol.HasProp("_chem_comp.mon_nstd_parent_comp_id"):
+             parent = mol.GetProp("_chem_comp.mon_nstd_parent_comp_id")
+-            if parent and parent in STANDARD_AA_THREE_LETTER:
+-                return (parent, STANDARD_AA_CODES[parent])
+-
+-        atom_names = set()
+-        for atom in mol.GetAtoms():
+-            if atom.HasProp("name"):
+-                atom_names.add(atom.GetProp("name"))
+-
+-        backbone_atoms = {"N", "CA", "C", "O"}
+-        if backbone_atoms.issubset(atom_names):
+-            if "CB" in atom_names or ccd_code in ['GLY']:
+-                pass
++            if parent and parent in STANDARD_RES_THREE_LETTER:
++                return (parent, STANDARD_RES_ONE_LETTER[parent])
+     except Exception:
+         pass
+ 
+diff --git a/scripts/inpainting/cif_writer.py b/scripts/inpainting/cif_writer.py
+index 3b0ddc5..1f36efe 100644
+--- a/scripts/inpainting/cif_writer.py
++++ b/scripts/inpainting/cif_writer.py
+@@ -367,7 +367,9 @@ def generate_cif(
+             has_mods = bool(modifications_from_entity_poly.get(chain_id))
+             nstd_monomer = 'yes' if has_mods else 'no'
+             lines.append(f"{entity_id} {poly_type} no {nstd_monomer}")
+-            if has_mods and entity_type == 'protein':
++            # `pdbx_seq_one_letter_code`: bracketed 3-letter codes for non-standard
++            # residues (mmCIF spec).  Applies to protein, DNA and RNA equally.
++            if has_mods:
+                 mod_positions = {m['position']: m['ccd'] for m in modifications_from_entity_poly.get(chain_id, [])}
+                 bracketed_seq = []
+                 for pos, aa in enumerate(sequence, 1):
+@@ -378,14 +380,30 @@ def generate_cif(
+                 formatted_seq = ''.join(bracketed_seq)
+             else:
+                 formatted_seq = sequence
++            # `_can`: canonical 1-letter sequence — substitute parent's 1-letter
++            # code at modification positions.  The chain's enriched
++            # modifications list (built in StructureProcessor) carries
++            # parent_one; falls back to 'X' when truly unresolvable.  Applies
++            # to protein, DNA and RNA equally.
++            if has_mods:
++                chain_mods = all_chains_data[chain_id].get('modifications', [])
++                pos_to_parent_one = {m['position']: (m.get('parent_one') or 'X')
++                                     for m in chain_mods}
++                canonical_chars = list(sequence)
++                for pos, p_one in pos_to_parent_one.items():
++                    if 1 <= pos <= len(canonical_chars):
++                        canonical_chars[pos - 1] = p_one
++                canonical_seq = ''.join(canonical_chars)
++            else:
++                canonical_seq = sequence
++            # First field: pdbx_seq_one_letter_code (bracketed form for non-std)
+             lines.append(";")
+             lines.append(format_sequence_for_cif(formatted_seq))
+             lines.append(";")
+             lines.append("")
+-            # Use bracketed form for second field when we have mods so gemmi's full_sequence
+-            # matches entity_poly_seq and atom_site (avoids Alignment mismatch! in boltz parse_polymer)
++            # Second field: pdbx_seq_one_letter_code_can (canonical 1-letter codes)
+             lines.append(";")
+-            lines.append(format_sequence_for_cif(formatted_seq))
++            lines.append(format_sequence_for_cif(canonical_seq))
+             lines.append(";")
+             lines.append(f"{chain_id} ?")
+         lines.append("#")
+@@ -417,6 +435,39 @@ def generate_cif(
+                 lines.append(f"{entity_id} {i} {three_letter} n")
+         lines.append("#")
+ 
++        # _pdbx_struct_mod_residue: explicit catalog of modified residues with
++        # parent assignments. Standard mmCIF category — used by RCSB, PyMOL,
++        # Chimera, etc. to surface non-standard residues without requiring
++        # _entity_poly_seq + _chem_comp cross-referencing.
++        mod_rows: list[tuple] = []
++        for chain_id in polymer_chain_ids:
++            chain_mods = all_chains_data[chain_id].get('modifications', [])
++            for m in chain_mods:
++                if m.get('ccd') in (None, ''):
++                    continue
++                mod_rows.append((
++                    chain_id,
++                    int(m['position']),
++                    m['ccd'],
++                    m.get('parent') or '?',
++                ))
++        if mod_rows:
++            lines.append("loop_")
++            lines.append("_pdbx_struct_mod_residue.id")
++            lines.append("_pdbx_struct_mod_residue.label_asym_id")
++            lines.append("_pdbx_struct_mod_residue.label_seq_id")
++            lines.append("_pdbx_struct_mod_residue.label_comp_id")
++            lines.append("_pdbx_struct_mod_residue.auth_asym_id")
++            lines.append("_pdbx_struct_mod_residue.auth_seq_id")
++            lines.append("_pdbx_struct_mod_residue.auth_comp_id")
++            lines.append("_pdbx_struct_mod_residue.PDB_ins_code")
++            lines.append("_pdbx_struct_mod_residue.parent_comp_id")
++            lines.append("_pdbx_struct_mod_residue.details")
++            for idx, (cid, pos, ccd, parent) in enumerate(mod_rows, 1):
++                author_chain = all_chains_data[cid].get('author_chain_id', cid)
++                lines.append(f"{idx} {cid} {pos} {ccd} {author_chain} {pos} {ccd} ? {parent} ?")
++            lines.append("#")
++
+     comp_ids_for_chem = set()
+     for chain_id in chain_ids:
+         for atom in all_chains_data[chain_id]['atoms']:
+@@ -575,14 +626,15 @@ def generate_cif(
+         # label_asym_id in the output CIF is the processor's chain_id (label).
+         # auth_asym_id preserves the original author chain (may collide).
+         author_chain_id = all_chains_data[chain_id].get('author_chain_id', chain_id)
+-        use_atom_for_chain = (
+-            bool(modifications_from_entity_poly.get(chain_id)) or
+-            any(a.get('group_PDB') == 'HETATM' for a in atoms)
+-        )
+         for atom in atoms:
+             atom_id = next_atom_id
+             next_atom_id += 1
+-            group_pdb = 'ATOM' if use_atom_for_chain else atom['group_PDB']
++            # Per wwPDB convention: ATOM for standard polymer residues, HETATM
++            # for non-standard residues (MSE, TPO, PTR, ...), ligands, ions,
++            # and water — even when polymer-embedded. Trust the source group_PDB
++            # captured in atom_parse.py; for parent-rewritten residues the
++            # processor explicitly normalises group_PDB to 'ATOM' upstream.
++            group_pdb = atom.get('group_PDB', 'ATOM')
+             atom_rows.append([
+                 group_pdb, str(atom_id), atom['type_symbol'],
+                 atom['label_atom_id'], atom['label_alt_id'],
+diff --git a/scripts/inpainting/constants.py b/scripts/inpainting/constants.py
+index 87c99fb..57a8c34 100644
+--- a/scripts/inpainting/constants.py
++++ b/scripts/inpainting/constants.py
+@@ -37,6 +37,87 @@ def get_default_ccd_path() -> Path:
+     'A', 'C', 'G', 'U', 'I',
+ }
+ 
++# 1-letter codes for DNA / RNA monomers.  Used when a non-standard nucleotide
++# resolves to a standard parent and we need to fill `pdbx_seq_one_letter_code_can`
++# or the YAML sequence with the parent's 1-letter form.
++STANDARD_NUCLEOTIDE_ONE_LETTER = {
++    # DNA
++    'DA': 'A', 'DC': 'C', 'DG': 'G', 'DT': 'T', 'DI': 'I', 'DU': 'U',
++    # RNA
++    'A': 'A', 'C': 'C', 'G': 'G', 'U': 'U', 'I': 'I',
++}
++
++# Combined 3-letter -> 1-letter mapping (protein + DNA + RNA).
++STANDARD_RES_ONE_LETTER = {**STANDARD_AA_CODES, **STANDARD_NUCLEOTIDE_ONE_LETTER}
++
++# Combined "standard 3-letter code" set (protein + DNA + RNA). Use this for
++# parent-acceptance checks instead of STANDARD_AA_THREE_LETTER, which is
++# protein-only and incorrectly rejects DA/DT/DU/etc. as "unknown".
++STANDARD_RES_THREE_LETTER = STANDARD_AA_THREE_LETTER | set(STANDARD_NUCLEOTIDE_ONE_LETTER)
++
++# Hardcoded fallback for common non-standard residues → parent standard residue.
++# Used when ccd.pkl lacks `_chem_comp.mon_nstd_parent_comp_id` (typical with
++# pdbeccdutils-built mol pickles) AND the residue isn't in non_standard_residues
++# (e.g. when atoms are missing for that position). Mirrors deepfold3's
++# `_NONSTANDARD_TO_STANDARD` so PATCHR-generated templates and deepfold3 training
++# agree on parent assignments.
++NONSTANDARD_TO_STANDARD: dict[str, str] = {
++    # Selenium / sulfur variants
++    'MSE': 'MET',  # selenomethionine
++    'SEC': 'CYS',  # selenocysteine
++    'PYL': 'LYS',  # pyrrolysine
++    'FME': 'MET',  # N-formylmethionine
++    # Phosphorylation
++    'SEP': 'SER',  # phosphoserine
++    'TPO': 'THR',  # phosphothreonine
++    'PTR': 'TYR',  # phosphotyrosine
++    # Methylation
++    'MLY': 'LYS',  # N-dimethyl-lysine
++    'M3L': 'LYS',  # N-trimethyl-lysine
++    'AGM': 'ARG',  # 5-methyl-arginine
++    # Cysteine variants
++    'CYX': 'CYS', 'CSD': 'CYS', 'CME': 'CYS', 'OCS': 'CYS', 'CSO': 'CYS',
++    'CSS': 'CYS', 'SMC': 'CYS',
++    # Histidine variants
++    'HSD': 'HIS', 'HSE': 'HIS', 'HSP': 'HIS',
++    'HIE': 'HIS', 'HID': 'HIS', 'HIP': 'HIS',
++    # Hydroxylation / cyclization
++    'HYP': 'PRO',  # 4-hydroxyproline
++    'PCA': 'GLU',  # pyroglutamate
++    '5HP': 'GLU',
++    # Misc protein
++    'ASX': 'ASP', 'GLX': 'GLU',
++    'ABA': 'ALA', 'AIB': 'ALA',
++    # Nucleic acid variants
++    'DU': 'DT',
++    'PSU': 'U', '5MU': 'U', 'OMU': 'U',
++    'OMC': 'C',
++    '1MA': 'A', '6MA': 'A',
++    '7MG': 'G', 'OMG': 'G',
++    # DNA modifications — analogues that substitute for one of the standard
++    # DNA bases.  Mappings chosen to match RCSB convention (parent CCD code).
++    'BRU': 'DU',  # 5-bromo-2'-deoxyuridine  (RCSB pdbx parent = DU; canonical 'U')
++    '5BU': 'DU',  # alias of BRU in some PDB entries
++    'IDU': 'DU',  # 5-iodo-2'-deoxyuridine
++    'CBR': 'DC',  # 5-bromo-2'-deoxycytidine
++    '5HU': 'DU',  # 5-hydroxy-2'-deoxyuridine
++    'TFT': 'DT',  # alpha-trifluorothymidine
++    '5MC': 'DC',  # 5-methyl-2'-deoxycytidine (DNA)
++    '5CM': 'DC',
++    '6MA': 'DA',
++    '8OG': 'DG',  # 8-oxo-2'-deoxyguanosine
++    'CFL': 'DC',
++    # Additional protein modifications (RCSB CCD-confirmed parents).
++    'NLE': 'LEU',  # norleucine                       → L
++    'HIC': 'HIS',  # 4-methyl-histidine               → H
++    # Additional RNA modifications (RCSB CCD-confirmed parents).
++    '4AC': 'C',    # N4-acetylcytidine                → C
++    'G7M': 'G',    # 7-methylguanosine                → G
++    '2MG': 'G',    # 2N-methylguanosine               → G
++    'UR3': 'U',    # 3-methyluridine                  → U
++    '4OC': 'C',    # 4N,2'-O-dimethylcytidine         → C
++}
++
+ # Reference atoms from boltz.data.const (used for missing-atom checks and inpainting region)
+ ref_atoms = {
+     "ALA": ["N", "CA", "C", "O", "CB"],
+diff --git a/scripts/inpainting/processor/base.py b/scripts/inpainting/processor/base.py
+index f86b945..bd82b55 100644
+--- a/scripts/inpainting/processor/base.py
++++ b/scripts/inpainting/processor/base.py
+@@ -9,9 +9,12 @@
+ from ..constants import (
+     get_boltz_cache,
+     get_default_ccd_path,
++    NONSTANDARD_TO_STANDARD,
+     STANDARD_AA_CODES,
+     STANDARD_AA_THREE_LETTER,
+     STANDARD_NUCLEOTIDE_CODES,
++    STANDARD_RES_ONE_LETTER,
++    STANDARD_RES_THREE_LETTER,
+     ref_atoms,
+ )
+ 
+@@ -697,45 +700,129 @@ def _shift_and_filter(residues):
+                         chain_modifications.append({'position': pos, 'ccd': comp_id, 'parent': None, 'parent_one': None})
+                         positions_added.add(pos)
+             chain_modifications.sort(key=lambda m: m['position'])
+-            # Filter out modifications whose CCD is not available in boltz's CCD database.
+-            # Also collect positions to scrub from the template CIF atoms so that boltz's
+-            # parse_mmcif does not encounter an unsupported residue name.
++
++            # Enrich each modification with parent info (some sources omit it,
++            # e.g. _modifications_from_entity_poly_seq → only {position, ccd}).
+             _ccd_db = getattr(self, 'ccd', None)
++            _ns_key = self._base_chain_id(chain_id)
++            if _ns_key not in self.non_standard_residues and chain_id in self.non_standard_residues:
++                _ns_key = chain_id
++            _ns_chain = self.non_standard_residues.get(_ns_key, {})
++            for _m in chain_modifications:
++                if _m.get('parent') in STANDARD_RES_THREE_LETTER:
++                    # Even if the parent was set by an earlier source, make sure
++                    # parent_one is filled with the correct 1-letter code.
++                    if not _m.get('parent_one'):
++                        _m['parent_one'] = STANDARD_RES_ONE_LETTER.get(_m['parent'], 'X')
++                    continue
++                # (a) non_standard_residues keyed by untrimmed SEQRES position
++                ns_info = _ns_chain.get(_m['position'] + trim_offset)
++                if ns_info and ns_info.get('parent') in STANDARD_RES_THREE_LETTER:
++                    _m['parent'] = ns_info['parent']
++                    _m['parent_one'] = ns_info.get('parent_one') or STANDARD_RES_ONE_LETTER.get(ns_info['parent'], 'X')
++                    continue
++                # (b) ccd.pkl fallback (resolves _chem_comp.mon_nstd_parent_comp_id)
++                resolved = get_non_standard_parent_from_ccd(_ccd_db, _m.get('ccd', ''))
++                if resolved:
++                    _m['parent'], _m['parent_one'] = resolved
++                    continue
++                # (c) hardcoded common-modification table (covers cases where
++                #     ccd.pkl was built without `mon_nstd_parent_comp_id` props).
++                hard_parent = NONSTANDARD_TO_STANDARD.get(_m.get('ccd', '').upper())
++                if hard_parent and hard_parent in STANDARD_RES_THREE_LETTER:
++                    _m['parent'] = hard_parent
++                    _m['parent_one'] = STANDARD_RES_ONE_LETTER[hard_parent]
++
++            # Categorise each modification:
++            #   1) standard AA / nucleotide  → keep as-is
++            #   2) MSE                       → keep (Boltz hardcodes MSE→MET, SE→SD)
++            #   3) CCD mol available         → keep
++            #   4) CCD missing + parent OK   → drop from mods, rewrite atoms to parent
++            #   5) CCD missing + no parent   → drop from mods, rewrite atoms to UNK
++            # In all cases the atom coordinates are preserved (categories 4 and 5 may
++            # drop atoms whose names are absent from the parent / UNK ref_atoms set).
+             filtered_mods = []
+-            _unavailable_seq_positions: set = set()
++            _rewrites: Dict[int, str] = {}  # position -> parent three-letter (or 'UNK')
+             for _m in chain_modifications:
+-                _ccd_code = _m.get('ccd', '')
+-                if _ccd_code in STANDARD_AA_THREE_LETTER or _ccd_code in STANDARD_NUCLEOTIDE_CODES:
++                ccd = _m.get('ccd', '')
++                parent = _m.get('parent', '')
++                if ccd in STANDARD_RES_THREE_LETTER:
+                     filtered_mods.append(_m)
+-                elif is_ccd_available(_ccd_db, _ccd_code):
++                elif ccd == 'MSE' or is_ccd_available(_ccd_db, ccd):
+                     filtered_mods.append(_m)
++                elif parent in STANDARD_RES_THREE_LETTER:
++                    _rewrites[_m['position']] = parent
++                    info(f"Chain {chain_id}: CCD '{ccd}' at position {_m['position']} "
++                         f"unavailable in boltz mols; substituting atoms with parent '{parent}' "
++                         f"(coordinates preserved)")
+                 else:
+-                    warning(f"Chain {chain_id}: modification CCD '{_ccd_code}' at position "
+-                            f"{_m.get('position')} not found in boltz CCD database, skipping modification "
+-                            f"and removing its atoms from template CIF")
+-                    _unavailable_seq_positions.add(_m.get('position'))
++                    _rewrites[_m['position']] = 'UNK'
++                    warning(f"Chain {chain_id}: CCD '{ccd}' at position {_m['position']} "
++                            f"unavailable in boltz mols and no parent resolvable; "
++                            f"labeling atoms as UNK (coordinates preserved)")
+             chain_modifications = filtered_mods
+-            # Remove atoms at positions with unavailable CCD so the template CIF is clean.
+-            if _unavailable_seq_positions:
++
++            # Apply atom rewrites for parent / UNK substitutions.
++            # Drop atoms whose names are not in the target residue's ref_atoms set
++            # (e.g. SEP's PO3 group, MLY's CM1/CM2) so the template CIF stays valid
++            # under boltz's per-residue ref_atoms filter (mmcif.py:660).
++            if _rewrites:
+                 def _atom_seq_pos(a):
+                     try:
+                         return int(a.get('label_seq_id', -1))
+                     except (ValueError, TypeError):
+                         return -1
+-                renumbered_atoms = [
+-                    a for a in renumbered_atoms
+-                    if _atom_seq_pos(a) not in _unavailable_seq_positions
+-                ]
+-            # Modification positions: set X for non-standard residues only (e.g. PTR, TPO); keep standard AA (e.g. ASN) as is
++                _new_atoms = []
++                for atom in renumbered_atoms:
++                    pos = _atom_seq_pos(atom)
++                    if pos in _rewrites:
++                        new_comp = _rewrites[pos]
++                        parent_ref = set(ref_atoms.get(new_comp, ref_atoms.get('UNK', [])))
++                        atom_name = (atom.get('label_atom_id') or '').strip()
++                        if atom_name in parent_ref:
++                            atom['label_comp_id'] = new_comp
++                            atom['auth_comp_id'] = new_comp
++                            # Atom now belongs to a standard residue → normalise
++                            # group_PDB to 'ATOM' (was 'HETATM' as the source
++                            # non-standard residue). UNK fallback stays HETATM.
++                            if new_comp != 'UNK':
++                                atom['group_PDB'] = 'ATOM'
++                            _new_atoms.append(atom)
++                        # else: drop atom (not part of the target ref set)
++                    else:
++                        _new_atoms.append(atom)
++                renumbered_atoms = _new_atoms
++
++                # cif_writer (_entity_poly_seq, _chem_comp) reads monomer_ids first;
++                # keep it consistent with the rewritten atoms or alignment will break.
++                for pos, new_comp in _rewrites.items():
++                    seq_pos_to_monomer[pos] = new_comp
++
++                # Reflect rewrites in the sequence so YAML carries the parent one-letter
++                # at category-4 positions (instead of the placeholder 'X').
++                seq_list = list(final_sequence)
++                for pos, new_comp in _rewrites.items():
++                    if 1 <= pos <= len(seq_list):
++                        seq_list[pos - 1] = STANDARD_RES_ONE_LETTER.get(new_comp, 'X')
++                final_sequence = ''.join(seq_list)
++            # Modification positions in the YAML sequence: replace with the
++            # *parent* one-letter code when known (e.g. BRU → 'U', MSE → 'M'),
++            # falling back to 'X' only when no parent can be resolved.  This
++            # matches RCSB's `pdbx_seq_one_letter_code_can` convention.
+             output_sequence = final_sequence
+             for mod in chain_modifications:
+                 pos = mod.get('position')
+                 ccd = mod.get('ccd', '')
+-                if pos and 1 <= pos <= len(output_sequence) and ccd not in STANDARD_AA_THREE_LETTER and ccd not in STANDARD_NUCLEOTIDE_CODES:
+-                    # Set X only for non-standard modifications (standard AA/nucleotide residues stay as-is)
+-                    seq_list = list(output_sequence)
+-                    seq_list[pos - 1] = 'X'
+-                    output_sequence = ''.join(seq_list)
++                if not (pos and 1 <= pos <= len(output_sequence)):
++                    continue
++                if ccd in STANDARD_RES_THREE_LETTER:
++                    # Standard AA / nucleotide listed as a "modification" — leave the
++                    # SEQRES letter as-is.
++                    continue
++                replacement = mod.get('parent_one') or 'X'
++                seq_list = list(output_sequence)
++                seq_list[pos - 1] = replacement
++                output_sequence = ''.join(seq_list)
+             if chain_modifications:
+                 info(f"Chain {chain_id} has {len(chain_modifications)} modification(s):")
+                 for mod in chain_modifications:
+diff --git a/scripts/inpainting/processor/modifications.py b/scripts/inpainting/processor/modifications.py
+index da33db1..00f1553 100644
+--- a/scripts/inpainting/processor/modifications.py
++++ b/scripts/inpainting/processor/modifications.py
+@@ -3,7 +3,14 @@
+ from pathlib import Path
+ 
+ from ..ccd_utils import load_ccd_dict, get_non_standard_parent_from_ccd
+-from ..constants import STANDARD_AA_CODES, STANDARD_AA_THREE_LETTER, STANDARD_NUCLEOTIDE_CODES
++from ..constants import (
++    NONSTANDARD_TO_STANDARD,
++    STANDARD_AA_CODES,
++    STANDARD_AA_THREE_LETTER,
++    STANDARD_NUCLEOTIDE_CODES,
++    STANDARD_RES_ONE_LETTER,
++    STANDARD_RES_THREE_LETTER,
++)
+ from .log import info, warning
+ 
+ 
+@@ -73,14 +80,23 @@ def parse_non_standard_residues(self, ccd: Optional[dict] = None, ccd_path: Opti
+                         # Get parent from CIF (most reliable)
+                         parent_code = parent_comp_ids[i] if i < len(parent_comp_ids) else None
+ 
+-                        # If parent not in CIF, resolve from CCD (ccd.pkl)
+-                        if not parent_code or parent_code not in STANDARD_AA_THREE_LETTER:
++                        # If parent not in CIF (or not a recognised standard
++                        # protein/nucleic residue), resolve from CCD (ccd.pkl)
++                        if not parent_code or parent_code not in STANDARD_RES_THREE_LETTER:
+                             resolved = get_non_standard_parent_from_ccd(ccd, ccd_code)
+                             if resolved:
+                                 parent_code = resolved[0]
+ 
+-                        # Get one-letter code for parent
+-                        parent_one = STANDARD_AA_CODES.get(parent_code, 'X') if parent_code else 'X'
++                        # Last-ditch fallback: hardcoded NONSTANDARD_TO_STANDARD
++                        # (covers cases where ccd.pkl was built without parent
++                        #  properties — common with pdbeccdutils-generated mol pickles).
++                        if not parent_code or parent_code not in STANDARD_RES_THREE_LETTER:
++                            hard = NONSTANDARD_TO_STANDARD.get(ccd_code.upper())
++                            if hard and hard in STANDARD_RES_THREE_LETTER:
++                                parent_code = hard
++
++                        # Get one-letter code for parent (covers protein + DNA + RNA).
++                        parent_one = STANDARD_RES_ONE_LETTER.get(parent_code, 'X') if parent_code else 'X'
+ 
+                         if chain_id not in non_standard_residues:
+                             non_standard_residues[chain_id] = {}
+diff --git a/src/boltz/data/parse/mmcif.py b/src/boltz/data/parse/mmcif.py
+index e9b8ff5..de5850a 100644
+--- a/src/boltz/data/parse/mmcif.py
++++ b/src/boltz/data/parse/mmcif.py
+@@ -625,14 +625,11 @@ def parse_polymer(  # noqa: C901, PLR0915, PLR0912
+             # Increment polymer index
+             i += 1
+ 
+-        # Map MSE to MET, put the selenium atom in the sulphur column
+-        if res_name == "MSE":
+-            res_name = "MET"
+-            if "SE" in name_to_atom:
+-                name_to_atom["SD"] = name_to_atom["SE"]
+-
+-        # Handle non-standard residues
+-        elif res_name not in ref_res:
++        # Handle non-standard residues (including MSE) via the CCD path so the
++        # residue identity is preserved through to the writer.  Previously MSE
++        # was hardcoded to MET, which destroyed selenomethionine identity in
++        # the prediction output.
++        if res_name not in ref_res:
+             try:
+                 modified_mol = get_mol(res_name, mols, moldir)
+             except ValueError:
+diff --git a/src/boltz/data/parse/mmcif_with_constraints.py b/src/boltz/data/parse/mmcif_with_constraints.py
+index 6a5b040..02b7ab2 100644
+--- a/src/boltz/data/parse/mmcif_with_constraints.py
++++ b/src/boltz/data/parse/mmcif_with_constraints.py
+@@ -869,14 +869,11 @@ def parse_polymer(  # noqa: C901, PLR0915, PLR0912
+             # Increment polymer index
+             i += 1
+ 
+-        # Map MSE to MET, put the selenium atom in the sulphur column
+-        if res_name == "MSE":
+-            res_name = "MET"
+-            if "SE" in name_to_atom:
+-                name_to_atom["SD"] = name_to_atom["SE"]
+-
+-        # Handle non-standard residues
+-        elif res_name not in ref_res:
++        # Handle non-standard residues (including MSE) via the CCD path so the
++        # residue identity is preserved through to the writer.  Previously MSE
++        # was hardcoded to MET, which destroyed selenomethionine identity in
++        # the prediction output.
++        if res_name not in ref_res:
+             modified_mol = get_mol(res_name, mols, moldir)
+             if modified_mol is not None:
+                 residue = parse_ccd_residue(
+diff --git a/src/boltz/data/parse/schema.py b/src/boltz/data/parse/schema.py
+index 3be8bdd..ea7bf7c 100644
+--- a/src/boltz/data/parse/schema.py
++++ b/src/boltz/data/parse/schema.py
+@@ -870,9 +870,11 @@ def parse_polymer(
+     # Get coordinates and masks
+     parsed = []
+     for res_idx, res_name in enumerate(sequence):
+-        # Check if modified residue
+-        # Map MSE to MET
+-        res_corrected = res_name if res_name != "MSE" else "MET"
++        # Preserve non-standard residue identity (including MSE).  Previously
++        # MSE was hardcoded to MET here, which forced selenomethionine to be
++        # written out as plain methionine.  Treat every non-standard residue
++        # via the CCD path so the original CCD code survives to the writer.
++        res_corrected = res_name
+ 
+         # Handle non-standard residues
+         if res_corrected not in ref_res:
+diff --git a/src/boltz/data/write/merge_cif_blocks.py b/src/boltz/data/write/merge_cif_blocks.py
+index 2405cbc..e5e3a32 100644
+--- a/src/boltz/data/write/merge_cif_blocks.py
++++ b/src/boltz/data/write/merge_cif_blocks.py
+@@ -215,6 +215,64 @@ def _quote(s: str) -> str:
+     return lines
+ 
+ 
++_MOD_RESIDUE_KEYS = [
++    "_pdbx_struct_mod_residue.id",
++    "_pdbx_struct_mod_residue.label_asym_id",
++    "_pdbx_struct_mod_residue.label_seq_id",
++    "_pdbx_struct_mod_residue.label_comp_id",
++    "_pdbx_struct_mod_residue.auth_asym_id",
++    "_pdbx_struct_mod_residue.auth_seq_id",
++    "_pdbx_struct_mod_residue.auth_comp_id",
++    "_pdbx_struct_mod_residue.PDB_ins_code",
++    "_pdbx_struct_mod_residue.parent_comp_id",
++    "_pdbx_struct_mod_residue.details",
++]
++
++
++def _parse_mod_residue(cif_content: str, chain_ids: Set[str]) -> list:
++    """Parse _pdbx_struct_mod_residue from template CIF, filtered to chains
++    that survived into the prediction output.
++
++    Returns a list of pre-formatted data row strings (one per record), with
++    record IDs renumbered from 1 so the merged loop is well-formed even when
++    some input chains were dropped.
++    """
++    if not cif_content:
++        return []
++    try:
++        cif_dict = MMCIF2Dict(StringIO(cif_content))
++    except Exception:
++        return []
++    if _MOD_RESIDUE_KEYS[0] not in cif_dict:
++        return []
++
++    cols = []
++    n = None
++    for k in _MOD_RESIDUE_KEYS:
++        v = cif_dict.get(k, [])
++        if isinstance(v, str):
++            v = [v]
++        cols.append(v)
++        if n is None and v:
++            n = len(v)
++    if not n:
++        return []
++    # pad short columns with '?'
++    cols = [list(c) + ["?"] * (n - len(c)) if len(c) < n else list(c) for c in cols]
++
++    rows = []
++    new_id = 0
++    for i in range(n):
++        label_asym = cols[1][i]
++        if chain_ids and label_asym not in chain_ids:
++            continue
++        new_id += 1
++        # Renumber the id column so the merged loop has a clean 1..N sequence.
++        vals = [str(new_id)] + [str(cols[j][i]) for j in range(1, len(cols))]
++        rows.append(" ".join(_quote_cif(v) for v in vals))
++    return rows
++
++
+ def _parse_crystallographic(
+     cif_content: str, entry_id: str
+ ) -> Tuple[list, list, list]:
+@@ -465,6 +523,14 @@ def merge_template_blocks_into_cif(
+         extra.extend(chem_comp_lines)
+         extra.append("#")
+ 
++    mod_res_rows = _parse_mod_residue(template_content, chain_ids)
++    if mod_res_rows:
++        extra.append("loop_")
++        for k in _MOD_RESIDUE_KEYS:
++            extra.append(k)
++        extra.extend(mod_res_rows)
++        extra.append("#")
++
+     cell_lines, symmetry_lines, atom_sites_lines = _parse_crystallographic(
+         template_content, entry_id
+     )
+diff --git a/src/boltz/data/write/mmcif.py b/src/boltz/data/write/mmcif.py
+index 7592ddb..5e75bbb 100644
+--- a/src/boltz/data/write/mmcif.py
++++ b/src/boltz/data/write/mmcif.py
+@@ -14,6 +14,61 @@
+ from boltz.data.types import Structure
+ 
+ 
++# Hardcoded fallback for non-standard residues whose parent residue is known
++# but not in ihm's built-in alphabet.  Mirrors
++# scripts/inpainting/constants.py:NONSTANDARD_TO_STANDARD so the prediction
++# writer can fill `code_canonical` with the parent's one-letter code instead
++# of a blanket "X" / "N".
++_NONSTANDARD_PARENT_ONE_LETTER_AA = {
++    # Selenium / sulfur variants
++    "MSE": "M", "SEC": "C", "PYL": "K", "FME": "M",
++    # Phosphorylation
++    "SEP": "S", "TPO": "T", "PTR": "Y",
++    # Methylation
++    "MLY": "K", "M3L": "K", "AGM": "R",
++    # Cysteine variants
++    "CYX": "C", "CSD": "C", "CME": "C", "OCS": "C", "CSO": "C",
++    "CSS": "C", "SMC": "C", "OAS": "C",
++    # Methionine oxidation / N-terminal cap
++    "MHO": "M", "OMT": "M", "CXM": "M",
++    # Histidine variants
++    "HSD": "H", "HSE": "H", "HSP": "H",
++    "HIE": "H", "HID": "H", "HIP": "H",
++    # Hydroxylation / cyclization
++    "HYP": "P", "PCA": "E", "5HP": "E",
++    # Misc protein
++    "ASX": "B", "GLX": "Z",
++    "ABA": "A", "AIB": "A",
++}
++
++_NONSTANDARD_PARENT_ONE_LETTER_DNA = {
++    "DU": "T",
++}
++
++_NONSTANDARD_PARENT_ONE_LETTER_RNA = {
++    "PSU": "U", "5MU": "U", "OMU": "U",
++    "OMC": "C",
++    "1MA": "A", "6MA": "A",
++    "7MG": "G", "OMG": "G",
++}
++
++
++def _build_three_letter_alphabet(base_alphabet, fallback_canonical):
++    """Build a 3-letter-keyed lookup from an ``ihm`` Alphabet.
++
++    ``ihm.LPeptideAlphabet`` / ``DNAAlphabet`` / ``RNAAlphabet`` use 1-letter
++    keys ("A", "G", ...), but Structure residues are stored using 3-letter
++    CCD codes ("ALA", "MSE", ...).  Re-key the alphabet by the ChemComp's
++    ``id`` so the writer can look up by 3-letter codes.
++
++    Returns a dict mapping 3-letter code -> ChemComp instance.
++    """
++    out = {}
++    for comp in base_alphabet._comps.values():
++        out[comp.id] = comp
++    return out
++
++
+ def to_mmcif(
+     structure: Structure,
+     plddts: Optional[Tensor] = None,
+@@ -69,14 +124,29 @@ def to_mmcif(
+         mol_type = entity_to_moltype[entity]
+ 
+         if mol_type == const.chain_type_ids["PROTEIN"]:
+-            alphabet = ihm.LPeptideAlphabet()
+-            chem_comp = lambda x: ihm.LPeptideChemComp(id=x, code=x, code_canonical="X")  # noqa: E731
++            alphabet = _build_three_letter_alphabet(
++                ihm.LPeptideAlphabet(), fallback_canonical="X"
++            )
++            chem_comp = lambda x: ihm.LPeptideChemComp(  # noqa: E731
++                id=x, code=x,
++                code_canonical=_NONSTANDARD_PARENT_ONE_LETTER_AA.get(x, "X"),
++            )
+         elif mol_type == const.chain_type_ids["DNA"]:
+-            alphabet = ihm.DNAAlphabet()
+-            chem_comp = lambda x: ihm.DNAChemComp(id=x, code=x, code_canonical="N")  # noqa: E731
++            alphabet = _build_three_letter_alphabet(
++                ihm.DNAAlphabet(), fallback_canonical="N"
++            )
++            chem_comp = lambda x: ihm.DNAChemComp(  # noqa: E731
++                id=x, code=x,
++                code_canonical=_NONSTANDARD_PARENT_ONE_LETTER_DNA.get(x, "N"),
++            )
+         elif mol_type == const.chain_type_ids["RNA"]:
+-            alphabet = ihm.RNAAlphabet()
+-            chem_comp = lambda x: ihm.RNAChemComp(id=x, code=x, code_canonical="N")  # noqa: E731
++            alphabet = _build_three_letter_alphabet(
++                ihm.RNAAlphabet(), fallback_canonical="N"
++            )
++            chem_comp = lambda x: ihm.RNAChemComp(  # noqa: E731
++                id=x, code=x,
++                code_canonical=_NONSTANDARD_PARENT_ONE_LETTER_RNA.get(x, "N"),
++            )
+         elif len(sequence) > 1:
+             alphabet = {}
+             chem_comp = lambda x: ihm.SaccharideChemComp(id=x)  # noqa: E731

@@ -1,0 +1,380 @@
+diff --git a/docs/source/user_guide/lammps_mliap.md b/docs/source/user_guide/lammps_mliap.md
+index 4b564295..f0f9a69a 100644
+--- a/docs/source/user_guide/lammps_mliap.md
++++ b/docs/source/user_guide/lammps_mliap.md
+@@ -1,7 +1,7 @@
+ # LAMMPS: ML-IAP
+ 
+ :::{caution}
+-Currently the parallel implementation of LAMMPS/ML-IAP is not tested.
++Parallel execution of LAMMPS/ML-IAP using CUDA-aware MPI is supported, but not yet sufficiently tested. For multi-rank LAMMPS runs, use the TorchScript `e3gnn/parallel` workflow described in {doc}`lammps_torch`.
+ :::
+ 
+ ## Requirements
+@@ -22,10 +22,12 @@ Get LAMMPS source code:
+ ```bash
+ git clone https://github.com/lammps/lammps lammps-mliap
+ cd lammps-mliap
+-git checkout ccca772
++git checkout stable_22Jul2025_update4
+ ```
+ :::{note}
+-We found that some of the latest versions of LAMMPS produce inconsistent energies. Therefore, we highly recommend using this specific commit. This restriction will be relaxed once consistency checks are completed.
++SevenNet's ML-IAP tests are validated against the LAMMPS
++`stable_22Jul2025_update4` release. Other LAMMPS versions may work, but should
++be validated with the ML-IAP test suite before production use.
+ :::
+ 
+ 
+diff --git a/sevenn/calculator.py b/sevenn/calculator.py
+index 803ad779..a1256b5f 100644
+--- a/sevenn/calculator.py
++++ b/sevenn/calculator.py
+@@ -313,6 +313,13 @@ def __init__(
+ 
+         super().__init__([sevennet_calc, d3_calc])
+ 
++    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
++        # To match the precision of SevenNetCalculator output
++        super().calculate(atoms, properties, system_changes)
++        for key in ('forces', 'stress', 'stresses'):
++            if key in self.results:
++                self.results[key] = np.asarray(self.results[key], dtype=np.float32)
++
+ 
+ def _load(name: str) -> ctypes.CDLL:
+     from torch.utils.cpp_extension import LIB_EXT, _get_build_directory, load
+diff --git a/sevenn/nn/scale.py b/sevenn/nn/scale.py
+index 551355d4..90073c30 100644
+--- a/sevenn/nn/scale.py
++++ b/sevenn/nn/scale.py
+@@ -1,3 +1,4 @@
++import os
+ from typing import Any, Dict, List, Optional, Union
+ 
+ import torch
+@@ -7,6 +8,19 @@
+ import sevenn._keys as KEY
+ from sevenn._const import NUM_UNIV_ELEMENT, AtomGraphDataType
+ 
++# Precision of the final energy shift/scale (rescale) parameters. Defaults to
++# double for numerical consistency; set SEVENN_SHIFT_SCALE_DTYPE='single' only
++# to reproduce the legacy float32 behavior.
++
++
++def resolve_shift_scale_dtype() -> torch.dtype:
++    dtype = os.environ.get('SEVENN_SHIFT_SCALE_DTYPE', 'double')
++    if dtype == 'single':
++        return torch.float32
++    if dtype == 'double':
++        return torch.float64
++    raise ValueError(f'Unsupported shift/scale dtype: {dtype!r}')
++
+ 
+ def _as_univ(
+     ss: List[float], type_map: Dict[int, int], default: float
+@@ -40,11 +54,12 @@ def __init__(
+         if train_shift_scale:
+             train_shift = True
+             train_scale = True
++        dtype = resolve_shift_scale_dtype()
+         self.shift = nn.Parameter(
+-            torch.FloatTensor([shift]), requires_grad=train_shift
++            torch.tensor([shift], dtype=dtype), requires_grad=train_shift
+         )
+         self.scale = nn.Parameter(
+-            torch.FloatTensor([scale]), requires_grad=train_scale
++            torch.tensor([scale], dtype=dtype), requires_grad=train_scale
+         )
+         self.key_input = data_key_in
+         self.key_output = data_key_out
+@@ -56,7 +71,8 @@ def get_scale(self) -> float:
+         return self.scale.detach().cpu().tolist()[0]
+ 
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+-        data[self.key_output] = data[self.key_input] * self.scale + self.shift
++        inp = data[self.key_input].to(self.shift.dtype)
++        data[self.key_output] = inp * self.scale + self.shift
+ 
+         return data
+ 
+@@ -84,6 +100,7 @@ def __init__(
+         if train_shift_scale:
+             train_shift = True
+             train_scale = True
++        dtype = resolve_shift_scale_dtype()
+         assert isinstance(shift, float) or isinstance(shift, list)
+         assert isinstance(scale, float) or isinstance(scale, list)
+ 
+@@ -105,10 +122,10 @@ def __init__(
+         scale = [scale] * num_species if isinstance(scale, float) else scale
+ 
+         self.shift = nn.Parameter(
+-            torch.FloatTensor(shift), requires_grad=train_shift
++            torch.tensor(shift, dtype=dtype), requires_grad=train_shift
+         )
+         self.scale = nn.Parameter(
+-            torch.FloatTensor(scale), requires_grad=train_scale
++            torch.tensor(scale, dtype=dtype), requires_grad=train_scale
+         )
+         self.key_input = data_key_in
+         self.key_output = data_key_out
+@@ -165,9 +182,10 @@ def from_mappers(
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+ 
+         indices = data[self.key_indices]
+-        data[self.key_output] = data[self.key_input] * self.scale[indices].view(
+-            -1, 1
+-        ) + self.shift[indices].view(-1, 1)
++        scale = self.scale[indices].view(-1, 1)
++        shift = self.shift[indices].view(-1, 1)
++        inp = data[self.key_input].to(shift.dtype)
++        data[self.key_output] = inp * scale + shift
+ 
+         return data
+ 
+@@ -198,11 +216,12 @@ def __init__(
+         if train_shift_scale:
+             train_shift = True
+             train_scale = True
++        dtype = resolve_shift_scale_dtype()
+         self.shift = nn.Parameter(
+-            torch.FloatTensor(shift), requires_grad=train_shift
++            torch.tensor(shift, dtype=dtype), requires_grad=train_shift
+         )
+         self.scale = nn.Parameter(
+-            torch.FloatTensor(scale), requires_grad=train_scale
++            torch.tensor(scale, dtype=dtype), requires_grad=train_scale
+         )
+         self.key_input = data_key_in
+         self.key_output = data_key_out
+@@ -371,9 +390,8 @@ def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+             if self.use_modal_wise_scale
+             else self.scale[atom_indices]
+         )
+-        data[self.key_output] = data[self.key_input] * scale.view(
+-            -1, 1
+-        ) + shift.view(-1, 1)
++        inp = data[self.key_input].to(shift.dtype)
++        data[self.key_output] = inp * scale.view(-1, 1) + shift.view(-1, 1)
+ 
+         return data
+ 
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn.cpp b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+index 587f4273..3912b41a 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+@@ -204,10 +204,10 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   // dE_dr
+   auto grads = torch::autograd::grad({energy_tensor}, {edge_vec_device});
+-  torch::Tensor dE_dr = grads[0].to(torch::kCPU);
++  torch::Tensor dE_dr = grads[0].to(torch::kCPU).to(torch::kFloat);
+ 
+-  eng_vdwl += energy_tensor.detach().to(torch::kCPU).item<float>();
+-  torch::Tensor force_tensor = torch::zeros({nlocal, 3});
++  eng_vdwl += energy_tensor.detach().to(torch::kCPU).item<double>();
++  torch::Tensor force_tensor = torch::zeros({nlocal, 3}, FLOAT_TYPE);
+ 
+   auto _edge_idx_src_tensor =
+       edge_idx_src_tensor.repeat_interleave(3).view({nedges, 3});
+@@ -237,7 +237,7 @@ void PairE3GNN::compute(int eflag, int vflag) {
+         diag, s12.unsqueeze(-1), s23.unsqueeze(-1), s31.unsqueeze(-1)};
+     auto voigt = torch::cat(voigt_list, 1);
+ 
+-    torch::Tensor per_atom_stress_tensor = torch::zeros({nlocal, 6});
++    torch::Tensor per_atom_stress_tensor = torch::zeros({nlocal, 6}, FLOAT_TYPE);
+     auto _edge_idx_dst6_tensor =
+         edge_idx_dst_tensor.repeat_interleave(6).view({nedges, 6});
+     per_atom_stress_tensor.scatter_reduce_(0, _edge_idx_dst6_tensor, voigt,
+@@ -271,8 +271,8 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   if (eflag_atom) {
+     torch::Tensor atomic_energy_tensor =
+-        output.at("atomic_energy").toTensor().to(torch::kCPU).view({nlocal});
+-    auto atomic_energy = atomic_energy_tensor.accessor<float, 1>();
++        output.at("atomic_energy").toTensor().to(torch::kCPU).to(torch::kDouble).view({nlocal});
++    auto atomic_energy = atomic_energy_tensor.accessor<double, 1>();
+     for (int gi = 0; gi < nlocal; gi++) {
+       const int i = graph_index_to_i[gi];
+       eatom[i] += atomic_energy[gi];
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+index de8c6a11..b8f49e46 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+@@ -456,10 +456,10 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+     std::cout << world_rank << " Used/GraphSize: " << Mused / graph_size << "\n"
+               << std::endl;
+   }
+-  eng_vdwl += energy_tensor.item<float>(); // accumulate energy
++  eng_vdwl += energy_tensor.detach().to(torch::kCPU).item<double>();
+ 
+-  dE_dr = dE_dr.to(torch::kCPU);
+-  torch::Tensor force_tensor = torch::zeros({graph_indexer, 3});
++  dE_dr = dE_dr.to(torch::kCPU).to(torch::kFloat);
++  torch::Tensor force_tensor = torch::zeros({graph_indexer, 3}, FLOAT_TYPE);
+ 
+   auto _edge_idx_src_tensor =
+       edge_idx_src_tensor.repeat_interleave(3).view({nedges, 3});
+@@ -488,7 +488,8 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+         diag, s12.unsqueeze(-1), s23.unsqueeze(-1), s31.unsqueeze(-1)};
+     auto voigt = torch::cat(voigt_list, 1);
+ 
+-    torch::Tensor per_atom_stress_tensor = torch::zeros({graph_indexer, 6});
++    torch::Tensor per_atom_stress_tensor =
++        torch::zeros({graph_indexer, 6}, FLOAT_TYPE);
+     auto _edge_idx_dst6_tensor =
+         edge_idx_dst_tensor.repeat_interleave(6).view({nedges, 6});
+     per_atom_stress_tensor.scatter_reduce_(0, _edge_idx_dst6_tensor, voigt,
+@@ -507,8 +508,8 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+ 
+   if (eflag_atom) {
+     torch::Tensor atomic_energy_tensor =
+-        output.at("atomic_energy").toTensor().cpu().view({nlocal});
+-    auto atomic_energy = atomic_energy_tensor.accessor<float, 1>();
++        output.at("atomic_energy").toTensor().cpu().to(torch::kDouble).view({nlocal});
++    auto atomic_energy = atomic_energy_tensor.accessor<double, 1>();
+     for (int graph_idx = 0; graph_idx < nlocal; graph_idx++) {
+       int i = graph_index_to_i[graph_idx];
+       eatom[i] += atomic_energy[graph_idx];
+diff --git a/sevenn/torchsim.py b/sevenn/torchsim.py
+index 2f375542..f4706738 100644
+--- a/sevenn/torchsim.py
++++ b/sevenn/torchsim.py
+@@ -101,7 +101,9 @@ def __init__(
+             neighbor_list_fn (Callable): Neighbor list function to use.
+                 Default is torch_nl_linked_cell.
+             device (torch.device | str): Device to run the model on
+-            dtype (torch.dtype): Data type for computation
++            dtype (torch.dtype): TorchSim interface dtype.  Only float32 is
++                supported; wrap with Float64Wrapper if outer TorchSim cell/state
++                arithmetic must run in double precision.
+ 
+         Raises:
+             ImportError: if torch_sim is not installed
+@@ -167,9 +169,6 @@ def __init__(
+         self.model = model.to(self._device)
+         self.model = self.model.eval()
+ 
+-        if self._dtype is not None:
+-            self.model = self.model.to(dtype=self._dtype)
+-
+         self.implemented_properties = ['energy', 'forces', 'stress']
+ 
+     @property
+@@ -282,13 +281,13 @@ def forward(self, state: ts.SimState, **kwargs) -> dict[str, torch.Tensor]:
+ 
+         forces = output[key.PRED_FORCE]
+         if forces is not None:
+-            results['forces'] = forces
++            results['forces'] = forces.to(dtype=self._dtype)
+ 
+         stress = output[key.PRED_STRESS]
+         if stress is not None:
+             results['stress'] = -voigt_6_to_full_3x3_stress(
+                 stress[..., [0, 1, 2, 4, 5, 3]],
+-            )
++            ).to(dtype=self._dtype)
+ 
+         results = {k: v.detach() for k, v in results.items()}
+ 
+@@ -477,7 +476,7 @@ def _apply_batch_d3(
+         )
+ 
+         results['energy'] += torch.from_numpy(d3_energy).to(
+-            device=self._device, dtype=self._dtype,
++            device=self._device, dtype=results['energy'].dtype,
+         )
+         results['forces'] += torch.from_numpy(
+             np.ascontiguousarray(d3_forces),
+@@ -505,7 +504,8 @@ class Float64Wrapper(ModelInterface):
+ 
+     Casts state tensors to float32 before calling the wrapped model, then
+     casts outputs back to float64.  Reports ``dtype=float64`` to torch-sim
+-    so all optimizer / integrator arithmetic is done in double precision.
++    so all cell algebra / optimizer / integrator arithmetic is done in double.
++    The wrapped model still receives a float32 ``SimState``.
+ 
+     This is needed because ``SumModel`` requires all children to share the
+     same dtype, and ``D3DispersionModel`` defaults to float64.
+diff --git a/sevenn/train/loss.py b/sevenn/train/loss.py
+index 941eabcd..040fa064 100644
+--- a/sevenn/train/loss.py
++++ b/sevenn/train/loss.py
+@@ -75,6 +75,10 @@ def get_loss(self, batch_data: Dict[str, Any], model: Optional[Callable] = None)
+             assert self.ref_key is not None
+             return torch.zeros(1, device=batch_data[self.ref_key].device)
+ 
++        ref = ref.to(dtype=pred.dtype)
++        if w_tensor is not None:
++            w_tensor = w_tensor.to(dtype=pred.dtype)
++
+         loss = self.criterion(pred, ref)
+         if self.use_weight:
+             loss = torch.mean(loss * w_tensor)
+diff --git a/tests/unit_tests/test_pretrained.py b/tests/unit_tests/test_pretrained.py
+index 2bc2c645..7398fe2b 100644
+--- a/tests/unit_tests/test_pretrained.py
++++ b/tests/unit_tests/test_pretrained.py
+@@ -11,7 +11,7 @@
+ 
+ 
+ def acl(a, b, atol=1e-6):
+-    return torch.allclose(a, b, atol=atol)
++    return torch.allclose(a.float(), b.float(), atol=atol)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/unit_tests/test_shift_scale.py b/tests/unit_tests/test_shift_scale.py
+index 3d5a4eba..5806fedb 100644
+--- a/tests/unit_tests/test_shift_scale.py
++++ b/tests/unit_tests/test_shift_scale.py
+@@ -10,6 +10,10 @@
+     get_resolved_shift_scale,
+ )
+ 
++
++def acl(a, b):
++    return torch.allclose(a.float(), b.float())
++
+ ################################################################################
+ #                             Tests for Rescale                                #
+ ################################################################################
+@@ -45,7 +49,7 @@ def test_rescale_forward():
+ 
+     # Check correctness
+     expected_output = input_data * scale + shift
+-    assert torch.allclose(out_data[KEY.ATOMIC_ENERGY], expected_output)
++    assert acl(out_data[KEY.ATOMIC_ENERGY], expected_output)
+ 
+ 
+ def test_rescale_get_shift_and_scale():
+@@ -86,8 +90,8 @@ def test_specieswise_rescale_init_list():
+     module = SpeciesWiseRescale(shift=shift, scale=scale)
+     assert len(module.shift) == 3
+     assert len(module.scale) == 3
+-    assert torch.allclose(module.shift, torch.tensor([1.0, 2.0, 3.0]))
+-    assert torch.allclose(module.scale, torch.tensor([2.0, 3.0, 4.0]))
++    assert acl(module.shift, torch.tensor([1.0, 2.0, 3.0]))
++    assert acl(module.scale, torch.tensor([2.0, 3.0, 4.0]))
+ 
+ 
+ def test_specieswise_rescale_forward():
+@@ -123,7 +127,7 @@ def test_specieswise_rescale_forward():
+     # For atom 2: scale=2, shift=1, input=3 => 3*2+1=7
+     expected = torch.tensor([[3.0], [15.0], [7.0]])
+ 
+-    assert torch.allclose(out['out'], expected)
++    assert acl(out['out'], expected)
+ 
+ 
+ def test_specieswise_rescale_get_shift_scale():
+@@ -212,7 +216,7 @@ def test_modalwise_rescale_forward():
+     # i=2 => modal_idx=1, atom_idx=0 => shift=5.0, scale=10.0 => out=2*10+5=25
+     # i=3 => modal_idx=1, atom_idx=1 => shift=15.0, scale=20.0 => out=2*20+15=55
+     expected = torch.tensor([[1.0], [12.0], [25.0], [55.0]])
+-    assert torch.allclose(out['out'], expected)
++    assert acl(out['out'], expected)
+ 
+ 
+ def test_modalwise_rescale_get_shift_scale():

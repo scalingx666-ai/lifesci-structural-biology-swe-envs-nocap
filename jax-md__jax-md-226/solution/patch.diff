@@ -1,0 +1,3443 @@
+diff --git a/jax_md/_nn/__init__.py b/jax_md/_nn/__init__.py
+new file mode 100644
+index 00000000..1230ebb1
+--- /dev/null
++++ b/jax_md/_nn/__init__.py
+@@ -0,0 +1,18 @@
++# Copyright 2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from . import behler_parrinello
++from . import nequip
++from . import gnome
++from . import util
+\ No newline at end of file
+diff --git a/jax_md/_nn/behler_parrinello.py b/jax_md/_nn/behler_parrinello.py
+new file mode 100644
+index 00000000..06e2ccd0
+--- /dev/null
++++ b/jax_md/_nn/behler_parrinello.py
+@@ -0,0 +1,490 @@
++# Copyright 2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++from typing import Callable, Tuple, Dict, Any, Optional
++
++import numpy as onp
++
++import jax
++from jax import vmap, jit
++import jax.numpy as jnp
++
++from jax_md import space, dataclasses, quantity, partition, smap, util
++import haiku as hk
++
++from collections import namedtuple
++from functools import partial, reduce
++from jax.tree_util import tree_map
++from jax import ops
++
++import jraph
++
++
++# Typing
++
++
++Array = util.Array
++f32 = util.f32
++f64 = util.f64
++
++InitFn = Callable[..., Array]
++CallFn = Callable[..., Array]
++
++DisplacementOrMetricFn = space.DisplacementOrMetricFn
++DisplacementFn = space.DisplacementFn
++NeighborList = partition.NeighborList
++
++"""
++Our neural network force field is based on the Behler-Parrinello neural network
++architecture (BP-NN) [1]. The BP-NN architecture uses a relatively simple,
++fully connected neural network to predict the local energy for each atom. Then
++the total energy is the sum of local energies due to each atom. Atoms of the
++same type use the same NN to predict energy.
++
++Each atomic NN is applied to hand-crafted features called symmetry functions.
++There are two kinds of symmetry functions: radial and angular. Radial symmetry
++functions represent information about two-body interactions of the central
++atom, whereas angular symmetry functions represent information about three-body
++interactions. Below we implement radial and angular symmetry functions for
++arbitrary number of types of atoms (Note that most applications of BP-NN limit
++their systems to 1 to 3 types of atoms). We also present a convenience wrapper
++that returns radial and angular symmetry functions with symmetry function
++parameters that should work reasonably for most systems (the symmetry functions
++are taken from reference [2]). Please see references [1, 2] for details about
++how the BP-NN works.
++
++[1] Behler, Jörg, and Michele Parrinello. "Generalized neural-network
++representation of high-dimensional potential-energy surfaces." Physical
++Review Letters 98.14 (2007): 146401.
++
++[2] Artrith, Nongnuch, Björn Hiller, and Jörg Behler. "Neural network
++potentials for metals and oxides–First applications to copper clusters at zinc
++oxide."
++Physica Status Solidi (b) 250.6 (2013): 1191-1203.
++"""
++
++def _cutoff_fn(dr: Array,
++                                 cutoff_distance: float=8.0) -> Array:
++  """Function of pairwise distance that smoothly goes to zero at the cutoff."""
++  # Also returns zero if the pairwise distance is zero,
++  # to prevent a particle from interacting with itself.
++  return jnp.where((dr < cutoff_distance) & (dr > 1e-7),
++                  0.5 * (jnp.cos(jnp.pi * dr / cutoff_distance) + 1), 0)
++
++
++def radial_symmetry_functions(displacement_or_metric: DisplacementOrMetricFn,
++                              species: Optional[Array],
++                              etas: Array,
++                              cutoff_distance: float
++                              ) -> Callable[[Array], Array]:
++  """Returns a function that computes radial symmetry functions.
++
++
++  Args:
++    displacement: A function that produces an `[N_atoms, M_atoms,
++      spatial_dimension]` of particle displacements from particle positions
++      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
++      spatial_dimension]` respectively.
++    species: An `[N_atoms]` that contains the species of each particle.
++    etas: List of radial symmetry function parameters that control the spatial
++      extension.
++    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
++      not contribute to each others symmetry functions. The contribution of a
++      neighbor to the symmetry function and its derivative goes to zero at this
++      distance.
++
++  Returns:
++    A function that computes the radial symmetry function from input `[N_atoms,
++    spatial_dimension]` and returns `[N_atoms, N_etas * N_types]` where `N_etas`
++    is the number of eta parameters, `N_types` is the number of types of
++    particles in the system.
++  """
++  metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
++
++  def radial_fn(eta: Array, dr: Array) -> Array:
++    return jnp.exp(-eta * dr**2) * _cutoff_fn(dr, cutoff_distance)
++  radial_fn = vmap(radial_fn, (0, None))
++
++  if species is None:
++    def compute_fn(R: Array, **kwargs) -> Array:
++      _metric = partial(metric, **kwargs)
++      _metric = space.map_product(_metric)
++      return util.high_precision_sum(radial_fn(etas, _metric(R, R)), axis=1).T
++  elif isinstance(species, jnp.ndarray):
++    species = onp.array(species)
++    def compute_fn(R: Array, **kwargs) -> Array:
++      _metric = partial(metric, **kwargs)
++      _metric = space.map_product(_metric)
++      def return_radial(atom_type):
++        """Returns the radial symmetry functions for neighbor type atom_type."""
++        R_neigh = R[species == atom_type, :]
++        dr = _metric(R, R_neigh)
++        return util.high_precision_sum(radial_fn(etas, dr), axis=1).T
++      return jnp.hstack([return_radial(atom_type) for
++                        atom_type in onp.unique(species)])
++  return compute_fn
++
++
++def radial_symmetry_functions_neighbor_list(
++    displacement_or_metric: DisplacementOrMetricFn,
++    species: Array,
++    etas: Array,
++    cutoff_distance: float) -> Callable[[Array, NeighborList], Array]:
++  """Returns a function that computes radial symmetry functions.
++
++
++  Args:
++    displacement: A function that produces an `[N_atoms, M_atoms,
++      spatial_dimension]` of particle displacements from particle positions
++      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
++      spatial_dimension]` respectively.
++    species: An `[N_atoms]` that contains the species of each particle.
++    etas: List of radial symmetry function parameters that control the spatial
++      extension.
++    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
++      not contribute to each others symmetry functions. The contribution of a
++      neighbor to the symmetry function and its derivative goes to zero at this
++      distance.
++
++  Returns:
++    A function that computes the radial symmetry function from input `[N_atoms,
++    spatial_dimension]` and returns `[N_atoms, N_etas * N_types]` where `N_etas`
++    is the number of eta parameters, `N_types` is the number of types of
++    particles in the system.
++  """
++  metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
++
++  def radial_fn(eta, dr):
++    return jnp.exp(-eta * dr**2) * _cutoff_fn(dr, cutoff_distance)
++  radial_fn = vmap(radial_fn, (0, None))
++
++  def sym_fn(R: Array, neighbor: NeighborList, mask: Array=None,
++             **kwargs) -> Array:
++    _metric = partial(metric, **kwargs)
++    if neighbor.format is partition.Dense:
++      _metric = space.map_neighbor(_metric)
++      R_neigh = R[neighbor.idx]
++      mask = True if mask is None else mask[neighbor.idx]
++      mask = (neighbor.idx < R.shape[0])[None, :, :] & mask
++      dr = _metric(R, R_neigh)
++      return util.high_precision_sum(radial_fn(etas, dr) * mask, axis=2).T
++    elif neighbor.format is partition.Sparse:
++      _metric = space.map_bond(_metric)
++      dr = _metric(R[neighbor.idx[0]], R[neighbor.idx[1]])
++      radial = radial_fn(etas, dr).T
++      N = R.shape[0]
++      mask = True if mask is None else mask[neighbor.idx[1]]
++      mask = (neighbor.idx[0] < N) & mask
++      return ops.segment_sum(radial * mask[:, None], neighbor.idx[0], N)
++    else:
++      raise ValueError()
++
++  if species is None:
++    def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
++      return sym_fn(R, neighbor, **kwargs)
++    return compute_fn
++
++  def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
++    _metric = partial(metric, **kwargs)
++    def return_radial(atom_type):
++      """Returns the radial symmetry functions for neighbor type atom_type."""
++      return sym_fn(R, neighbor, species==atom_type, **kwargs)
++    return jnp.hstack([return_radial(atom_type) for
++                     atom_type in onp.unique(species)])
++
++  return compute_fn
++
++
++def single_pair_angular_symmetry_function(dR12: Array,
++                                          dR13: Array,
++                                          eta: Array,
++                                          lam: Array,
++                                          zeta: Array,
++                                          cutoff_distance: float
++                                          ) -> Array:
++  """Computes the angular symmetry function due to one pair of neighbors."""
++
++  dR23 = dR12 - dR13
++  dr12_2 = space.square_distance(dR12)
++  dr13_2 = space.square_distance(dR13)
++  dr23_2 = space.square_distance(dR23)
++  dr12 = space.distance(dR12)
++  dr13 = space.distance(dR13)
++  dr23 = space.distance(dR23)
++  triplet_squared_distances = dr12_2 + dr13_2 + dr23_2
++  triplet_cutoff = reduce(
++      lambda x, y: x * _cutoff_fn(y, cutoff_distance),
++      [dr12, dr13, dr23], 1.0)
++  z = zeta
++  result = 2.0 ** (1.0 - zeta) * ((
++    1.0 + lam * quantity.cosine_angle_between_two_vectors(dR12, dR13)) ** z *
++    jnp.exp(-eta * triplet_squared_distances) * triplet_cutoff)
++  return result
++
++
++def angular_symmetry_functions(displacement: DisplacementFn,
++                               species: Array,
++                               etas: Array,
++                               lambdas: Array,
++                               zetas: Array,
++                               cutoff_distance: float
++                               ) -> Callable[[Array], Array]:
++  """Returns a function that computes angular symmetry functions.
++
++  Args:
++    displacement: A function that produces an `[N_atoms, M_atoms,
++      spatial_dimension]` of particle displacements from particle positions
++      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
++      spatial_dimension]` respectively.
++    species: An `[N_atoms]` that contains the species of each particle.
++    eta: Parameter of angular symmetry function that controls the spatial
++      extension.
++    lam:
++    zeta:
++    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
++      not contribute to each others symmetry functions. The contribution of a
++      neighbor to the symmetry function and its derivative goes to zero at this
++      distance.
++  Returns:
++    A function that computes the angular symmetry function from input `[N_atoms,
++    spatial_dimension]` and returns `[N_atoms, N_types * (N_types + 1) / 2]`
++    where `N_types` is the number of types of particles in the system.
++  """
++
++  _angular_fn = vmap(single_pair_angular_symmetry_function,
++                     (None, None, 0, 0, 0, None))
++
++  _batched_angular_fn = lambda dR12, dR13: _angular_fn(dR12,
++                                                       dR13,
++                                                       etas,
++                                                       lambdas,
++                                                       zetas,
++                                                       cutoff_distance)
++  _all_pairs_angular = vmap(
++      vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0)
++
++  if species is None:
++   def compute_fn(R, **kwargs):
++     D_fn = partial(displacement, **kwargs)
++     D_fn = space.map_product(D_fn)
++     dR = D_fn(R, R)
++     return jnp.sum(_all_pairs_angular(dR, dR), axis=[1, 2])
++   return compute_fn
++
++  if isinstance(species, jnp.ndarray):
++    species = onp.array(species)
++
++  def compute_fn(R, **kwargs):
++    atom_types = onp.unique(species)
++    D_fn = partial(displacement, **kwargs)
++    D_fn = space.map_product(D_fn)
++    D_different_types = [D_fn(R[species == s, :], R) for s in atom_types]
++    out = []
++    for i in range(len(atom_types)):
++      for j in range(i, len(atom_types)):
++        out += [
++            jnp.sum(
++                _all_pairs_angular(D_different_types[i], D_different_types[j]),
++                axis=[1, 2])
++        ]
++    return jnp.hstack(out)
++  return compute_fn
++
++def angular_symmetry_functions_neighbor_list(
++    displacement: DisplacementFn,
++    species: Array,
++    etas: Array,
++    lambdas: Array,
++    zetas: Array,
++    cutoff_distance: float
++) -> Callable[[Array, NeighborList], Array]:
++  """Returns a function that computes angular symmetry functions.
++
++  Args:
++    displacement: A function that produces an `[N_atoms, M_atoms,
++      spatial_dimension]` of particle displacements from particle positions
++      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
++      spatial_dimension]` respectively.
++    species: An `[N_atoms]` that contains the species of each particle.
++    eta: Parameter of angular symmetry function that controls the spatial
++      extension.
++    lam:
++    zeta:
++    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
++      not contribute to each others symmetry functions. The contribution of a
++      neighbor to the symmetry function and its derivative goes to zero at this
++      distance.
++  Returns:
++    A function that computes the angular symmetry function from input
++    `[N_atoms, spatial_dimension]` and returns
++    `[N_atoms, N_types * (N_types + 1) / 2]` where `N_types` is the number of
++    types of particles in the system.
++  """
++
++  _angular_fn = vmap(single_pair_angular_symmetry_function,
++                     (None, None, 0, 0, 0, None))
++
++  _batched_angular_fn = lambda dR12, dR13: _angular_fn(dR12,
++                                                       dR13,
++                                                       etas,
++                                                       lambdas,
++                                                       zetas,
++                                                       cutoff_distance)
++  _all_pairs_angular = vmap(
++      vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0)
++
++  def sym_fn(R: Array, neighbor: NeighborList,
++             mask_i: Array=None, mask_j: Array=None,
++             **kwargs) -> Array:
++    D_fn = partial(displacement, **kwargs)
++
++    if neighbor.format is partition.Dense:
++      D_fn = space.map_neighbor(D_fn)
++
++      R_neigh = R[neighbor.idx]
++
++      dR = D_fn(R, R_neigh)
++      _all_pairs_angular = vmap(
++        vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0)
++      all_angular = _all_pairs_angular(dR, dR)
++
++      mask_i = True if mask_i is None else mask_i[neighbor.idx]
++      mask_j = True if mask_j is None else mask_j[neighbor.idx]
++
++      mask_i = (neighbor.idx < R.shape[0]) & mask_i
++      mask_i = mask_i[:, :, jnp.newaxis, jnp.newaxis]
++      mask_j = (neighbor.idx < R.shape[0]) & mask_j
++      mask_j = mask_j[:, jnp.newaxis, :, jnp.newaxis]
++
++      return util.high_precision_sum(all_angular * mask_i * mask_j,
++                                     axis=[1, 2])
++    elif neighbor.format is partition.Sparse:
++      D_fn = space.map_bond(D_fn)
++      dR = D_fn(R[neighbor.idx[0]], R[neighbor.idx[1]])
++      _all_pairs_angular = vmap(vmap(_batched_angular_fn, (0, None)),
++                                (None, 0))
++      all_angular = _all_pairs_angular(dR, dR)
++
++      N = R.shape[0]
++      mask_i = True if mask_i is None else mask_i[neighbor.idx[1]]
++      mask_j = True if mask_j is None else mask_j[neighbor.idx[1]]
++      mask_i = (neighbor.idx[0] < N) & mask_i
++      mask_j = (neighbor.idx[0] < N) & mask_j
++
++      mask = mask_i[:, None] & mask_j[None, :]
++      mask = mask[:, :, None, None]
++      all_angular = jnp.reshape(all_angular, (-1,) + all_angular.shape[2:])
++      neighbor_idx = jnp.repeat(neighbor.idx[0], len(neighbor.idx[0]))
++      out = ops.segment_sum(all_angular, neighbor_idx, N)
++      return out
++    else:
++      raise ValueError()
++
++  if species is None:
++    def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
++      return sym_fn(R, neighbor, **kwargs)
++    return compute_fn
++
++  def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
++    atom_types = onp.unique(species)
++    out = []
++    for i in range(len(atom_types)):
++      mask_i = species == i
++      for j in range(i, len(atom_types)):
++        mask_j = species == j
++        out += [
++            sym_fn(R, neighbor, mask_i, mask_j)
++        ]
++    return jnp.hstack(out)
++  return compute_fn
++
++
++def symmetry_functions_neighbor_list(
++    displacement: DisplacementFn,
++    species: Array,
++    radial_etas: Optional[Array]=None,
++    angular_etas: Optional[Array]=None,
++    lambdas: Optional[Array]=None,
++    zetas: Optional[Array]=None,
++    cutoff_distance: float=8.0) -> Callable[[Array, NeighborList], Array]:
++  if radial_etas is None:
++    radial_etas = jnp.array([9e-4, 0.01, 0.02, 0.035, 0.06, 0.1, 0.2, 0.4],
++                    f32) / f32(0.529177 ** 2)
++
++  if angular_etas is None:
++    angular_etas = jnp.array([1e-4] * 4 + [0.003] * 4 + [0.008] * 2 +
++                            [0.015] * 4 + [0.025] * 4 + [0.045] * 4,
++                            f32) / f32(0.529177 ** 2)
++
++  if lambdas is None:
++    lambdas = jnp.array([-1, 1] * 4 + [1] * 14, f32)
++
++  if zetas is None:
++    zetas = jnp.array([1, 1, 2, 2] * 2 + [1, 2] + [1, 2, 4, 16] * 3, f32)
++
++  radial_fn = radial_symmetry_functions_neighbor_list(
++    displacement,
++    species,
++    etas=radial_etas,
++    cutoff_distance=cutoff_distance)
++  angular_fn = angular_symmetry_functions_neighbor_list(
++    displacement,
++    species,
++    etas=angular_etas,
++    lambdas=lambdas,
++    zetas=zetas,
++    cutoff_distance=cutoff_distance)
++  return (lambda R, neighbor, **kwargs:
++          jnp.hstack((radial_fn(R, neighbor, **kwargs),
++                     angular_fn(R, neighbor, **kwargs))))
++
++
++def symmetry_functions(displacement: DisplacementFn,
++                       species: Optional[Array]=None,
++                       radial_etas: Optional[Array]=None,
++                       angular_etas: Optional[Array]=None,
++                       lambdas: Optional[Array]=None,
++                       zetas: Optional[Array]=None,
++                       cutoff_distance: float=8.0
++                       ) -> Callable[[Array], Array]:
++  if radial_etas is None:
++    radial_etas = jnp.array([9e-4, 0.01, 0.02, 0.035, 0.06, 0.1, 0.2, 0.4],
++                    f32) / f32(0.529177 ** 2)
++
++  if angular_etas is None:
++    angular_etas = jnp.array([1e-4] * 4 + [0.003] * 4 + [0.008] * 2 +
++                            [0.015] * 4 + [0.025] * 4 + [0.045] * 4,
++                            f32) / f32(0.529177 ** 2)
++
++  if lambdas is None:
++    lambdas = jnp.array([-1, 1] * 4 + [1] * 14, f32)
++
++  if zetas is None:
++    zetas = jnp.array([1, 1, 2, 2] * 2 + [1, 2] + [1, 2, 4, 16] * 3, f32)
++
++  radial_fn = radial_symmetry_functions(displacement,
++                                        species,
++                                        etas=radial_etas,
++                                        cutoff_distance=cutoff_distance)
++  angular_fn = angular_symmetry_functions(displacement,
++                                          species,
++                                          etas=angular_etas,
++                                          lambdas=lambdas,
++                                          zetas=zetas,
++                                          cutoff_distance=cutoff_distance)
++  symmetry_fn = lambda R, **kwargs: jnp.hstack((radial_fn(R, **kwargs),
++                                               angular_fn(R, **kwargs)))
++
++  return symmetry_fn
+diff --git a/jax_md/_nn/e3nn_layer.py b/jax_md/_nn/e3nn_layer.py
+new file mode 100644
+index 00000000..06c90b75
+--- /dev/null
++++ b/jax_md/_nn/e3nn_layer.py
+@@ -0,0 +1,335 @@
++"""The modules in this file are modifications from original code here:
++https://github.com/e3nn/e3nn-jax
++
++We include the license of the original code below:
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++"""
++
++from typing import Optional
++
++from e3nn_jax import Irreps
++from e3nn_jax import IrrepsArray
++from e3nn_jax import FunctionalLinear
++from e3nn_jax import FunctionalFullyConnectedTensorProduct
++
++import flax.linen as nn
++
++import jax
++import jax.numpy as jnp
++
++from jax.nn import initializers
++from jax import tree_util
++from jax import jit
++from jax import vmap
++from jax import tree_map
++
++import numpy as onp
++
++
++def naive_broadcast_decorator(func):
++  def wrapper(*args):
++      leading_shape = jnp.broadcast_shapes(*(arg.shape[:-1] for arg in args))
++      args = [jnp.broadcast_to(arg, leading_shape + (-1,)) for arg in args]
++      f = func
++      for _ in range(len(leading_shape)):
++          f = jax.vmap(f)
++      return f(*args)
++
++  return wrapper
++
++
++class FullyConnectedTensorProductE3nn(nn.Module):
++  """Flax module of an equivariant Fully-Connected Tensor Product."""
++  irreps_out: Irreps
++  irreps_in1: Optional[Irreps] = None
++  irreps_in2: Optional[Irreps] = None
++
++  @nn.compact
++  def __call__(self, x1: IrrepsArray, x2: IrrepsArray) -> IrrepsArray:
++
++    irreps_out = Irreps(self.irreps_out)
++    irreps_in1 = Irreps(
++        self.irreps_in1
++        ) if self.irreps_in1 is not None else None
++    irreps_in2 = Irreps(
++        self.irreps_in2
++        ) if self.irreps_in2 is not None else None
++
++    if irreps_in1 is not None:
++      x1 = IrrepsArray(irreps_in1, x1)
++    if irreps_in2 is not None:
++      x2 = IrrepsArray(irreps_in2, x2)
++
++    x1 = x1.remove_nones().simplify()
++    x2 = x2.remove_nones().simplify()
++
++    tp = FunctionalFullyConnectedTensorProduct(
++        x1.irreps,
++        x2.irreps,
++        irreps_out.simplify()
++        )
++
++    ws = [
++        self.param(
++            (
++                f"w[{ins.i_in1},{ins.i_in2},{ins.i_out}] "
++                f"{tp.irreps_in1[ins.i_in1]},"
++                f"{tp.irreps_in2[ins.i_in2]},{tp.irreps_out[ins.i_out]}"
++                ),
++            nn.initializers.normal(stddev=ins.weight_std),
++            ins.path_shape
++            )
++        for ins in tp.instructions
++    ]
++
++    f = naive_broadcast_decorator(lambda x1, x2: tp.left_right(ws, x1, x2))
++    output = f(x1, x2)
++    output = tree_map(lambda x: x.astype(x1.dtype), output)
++    return output._convert(self.irreps_out)
++
++
++class Linear(nn.Module):
++  """Flax module of an equivariant Linear."""
++  irreps_out: Irreps
++  irreps_in: Optional[Irreps] = None
++
++  @nn.compact
++  def __call__(self, x: IrrepsArray) -> IrrepsArray:
++    irreps_out = Irreps(self.irreps_out)
++    irreps_in = Irreps(self.irreps_in) if self.irreps_in is not None else None
++
++    if self.irreps_in is None and not isinstance(x, IrrepsArray):
++      raise ValueError("the input of Linear must be an IrrepsArray, or "
++                       "`irreps_in` must be specified")
++
++    if irreps_in is not None:
++      x = IrrepsArray(irreps_in, x)
++
++    x = x.remove_nones().simplify()
++
++    lin = FunctionalLinear(x.irreps, irreps_out, instructions=None, biases=None)
++
++    w = [
++        self.param(
++            f"b[{ins.i_out}] {lin.irreps_out[ins.i_out]}",
++            nn.initializers.normal(stddev=ins.weight_std),
++            ins.path_shape,
++            )
++        if ins.i_in == -1
++        else self.param(
++            f"w[{ins.i_in},{ins.i_out}] {lin.irreps_in[ins.i_in]},"
++            f"{lin.irreps_out[ins.i_out]}",
++            nn.initializers.normal(stddev=ins.weight_std),
++            ins.path_shape
++            )
++        for ins in lin.instructions
++        ]
++
++    f = lambda x: lin(w, x)
++    for _ in range(x.ndim - 1):
++      f = vmap(f)
++    output = f(x)
++    output = tree_map(lambda y: y.astype(x.dtype), output)
++    return output
++
+diff --git a/jax_md/_nn/gnome.py b/jax_md/_nn/gnome.py
+new file mode 100644
+index 00000000..24985ddc
+--- /dev/null
++++ b/jax_md/_nn/gnome.py
+@@ -0,0 +1,179 @@
++# Copyright 2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from typing import NamedTuple, Tuple
++
++import os
++
++from jax import ShapedArray
++from jax import eval_shape
++from jax import random
++from jax import tree_map
++
++import jax.numpy as jnp
++
++from jax_md import util
++
++import json
++import jraph
++
++import e3nn_jax as e3nn
++
++from . import nequip
++
++import optax
++
++from ml_collections import ConfigDict
++
++from flax import serialization
++import flax.linen as nn
++
++
++f32 = jnp.float32
++i32 = jnp.int32
++
++GraphsTuple = jraph.GraphsTuple
++
++IrrepsArray = e3nn.IrrepsArray
++
++NUM_ELEMENTS = 94
++
++PyTree = util.PyTree
++
++
++def model_from_config(cfg: ConfigDict) -> nn.Module:
++  model_family = cfg.get('model_family', 'nequip')
++  if model_family == 'nequip':
++    return nequip.model_from_config(cfg)
++  else:
++    raise ValueError(f'Unrecognized model family: {model_family}')
++
++
++def minimum_batch_size(cfg: ConfigDict) -> int:
++  if not hasattr(cfg, 'train_batch_size'):
++    return 1
++  if isinstance(cfg.train_batch_size, int):
++    return cfg.train_batch_size
++  return min(cfg.train_batch_size)
++
++
++class ScaleLROnPlateau(NamedTuple):
++  step_size: jnp.ndarray
++  minimum_loss: jnp.ndarray
++  steps_without_reduction: jnp.ndarray
++  max_steps_without_reduction: jnp.ndarray
++  reduction_factor: jnp.ndarray
++
++
++def scale_lr_on_plateau(initial_step_size: float,
++                        max_steps_without_reduction: int,
++                        reduction_factor: float
++                        ) -> optax.GradientTransformation:
++  def init_fn(params):
++    del params
++    return ScaleLROnPlateau(initial_step_size,
++                            jnp.inf,
++                            0,
++                            max_steps_without_reduction,
++                            reduction_factor)
++
++  def update_fn(updates, state, params=None):
++    del params
++    updates = jax.tree_map(lambda g: g * state.step_size, updates)
++    return updates, state
++
++  return optax.GradientTransformation(init_fn, update_fn)
++
++
++def optimizer(cfg: ConfigDict) -> optax.OptState:
++  epoch_size = cfg.epoch_size if hasattr(cfg, 'epoch_size') else -1
++  # TODO:
++  # if epoch_size < 0:
++  #   epoch_size = aggregate_dataset_size(cfg.train_dataset)
++  # Maybe replace stubbed in value.
++
++  batch_size = minimum_batch_size(cfg)
++  total_steps = cfg.epochs * (epoch_size // batch_size)
++  warmup_steps = cfg.get('warmup_steps', 0)
++
++  if cfg.schedule == 'constant':
++    schedule = cfg.learning_rate
++  elif cfg.schedule == 'linear_decay':
++    schedule = optax.polynomial_schedule(cfg.learning_rate, 0.0, 1, total_steps)
++  elif cfg.schedule == 'cosine_decay':
++    schedule = optax.cosine_decay_schedule(cfg.learning_rate, total_steps)
++  elif cfg.schedule == 'warmup_cosine_decay':
++    schedule = optax.warmup_cosine_decay_schedule(
++        1e-7, cfg.learning_rate, warmup_steps, total_steps)
++  elif cfg.schedule == 'scale_on_plateau':
++    max_plateau_steps = cfg.max_lr_plateau_epochs // cfg.epochs_per_eval
++    return optax.chain(
++        optax.scale_by_adam(),
++        scale_lr_on_plateau(-cfg.learning_rate, max_plateau_steps, 0.8)
++        )
++  else:
++    raise ValueError(f'Unknown learning rate schedule, "{cfg.schedule}".')
++
++  if not hasattr(cfg, 'l2_regularization') or cfg.l2_regularization == 0.0:
++    return optax.adam(schedule)
++
++  return optax.adamw(schedule, weight_decay=cfg.l2_regularization)
++
++
++def load_model(directory: str) -> Tuple[ConfigDict, nn.Module, PyTree]:
++  with open(os.path.join(directory, 'config.json'), 'r') as f:
++    c = json.loads(json.loads(f.read()))
++    c = ConfigDict(c)
++
++  # Now initialize the model and the optimizer functions.
++  featurizer, model = model_from_config(c)
++  opt_init, _ = optimizer(c)
++
++  # Create a dummy example to use for abstract initialization since we only need
++  # the PyTree structure to deserialize.
++  def make_irreps(x):
++    return IrrepsArray('0e + 1e', x)
++
++  graph = GraphsTuple(
++    ShapedArray((1, NUM_ELEMENTS), f32),    # Nodes     (nodes, features)
++    (ShapedArray((1, 3), f32),   # dR        (edges, spatial)
++     ShapedArray((1,), f32),      # dr
++     eval_shape(make_irreps, ShapedArray((1, 4), f32))),  # Spherical Harmonics
++    ShapedArray((1,), i32),      # senders   (edges,)
++    ShapedArray((1,), i32),      # receivers (edges,)
++    ShapedArray((1, 1), f32),      # globals   (graphs,)
++    ShapedArray((1,), i32),      # n_node    (graphs,)
++    ShapedArray((1,), i32))     # n_edge    (graphs,)
++
++  def init_opt_and_model(graph):
++    key = random.PRNGKey(0)
++    params = model.init(key, graph)
++    state = opt_init(params)
++    return params, state
++
++  abstract_params, abstract_state = eval_shape(init_opt_and_model, graph)
++
++  # Now that we have the structure, load the data using FLAX checkpointing.
++  ckpt_data = (0, abstract_params, abstract_state)
++
++  checkpoints = [c for c in os.listdir(directory) if 'checkpoint' in c]
++  assert len(checkpoints) == 1
++
++  checkpoint = os.path.join(directory, checkpoints[0])
++
++  with open(checkpoint, 'rb') as f:
++    ckpt = serialization.from_bytes(ckpt_data, f.read())
++
++  params = tree_map(lambda x: x.astype(f32), ckpt[1])
++  return c, featurizer, model, params
+\ No newline at end of file
+diff --git a/jax_md/_nn/nequip.py b/jax_md/_nn/nequip.py
+new file mode 100644
+index 00000000..254db0cd
+--- /dev/null
++++ b/jax_md/_nn/nequip.py
+@@ -0,0 +1,1000 @@
++# Copyright 2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++from typing import Dict, Union, Tuple
++
++
++import functools
++
++import e3nn_jax as e3nn
++
++import flax.linen as nn
++
++import jax
++import jax.numpy as jnp
++from jax import tree_util
++from jax import vmap
++
++from jax_md import space
++from jax_md import util
++
++import jraph
++
++from . import util as nn_util
++
++from .e3nn_layer import FullyConnectedTensorProductE3nn
++from .e3nn_layer import Linear
++
++import operator
++
++from ml_collections import ConfigDict
++
++
++# Types
++
++
++Irreps = e3nn.Irreps
++IrrepsArray = e3nn.IrrepsArray
++Irrep = e3nn.Irrep
++Array = util.Array
++FeaturizerFn = nn_util.FeaturizerFn
++
++
++get_nonlinearity_by_name = nn_util.get_nonlinearity_by_name
++partial = functools.partial
++
++
++# Code
++
++
++def featurizer(sh_irreps: str)-> FeaturizerFn:
++  """Node, edge, global features for NequIP."""
++  def node_feature_fn(graph):
++    """ NequIP node features are simply the input graph's nodes. """
++    return graph.nodes
++
++  def edge_feature_fn(dR):
++    """ NequIP edge features.
++
++     Builds the following:
++     - the relative interatomic positions \vec{r}_{ij}
++     - interatomic distances r_{ij}
++     - normalized spherical harmonics Y(\hat{r}_{ij})
++     """
++    features = []
++    edge_sh_irreps = Irreps(sh_irreps)
++    edge_sh = e3nn.spherical_harmonics(edge_sh_irreps, dR, normalize=True)
++    return dR, space.distance(dR), edge_sh
++
++  def global_feature_fn(g):
++    """ NequIP does not use global features. """
++    return g
++
++  return node_feature_fn, edge_feature_fn, global_feature_fn
++
++
++def prod(xs):
++  """From e3nn_jax/util/__init__.py."""
++  return functools.reduce(operator.mul, xs, 1)
++
++
++def tp_path_exists(arg_in1, arg_in2, arg_out):
++  """Check if a tensor product path is viable.
++
++  This helper function is similar to the one used in:
++  https://github.com/e3nn/e3nn
++  """
++  arg_in1 = Irreps(arg_in1).simplify()
++  arg_in2 = Irreps(arg_in2).simplify()
++  arg_out = Irrep(arg_out)
++
++  for multiplicity_1, irreps_1 in arg_in1:
++    for multiplicity_2, irreps_2 in arg_in2:
++      if arg_out in irreps_1 * irreps_2:
++        return True
++  return False
++
++
++class NequIPConvolution(nn.Module):
++  """NequIP Convolution.
++
++  Implementation follows the original paper by Batzner et al.
++
++  nature.com/articles/s41467-022-29939-5 and partially
++  https://github.com/mir-group/nequip.
++
++  Args:
++        hidden_irreps: irreducible representation of hidden/latent features
++        use_sc: use self-connection in network (recommended)
++        nonlinearities: nonlinearities to use for even/odd irreps
++        radial_net_nonlinearity: nonlinearity to use in radial MLP
++        radial_net_n_hidden: number of hidden neurons in radial MLP
++        radial_net_n_layers: number of hidden layers for radial MLP
++        num_basis: number of Bessel basis functions to use
++        n_neighbors: constant number of per-atom neighbors, used for internal
++        normalization
++        scalar_mlp_std: standard deviation of weight init of radial MLP
++
++    Returns:
++        Updated node features h after the convolution.
++  """
++  hidden_irreps: Irreps
++  use_sc: bool
++  nonlinearities: Union[str, Dict[str, str]]
++  radial_net_nonlinearity: str = 'raw_swish'
++  radial_net_n_hidden: int = 64
++  radial_net_n_layers: int = 2
++  num_basis: int = 8
++  n_neighbors: float = 1.
++  scalar_mlp_std: float = 4.0
++
++  @nn.compact
++  def __call__(
++      self,
++      node_features: IrrepsArray,
++      node_attributes: IrrepsArray,
++      edge_sh: Array,
++      edge_src: Array,
++      edge_dst: Array,
++      edge_embedded: Array
++      ) -> IrrepsArray:
++    # Convolution outline in NequIP is:
++    # Linear on nodes
++    # TP + aggregate
++    # divide by average number of neighbors
++    # Concatenation
++    # Linear on nodes
++    # Self-connection
++    # Gate
++    irreps_scalars = []
++    irreps_nonscalars = []
++    irreps_gate_scalars = []
++
++    # get scalar target irreps
++    for multiplicity, irrep in self.hidden_irreps:
++      # need the additional Irrep() here for the build, even though irrep is
++      # already of type Irrep()
++      if (Irrep(irrep).l == 0 and
++          tp_path_exists(node_features.irreps, edge_sh.irreps, irrep)):
++        irreps_scalars += [(multiplicity, irrep)]
++
++    irreps_scalars = Irreps(irreps_scalars)
++
++    # get non-scalar target irreps
++    for multiplicity, irrep in self.hidden_irreps:
++      # need the additional Irrep() here for the build, even though irrep is
++      # already of type Irrep()
++      if (Irrep(irrep).l > 0 and
++          tp_path_exists(node_features.irreps, edge_sh.irreps, irrep)):
++        irreps_nonscalars += [(multiplicity, irrep)]
++
++    irreps_nonscalars = Irreps(irreps_nonscalars)
++
++    # get gate scalar irreps
++    if tp_path_exists(node_features.irreps, edge_sh.irreps, '0e'):
++      gate_scalar_irreps_type = '0e'
++    else:
++      gate_scalar_irreps_type = '0o'
++
++    for multiplicity, irreps in irreps_nonscalars:
++      irreps_gate_scalars += [(multiplicity, gate_scalar_irreps_type)]
++
++    irreps_gate_scalars = Irreps(irreps_gate_scalars)
++
++    # final layer output irreps are all three
++    # note that this order is assumed by the gate function later, i.e.
++    # scalars left, then gate scalar, then non-scalars
++    h_out_irreps = irreps_scalars + irreps_gate_scalars + irreps_nonscalars
++
++    # self-connection: TP between node features and node attributes
++    # this can equivalently be seen as a matrix multiplication acting on
++    # the node features where the weight matrix is indexed by the node
++    # attributes (typically the chemical species), i.e. a linear transform
++    # that is a function of the species of the central atom
++    if self.use_sc:
++      self_connection = FullyConnectedTensorProductE3nn(
++          h_out_irreps,
++          # node_features.irreps,
++          # node_attributes.irreps
++          )(node_features, node_attributes)
++
++    h = node_features
++
++    # first linear, stays in current h-space
++    h = Linear(node_features.irreps)(h)
++
++    # map node features onto edges for tp
++    edge_features = jax.tree_map(lambda x: x[edge_src], h)
++
++    # we gather the instructions for the tp as well as the tp output irreps
++    mode = 'uvu'
++    trainable = 'True'
++    irreps_after_tp = []
++    instructions = []
++
++    # iterate over both arguments, i.e. node irreps and edge irreps
++    # if they have a valid TP path for any of the target irreps,
++    # add to instructions and put in appropriate position
++    # we use uvu mode (where v is a single-element sum) and weights will
++    # be provide externally by the scalar MLP
++    # this triple for loop is similar to the one used in e3nn and nequip
++    for i, (mul_in1, irreps_in1) in enumerate(node_features.irreps):
++      for j, (_, irreps_in2) in enumerate(edge_sh.irreps):
++        for curr_irreps_out in irreps_in1 * irreps_in2:
++          if curr_irreps_out in h_out_irreps:
++            k = len(irreps_after_tp)
++            irreps_after_tp += [(mul_in1, curr_irreps_out)]
++            instructions += [(i, j, k, mode, trainable)]
++
++    # we will likely have constructed irreps in a non-l-increasing order
++    # so we sort them to be in a l-increasing order
++    irreps_after_tp, p, _ = Irreps(irreps_after_tp).sort()
++
++    # if we sort the target irreps, we will have to sort the instructions
++    # acoordingly, using the permutation indices
++    sorted_instructions = []
++
++    for irreps_in1, irreps_in2, irreps_out, mode, trainable in instructions:
++      sorted_instructions += [
++          (irreps_in1, irreps_in2, p[irreps_out], mode, trainable)]
++
++    # TP between spherical harmonics embedding of the edge vector
++    # Y_ij(\hat{r}) and neighboring node h_j, weighted on a per-element basis
++    # by the radial network R(r_ij)
++    tp = e3nn.FunctionalTensorProduct(
++        irreps_in1=edge_features.irreps,
++        irreps_in2=edge_sh.irreps,
++        irreps_out=irreps_after_tp,
++        instructions=sorted_instructions
++    )
++
++    # scalar radial network, number of output neurons is the total number of
++    # tensor product paths, nonlinearity must have f(0)=0 and MLP must not
++    # have biases
++    n_tp_weights = 0
++
++    # get output dim of radial MLP / number of TP weights
++    for ins in tp.instructions:
++      if ins.has_weight:
++        n_tp_weights += prod(ins.path_shape)
++
++    # build radial MLP R(r) that maps from interatomic distances to TP weights
++    # must not use bias to that R(0)=0
++    fc = nn_util.MLP(
++        (self.radial_net_n_hidden,) * self.radial_net_n_layers + (n_tp_weights,),
++        self.radial_net_nonlinearity,
++        use_bias=False,
++        scalar_mlp_std=self.scalar_mlp_std
++        )
++
++    # the TP weights (v dimension) are given by the FC
++    weight = fc(edge_embedded)
++
++    # tp between node features that have been mapped onto edges and edge RSH
++    # weighted by FC weight, we vmap over the dimension of the edges
++    edge_features = jax.vmap(tp.left_right)(weight, edge_features, edge_sh)
++
++    # aggregate edges onto nodes after tp using e3nn-jax's index_add
++    h = jax.tree_map(
++        lambda x: e3nn.index_add(edge_dst, x, out_dim=h.shape[0]),
++        edge_features
++        )
++
++    # normalize by the average (not local) number of neighbors
++    h = h / self.n_neighbors
++
++    # second linear, now we create extra gate scalars by mapping to h-out
++    h = Linear(h_out_irreps)(h)
++
++    # self-connection, similar to a resnet-update that sums the output from
++    # the TP to chemistry-weighted h
++    if self.use_sc:
++      h = h + self_connection
++
++    # gate nonlinearity, applied to gate data, consisting of:
++    # a) regular scalars,
++    # b) gate scalars, and
++    # c) non-scalars to be gated
++    # in this order
++    gate_fn = partial(
++        e3nn.gate,
++        even_act=get_nonlinearity_by_name(self.nonlinearities['e']),
++        odd_act=get_nonlinearity_by_name(self.nonlinearities['o']),
++        even_gate_act=get_nonlinearity_by_name(self.nonlinearities['e']),
++        odd_gate_act=get_nonlinearity_by_name(self.nonlinearities['o'])
++        )
++
++    h = gate_fn(h)
++
++    return h
++
++
++class NequIPEnergyModel(nn.Module):
++  """NequIP.
++
++  Implementation follows the original paper by Batzner et al.
++
++  nature.com/articles/s41467-022-29939-5 and partially
++  https://github.com/mir-group/nequip.
++
++    Args:
++        graph_net_steps: number of NequIP convolutional layers
++        use_sc: use self-connection in network (recommended)
++        nonlinearities: nonlinearities to use for even/odd irreps
++        n_element: number of chemical elements in input data
++        hidden_irreps: irreducible representation of hidden/latent features
++        sh_irreps: irreducible representations on the edges
++        num_basis: number of Bessel basis functions to use
++        r_max: radial cutoff used in length units
++        radial_net_nonlinearity: nonlinearity to use in radial MLP
++        radial_net_n_hidden: number of hidden neurons in radial MLP
++        radial_net_n_layers: number of hidden layers for radial MLP
++        shift: per-atom energy shift
++        scale: per-atom energy scale
++        n_neighbors: constant number of per-atom neighbors, used for internal
++        normalization
++        scalar_mlp_std: standard deviation of weight init of radial MLP
++
++    Returns:
++        Potential energy of the inputs.
++  """
++
++  graph_net_steps: int
++  use_sc: bool
++  nonlinearities: Union[str, Dict[str, str]]
++  n_elements: int
++
++  hidden_irreps: str
++  sh_irreps: str
++
++  num_basis: int = 8
++  r_max: float = 4.
++
++  radial_net_nonlinearity: str = 'raw_swish'
++  radial_net_n_hidden: int = 64
++  radial_net_n_layers: int = 2
++
++  shift: float = 0.
++  scale: float = 1.
++  n_neighbors: float = 1.
++  scalar_mlp_std: float = 4.0
++
++  @nn.compact
++  def __call__(self, graph):
++    r_max = jnp.float32(self.r_max)
++    hidden_irreps = Irreps(self.hidden_irreps)
++
++    # get src/dst from graph
++    edge_src = graph.senders
++    edge_dst = graph.receivers
++
++    # node features
++    embedding_irreps = Irreps(f'{self.n_elements}x0e')
++    node_attrs = IrrepsArray(embedding_irreps, graph.nodes)
++
++    # edge embedding
++    _, scalar_dr_edge, edge_sh = graph.edges
++
++    embedded_dr_edge = nn_util.BesselEmbedding(
++        count=self.num_basis,
++        inner_cutoff=r_max - 0.5,
++        outer_cutoff=r_max
++        )(scalar_dr_edge)
++
++    # embedding layer
++    h_node = Linear(irreps_out=Irreps(hidden_irreps))(node_attrs)
++
++    # convolutions
++    for _ in range(self.graph_net_steps):
++      h_node = NequIPConvolution(
++          hidden_irreps=hidden_irreps,
++          use_sc=self.use_sc,
++          nonlinearities=self.nonlinearities,
++          radial_net_nonlinearity=self.radial_net_nonlinearity,
++          radial_net_n_hidden=self.radial_net_n_hidden,
++          radial_net_n_layers=self.radial_net_n_layers,
++          num_basis=self.num_basis,
++          n_neighbors=self.n_neighbors,
++          scalar_mlp_std=self.scalar_mlp_std
++          )(h_node,
++            node_attrs,
++            edge_sh,
++            edge_src,
++            edge_dst,
++            embedded_dr_edge
++            )
++
++    # output block, two Linears that decay dimensions from h to h//2 to 1
++    for mul, ir in h_node.irreps:
++      if ir == Irrep('0e'):
++        mul_second_to_final = mul // 2
++
++    second_to_final_irreps = Irreps(f'{mul_second_to_final}x0e')
++    final_irreps = Irreps('1x0e')
++
++    h_node = Linear(irreps_out=second_to_final_irreps)(h_node)
++    atomic_output = Linear(irreps_out=final_irreps)(h_node).array
++
++    # shift + scale atomic energies
++    atomic_output = self.scale * atomic_output + self.shift
++
++    # this aggregation follows jraph/_src/models.py
++    n_graph = graph.n_node.shape[0]
++    graph_idx = jnp.arange(n_graph)
++    sum_n_node = tree_util.tree_leaves(graph.nodes)[0].shape[0]
++    node_gr_idx = jnp.repeat(
++        graph_idx,
++        graph.n_node,
++        axis=0,
++        total_repeat_length=sum_n_node
++        )
++
++    global_output = tree_util.tree_map(
++        lambda n: jraph.segment_sum(
++            n,
++            node_gr_idx,
++            n_graph
++            ), atomic_output)
++
++    return global_output
++
++
++def model_from_config(cfg: ConfigDict
++                      ) -> Tuple[FeaturizerFn, NequIPEnergyModel]:
++  """Model replication of NequIP.
++
++  Implementation follows the original paper by Batzner et al.
++
++  nature.com/articles/s41467-022-29939-5 and partially
++  https://github.com/mir-group/nequip.
++  """
++  shift, scale = nn_util.get_shift_and_scale(cfg)
++
++  model = NequIPEnergyModel(
++      graph_net_steps=cfg.graph_net_steps,
++      use_sc=cfg.use_sc,
++      nonlinearities=cfg.nonlinearities,
++      n_elements=cfg.n_elements,
++      hidden_irreps=cfg.hidden_irreps,
++      sh_irreps=cfg.sh_irreps,
++      num_basis=cfg.num_basis,
++      r_max=cfg.r_max,
++      radial_net_nonlinearity=cfg.radial_net_nonlinearity,
++      radial_net_n_hidden=cfg.radial_net_n_hidden,
++      radial_net_n_layers=cfg.radial_net_n_layers,
++      shift=shift,
++      scale=scale,
++      n_neighbors=cfg.n_neighbors,
++      scalar_mlp_std=cfg.scalar_mlp_std,
++      )
++
++  return featurizer(cfg.sh_irreps), model
++# Copyright 2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++from typing import Dict, Union, Tuple
++
++
++import functools
++
++import e3nn_jax as e3nn
++
++import flax.linen as nn
++
++import jax
++import jax.numpy as jnp
++from jax import tree_util
++from jax import vmap
++
++from jax_md import space
++from jax_md import util
++
++import jraph
++
++from . import util as nn_util
++
++from .e3nn_layer import FullyConnectedTensorProductE3nn
++from .e3nn_layer import Linear
++
++import operator
++
++from ml_collections import ConfigDict
++
++
++# Types
++
++
++Irreps = e3nn.Irreps
++IrrepsArray = e3nn.IrrepsArray
++Irrep = e3nn.Irrep
++Array = util.Array
++FeaturizerFn = nn_util.FeaturizerFn
++
++
++get_nonlinearity_by_name = nn_util.get_nonlinearity_by_name
++partial = functools.partial
++
++
++# Code
++
++
++def featurizer(sh_irreps: str)-> FeaturizerFn:
++  """Node, edge, global features for NequIP."""
++  def node_feature_fn(graph):
++    """ NequIP node features are simply the input graph's nodes. """
++    return graph.nodes
++
++  def edge_feature_fn(dR):
++    """ NequIP edge features.
++
++     Builds the following:
++     - the relative interatomic positions \vec{r}_{ij}
++     - interatomic distances r_{ij}
++     - normalized spherical harmonics Y(\hat{r}_{ij})
++     """
++    features = []
++    edge_sh_irreps = Irreps(sh_irreps)
++    edge_sh = e3nn.spherical_harmonics(edge_sh_irreps, dR, normalize=True)
++    return dR, space.distance(dR), edge_sh
++
++  def global_feature_fn(g):
++    """ NequIP does not use global features. """
++    return g
++
++  return node_feature_fn, edge_feature_fn, global_feature_fn
++
++
++def prod(xs):
++  """From e3nn_jax/util/__init__.py."""
++  return functools.reduce(operator.mul, xs, 1)
++
++
++def tp_path_exists(arg_in1, arg_in2, arg_out):
++  """Check if a tensor product path is viable.
++
++  This helper function is similar to the one used in:
++  https://github.com/e3nn/e3nn
++  """
++  arg_in1 = Irreps(arg_in1).simplify()
++  arg_in2 = Irreps(arg_in2).simplify()
++  arg_out = Irrep(arg_out)
++
++  for multiplicity_1, irreps_1 in arg_in1:
++    for multiplicity_2, irreps_2 in arg_in2:
++      if arg_out in irreps_1 * irreps_2:
++        return True
++  return False
++
++
++class NequIPConvolution(nn.Module):
++  """NequIP Convolution.
++
++  Implementation follows the original paper by Batzner et al.
++
++  nature.com/articles/s41467-022-29939-5 and partially
++  https://github.com/mir-group/nequip.
++
++  Args:
++        hidden_irreps: irreducible representation of hidden/latent features
++        use_sc: use self-connection in network (recommended)
++        nonlinearities: nonlinearities to use for even/odd irreps
++        radial_net_nonlinearity: nonlinearity to use in radial MLP
++        radial_net_n_hidden: number of hidden neurons in radial MLP
++        radial_net_n_layers: number of hidden layers for radial MLP
++        num_basis: number of Bessel basis functions to use
++        n_neighbors: constant number of per-atom neighbors, used for internal
++        normalization
++        scalar_mlp_std: standard deviation of weight init of radial MLP
++
++    Returns:
++        Updated node features h after the convolution.
++  """
++  hidden_irreps: Irreps
++  use_sc: bool
++  nonlinearities: Union[str, Dict[str, str]]
++  radial_net_nonlinearity: str = 'raw_swish'
++  radial_net_n_hidden: int = 64
++  radial_net_n_layers: int = 2
++  num_basis: int = 8
++  n_neighbors: float = 1.
++  scalar_mlp_std: float = 4.0
++
++  @nn.compact
++  def __call__(
++      self,
++      node_features: IrrepsArray,
++      node_attributes: IrrepsArray,
++      edge_sh: Array,
++      edge_src: Array,
++      edge_dst: Array,
++      edge_embedded: Array
++      ) -> IrrepsArray:
++    # Convolution outline in NequIP is:
++    # Linear on nodes
++    # TP + aggregate
++    # divide by average number of neighbors
++    # Concatenation
++    # Linear on nodes
++    # Self-connection
++    # Gate
++    irreps_scalars = []
++    irreps_nonscalars = []
++    irreps_gate_scalars = []
++
++    # get scalar target irreps
++    for multiplicity, irrep in self.hidden_irreps:
++      # need the additional Irrep() here for the build, even though irrep is
++      # already of type Irrep()
++      if (Irrep(irrep).l == 0 and
++          tp_path_exists(node_features.irreps, edge_sh.irreps, irrep)):
++        irreps_scalars += [(multiplicity, irrep)]
++
++    irreps_scalars = Irreps(irreps_scalars)
++
++    # get non-scalar target irreps
++    for multiplicity, irrep in self.hidden_irreps:
++      # need the additional Irrep() here for the build, even though irrep is
++      # already of type Irrep()
++      if (Irrep(irrep).l > 0 and
++          tp_path_exists(node_features.irreps, edge_sh.irreps, irrep)):
++        irreps_nonscalars += [(multiplicity, irrep)]
++
++    irreps_nonscalars = Irreps(irreps_nonscalars)
++
++    # get gate scalar irreps
++    if tp_path_exists(node_features.irreps, edge_sh.irreps, '0e'):
++      gate_scalar_irreps_type = '0e'
++    else:
++      gate_scalar_irreps_type = '0o'
++
++    for multiplicity, irreps in irreps_nonscalars:
++      irreps_gate_scalars += [(multiplicity, gate_scalar_irreps_type)]
++
++    irreps_gate_scalars = Irreps(irreps_gate_scalars)
++
++    # final layer output irreps are all three
++    # note that this order is assumed by the gate function later, i.e.
++    # scalars left, then gate scalar, then non-scalars
++    h_out_irreps = irreps_scalars + irreps_gate_scalars + irreps_nonscalars
++
++    # self-connection: TP between node features and node attributes
++    # this can equivalently be seen as a matrix multiplication acting on
++    # the node features where the weight matrix is indexed by the node
++    # attributes (typically the chemical species), i.e. a linear transform
++    # that is a function of the species of the central atom
++    if self.use_sc:
++      self_connection = FullyConnectedTensorProductE3nn(
++          h_out_irreps,
++          # node_features.irreps,
++          # node_attributes.irreps
++          )(node_features, node_attributes)
++
++    h = node_features
++
++    # first linear, stays in current h-space
++    h = Linear(node_features.irreps)(h)
++
++    # map node features onto edges for tp
++    edge_features = jax.tree_map(lambda x: x[edge_src], h)
++
++    # we gather the instructions for the tp as well as the tp output irreps
++    mode = 'uvu'
++    trainable = 'True'
++    irreps_after_tp = []
++    instructions = []
++
++    # iterate over both arguments, i.e. node irreps and edge irreps
++    # if they have a valid TP path for any of the target irreps,
++    # add to instructions and put in appropriate position
++    # we use uvu mode (where v is a single-element sum) and weights will
++    # be provide externally by the scalar MLP
++    # this triple for loop is similar to the one used in e3nn and nequip
++    for i, (mul_in1, irreps_in1) in enumerate(node_features.irreps):
++      for j, (_, irreps_in2) in enumerate(edge_sh.irreps):
++        for curr_irreps_out in irreps_in1 * irreps_in2:
++          if curr_irreps_out in h_out_irreps:
++            k = len(irreps_after_tp)
++            irreps_after_tp += [(mul_in1, curr_irreps_out)]
++            instructions += [(i, j, k, mode, trainable)]
++
++    # we will likely have constructed irreps in a non-l-increasing order
++    # so we sort them to be in a l-increasing order
++    irreps_after_tp, p, _ = Irreps(irreps_after_tp).sort()
++
++    # if we sort the target irreps, we will have to sort the instructions
++    # acoordingly, using the permutation indices
++    sorted_instructions = []
++
++    for irreps_in1, irreps_in2, irreps_out, mode, trainable in instructions:
++      sorted_instructions += [
++          (irreps_in1, irreps_in2, p[irreps_out], mode, trainable)]
++
++    # TP between spherical harmonics embedding of the edge vector
++    # Y_ij(\hat{r}) and neighboring node h_j, weighted on a per-element basis
++    # by the radial network R(r_ij)
++    tp = e3nn.FunctionalTensorProduct(
++        irreps_in1=edge_features.irreps,
++        irreps_in2=edge_sh.irreps,
++        irreps_out=irreps_after_tp,
++        instructions=sorted_instructions
++    )
++
++    # scalar radial network, number of output neurons is the total number of
++    # tensor product paths, nonlinearity must have f(0)=0 and MLP must not
++    # have biases
++    n_tp_weights = 0
++
++    # get output dim of radial MLP / number of TP weights
++    for ins in tp.instructions:
++      if ins.has_weight:
++        n_tp_weights += prod(ins.path_shape)
++
++    # build radial MLP R(r) that maps from interatomic distances to TP weights
++    # must not use bias to that R(0)=0
++    fc = nn_util.MLP(
++        (self.radial_net_n_hidden,) * self.radial_net_n_layers + (n_tp_weights,),
++        self.radial_net_nonlinearity,
++        use_bias=False,
++        scalar_mlp_std=self.scalar_mlp_std
++        )
++
++    # the TP weights (v dimension) are given by the FC
++    weight = fc(edge_embedded)
++
++    # tp between node features that have been mapped onto edges and edge RSH
++    # weighted by FC weight, we vmap over the dimension of the edges
++    edge_features = jax.vmap(tp.left_right)(weight, edge_features, edge_sh)
++    # TODO: It's not great that e3nn_jax automatically upcasts internally,
++    # but this would need to be fixed at the e3nn level.
++    edge_features = jax.tree_map(lambda x: x.astype(h.dtype), edge_features)
++
++    # aggregate edges onto nodes after tp using e3nn-jax's index_add
++    h_type = h.dtype
++    h = jax.tree_map(
++        lambda x: e3nn.index_add(edge_dst, x, out_dim=h.shape[0]),
++        edge_features
++        )
++    # TODO: Remove this once e3nn_jax doesn't upcast inputs.
++    h = jax.tree_map(lambda x: x.astype(h_type), h)
++
++    # normalize by the average (not local) number of neighbors
++    h = h / self.n_neighbors
++
++    # second linear, now we create extra gate scalars by mapping to h-out
++    h = Linear(h_out_irreps)(h)
++
++    # self-connection, similar to a resnet-update that sums the output from
++    # the TP to chemistry-weighted h
++    if self.use_sc:
++      h = h + self_connection
++
++    # gate nonlinearity, applied to gate data, consisting of:
++    # a) regular scalars,
++    # b) gate scalars, and
++    # c) non-scalars to be gated
++    # in this order
++    gate_fn = partial(
++        e3nn.gate,
++        even_act=get_nonlinearity_by_name(self.nonlinearities['e']),
++        odd_act=get_nonlinearity_by_name(self.nonlinearities['o']),
++        even_gate_act=get_nonlinearity_by_name(self.nonlinearities['e']),
++        odd_gate_act=get_nonlinearity_by_name(self.nonlinearities['o'])
++        )
++
++    h = gate_fn(h)
++    # TODO: Remove this once e3nn_jax doesn't upcast inputs.
++    h = jax.tree_map(lambda x: x.astype(h_type), h)
++
++    return h
++
++
++class NequIPEnergyModel(nn.Module):
++  """NequIP.
++
++  Implementation follows the original paper by Batzner et al.
++
++  nature.com/articles/s41467-022-29939-5 and partially
++  https://github.com/mir-group/nequip.
++
++    Args:
++        graph_net_steps: number of NequIP convolutional layers
++        use_sc: use self-connection in network (recommended)
++        nonlinearities: nonlinearities to use for even/odd irreps
++        n_element: number of chemical elements in input data
++        hidden_irreps: irreducible representation of hidden/latent features
++        sh_irreps: irreducible representations on the edges
++        num_basis: number of Bessel basis functions to use
++        r_max: radial cutoff used in length units
++        radial_net_nonlinearity: nonlinearity to use in radial MLP
++        radial_net_n_hidden: number of hidden neurons in radial MLP
++        radial_net_n_layers: number of hidden layers for radial MLP
++        shift: per-atom energy shift
++        scale: per-atom energy scale
++        n_neighbors: constant number of per-atom neighbors, used for internal
++        normalization
++        scalar_mlp_std: standard deviation of weight init of radial MLP
++
++    Returns:
++        Potential energy of the inputs.
++  """
++
++  graph_net_steps: int
++  use_sc: bool
++  nonlinearities: Union[str, Dict[str, str]]
++  n_elements: int
++
++  hidden_irreps: str
++  sh_irreps: str
++
++  num_basis: int = 8
++  r_max: float = 4.
++
++  radial_net_nonlinearity: str = 'raw_swish'
++  radial_net_n_hidden: int = 64
++  radial_net_n_layers: int = 2
++
++  shift: float = 0.
++  scale: float = 1.
++  n_neighbors: float = 1.
++  scalar_mlp_std: float = 4.0
++
++  @nn.compact
++  def __call__(self, graph):
++    r_max = jnp.float32(self.r_max)
++    hidden_irreps = Irreps(self.hidden_irreps)
++
++    # get src/dst from graph
++    edge_src = graph.senders
++    edge_dst = graph.receivers
++
++    # node features
++    embedding_irreps = Irreps(f'{self.n_elements}x0e')
++    node_attrs = IrrepsArray(embedding_irreps, graph.nodes)
++
++    # edge embedding
++    _, scalar_dr_edge, edge_sh = graph.edges
++
++    embedded_dr_edge = nn_util.BesselEmbedding(
++        count=self.num_basis,
++        inner_cutoff=r_max - 0.5,
++        outer_cutoff=r_max
++        )(scalar_dr_edge)
++
++    # embedding layer
++    h_node = Linear(irreps_out=Irreps(hidden_irreps))(node_attrs)
++
++    # convolutions
++    for _ in range(self.graph_net_steps):
++      h_node = NequIPConvolution(
++          hidden_irreps=hidden_irreps,
++          use_sc=self.use_sc,
++          nonlinearities=self.nonlinearities,
++          radial_net_nonlinearity=self.radial_net_nonlinearity,
++          radial_net_n_hidden=self.radial_net_n_hidden,
++          radial_net_n_layers=self.radial_net_n_layers,
++          num_basis=self.num_basis,
++          n_neighbors=self.n_neighbors,
++          scalar_mlp_std=self.scalar_mlp_std
++          )(h_node,
++            node_attrs,
++            edge_sh,
++            edge_src,
++            edge_dst,
++            embedded_dr_edge
++            )
++
++    # output block, two Linears that decay dimensions from h to h//2 to 1
++    for mul, ir in h_node.irreps:
++      if ir == Irrep('0e'):
++        mul_second_to_final = mul // 2
++
++    second_to_final_irreps = Irreps(f'{mul_second_to_final}x0e')
++    final_irreps = Irreps('1x0e')
++
++    h_node = Linear(irreps_out=second_to_final_irreps)(h_node)
++    atomic_output = Linear(irreps_out=final_irreps)(h_node).array
++
++    # shift + scale atomic energies
++    atomic_output = self.scale * atomic_output + self.shift
++
++    # this aggregation follows jraph/_src/models.py
++    n_graph = graph.n_node.shape[0]
++    graph_idx = jnp.arange(n_graph)
++    sum_n_node = tree_util.tree_leaves(graph.nodes)[0].shape[0]
++    node_gr_idx = jnp.repeat(
++        graph_idx,
++        graph.n_node,
++        axis=0,
++        total_repeat_length=sum_n_node
++        )
++
++    global_output = tree_util.tree_map(
++        lambda n: jraph.segment_sum(
++            n,
++            node_gr_idx,
++            n_graph
++            ), atomic_output)
++
++    return global_output
++
++
++def model_from_config(cfg: ConfigDict
++                      ) -> Tuple[FeaturizerFn, NequIPEnergyModel]:
++  """Model replication of NequIP.
++
++  Implementation follows the original paper by Batzner et al.
++
++  nature.com/articles/s41467-022-29939-5 and partially
++  https://github.com/mir-group/nequip.
++  """
++  shift, scale = nn_util.get_shift_and_scale(cfg)
++
++  model = NequIPEnergyModel(
++      graph_net_steps=cfg.graph_net_steps,
++      use_sc=cfg.use_sc,
++      nonlinearities=cfg.nonlinearities,
++      n_elements=cfg.n_elements,
++      hidden_irreps=cfg.hidden_irreps,
++      sh_irreps=cfg.sh_irreps,
++      num_basis=cfg.num_basis,
++      r_max=cfg.r_max,
++      radial_net_nonlinearity=cfg.radial_net_nonlinearity,
++      radial_net_n_hidden=cfg.radial_net_n_hidden,
++      radial_net_n_layers=cfg.radial_net_n_layers,
++      shift=shift,
++      scale=scale,
++      n_neighbors=cfg.n_neighbors,
++      scalar_mlp_std=cfg.scalar_mlp_std,
++      )
++
++  return featurizer(cfg.sh_irreps), model
++
++
++def default_config() -> ConfigDict:
++  config = ConfigDict()
++
++  config.graph_net_steps = 5
++  config.nonlinearities = {'e': 'raw_swish', 'o': 'tanh'}
++  config.use_sc = True
++  config.n_elements = 94
++  config.hidden_irreps = '128x0e + 64x1e + 4x2e'
++  config.sh_irreps = '1x0e + 1x1e + 1x2e'
++  config.num_basis = 8
++  config.r_max = 5.
++  config.radial_net_nonlinearity = 'raw_swish'
++  config.radial_net_n_hidden = 64
++  config.radial_net_n_layers = 2
++
++  # average number of neighbors per atom, used to divide activations are sum
++  # in the nequip convolution, helpful for internal normalization.
++  config.n_neighbors = 10.
++
++  # Standard deviation used for the initializer of the weight matrix in the
++  # radial scalar MLP
++  config.scalar_mlp_std = 4.
++
++  return config
+diff --git a/jax_md/_nn/util.py b/jax_md/_nn/util.py
+new file mode 100644
+index 00000000..446b0b38
+--- /dev/null
++++ b/jax_md/_nn/util.py
+@@ -0,0 +1,189 @@
++# Copyright 2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Neural Network Primitives."""
++
++
++from typing import Union, Dict, Callable, Tuple, Optional
++
++import functools
++
++from jraph import GraphsTuple
++import jraph
++
++from jax import vmap
++from jax.nn import initializers
++import jax.numpy as jnp
++
++from jax_md import util
++from jax_md import energy
++from jax_md import partition
++
++from ml_collections import ConfigDict
++
++import flax.linen as nn
++
++
++Array = util.Array
++FeaturizerFn = Callable[[GraphsTuple, Array, Array, Optional[Array]], GraphsTuple]
++
++f32 = jnp.float32
++
++partial = functools.partial
++normal = lambda var: initializers.variance_scaling(var, 'fan_in', 'normal')
++
++
++# Nonlinearities:
++
++
++UnaryFn = Callable[[Array], Array]
++
++
++class BetaSwish(nn.Module):
++  @nn.compact
++  def __call__(self, x):
++    features = x.shape[-1]
++    beta = self.param('Beta', nn.initializers.ones, (features,))
++    return x * nn.sigmoid(beta * x)
++
++
++NONLINEARITY = {
++    'none': lambda x: x,
++    'relu': nn.relu,
++    'swish': lambda x: BetaSwish()(x),
++    'raw_swish': nn.swish,
++    'tanh': nn.tanh,
++    'sigmoid': nn.sigmoid,
++    'silu': nn.silu,
++}
++
++
++def get_nonlinearity_by_name(name: str) -> UnaryFn:
++  if name in NONLINEARITY:
++    return NONLINEARITY[name]
++  raise ValueError(f'Nonlinearity "{name}" not found.')
++
++
++# Fully-Connected Networks
++
++
++class MLP(nn.Module):
++  features: Tuple[int, ...]
++  nonlinearity: str
++
++  use_bias: bool = True
++  scalar_mlp_std: Optional[float] = None
++
++  @nn.compact
++  def __call__(self, x):
++    features = self.features
++
++    dense = partial(nn.Dense, use_bias=self.use_bias)
++    phi = get_nonlinearity_by_name(self.nonlinearity)
++
++    kernel_init = normal(self.scalar_mlp_std)
++
++    for h in features[:-1]:
++      x = phi(dense(h, kernel_init=kernel_init)(x))
++
++    return dense(features[-1], kernel_init=normal(1.0))(x)
++
++
++def mlp(hidden_features: Union[int, Tuple[int, ...]],
++        nonlinearity: str,
++        **kwargs) -> Callable[..., Array]:
++  if isinstance(hidden_features, int):
++    hidden_features = (hidden_features,)
++
++  def mlp_fn(*args):
++    fn = MLP(hidden_features, nonlinearity, **kwargs)
++    return jraph.concatenated_args(fn)(*args)
++  return mlp_fn
++
++
++# Featurizers
++
++
++def neighbor_list_featurizer(displacement_fn,
++                             atom_feature_fn,
++                             edge_feature_fn,
++                             global_feature_fn):
++  def featurize(atoms, position, neighbor, **kwargs):
++    N = position.shape[0]
++    graph = partition.to_jraph(neighbor, nodes=atoms)
++    mask = partition.neighbor_list_mask(neighbor, True)
++
++    Rb = position[graph.senders]
++    Ra = position[graph.receivers]
++
++    d = vmap(partial(displacement_fn, **kwargs))
++    dR = d(Ra, Rb)
++    dR = jnp.where(mask[:, None], dR, 1)
++
++    return graph._replace(nodes=atom_feature_fn(graph),
++                          edges=edge_feature_fn(dR))
++  return featurize
++
++
++# Bessel Functions
++
++
++# Similar to the original Behler-Parinello features. Used by Nequip [1] and
++# Schnet [2] to encode distance information.
++
++
++def bessel(r_c, frequencies, r):
++  rp = jnp.where(r > f32(1e-5), r, f32(1000.0))
++  b = 2 / r_c * jnp.sin(frequencies * rp / r_c) / rp
++  return jnp.where(r > f32(1e-5), b, 0)
++
++
++class BesselEmbedding(nn.Module):
++  count: int
++  inner_cutoff: float
++  outer_cutoff: float
++
++  @nn.compact
++  def __call__(self, rs: Array) -> Array:
++    def init_fn(key, shape):
++      del key
++      assert len(shape) == 1
++      n = shape[0]
++      return jnp.arange(1, n + 1) * jnp.pi
++    frequencies = self.param('frequencies', init_fn, (self.count,))
++    bessel_fn = partial(bessel, self.outer_cutoff, frequencies)
++    bessel_fn = vmap(energy.multiplicative_isotropic_cutoff(bessel_fn,
++                                                            self.inner_cutoff,
++                                                            self.outer_cutoff))
++    return bessel_fn(rs)
++
++
++# Scale and Shifts
++
++# TODO(schsam): Currently, we refer to a global dataset-level scale / shift
++# if no scale / shift is specified by the config. At some point, it would be
++# nice to remove this.
++
++DATASET_SHIFT_SCALE = {
++    'harder_silicon': (2.2548, 0.8825)
++}
++
++
++def get_shift_and_scale(cfg: ConfigDict) -> Tuple[float, float]:
++  if hasattr(cfg, 'scale') and hasattr(cfg, 'shift'):
++    return cfg.shift, cfg.scale
++  elif hasattr(cfg, 'train_dataset'):
++    return DATASET_SHIFT_SCALE[cfg.train_dataset[0]]
++  else:
++    raise ValueError()
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index 3fe08d16..806318bc 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -29,8 +29,14 @@
+ from jax.scipy.special import erfc  # error function
+ from jax_md import space, smap, partition, nn, quantity, interpolate, util
+ 
++from ml_collections import ConfigDict
++
++bp = nn.behler_parrinello
++gnome = nn.gnome
++
+ maybe_downcast = util.maybe_downcast
+ 
++
+ # Types
+ 
+ 
+@@ -1494,9 +1500,7 @@ def behler_parrinello(displacement: DisplacementFn,
+         'activation': jnp.tanh
+     }
+ 
+-  sym_fn = nn.behler_parrinello_symmetry_functions(displacement,
+-                                                   species,
+-                                                   **sym_kwargs)
++  sym_fn = bp.symmetry_functions(displacement, species, **sym_kwargs)
+ 
+   @hk.without_apply_rng
+   @hk.transform
+@@ -1547,9 +1551,8 @@ def behler_parrinello_neighbor_list(
+     format=format,
+     **neighbor_kwargs)
+ 
+-  sym_fn = nn.behler_parrinello_symmetry_functions_neighbor_list(displacement,
+-                                                                 species,
+-                                                                 **sym_kwargs)
++  sym_fn = bp.symmetry_functions_neighbor_list(displacement, species,
++                                               **sym_kwargs)
+ 
+   @hk.without_apply_rng
+   @hk.transform
+@@ -1779,3 +1782,68 @@ def model(R, neighbor, **kwargs):
+   init_fn, apply_fn = model.init, model.apply
+ 
+   return neighbor_fn, init_fn, apply_fn
++
++
++def nequip_neighbor_list(displacement_fn,
++                         box,
++                         cfg: ConfigDict=None,
++                         atoms=None,
++                         **nl_kwargs):
++  cfg = nequip.default_config() if cfg is None else cfg
++  featurizer, model = nequip.model_from_config(cfg)
++
++  neighbor_fn = partition.neighbor_list(
++    displacement_fn,
++    box,
++    cfg.r_max,
++    format=partition.Sparse,
++    **nl_kwargs)
++
++  featurizer = nn.util.neighbor_list_featurizer(displacement_fn, *featurizer)
++
++  def init_fn(key, position, neighbor, **kwargs):
++    _atoms = kwargs.pop('atoms', atoms)
++    if _atoms is None:
++      raise ValueError('A one-hot encoding of the atoms is required.')
++    # TODO: It would be nicer to do this without computing flops
++    # since we really only need the shape of the graph for initialization.
++    graph = featurizer(_atoms, position, neighbor, **kwargs)
++    return model.init(key, graph)
++
++  def energy_fn(params, position, neighbor, **kwargs):
++    _atoms = kwargs.pop('atoms', atoms)
++    if _atoms is None:
++      raise ValueError('A one-hot encoding of the atoms is required.')
++    graph = featurizer(_atoms, position, neighbor, **kwargs)
++    return model.apply(params, graph)[0, 0]
++
++  return neighbor_fn, init_fn, energy_fn
++
++
++def load_gnome_model_neighbor_list(
++        displacement_fn,
++        box,
++        directory,
++        atoms = None,
++        **nl_kwargs):
++  """Load a gnome model from a checkpoint."""
++  cfg, featurizer, model, params = gnome.load_model(directory)
++
++  neighbor_fn = partition.neighbor_list(
++    displacement_fn,
++    box,
++    cfg.r_max,
++    format=partition.Sparse,
++    **nl_kwargs)
++
++  featurizer = nn.util.neighbor_list_featurizer(displacement_fn, *featurizer)
++
++  def energy_fn(position, neighbor, **kwargs):
++    _atoms = kwargs.pop('atoms', atoms)
++    if _atoms is None:
++      raise ValueError('A one-hot encoding of the atoms is required.')
++    graph = featurizer(_atoms, position, neighbor, **kwargs)
++    return model.apply(params, graph)[0, 0]
++
++  return neighbor_fn, energy_fn
++
+diff --git a/jax_md/nn.py b/jax_md/nn.py
+index 110036f8..25f08091 100644
+--- a/jax_md/nn.py
++++ b/jax_md/nn.py
+@@ -22,7 +22,8 @@
+ from jax import vmap, jit
+ import jax.numpy as jnp
+ 
+-from jax_md import space, dataclasses, quantity, partition, smap, util
++from jax_md import space, dataclasses, quantity, partition, smap
++from jax_md import util as jmd_util
+ import haiku as hk
+ 
+ from collections import namedtuple
+@@ -32,12 +33,17 @@
+ 
+ import jraph
+ 
++from ._nn import behler_parrinello
++from ._nn import nequip
++from ._nn import gnome
++from ._nn import util
++
+ # Typing
+ 
+ 
+-Array = util.Array
+-f32 = util.f32
+-f64 = util.f64
++Array = jmd_util.Array
++f32 = jmd_util.f32
++f64 = jmd_util.f64
+ 
+ InitFn = Callable[..., Array]
+ CallFn = Callable[..., Array]
+@@ -46,454 +52,7 @@
+ DisplacementFn = space.DisplacementFn
+ NeighborList = partition.NeighborList
+ 
+-
+-# Features used in fixed feature methods
+-
+-
+-"""
+-Our neural network force field is based on the Behler-Parrinello neural network
+-architecture (BP-NN) [1]. The BP-NN architecture uses a relatively simple,
+-fully connected neural network to predict the local energy for each atom. Then
+-the total energy is the sum of local energies due to each atom. Atoms of the
+-same type use the same NN to predict energy.
+-
+-Each atomic NN is applied to hand-crafted features called symmetry functions.
+-There are two kinds of symmetry functions: radial and angular. Radial symmetry
+-functions represent information about two-body interactions of the central
+-atom, whereas angular symmetry functions represent information about three-body
+-interactions. Below we implement radial and angular symmetry functions for
+-arbitrary number of types of atoms (Note that most applications of BP-NN limit
+-their systems to 1 to 3 types of atoms). We also present a convenience wrapper
+-that returns radial and angular symmetry functions with symmetry function
+-parameters that should work reasonably for most systems (the symmetry functions
+-are taken from reference [2]). Please see references [1, 2] for details about
+-how the BP-NN works.
+-
+-[1] Behler, Jörg, and Michele Parrinello. "Generalized neural-network
+-representation of high-dimensional potential-energy surfaces." Physical
+-Review Letters 98.14 (2007): 146401.
+-
+-[2] Artrith, Nongnuch, Björn Hiller, and Jörg Behler. "Neural network
+-potentials for metals and oxides–First applications to copper clusters at zinc
+-oxide."
+-Physica Status Solidi (b) 250.6 (2013): 1191-1203.
+-"""
+-
+-def _behler_parrinello_cutoff_fn(dr: Array,
+-                                 cutoff_distance: float=8.0) -> Array:
+-  """Function of pairwise distance that smoothly goes to zero at the cutoff."""
+-  # Also returns zero if the pairwise distance is zero,
+-  # to prevent a particle from interacting with itself.
+-  return jnp.where((dr < cutoff_distance) & (dr > 1e-7),
+-                  0.5 * (jnp.cos(jnp.pi * dr / cutoff_distance) + 1), 0)
+-
+-
+-def radial_symmetry_functions(displacement_or_metric: DisplacementOrMetricFn,
+-                              species: Optional[Array],
+-                              etas: Array,
+-                              cutoff_distance: float
+-                              ) -> Callable[[Array], Array]:
+-  """Returns a function that computes radial symmetry functions.
+-
+-
+-  Args:
+-    displacement: A function that produces an `[N_atoms, M_atoms,
+-      spatial_dimension]` of particle displacements from particle positions
+-      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
+-      spatial_dimension]` respectively.
+-    species: An `[N_atoms]` that contains the species of each particle.
+-    etas: List of radial symmetry function parameters that control the spatial
+-      extension.
+-    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
+-      not contribute to each others symmetry functions. The contribution of a
+-      neighbor to the symmetry function and its derivative goes to zero at this
+-      distance.
+-
+-  Returns:
+-    A function that computes the radial symmetry function from input `[N_atoms,
+-    spatial_dimension]` and returns `[N_atoms, N_etas * N_types]` where `N_etas`
+-    is the number of eta parameters, `N_types` is the number of types of
+-    particles in the system.
+-  """
+-  metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
+-
+-  radial_fn = lambda eta, dr: (jnp.exp(-eta * dr**2) *
+-                               _behler_parrinello_cutoff_fn(dr, cutoff_distance))
+-  radial_fn = vmap(radial_fn, (0, None))
+-
+-  if species is None:
+-    def compute_fn(R: Array, **kwargs) -> Array:
+-      _metric = partial(metric, **kwargs)
+-      _metric = space.map_product(_metric)
+-      return util.high_precision_sum(radial_fn(etas, _metric(R, R)), axis=1).T
+-  elif isinstance(species, jnp.ndarray):
+-    species = onp.array(species)
+-    def compute_fn(R: Array, **kwargs) -> Array:
+-      _metric = partial(metric, **kwargs)
+-      _metric = space.map_product(_metric)
+-      def return_radial(atom_type):
+-        """Returns the radial symmetry functions for neighbor type atom_type."""
+-        R_neigh = R[species == atom_type, :]
+-        dr = _metric(R, R_neigh)
+-        return util.high_precision_sum(radial_fn(etas, dr), axis=1).T
+-      return jnp.hstack([return_radial(atom_type) for
+-                        atom_type in onp.unique(species)])
+-  return compute_fn
+-
+-
+-def radial_symmetry_functions_neighbor_list(
+-    displacement_or_metric: DisplacementOrMetricFn,
+-    species: Array,
+-    etas: Array,
+-    cutoff_distance: float) -> Callable[[Array, NeighborList], Array]:
+-  """Returns a function that computes radial symmetry functions.
+-
+-
+-  Args:
+-    displacement: A function that produces an `[N_atoms, M_atoms,
+-      spatial_dimension]` of particle displacements from particle positions
+-      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
+-      spatial_dimension]` respectively.
+-    species: An `[N_atoms]` that contains the species of each particle.
+-    etas: List of radial symmetry function parameters that control the spatial
+-      extension.
+-    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
+-      not contribute to each others symmetry functions. The contribution of a
+-      neighbor to the symmetry function and its derivative goes to zero at this
+-      distance.
+-
+-  Returns:
+-    A function that computes the radial symmetry function from input `[N_atoms,
+-    spatial_dimension]` and returns `[N_atoms, N_etas * N_types]` where `N_etas`
+-    is the number of eta parameters, `N_types` is the number of types of
+-    particles in the system.
+-  """
+-  metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
+-
+-  def radial_fn(eta, dr):
+-    return (jnp.exp(-eta * dr**2) *
+-            _behler_parrinello_cutoff_fn(dr, cutoff_distance))
+-  radial_fn = vmap(radial_fn, (0, None))
+-
+-  def sym_fn(R: Array, neighbor: NeighborList, mask: Array=None,
+-             **kwargs) -> Array:
+-    _metric = partial(metric, **kwargs)
+-    if neighbor.format is partition.Dense:
+-      _metric = space.map_neighbor(_metric)
+-      R_neigh = R[neighbor.idx]
+-      mask = True if mask is None else mask[neighbor.idx]
+-      mask = (neighbor.idx < R.shape[0])[None, :, :] & mask
+-      dr = _metric(R, R_neigh)
+-      return util.high_precision_sum(radial_fn(etas, dr) * mask, axis=2).T
+-    elif neighbor.format is partition.Sparse:
+-      _metric = space.map_bond(_metric)
+-      dr = _metric(R[neighbor.idx[0]], R[neighbor.idx[1]])
+-      radial = radial_fn(etas, dr).T
+-      N = R.shape[0]
+-      mask = True if mask is None else mask[neighbor.idx[1]]
+-      mask = (neighbor.idx[0] < N) & mask
+-      return ops.segment_sum(radial * mask[:, None], neighbor.idx[0], N)
+-    else:
+-      raise ValueError()
+-
+-  if species is None:
+-    def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
+-      return sym_fn(R, neighbor, **kwargs)
+-    return compute_fn
+-
+-  def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
+-    _metric = partial(metric, **kwargs)
+-    def return_radial(atom_type):
+-      """Returns the radial symmetry functions for neighbor type atom_type."""
+-      return sym_fn(R, neighbor, species==atom_type, **kwargs)
+-    return jnp.hstack([return_radial(atom_type) for
+-                     atom_type in onp.unique(species)])
+-
+-  return compute_fn
+-
+-
+-def single_pair_angular_symmetry_function(dR12: Array,
+-                                          dR13: Array,
+-                                          eta: Array,
+-                                          lam: Array,
+-                                          zeta: Array,
+-                                          cutoff_distance: float
+-                                          ) -> Array:
+-  """Computes the angular symmetry function due to one pair of neighbors."""
+-
+-  dR23 = dR12 - dR13
+-  dr12_2 = space.square_distance(dR12)
+-  dr13_2 = space.square_distance(dR13)
+-  dr23_2 = space.square_distance(dR23)
+-  dr12 = space.distance(dR12)
+-  dr13 = space.distance(dR13)
+-  dr23 = space.distance(dR23)
+-  triplet_squared_distances = dr12_2 + dr13_2 + dr23_2
+-  triplet_cutoff = reduce(
+-      lambda x, y: x * _behler_parrinello_cutoff_fn(y, cutoff_distance),
+-      [dr12, dr13, dr23], 1.0)
+-  z = zeta
+-  result = 2.0 ** (1.0 - zeta) * ((
+-    1.0 + lam * quantity.cosine_angle_between_two_vectors(dR12, dR13)) ** z *
+-    jnp.exp(-eta * triplet_squared_distances) * triplet_cutoff)
+-  return result
+-
+-
+-def angular_symmetry_functions(displacement: DisplacementFn,
+-                               species: Array,
+-                               etas: Array,
+-                               lambdas: Array,
+-                               zetas: Array,
+-                               cutoff_distance: float
+-                               ) -> Callable[[Array], Array]:
+-  """Returns a function that computes angular symmetry functions.
+-
+-  Args:
+-    displacement: A function that produces an `[N_atoms, M_atoms,
+-      spatial_dimension]` of particle displacements from particle positions
+-      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
+-      spatial_dimension]` respectively.
+-    species: An `[N_atoms]` that contains the species of each particle.
+-    eta: Parameter of angular symmetry function that controls the spatial
+-      extension.
+-    lam:
+-    zeta:
+-    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
+-      not contribute to each others symmetry functions. The contribution of a
+-      neighbor to the symmetry function and its derivative goes to zero at this
+-      distance.
+-  Returns:
+-    A function that computes the angular symmetry function from input `[N_atoms,
+-    spatial_dimension]` and returns `[N_atoms, N_types * (N_types + 1) / 2]`
+-    where `N_types` is the number of types of particles in the system.
+-  """
+-
+-  _angular_fn = vmap(single_pair_angular_symmetry_function,
+-                     (None, None, 0, 0, 0, None))
+-
+-  _batched_angular_fn = lambda dR12, dR13: _angular_fn(dR12,
+-                                                       dR13,
+-                                                       etas,
+-                                                       lambdas,
+-                                                       zetas,
+-                                                       cutoff_distance)
+-  _all_pairs_angular = vmap(
+-      vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0)
+-
+-  if species is None:
+-   def compute_fn(R, **kwargs):
+-     D_fn = partial(displacement, **kwargs)
+-     D_fn = space.map_product(D_fn)
+-     dR = D_fn(R, R)
+-     return jnp.sum(_all_pairs_angular(dR, dR), axis=[1, 2])
+-   return compute_fn
+-
+-  if isinstance(species, jnp.ndarray):
+-    species = onp.array(species)
+-
+-  def compute_fn(R, **kwargs):
+-    atom_types = onp.unique(species)
+-    D_fn = partial(displacement, **kwargs)
+-    D_fn = space.map_product(D_fn)
+-    D_different_types = [D_fn(R[species == s, :], R) for s in atom_types]
+-    out = []
+-    for i in range(len(atom_types)):
+-      for j in range(i, len(atom_types)):
+-        out += [
+-            jnp.sum(
+-                _all_pairs_angular(D_different_types[i], D_different_types[j]),
+-                axis=[1, 2])
+-        ]
+-    return jnp.hstack(out)
+-  return compute_fn
+-
+-def angular_symmetry_functions_neighbor_list(
+-    displacement: DisplacementFn,
+-    species: Array,
+-    etas: Array,
+-    lambdas: Array,
+-    zetas: Array,
+-    cutoff_distance: float) -> Callable[[Array, NeighborList], Array]:
+-  """Returns a function that computes angular symmetry functions.
+-
+-  Args:
+-    displacement: A function that produces an `[N_atoms, M_atoms,
+-      spatial_dimension]` of particle displacements from particle positions
+-      specified as an `[N_atoms, spatial_dimension] and `[M_atoms,
+-      spatial_dimension]` respectively.
+-    species: An `[N_atoms]` that contains the species of each particle.
+-    eta: Parameter of angular symmetry function that controls the spatial
+-      extension.
+-    lam:
+-    zeta:
+-    cutoff_distance: Neighbors whose distance is larger than `cutoff_distance` do
+-      not contribute to each others symmetry functions. The contribution of a
+-      neighbor to the symmetry function and its derivative goes to zero at this
+-      distance.
+-  Returns:
+-    A function that computes the angular symmetry function from input
+-    `[N_atoms, spatial_dimension]` and returns
+-    `[N_atoms, N_types * (N_types + 1) / 2]` where `N_types` is the number of
+-    types of particles in the system.
+-  """
+-
+-  _angular_fn = vmap(single_pair_angular_symmetry_function,
+-                     (None, None, 0, 0, 0, None))
+-
+-  _batched_angular_fn = lambda dR12, dR13: _angular_fn(dR12,
+-                                                       dR13,
+-                                                       etas,
+-                                                       lambdas,
+-                                                       zetas,
+-                                                       cutoff_distance)
+-  _all_pairs_angular = vmap(
+-      vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0)
+-
+-  def sym_fn(R: Array, neighbor: NeighborList,
+-             mask_i: Array=None, mask_j: Array=None,
+-             **kwargs) -> Array:
+-    D_fn = partial(displacement, **kwargs)
+-
+-    if neighbor.format is partition.Dense:
+-      D_fn = space.map_neighbor(D_fn)
+-
+-      R_neigh = R[neighbor.idx]
+-
+-      dR = D_fn(R, R_neigh)
+-      _all_pairs_angular = vmap(
+-        vmap(vmap(_batched_angular_fn, (0, None)), (None, 0)), 0)
+-      all_angular = _all_pairs_angular(dR, dR)
+-
+-      mask_i = True if mask_i is None else mask_i[neighbor.idx]
+-      mask_j = True if mask_j is None else mask_j[neighbor.idx]
+-
+-      mask_i = (neighbor.idx < R.shape[0]) & mask_i
+-      mask_i = mask_i[:, :, jnp.newaxis, jnp.newaxis]
+-      mask_j = (neighbor.idx < R.shape[0]) & mask_j
+-      mask_j = mask_j[:, jnp.newaxis, :, jnp.newaxis]
+-
+-      return util.high_precision_sum(all_angular * mask_i * mask_j,
+-                                     axis=[1, 2])
+-    elif neighbor.format is partition.Sparse:
+-      D_fn = space.map_bond(D_fn)
+-      dR = D_fn(R[neighbor.idx[0]], R[neighbor.idx[1]])
+-      _all_pairs_angular = vmap(vmap(_batched_angular_fn, (0, None)),
+-                                (None, 0))
+-      all_angular = _all_pairs_angular(dR, dR)
+-
+-      N = R.shape[0]
+-      mask_i = True if mask_i is None else mask_i[neighbor.idx[1]]
+-      mask_j = True if mask_j is None else mask_j[neighbor.idx[1]]
+-      mask_i = (neighbor.idx[0] < N) & mask_i
+-      mask_j = (neighbor.idx[0] < N) & mask_j
+-
+-      mask = mask_i[:, None] & mask_j[None, :]
+-      mask = mask[:, :, None, None]
+-      all_angular = jnp.reshape(all_angular, (-1,) + all_angular.shape[2:])
+-      neighbor_idx = jnp.repeat(neighbor.idx[0], len(neighbor.idx[0]))
+-      out = ops.segment_sum(all_angular, neighbor_idx, N)
+-      return out
+-    else:
+-      raise ValueError()
+-
+-  if species is None:
+-    def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
+-      return sym_fn(R, neighbor, **kwargs)
+-    return compute_fn
+-
+-  def compute_fn(R: Array, neighbor: NeighborList, **kwargs) -> Array:
+-    atom_types = onp.unique(species)
+-    out = []
+-    for i in range(len(atom_types)):
+-      mask_i = species == i
+-      for j in range(i, len(atom_types)):
+-        mask_j = species == j
+-        out += [
+-            sym_fn(R, neighbor, mask_i, mask_j)
+-        ]
+-    return jnp.hstack(out)
+-  return compute_fn
+-
+-
+-def behler_parrinello_symmetry_functions_neighbor_list(
+-    displacement: DisplacementFn,
+-    species: Array,
+-    radial_etas: Optional[Array]=None,
+-    angular_etas: Optional[Array]=None,
+-    lambdas: Optional[Array]=None,
+-    zetas: Optional[Array]=None,
+-    cutoff_distance: float=8.0) -> Callable[[Array, NeighborList], Array]:
+-  if radial_etas is None:
+-    radial_etas = jnp.array([9e-4, 0.01, 0.02, 0.035, 0.06, 0.1, 0.2, 0.4],
+-                    f32) / f32(0.529177 ** 2)
+-
+-  if angular_etas is None:
+-    angular_etas = jnp.array([1e-4] * 4 + [0.003] * 4 + [0.008] * 2 +
+-                            [0.015] * 4 + [0.025] * 4 + [0.045] * 4,
+-                            f32) / f32(0.529177 ** 2)
+-
+-  if lambdas is None:
+-    lambdas = jnp.array([-1, 1] * 4 + [1] * 14, f32)
+-
+-  if zetas is None:
+-    zetas = jnp.array([1, 1, 2, 2] * 2 + [1, 2] + [1, 2, 4, 16] * 3, f32)
+-
+-  radial_fn = radial_symmetry_functions_neighbor_list(
+-    displacement,
+-    species,
+-    etas=radial_etas,
+-    cutoff_distance=cutoff_distance)
+-  angular_fn = angular_symmetry_functions_neighbor_list(
+-    displacement,
+-    species,
+-    etas=angular_etas,
+-    lambdas=lambdas,
+-    zetas=zetas,
+-    cutoff_distance=cutoff_distance)
+-  return (lambda R, neighbor, **kwargs:
+-          jnp.hstack((radial_fn(R, neighbor, **kwargs),
+-                     angular_fn(R, neighbor, **kwargs))))
+-
+-
+-def behler_parrinello_symmetry_functions(displacement: DisplacementFn,
+-                                         species: Optional[Array]=None,
+-                                         radial_etas: Optional[Array]=None,
+-                                         angular_etas: Optional[Array]=None,
+-                                         lambdas: Optional[Array]=None,
+-                                         zetas: Optional[Array]=None,
+-                                         cutoff_distance: float=8.0
+-                                         ) -> Callable[[Array], Array]:
+-  if radial_etas is None:
+-    radial_etas = jnp.array([9e-4, 0.01, 0.02, 0.035, 0.06, 0.1, 0.2, 0.4],
+-                    f32) / f32(0.529177 ** 2)
+-
+-  if angular_etas is None:
+-    angular_etas = jnp.array([1e-4] * 4 + [0.003] * 4 + [0.008] * 2 +
+-                            [0.015] * 4 + [0.025] * 4 + [0.045] * 4,
+-                            f32) / f32(0.529177 ** 2)
+-
+-  if lambdas is None:
+-    lambdas = jnp.array([-1, 1] * 4 + [1] * 14, f32)
+-
+-  if zetas is None:
+-    zetas = jnp.array([1, 1, 2, 2] * 2 + [1, 2] + [1, 2, 4, 16] * 3, f32)
+-
+-  radial_fn = radial_symmetry_functions(displacement,
+-                                        species,
+-                                        etas=radial_etas,
+-                                        cutoff_distance=cutoff_distance)
+-  angular_fn = angular_symmetry_functions(displacement,
+-                                          species,
+-                                          etas=angular_etas,
+-                                          lambdas=lambdas,
+-                                          zetas=zetas,
+-                                          cutoff_distance=cutoff_distance)
+-  symmetry_fn = lambda R, **kwargs: jnp.hstack((radial_fn(R, **kwargs),
+-                                               angular_fn(R, **kwargs)))
+-
+-  return symmetry_fn
+-
+-
++# TO BE DELETED BELOW:
+ # Graph neural network primitives
+ 
+ """
+@@ -748,4 +307,4 @@ def __call__(self, graph: GraphsTuple) -> GraphsTuple:
+       inputs = concatenate_graph_features((outputs, encoded))
+       outputs = self._propagation_network()(inputs)
+ 
+-    return outputs
++    return outputs
+\ No newline at end of file
+diff --git a/jax_md/partition.py b/jax_md/partition.py
+index 453c0fef..1bf67dfa 100644
+--- a/jax_md/partition.py
++++ b/jax_md/partition.py
+@@ -863,7 +863,7 @@ def to_jraph(neighbor: NeighborList,
+ 
+   # Pad the nodes to add one fictitious node.
+   def pad(x):
+-    padding = jnp.zeros((1,) + x.shape[1:])
++    padding = jnp.zeros((1,) + x.shape[1:], dtype=x.dtype)
+     return jnp.concatenate((x, padding), axis=0)
+   nodes = tree_map(pad, nodes)
+ 
+@@ -917,4 +917,4 @@ def to_dense(neighbor: NeighborList) -> Array:
+ 
+ Dense = NeighborListFormat.Dense
+ Sparse = NeighborListFormat.Sparse
+-OrderedSparse = NeighborListFormat.OrderedSparse
++OrderedSparse = NeighborListFormat.OrderedSparse
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index f5dd9d7d..dcbc28fd 100644
+--- a/setup.py
++++ b/setup.py
+@@ -24,12 +24,15 @@
+ INSTALL_REQUIRES = [
+     'absl-py',
+     'numpy',
+-    'jax>=0.1.73',
+-    'jaxlib>=0.1.52',
+-    'dm-haiku>=0.0.2',
++    'jax',
++    'jaxlib',
++    'flax',
+     'jraph',
+     'dataclasses',
+-    'einops'
++    'einops',
++    'ml_collections',
++    'e3nn-jax',
++    'dm-haiku',
+ ]
+ 
+ setuptools.setup(
+diff --git a/tests/data/nequip_silicon_test/checkpoint_2065 b/tests/data/nequip_silicon_test/checkpoint_2065
+new file mode 100644
+index 00000000..20926079
+Binary files /dev/null and b/tests/data/nequip_silicon_test/checkpoint_2065 differ
+diff --git a/tests/data/nequip_silicon_test/config.json b/tests/data/nequip_silicon_test/config.json
+new file mode 100644
+index 00000000..06fc55b5
+--- /dev/null
++++ b/tests/data/nequip_silicon_test/config.json
+@@ -0,0 +1 @@
++"{\"bandgap_lambda\": 0.0, \"bandgap_loss\": \"L2\", \"energy_lambda\": 1.0, \"energy_loss\": [\"huber\", 0.01], \"epoch_size\": -1, \"epochs\": 1000000, \"epochs_per_checkpoint\": 1, \"epochs_per_eval\": 1, \"eval_size\": -1, \"force_lambda\": 1.0, \"force_loss\": [\"huber\", 0.01], \"force_loss_normalization\": \"norm_by_3n\", \"graph_net_steps\": 5, \"hidden_irreps\": \"16x0e + 4x1e\", \"keep_every_n_checkpoints\": -1, \"l2_regularization\": 0.0, \"learning_rate\": 0.001, \"max_atoms\": -1, \"max_lr_plateau_epochs\": 200, \"model_family\": \"nequip\", \"multihost\": false, \"n_elements\": 94, \"n_neighbors\": 10.0, \"nonlinearities\": {\"e\": \"raw_swish\", \"o\": \"tanh\"}, \"num_basis\": 8, \"optimizer\": \"adam\", \"pretraining_checkpoint\": null, \"pretraining_checkpoint_to_start_from\": \"last\", \"r_max\": 5.0, \"radial_net_n_hidden\": 8, \"radial_net_n_layers\": 2, \"radial_net_nonlinearity\": \"raw_swish\", \"scalar_mlp_std\": 4.0, \"schedule\": \"constant\", \"seed\": 3, \"sh_irreps\": \"1x0e + 1x1e\", \"shuffle_seed\": 0, \"split_seed\": 0, \"stress_lambda\": 0.0, \"stress_loss\": [\"huber\", 10.0], \"test_batch_size\": 8, \"test_dataset\": [\"harder_silicon\"], \"train_batch_size\": 8, \"train_dataset\": [\"harder_silicon\"], \"use_sc\": true, \"validation_dataset\": []}"
+\ No newline at end of file
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index 31d01fe2..6e7c4167 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -19,6 +19,7 @@
+ 
+ from jax.config import config
+ from jax import random
++import jax
+ from jax import jit, vmap, grad
+ import jax.numpy as np
+ 
+@@ -36,6 +37,9 @@
+ config.parse_flags_with_absl()
+ FLAGS = config.FLAGS
+ 
++# TODO: Replace np by jnp everywhere.
++jnp = np
++
+ PARTICLE_COUNT = 100
+ STOCHASTIC_SAMPLES = 10
+ SPATIAL_DIMENSION = [2, 3]
+@@ -141,6 +145,27 @@ def lattice(R_unit_cell, copies, lattice_vectors):
+   return np.array(onp.concatenate(Rs))
+ 
+ 
++def tile_silicon(tile_count, position, box, *extra_data):
++  tiles = jnp.arange(tile_count)
++  dx, dy, dz = jnp.meshgrid(tiles, tiles, tiles)
++  dR = jnp.stack((dx, dy, dz), axis=-1)
++  dR = jnp.reshape(dR, (-1, 3))
++
++  position = (position[:, None, :] + dR[None, :, :]) / tile_count
++  position = jnp.reshape(position, (-1, 3))
++  box *= tile_count
++
++  tiled_data = []
++  for ex in extra_data:
++    assert ex.ndim == 2
++    ex = jnp.broadcast_to(ex[:, None, :],
++                          (ex.shape[0], len(dR), ex.shape[1]))
++    ex = jnp.reshape(ex, (-1, ex.shape[-1]))
++    tiled_data += [ex]
++
++  return [position, box] + tiled_data
++
++
+ class EnergyTest(test_util.JAXMDTestCase):
+ 
+   @parameterized.named_parameters(test_util.cases_from_list(
+@@ -899,7 +924,6 @@ def test_graph_network_neighbor_list_moving(self,
+       self.assertAllClose(energy_fn(params, R), nl_energy_fn(params, R, nbrs),
+                           rtol=2e-4, atol=2e-4)
+ 
+-
+   @parameterized.named_parameters(test_util.cases_from_list(
+       {
+           'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
+@@ -947,6 +971,63 @@ def update(params, opt_state, R):
+ 
+     assert loss(params, R) < l0 * 0.95
+ 
++  @parameterized.named_parameters(test_util.cases_from_list(
++      {
++          'testcase_name': '_dtype={}'.format(dtype.__name__),
++          'dtype': dtype,
++      } for dtype in POSITION_DTYPE))
++  def test_nequip_silicon(self, dtype):
++    position = jnp.array([[0.262703, 0.752304, 0.243743],
++                          [0.018137, 0.002302, 0.491184],
++                          [0.248363, 0.237012, 0.776354],
++                          [0.991889, 0.496844, 0.005244],
++                          [0.773055, 0.742292, 0.755667],
++                          [0.488418, 0.001649, 0.993714],
++                          [0.7502, 0.232352, 0.236175],
++                          [0.52915, 0.488468, 0.512127],], dtype=dtype)
++    n = len(position)
++
++    gt_forces = jnp.array(
++      [[ -6.2008705, -12.834937,    5.787031],
++       [  3.9308796,   8.419766,   -3.6275134],
++       [ -4.3150625,  -6.7310944,   2.2780294],
++       [  5.800577,  11.102457,   -3.3206246],
++       [ -4.4260826,  -8.080319,    3.398284],
++       [  6.7915206,  11.888205,   -5.344664],
++       [ -5.6801977, -10.894533,    3.8579397],
++       [  4.0992346,   7.1304564,  -3.0284817]], dtype=dtype)
++
++    box = jnp.array([[ 4.707482, -0.92776, 0],
++                     [ 0, 5.658054,  0.,],
++                     [ 2.14774, 1.224906, 6.006509]], dtype=dtype)
++
++    atoms = jnp.zeros((n, 94), dtype=dtype).at[:, 13].set(1)
++
++    position, box, atoms, gt_forces = tile_silicon(5, position, box, atoms,
++                                                   gt_forces)
++
++    displacement_fn, _ = space.periodic_general(box)
++
++    neighbor_fn, energy_fn = energy.load_gnome_model_neighbor_list(
++      displacement_fn,
++      box,
++      'tests/data/nequip_silicon_test/',
++      atoms,
++      fractional_coordinates=True,
++      disable_cell_list=True)
++
++    nbrs = neighbor_fn.allocate(position)
++
++    e, g = jax.value_and_grad(energy_fn)(position, nbrs)
++    etol = 5e-3
++    self.assertAllClose(e / len(position), dtype(14.0278845 / 8),
++                        rtol=etol, atol=etol)
++
++    fatol = 5e-2
++    frtol = 5e-3
++
++    self.assertAllClose(-g, gt_forces, rtol=frtol, atol=fatol)
++
++
+ if __name__ == '__main__':
+   absltest.main()
+-
+diff --git a/tests/nequip_test.py b/tests/nequip_test.py
+new file mode 100644
+index 00000000..49d5ebaf
+--- /dev/null
++++ b/tests/nequip_test.py
+@@ -0,0 +1,316 @@
++# Copyright 2020 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests jax_md.nn."""
++
++
++from absl.testing import parameterized
++
++from ml_collections import ConfigDict
++
++import jax
++import functools
++from absl.testing import absltest
++import e3nn_jax as e3nn
++from jax import jit
++from jax import random
++from jax_md import test_util
++from jax_md import space
++from jax_md import partition
++from jax_md.nn import nequip
++from jax_md.nn import util as nn_util
++from jax_md.nn import gnome
++
++import jax.numpy as jnp
++import numpy as onp
++
++
++def tile(position, box, nodes, tile_count):
++  tiles = jnp.arange(tile_count)
++  dx, dy, dz = jnp.meshgrid(tiles, tiles, tiles)
++  dR = jnp.stack((dx, dy, dz), axis=-1)
++  dR = jnp.reshape(dR, (-1, 3))
++
++  position = (position[:, None, :] + dR[None, :, :]) / tile_count
++  position = jnp.reshape(position, (-1, 3))
++  box *= tile_count
++
++  nodes = jnp.broadcast_to(nodes[:, None, :], (nodes.shape[0], len(dR), nodes.shape[1]))
++  nodes = jnp.reshape(nodes, (-1, nodes.shape[-1]))
++
++  return position, box, nodes
++
++
++def test_config() -> ConfigDict:
++  config = ConfigDict()
++
++  config.multihost = False
++
++  config.seed = 0
++  config.split_seed = 0
++  config.shuffle_seed = 0
++
++  config.epochs = 1000000
++  config.epochs_per_eval = 1
++  config.epochs_per_checkpoint = 1
++
++  # keep checkpoint every n checkpoints, -1 only keeps last
++  # works only on non-multihost, will error out on multi-host training
++  # note that this works together with config.epochs_per_checkpoint, i.e. the
++  # checkpointing will only be called on multiples of epochs_per_checkpoint
++  config.keep_every_n_checkpoints = -1
++
++  config.learning_rate = 1e-3
++  config.schedule = 'constant'
++  config.max_lr_plateau_epochs = 200
++
++  config.train_batch_size = 8
++  config.test_batch_size = 8
++
++  config.model_family = 'nequip'
++
++  # network
++  config.graph_net_steps = 5
++  config.nonlinearities = {'e': 'raw_swish', 'o': 'tanh'}
++  config.use_sc = True
++  config.n_elements = 94
++  config.hidden_irreps = '16x0e + 4x1e'
++  config.sh_irreps = '1x0e + 1x1e'
++  config.num_basis = 8
++  config.r_max = 5.
++  config.radial_net_nonlinearity = 'raw_swish'
++  config.radial_net_n_hidden = 8
++  config.radial_net_n_layers = 2
++
++  # average number of neighbors per atom, used to divide activations are sum
++  # in the nequip convolution, helpful for internal normalization.
++  config.n_neighbors = 10.
++
++  # Standard deviation used for the initializer of the weight matrix in the
++  # radial scalar MLP
++  config.scalar_mlp_std = 4.
++
++  config.train_dataset = ['harder_silicon']
++  config.test_dataset = ['harder_silicon']
++  config.validation_dataset = ['harder_silicon']
++
++  config.pretraining_checkpoint = None
++  # start from last or a specific pretraining checkpoint
++  # options: 'last', or 'ckpt_number', where 'ckpt_number' is string, e.g. '10'
++  # for multi-host training, can only be 'last'
++  config.pretraining_checkpoint_to_start_from = 'last'
++
++  # The loss is computed as three terms E + lam_F * F + lam_S * S where the
++  # first term computes the MSE of the energy, the second computes the MSE of
++  # the forces and the last term computes the MSE of the stress. The
++  # `force_lambda` and `stress_lambda` parameters determine the relative
++  # weighting of the terms.
++  config.energy_lambda = 1.0
++  config.force_lambda = 1.0
++  config.stress_lambda = 0.0
++  config.bandgap_lambda = 0.0
++
++  config.energy_loss = ('huber', 0.01)
++  config.force_loss = ('huber', 0.01)
++  config.stress_loss = ('huber', 10.0)
++  config.bandgap_loss = 'L2'
++
++  # 'norm_by_n', 'norm_by_3n', or 'unnormed', applies both to loss and
++  # metrics computation
++  config.force_loss_normalization = 'norm_by_3n'
++
++  # If L2 regularization is used, then the optimizer is switched to AdamW.
++  config.l2_regularization = 0.0
++
++  config.optimizer = 'adam'
++
++  # The epoch size controls the number of crystals in one epoch of data. If the
++  # `epoch_size` is set to -1 then it is equal to the size of the dataset. This
++  # is useful for large datasets where it is inconvenient to wait for a whole
++  # pass through the training data to finish before outputting statistics. It
++  # also allows datasets of different sizes to be compared on equal footing.
++  config.epoch_size = -1
++  config.eval_size = -1
++
++  # By default, we do not restrict the number of atoms for the current system.
++  config.max_atoms = -1
++
++  return config
++
++
++class NequIPTest(test_util.JAXMDTestCase):
++
++  def setup(self):
++    c = test_config()
++
++    # dummy system
++    atoms = onp.zeros((3, 94))
++    atoms[0][5] = 1.
++    atoms[1][5] = 1.
++    atoms[2][5] = 1.
++    atoms = jnp.array(atoms)
++
++    box = jnp.eye(3) * 1
++    pos = jnp.array([[0., 0., 0.], [0.239487, 0., 0.], [0.5234, 0.78234, 0.]])
++
++    pos, box, atoms = tile(pos, box, atoms, 10)
++
++    displacement, _ = space.periodic_general(box)
++
++    # build network and initialize
++    featurizer, net = nequip.model_from_config(c)
++    neighbor = partition.neighbor_list(
++        displacement,
++        jnp.diag(box),
++        r_cutoff=5.0,
++        format=partition.Sparse,
++        fractional_coordinates=True)
++    params = None
++
++    @jax.jit
++    def init_fn(key, atoms, position, nbrs):
++      f = nn_util.neighbor_list_featurizer(displacement, *featurizer)
++      return net.init(key, f(atoms, pos, nbrs))
++
++    @jax.jit
++    def apply_fn(params, atoms, position, nbrs):
++      f = nn_util.neighbor_list_featurizer(displacement, *featurizer)
++      return net.apply(params, f(atoms, pos, nbrs))[0, 0]
++
++    nbrs = neighbor.allocate(pos)
++    params = init_fn(random.PRNGKey(c.seed), atoms, pos, nbrs)
++    return apply_fn, (atoms, pos, nbrs), params
++
++
++  def test_nequip_equivariance(self):
++    """Test that the energy output is invariant and forces are equivariant."""
++    net, example, params = self.setup()
++
++    atoms, pos, box = example
++
++    e_f_fn = jax.value_and_grad(net, argnums=2)
++
++    energy, force = e_f_fn(params, *example)
++
++    # get random rotation + inversion
++    rand_rot_inv = -e3nn.rand_matrix(jax.random.PRNGKey(0), ())
++    rotated_pos = (rand_rot_inv @ pos.T).T
++
++    # rotated force output
++    force_rotated_output = (rand_rot_inv @ force.T).T
++
++    # eval on rotated input
++    energy_rotated_input, force_rotated_input = e_f_fn(
++        params, atoms, rotated_pos, box)
++
++    # energy should be invariant
++    self.assertAllClose(energy_rotated_input, energy)
++    self.assertAllClose(force_rotated_input, force_rotated_output)
++
++  def test_nequip_momentum_conversation(self):
++    """Test that the sum over all atomic forces is close to 0 in x, y, z."""
++    net, example, params = self.setup()
++
++    force = jax.grad(net, argnums=2)(params, *example)
++
++    f_sum = onp.abs(onp.sum(force, axis=0))
++    onp.testing.assert_allclose(f_sum, onp.zeros_like(f_sum), atol=1e-7)
++
++  def test_nequipcutoff_smoothness(self):
++    """Test that the energy changes smoothly as an atom enters the nbh."""
++    c = test_config()
++
++    c.r_max = 4.
++
++    # dummy C-C dimer
++    atoms = onp.zeros((2, 94))
++    atoms[0][5] = 1.
++    atoms[1][5] = 1.
++    atoms = jnp.array(atoms)
++
++    box = jnp.eye(3) * 10
++    pos = jnp.array([[0., 0., 0.], [0.5, 0., 0.]])
++
++    displacement, _ = space.periodic_general(box)
++
++    # build network and initialize
++    featurizer, net = nequip.model_from_config(c)
++    neighbor = partition.neighbor_list(
++        displacement,
++        jnp.diag(box),
++        r_cutoff=5.0,
++        format=partition.Sparse,
++        fractional_coordinates=True)
++    params = None
++
++    @jax.jit
++    def init_fn(key, atoms, position, nbrs):
++      f = nn_util.neighbor_list_featurizer(displacement, *featurizer)
++      return net.init(key, f(atoms, pos, nbrs))
++
++    @jax.jit
++    def apply_fn(params, atoms, position, nbrs):
++      f = nn_util.neighbor_list_featurizer(displacement, *featurizer)
++      return net.apply(params, f(atoms, pos, nbrs))[0, 0]
++
++    nbrs = neighbor.allocate(pos)
++    params = init_fn(random.PRNGKey(c.seed), atoms, pos, nbrs)
++
++    energy_force_fn = jax.value_and_grad(apply_fn, argnums=2)
++
++    r0 = 3.999 / 10.
++    r1 = 4.000 / 10.
++    r2 = 4.001 / 10.
++
++    es = []
++    for r in [r0, r1, r2]:
++      position = jnp.array([[0., 0., 0.], [0., 0., r]])
++      e = energy_force_fn(params, atoms, position, nbrs)
++      es.append(e[0])
++
++    es = jnp.array(es)
++
++    onp.testing.assert_allclose(es[0] * jnp.ones_like(es), es, atol=1e-7)
++
++  def test_zero_outside_cutoff(self):
++    """Test that basis + envelope give 0 if two atoms don't see each other."""
++    bessel = nn_util.BesselEmbedding(
++        count=8,
++        inner_cutoff=4 - 0.5,
++        outer_cutoff=4
++        )
++
++    scalar_dr_edge = jnp.expand_dims(jnp.array(4.1), 0)
++
++    variables = bessel.init(random.PRNGKey(0), scalar_dr_edge)
++    embedded_dr_edge = bessel.apply(variables, scalar_dr_edge)
++    onp.testing.assert_array_equal(embedded_dr_edge, jnp.zeros((1, 8)))
++
++  def test_radial_net_zero_to_zero(self):
++    """Test that the radial net gives f(0) = 0."""
++    fc = nn_util.MLP(
++        (64, 64, 1),
++        'raw_swish',
++        use_bias=False,
++        scalar_mlp_std=4.0
++    )
++    x = jnp.array([0.])
++    variables = fc.init(random.PRNGKey(0), x)
++    fc_out = fc.apply(variables, x)
++
++    self.assertAllClose(fc_out[0], 0.)
++
++
++if __name__ == '__main__':
++  absltest.main()
+diff --git a/tests/nn_test.py b/tests/nn_test.py
+index f896db6d..c18c1e19 100644
+--- a/tests/nn_test.py
++++ b/tests/nn_test.py
+@@ -25,6 +25,8 @@
+ 
+ from jax import jit, grad
+ from jax_md import space, quantity, nn, dataclasses, partition
++from jax_md.nn import behler_parrinello as bp
++
+ from jax_md.util import f32, f64
+ from jax_md import test_util
+ 
+@@ -54,7 +56,7 @@ class SymmetryFunctionTest(test_util.JAXMDTestCase):
+   def test_radial_symmetry_functions(self, N_types, N_etas, dtype):
+     displacement, shift = space.free()
+     rs = np.linspace(1.0, 2.0, N_etas, dtype=dtype)
+-    gr = nn.radial_symmetry_functions(displacement,
++    gr = bp.radial_symmetry_functions(displacement,
+                                       np.array([1, 1, N_types]),
+                                       rs,
+                                       4)
+@@ -94,8 +96,8 @@ def test_radial_symmetry_functions_neighbor_list(self,
+     neighbor_fn = partition.neighbor_list(displacement, box_size, r_cutoff, 0.)
+ 
+     rs = np.linspace(1.0, 2.0, N_etas, dtype=dtype)
+-    gr = nn.radial_symmetry_functions(displacement, species, rs, r_cutoff)
+-    gr_neigh = nn.radial_symmetry_functions_neighbor_list(
++    gr = bp.radial_symmetry_functions(displacement, species, rs, r_cutoff)
++    gr_neigh = bp.radial_symmetry_functions_neighbor_list(
+       displacement,
+       species,
+       np.linspace(1.0, 2.0, N_etas, dtype=dtype),
+@@ -139,14 +141,14 @@ def test_angular_symmetry_functions_neighbor_list(self,
+ 
+     etas = np.linspace(1., 2., N_etas, dtype=dtype)
+     lam = np.array([-1.0] * N_etas, dtype)
+-    gr = nn.angular_symmetry_functions(displacement,
++    gr = bp.angular_symmetry_functions(displacement,
+                                        species,
+                                        etas=etas,
+                                        lambdas=lam,
+                                        zetas=np.array([1.0] * N_etas, dtype),
+                                        cutoff_distance=r_cutoff)
+ 
+-    gr_neigh = nn.angular_symmetry_functions_neighbor_list(
++    gr_neigh = bp.angular_symmetry_functions_neighbor_list(
+       displacement,
+       species,
+       etas=etas,
+@@ -175,7 +177,7 @@ def test_angular_symmetry_functions(self, N_types, N_etas, dtype):
+     displacement, shift = space.free()
+     etas = np.array([1e-4/(0.529177 ** 2)] * N_etas, dtype)
+     lam = np.array([-1.0] * N_etas, dtype)
+-    gr = nn.angular_symmetry_functions(displacement,np.array([1, 1, N_types]),
++    gr = bp.angular_symmetry_functions(displacement,np.array([1, 1, N_types]),
+                                        etas=etas,
+                                        lambdas=lam,
+                                        zetas=np.array([1.0] * N_etas, dtype),
+@@ -198,7 +200,7 @@ def test_angular_symmetry_functions(self, N_types, N_etas, dtype):
+         for dtype in DTYPES))
+   def test_behler_parrinello_symmetry_functions(self, N_types, N_etas, dtype):
+     displacement, shift = space.free()
+-    gr = nn.behler_parrinello_symmetry_functions(
++    gr = bp.symmetry_functions(
+             displacement,np.array([1, 1, N_types]),
+             radial_etas=np.array([1e-4/(0.529177 ** 2)] * N_etas, dtype),
+             angular_etas=np.array([1e-4/(0.529177 ** 2)] * N_etas, dtype),
+@@ -228,7 +230,7 @@ def test_behler_parrinello_symmetry_functions_neighbor_list(self,
+                                                               dtype):
+     displacement, shift = space.free()
+     neighbor_fn = partition.neighbor_list(displacement, 10.0, 8.0, 0.0)
+-    gr = nn.behler_parrinello_symmetry_functions_neighbor_list(
++    gr = bp.symmetry_functions_neighbor_list(
+             displacement,np.array([1, 1, N_types]),
+             radial_etas=np.array([1e-4/(0.529177 ** 2)] * N_etas, dtype),
+             angular_etas=np.array([1e-4/(0.529177 ** 2)] * N_etas, dtype),
+@@ -354,4 +356,4 @@ def assertGraphsTuplesClose(self, a, b, tol=1e-6):
+ 
+ 
+ if __name__ == '__main__':
+-  absltest.main()
++  absltest.main()
+\ No newline at end of file

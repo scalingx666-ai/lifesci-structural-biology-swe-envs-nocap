@@ -1,0 +1,294 @@
+diff --git a/meeko/chemtempgen.py b/meeko/chemtempgen.py
+index c3421716..bdb95d34 100644
+--- a/meeko/chemtempgen.py
++++ b/meeko/chemtempgen.py
+@@ -9,7 +9,7 @@
+ import atexit
+ import os
+ 
+-from .utils.rdkitutils import covalent_radius
++from meeko.utils.rdkitutils import covalent_radius
+ 
+ from rdkit import Chem
+ from rdkit.Chem import rdmolops
+diff --git a/meeko/export_flexres.py b/meeko/export_flexres.py
+index 67603d6d..5765e881 100644
+--- a/meeko/export_flexres.py
++++ b/meeko/export_flexres.py
+@@ -3,6 +3,7 @@
+ from rdkit.Geometry import Point3D
+ from .utils.utils import parse_begin_res
+ from .utils.utils import mini_periodic_table
++from .rdkit_mol_create import RDKitMolCreate
+ 
+ 
+ mini_periodic_table = {v: k for k, v in mini_periodic_table.items()}
+@@ -42,55 +43,125 @@ def export_pdb_updated_flexres(chorizo, pdbqt_mol):
+             res_id = parse_begin_res(flexres_id[mol_idx])
+             atoms = pdbqt_mol.atoms(atom_idxs)
+             molsetup_to_pdbqt = pdbqt_mol._pose_data["index_map"][mol_idx]
++            
+             molsetup_to_template = chorizo.residues[res_id].molsetup_mapidx
+             template_to_molsetup = {j: i for i, j in molsetup_to_template.items()}
++            
++            # use smiles and smiles_index_map in PDBQT REMARK
++            # smiles will be None if it's a typical flexres
++            # but there will be a valid Smiles string if it's a covalent flexres
++            if pdbqt_mol._pose_data["smiles"][mol_idx] is not None: 
+ 
+-            # use index_map stored in PDBQT REMARK
+-            if molsetup_to_pdbqt:
+-                template_to_pdbqt = {}
+-                for i, j in molsetup_to_pdbqt.items():
+-                    template_to_pdbqt[molsetup_to_template[i - 1]] = j - 1
++                orig_resmol = Chem.Mol(chorizo.residues[res_id].rdkit_mol)
++                orig_atomnames = chorizo.residues[res_id].atom_names
++                
++                backbone_SMARTS = "[NX3]([H])[CX4][CX3](=O)"
++                expected_names = ('N', 'H', 'CA', 'C', 'O')
+ 
+-            # use chorizo template to match sidechain
+-            else:
+-                mol = sidechain_to_mol(atoms)
+-                key = chorizo.residues[res_id].residue_template_key
+-                template = chorizo.residue_chem_templates.residue_templates[key]
+-                _, template_to_pdbqt = template.match(mol)
++                backbone_qmol = Chem.MolFromSmarts(backbone_SMARTS)
++                backbone_matches = orig_resmol.GetSubstructMatches(backbone_qmol)
+ 
+-            sidechain_positions = {}
+-            molsetup_matched = set()
+-            for i, j in template_to_pdbqt.items():
+-                molsetup_matched.add(template_to_molsetup[i])
+-                sidechain_positions[i] = tuple(atoms["xyz"][j])
+-            if len(molsetup_matched) != len(template_to_pdbqt):
+-                raise RuntimeError(f"{len(molsetup_matched)} {len(template_to_pdbqt)=}")
+-            is_flexres_atom = chorizo.residues[res_id].is_flexres_atom 
+-            hit_count = sum([is_flexres_atom[i] for i in molsetup_matched])
+-            if hit_count != len(molsetup_matched):
+-                raise RuntimeError(f"{hit_count=} {len(molsetup_matched)=}")
+-            if hit_count != sum(is_flexres_atom):
+-                raise RuntimeError(f"{hit_count=} {sum(is_flexres_atom)=}")
+-            new_positions[res_id] = sidechain_positions
++                if not backbone_matches: 
++                    raise RuntimeError(f"Could not find standard backbone structures in receptor {res_id}. ")
++                backbone_expected = tuple(orig_atomnames.index(atom_name) for atom_name in expected_names)
+ 
+-            # remove root atom(s) (often C-alpha) and first atom after bond
+-            flex_model = chorizo.residues[res_id].molsetup.flexibility_model
+-            root_body_idx = flex_model["root"]
+-            graph = flex_model["rigid_body_graph"]
+-            conn = flex_model["rigid_body_connectivity"]
+-            rigid_index_by_atom = flex_model["rigid_index_by_atom"]
+-            first_after_root = set()
+-            for other_body_idx in graph[root_body_idx]:
+-                first_after_root.add(conn[(root_body_idx, other_body_idx)][1])
+-            to_pop = set()
+-            for index in sidechain_positions:
+-                index_molsetup = template_to_molsetup[index]
+-                if (
+-                    rigid_index_by_atom[index_molsetup] == root_body_idx or 
+-                    index_molsetup in first_after_root
+-                ): 
+-                    to_pop.add(index) 
+-            for index in to_pop:
+-                sidechain_positions.pop(index)
++                if backbone_expected not in backbone_matches: 
++                    raise RuntimeError(f"Could not confirm residue's backbone by atom names in receptor {res_id}. ")
++                
++                not_backbone = [atom.GetIdx() for atom in orig_resmol.GetAtoms() if atom.GetIdx() not in backbone_expected]
++                orig_backbone = Chem.RWMol(orig_resmol)
++                for idx in sorted(not_backbone, reverse=True):
++                    orig_backbone.RemoveAtom(idx)
++                orig_backbone = orig_backbone.GetMol()
++              
++                covres_mol = RDKitMolCreate.from_pdbqt_mol(pdbqt_mol, 
++                                                           only_cluster_leads=False, 
++                                                           keep_flexres=True)[mol_idx]
++                
++                covres_conformer = covres_mol.GetConformer()
++                CA_index = None
++                target_coord = orig_backbone.GetConformer().GetPositions()[expected_names.index('CA')]
++                tolerance = 5e-3
++                for atom in covres_mol.GetAtoms():
++                    idx = atom.GetIdx()
++                    pos = covres_conformer.GetAtomPosition(idx)
++                    if (abs(pos.x - target_coord[0]) <= tolerance and
++                        abs(pos.y - target_coord[1]) <= tolerance and
++                        abs(pos.z - target_coord[2]) <= tolerance):
++                        CA_index = idx
++                        break
++                if CA_index is None:
++                    raise RuntimeError(f"Could not determine CA by coordinates in docked pose of {res_id}. ")
++                
++                CA_in_covres = covres_mol.GetAtomWithIdx(CA_index)
++                bonds_to_recover = []
++                for bond in CA_in_covres.GetBonds():
++                    neighbor_idx = bond.GetOtherAtomIdx(CA_index)
++                    bond_type = bond.GetBondType()
++                    bonds_to_recover.append((neighbor_idx, bond_type))
++
++                combined_res = Chem.RWMol(Chem.CombineMols(covres_mol, orig_backbone))
++                for neighbor_idx, bond_type in bonds_to_recover: 
++                    new_CA_idx = covres_mol.GetNumAtoms() + expected_names.index('CA')
++                    combined_res.AddBond(new_CA_idx, neighbor_idx, bond_type)
++                combined_res.RemoveAtom(CA_index)
++                combined_res = combined_res.GetMol()
++
++                chorizo.residues[res_id].rdkit_mol = combined_res
++                chorizo.residues[res_id].atom_names = [atom.GetSymbol() for atom in combined_res.GetAtoms()]
++                new_positions[res_id] = {idx: coord for idx,coord in enumerate(combined_res.GetConformer().GetPositions())}
++
++            else: # use templates
++            
++                # use index_map stored in PDBQT REMARK
++                if molsetup_to_pdbqt:
++                    template_to_pdbqt = {}
++                    for i, j in molsetup_to_pdbqt.items():
++                        template_to_pdbqt[molsetup_to_template[i - 1]] = j - 1
++
++
++                # use chorizo template to match sidechain
++                else:
++                    mol = sidechain_to_mol(atoms)
++                    key = chorizo.residues[res_id].residue_template_key
++                    template = chorizo.residue_chem_templates.residue_templates[key]
++                    _, template_to_pdbqt = template.match(mol)
++
++                sidechain_positions = {}
++                molsetup_matched = set()
++                for i, j in template_to_pdbqt.items():
++                    molsetup_matched.add(template_to_molsetup[i])
++                    sidechain_positions[i] = tuple(atoms["xyz"][j])
++                if len(molsetup_matched) != len(template_to_pdbqt):
++                    raise RuntimeError(f"{len(molsetup_matched)} {len(template_to_pdbqt)=}")
++                is_flexres_atom = chorizo.residues[res_id].is_flexres_atom 
++                hit_count = sum([is_flexres_atom[i] for i in molsetup_matched])
++                if hit_count != len(molsetup_matched):
++                    raise RuntimeError(f"{hit_count=} {len(molsetup_matched)=}")
++                if hit_count != sum(is_flexres_atom):
++                    raise RuntimeError(f"{hit_count=} {sum(is_flexres_atom)=}")
++                # new_positions[res_id] = sidechain_positions
++
++                # remove root atom(s) (often C-alpha) and first atom after bond
++                flex_model = chorizo.residues[res_id].molsetup.flexibility_model
++                root_body_idx = flex_model["root"]
++                graph = flex_model["rigid_body_graph"]
++                conn = flex_model["rigid_body_connectivity"]
++                rigid_index_by_atom = flex_model["rigid_index_by_atom"]
++                first_after_root = set()
++                for other_body_idx in graph[root_body_idx]:
++                    first_after_root.add(conn[(root_body_idx, other_body_idx)][1])
++                to_pop = set()
++                for index in sidechain_positions:
++                    index_molsetup = template_to_molsetup[index]
++                    if (
++                        rigid_index_by_atom[index_molsetup] == root_body_idx or 
++                        index_molsetup in first_after_root
++                    ): 
++                        to_pop.add(index) 
++                for index in to_pop:
++                    sidechain_positions.pop(index)
++                new_positions[res_id] = sidechain_positions
++    
+     pdbstr = chorizo.to_pdb(new_positions)
+     return pdbstr
+diff --git a/meeko/rdkit_mol_create.py b/meeko/rdkit_mol_create.py
+index 30d1eecf..fd2a95db 100644
+--- a/meeko/rdkit_mol_create.py
++++ b/meeko/rdkit_mol_create.py
+@@ -334,8 +334,8 @@ def add_pose_to_mol(cls, mol, ligand_coordinates, index_map):
+                     raise RuntimeError("Expected H to have one neighbor")
+                 AllChem.SetTerminalAtomCoords(mol, i, neigh[0].GetIdx())
+         return mol
+-
+-
++    
++    
+     @staticmethod
+     def add_hydrogens(mol, coordinates_list, h_parent):
+         """Add hydrogen atoms to ligand RDKit mol, adjust the positions of
+diff --git a/meeko/writer.py b/meeko/writer.py
+index b476992a..61a7af0d 100644
+--- a/meeko/writer.py
++++ b/meeko/writer.py
+@@ -527,7 +527,7 @@ def write_from_linked_rdkit_chorizo(cls, chorizo):
+                 root = molsetup.flexibility_model["root"]
+                 if len(graph[root]) != 1:
+                     raise RuntimeError(
+-                        f"flexible residue {res_id} has {len(graph[root])}",
++                        f"flexible residue {res_id} has {len(graph[root])}"
+                         " rotatable bonds from root, but PDBQT is limited to 1"
+                     )
+                 # set ignore to True for static atoms of flexible sidechains
+diff --git a/scripts/mk_export.py b/scripts/mk_export.py
+index 66bc303e..eb6fd43f 100755
+--- a/scripts/mk_export.py
++++ b/scripts/mk_export.py
+@@ -8,6 +8,8 @@
+ import pathlib
+ import sys
+ import warnings
++import copy
++import numpy as np
+ 
+ from rdkit import Chem
+ 
+@@ -15,6 +17,7 @@
+ from meeko import RDKitMolCreate
+ from meeko import LinkedRDKitChorizo
+ from meeko import export_pdb_updated_flexres
++from meeko.utils.utils import parse_begin_res
+ 
+ 
+ def cmd_lineparser():
+@@ -103,6 +106,16 @@ def cmd_lineparser():
+     )
+     for i in failures:
+         warnings.warn("molecule %d not converted to RDKit/SD File" % i)
++    if sdf_string == "": 
++        warnings.warn("sdf_string does not contain molecular data.")
++        if redirect_stdout or write_pdb: 
++            pass
++        else:
++            print("Output SDF will not be created because there is no pose data for ligand. \n"
++                    + "Maybe the input poses only contain flexible sidechains and \n"
++                    + "keep_flexres_sdf is set to False. \n"
++                    + "Use -k with mk_export.py to retain the flexres and write to output SDF File. ")
++            sys.exit(2)
+     if len(failures) == len(pdbqt_mol._atom_annotations["mol_index"]):
+         msg = "\nCould not convert to RDKit. Maybe meeko was not used for preparing\n"
+         msg += "the input PDBQT for docking, and the SMILES string is missing?\n"
+@@ -122,10 +135,16 @@ def cmd_lineparser():
+     # write receptor with updated flexres
+     if read_json is not None:
+         pdb_string = ""
+-        for pose in pdbqt_mol:
+-            model_nr = pose.pose_id + 1
++        pose_id_to_iter = [pose.pose_id for pose in pdbqt_mol]
++        iter_pose = copy.deepcopy(pdbqt_mol)
++        for pose_id in pose_id_to_iter:
++            model_nr = pose_id + 1
++            iter_pose._positions = np.array([pdbqt_mol._positions[pose_id]])
++            iter_pose._pose_data['n_poses'] = 1  # Update the number of poses to reflect the reduction
++            iter_pose._current_pose = 0  # Reset to the first (and only) pose
+             pdb_string += "MODEL " + f"{model_nr:8}" + pathlib.os.linesep
+-            pdb_string += export_pdb_updated_flexres(polymer, pose)
++            pol_copy = copy.deepcopy(polymer)
++            pdb_string += export_pdb_updated_flexres(pol_copy, iter_pose)
+             pdb_string += "ENDMDL" + pathlib.os.linesep
+         if write_pdb is None:
+             fn = pathlib.Path(filename).with_suffix("").name + f"{suffix}.pdb"
+diff --git a/scripts/mk_prepare_ligand.py b/scripts/mk_prepare_ligand.py
+index c51a145b..4fc32d96 100755
+--- a/scripts/mk_prepare_ligand.py
++++ b/scripts/mk_prepare_ligand.py
+@@ -584,7 +584,7 @@ def get_suffixes(molsetups):
+                     root_atom_index=root_atom_index,
+                     not_terminal_atoms=[root_atom_index],
+                 )
+-                res, chain, num = cov_lig.res_id
++                chain, res, num = cov_lig.res_id
+                 suffixes = output.get_suffixes(molsetups)
+                 for molsetup, suffix in zip(molsetups, suffixes):
+                     pdbqt_string, success, error_msg = PDBQTWriterLegacy.write_string(

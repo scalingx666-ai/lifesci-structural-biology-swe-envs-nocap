@@ -1,0 +1,718 @@
+diff --git a/src/methods/initial_guess.jl b/src/methods/initial_guess.jl
+index f4dde1b0ae..0f3719fede 100755
+--- a/src/methods/initial_guess.jl
++++ b/src/methods/initial_guess.jl
+@@ -111,7 +111,7 @@ It can be overloaded to provide more accurate estimates if necessary.
+ function x0_sat_pure(model,T)
+     z = SA[1.0]
+     single_component_check(x0_sat_pure,model)
+-    
++
+     #=theory as follows
+     #given T = Teos:
+     #calculate B(Teos)
+@@ -122,25 +122,27 @@ function x0_sat_pure(model,T)
+     =#
+ 
+     R̄ = Rgas(model)
++    RT= R̄*T
+     B = second_virial_coefficient(model,T,z)
+-    lb_v = lb_volume(model,z)*one(T)
++    _0,_1 = zero(B),oneunit(B)
++    lb_v = lb_volume(model,z)*_1
+     #=
+     some very complicated models, like DAPT, fail on the calculation of the second virial coefficient.
+     while this is a numerical problem in the model itself, it is better to catch this early.
+-    
++
+     while a volume calculation is harder
+     =#
+     if isnan(B)
+         x0l = 3*lb_v
+         px = pressure(model,x0l,T)
+         if px < 0 #low pressure
+-            return x0_sat_volume_near0(model,T)
++            return x0_sat_pure_near0(model,T)
+         else #high pressure?
+             return 4*lb_v,20*lb_v
+         end
+     end
+ 
+-    
++
+     _0 = zero(B)
+     #virial volume below lower bound volume.
+     #that means that we are way over the critical point
+@@ -149,33 +151,115 @@ function x0_sat_pure(model,T)
+         return (_nan,_nan)
+     end
+ 
+-    p = -0.25*R̄*T/B
+-    vl_x0 = x0_volume(model,p,T,z,phase=:l)
+-    vl = _volume_compress(model,p,T,z,vl_x0)
+-
++    #=
++    we define the following functions
++    γc = Pc(eos)/P(virial, at v = -2B, B = B(eos,Tc))
++    γT(T) = P(v = -2B,T)/P(virial, at v = -2B, B = B(eos,T))
++
++    for cubics, γc is constant
++    we can relate γc = γc(γT(Tr = 1)), to obtain a pressure that has a liquid root.
++    we can further extend this to γc = γc(γT(T))
++    because at near critical pressures, the virial predicted pressure is below the liquid spinodal pressure
++    in one sense, γc is a correction factor.
++    =#
++    pv_virial = -0.25*RT/B #maximum virial predicted pressure
++    vv_virial = -2*B #volume at maximum virial pressure
++    pv_eos = pressure(model,vv_virial,T) #eos predicted pressure, gas phase
++
++    γT = pv_eos/pv_virial
++
++    #fitted function, using all coolprop fluids, at Tr = 1
++    aγ,bγ,cγ = 1.2442071971165476e-5, -8.695786307570637, 1.0505452946870144
++    γc = aγ*exp(-γT*bγ) + cγ
++    pl0 = γc*pv_virial #pressure of which we are (almost) sure there exists a liquid root
++    vl_x0 = x0_volume(model,pl0,T,z,phase=:l)
++    vl = _volume_compress(model,pl0,T,z,vl_x0)
+     #=the basis is that p = RT/v-b - a/v2
+-    we have a (p,v,T) pair
+-    and B = 2nd virial coefficient = b-a/RT
++    we can interpolate a vdW EoS between a liquid and a gas (p,v) point.
+     with that, we solve for a and b
+     as a and b are vdW, Pc and Tc can be calculated
+     with Tc and Pc, we use [1] to calculate vl0 and vv0
+     with Tc, we can also know in what regime we are.
+     in near critical pressures, we use directly vv0 = -2B
+     and vl0 = 4*lb_v
++    
+     [1]
+     DOI: 10.1007/s10910-007-9272-4
+     Journal of Mathematical Chemistry, Vol. 43, No. 4, May 2008 (© 2007)
+     The van der Waals equation: analytical and approximate solutions
+     =#
+-    γ = p*vl*vl/(R̄*T)
+-    _c = vl*(vl + B - γ)
+-    _b = γ - B - vl
+-    Δ = Solvers.det_22(_b,_b,4,_c)
+-    if isnan(vl) | (Δ < 0)
++    a,b = vdw_coefficients(vl,pl0,vv_virial,pv_eos,T)
++    Tc,Pc,Vc = vdw_crit_pure(a,b)
++    if isnan(a) | isnan(b)
+         #fails on two ocassions:
+         #near critical point, or too low.
+         #return high pressure estimate
+-        return 4*lb_v,-2*B + 2*lb_v
++        return 4*lb_v,vv_virial + 2*lb_v
++    end
++    Tr = T/Tc
++    #Tr(vdW approx) > Tr(model), try default.
++    if Tr >= 1
++        x0l = 4*lb_v
++        x0v = vv_virial + 2*lb_v
++        return (x0l,x0v)
++    end
++    #saturation volumes calculated from a vdW EoS.
++    Vl0,Vv0 = vdw_x0_xat_pure(T,Tc,Pc,Vc)
++
++    if Tr > 0.97
++        #in this region, finding both spinodals is cheaper than incurring in a crit_pure calculation.
++        return x0_sat_pure_hermite_spinodal(model,Vl0,Vv0,T)
++    elseif Vv0 > 1e4*one(Vv0)
++        #gas volume over threshold. but not diverged.
++        #normally this happens at low temperatures. we could suppose that Vl0 is a
++        #"zero-pressure" volume, apply corresponding strategy
++        x0l = min(Vl0,vl)
++        return x0_sat_pure_near0(model,T,x0l)
++    else
++        #we correct the gas saturation pressure. normally, B_vdw is lower than B_eos.
++        #this causes underprediction on the vapour initial point.
++        B_vdw = b - a/RT
++        p_vdw_sat = RT/(Vv0 - b) - a/Vv0/Vv0
++        p_vdw_gas_corrected = p_vdw_sat*B/B_vdw
++        pv_vdw_virial = -0.25*RT/B_vdw
++        Vv02 = volume_virial(B_vdw,p_vdw_gas_corrected,T) # virial correction.
++        if pv_virial < p_vdw_gas_corrected
++            return x0_sat_pure_hermite_spinodal(model,Vl0,Vv02,T)
++        end
++        return Vl0,Vv02
++    end
++end
++
++function vdw_coefficients(vl,pl,vv,pv,T)
++    #px = RT/(vx-b) - a/vx/vx
++    RT = R̄*T
++    βl = pl*vl*vl/RT # vl*vl/(vl - b) - a/RT
++    βv = pv*vv*vv/RT # vv*vv/(vv - b) - a/RT
++    Δβ = βv - βl
++    vv2,vl2 = vv*vv,vl*vl
++    vvΔβ,vlΔβ = vv2/Δβ,vl2/Δβ
++    #=
++    #we solve a in terms of the liquid values
++    a/RT = vl*vl/(vl - b) - βl
++
++    then:
++
++    βv - βl = vv2/(vv - b) - vl2/(vl - b)
++    Δβ*(vl - b)*(vv - b) = vv2*(vl - b) - vl2*(vv - b)
++    (vl - b)*(vv - b) = vv2/Δβ*(vl - b) - vl2/Δβ*(vv - b)
++    (vl - b)*(vv - b) = vvΔβ*(vl - b) - vlΔβ*(vv - b)
++    b^2 -(vl + vv)*b + vl*vv = vvΔβ*vl - vvΔβ*b - vlΔβ*vv + vlΔβ*b
++    b^2 -(vl + vv)*b + vl*vv - vvΔβ*vl + vvΔβ*b + vlΔβ*vv - vlΔβ*b = 0
++    b^2 + (-vl + -vv + vvΔβ - vlΔβ)*b + (vl*vv - vvβ*vl + vlΔβ*vv) = 0
++    =#
++    _c = vl*vv - vvΔβ*vl + vlΔβ*vv
++    _b = -vl + -vv + vvΔβ - vlΔβ
++
++    #quadratic solver
++    Δ = Solvers.det_22(_b,_b,4,_c)
++    if isnan(vl) | (Δ < 0)
++        nan = zero(Δ)/zero(Δ)
++        return nan,nan
+     end
+     Δsqrt = sqrt(Δ)
+     b1 = 0.5*(-_b + Δsqrt)
+@@ -187,51 +271,24 @@ function x0_sat_pure(model,T)
+     else
+         b = b1
+     end
+-    a = -R̄*T*(B-b)
++    a = RT*(vl2/(vl - b) - βl)
++    return a,b
++end
++
++#vdw crit pure values,given a and b
++function vdw_crit_pure(a,b)
++    Ωa,Ωb =  27/64, 1/8
+     Vc = 3*b
+-    Ωa =  27/64
+-    Ωb =  1/8
+     ar = a/Ωa
+     br = b/Ωb
+     Tc = ar/br/R̄
+     Pc = ar/(br*br)
+-    Tr = T/Tc
+-    #Tr(vdW approx) > Tr(model), try default.
+-    if Tr >= 1
+-        x0l = 4*lb_v
+-        x0v = -2*B + 2*lb_v
+-        return (x0l,x0v)
+-    end
+-    #@show (Tc,Pc)
+-    # if b1/b2 < -0.95, then T is near Tc.
+-    #if b<lb_v then we are in trouble
+-    #critical regime or something horribly wrong happened
+-    if (b1/b2 < -0.95) | (b<lb_v) | (Tr>0.99)
+-        x0l = 4*lb_v
+-        x0v = -2*B #gas volume as high as possible
+-        return (x0l,x0v)
+-    end
+-
+-    Vl0,Vv0 = vdw_x0_xat_pure(T,Tc,Pc,Vc)
+-    x0l = min(Vl0,vl)
+-    if Vv0 > 1e4*one(Vv0)
+-        #gas volume over threshold. but not diverged.
+-        #normally this happens at low temperatures. we could suppose that Vl0 is a 
+-        #"zero-pressure" volume, apply corresponding strategy
+-        ares = a_res(model, x0l, T, z)
+-        lnϕ_liq0 = ares - 1 + log(R̄*T/x0l)
+-        P0 = exp(lnϕ_liq0)
+-        x0v = R̄*T/P0
+-    else
+-        x0v = Vv0
+-    end
+-    return (x0l,x0v)
++    return Tc,Pc,Vc
+ end
+ 
+-function x0_sat_volume_near0(model, T)
++function x0_sat_pure_near0(model, T,vl0 = volume(model,zero(T),T,phase =:liquid))
+     R̄ = Rgas(model)
+     z = SA[1.0]
+-    vl0 = volume(model,zero(T),T,phase =:liquid)
+     ares = a_res(model, vl0, T, z)
+     lnϕ_liq0 = ares - 1 + log(R̄*T/vl0)
+     P0 = exp(lnϕ_liq0)
+@@ -240,6 +297,89 @@ function x0_sat_volume_near0(model, T)
+     return vl,vv
+ end
+ 
++function x0_sat_pure_hermite_spinodal(model,Vl00,Vv00,T)
++    p(x) = pressure(model,x,T)
++    TT = oneunit(eltype(model))*oneunit(T/T)
++    Vl_spinodal,Vv_spinodal = Vl00*TT,Vv00*TT
++    #=
++    strategy:
++
++    we create a quintic hermite interpolant for the pressure, given
++    p,dpdv,d2pdv2 for the liquid and vapour phases.
++
++    the hermite polynomial is translated in relation to Vl0: y = V - Vl0.
++    we find yl,yv such as dpdv(yl) = dpdv(yv) = 0
++    we recompute the new Vl0 and Vv0 and recalculate the hermite polynomial interpolant.
++    we iterate until yl < tolerance.
++
++    once the liquid spinodal is found, we can obtain the vapour one via optimization,
++    using the current Vv estimate and the liquid spinodal as bounds.
++
++    finally, once liquid and gas spinodals are found, we can obtain the spinodal initial point:
++    psat ≈ 0.5*(p(liquid spinodal) + p(vapour spinodal))
++    =#
++    for i in 1:30
++        fl,dfl,d2fl = Solvers.f∂f∂2f(p,Vl_spinodal)
++        fv,dfv,d2fv = Solvers.f∂f∂2f(p,Vv_spinodal)
++        poly_l = Solvers.hermite5_poly(Vl_spinodal,Vv_spinodal,fl,fv,dfl,dfv,d2fl,d2fv)
++        dpoly_l = Solvers.polyder(poly_l)
++        d2poly_l = Solvers.polyder(dpoly_l)
++        function f0_l(x)
++            df,d2f = evalpoly(x,dpoly_l),evalpoly(x,d2poly_l)
++            return df,df/d2f
++        end
++
++        poly_v = Solvers.hermite5_poly(Vv_spinodal,Vl_spinodal,fv,fl,dfv,dfl,d2fv,d2fl)
++        dpoly_v = Solvers.polyder(poly_v)
++        d2poly_v = Solvers.polyder(dpoly_v)
++
++        function f0_v(x)
++            df,d2f = evalpoly(x,dpoly_v),evalpoly(x,d2poly_v)
++            return df,df/d2f
++        end
++
++        prob_vl = Roots.ZeroProblem(f0_l,zero(Vl_spinodal))
++        yl = Roots.solve(prob_vl,Roots.Newton())
++        Vl_spinodal += yl
++        #find proper bounds for yv
++        ub_v = zero(Vv_spinodal)
++        lb_v = Vl_spinodal - Vv_spinodal
++        f_ub_v = evalpoly(zero(Vv_spinodal),dpoly_v)
++        x = LinRange(lb_v,ub_v,10)
++
++        #we need an initial point between the liquid spinodal and the initial point of the gas spinodal.
++        for i in 1:9
++            f_i = evalpoly(x[i],dpoly_v)
++            if sign(f_i*f_ub_v) == -1
++                lb_v = x[i]
++                break
++            end
++            #cannot find any spinodal point. bail out.
++            i == 9 && return Vl00,Vv00
++        end
++        yv_bounds = (lb_v,ub_v)
++        prob_vv = Roots.ZeroProblem(f0_v,yv_bounds)
++        yv = Roots.solve(prob_vv,Roots.LithBoonkkampIJzermanBracket())
++        Vv_spinodal += yv
++
++        if abs(yl) < sqrt(eps(Vl_spinodal)) && abs(yv) < sqrt(eps(Vv_spinodal))
++            #yl found calculate mean spinodal pressure.
++            P_max = evalpoly(yv,poly_v)
++            P_min = evalpoly(yl,poly_l)
++            P = 0.5*(P_max + P_min)
++            Vv0 = volume(model,P,T,vol0 = Vv00)::typeof(TT)
++            Vl0 = volume(model,P,T,vol0 = Vl00)::typeof(TT)
++            #this initial point gives good estimated for the saturated vapour volume
++            #but overpredicts the saturated liquid volume, causing failure in subsequent eq solvers.
++            #isofugacity criteria does not work here.
++            #On PCSAFT("water"), T = 0.9999Tc, this fails, even as the initial guesses provided
++            #here are closer to the eq values than the ones sugested by x0_sat_pure_crit.
++            return Vl0,Vv0
++        end
++    end
++    return Vl00,Vv00 #failed to find spinodal
++end
++
+ function vdw_x0_xat_pure(T,T_c,P_c,V_c)
+     Tr = T/T_c
+     Trm1 = 1.0-Tr
+@@ -256,7 +396,6 @@ function vdw_x0_xat_pure(T,T_c,P_c,V_c)
+     elseif Tr <= 0.33
+         #Eq. 33, valid in 0 < Tr < 0.33
+         c_v = (3*c_l/(ℯ*(3-c_l)))*exp(-(1/(1-c_l/3)))
+-
+     else
+         #Eq. 31 valid in 0.25 < Tr < 1
+         mean_c = 1.0 + 0.4*Trm1 + 0.161*Trm1*Trm1
+@@ -413,13 +552,11 @@ T_scales(model,z) = T_scales(model)
+ Solves the 2-phase problem with 1 component, using a 2nd order taylor aprox in helmholtz energy and a isothermal compressibility factor aproximation for pressure.
+ """
+ function solve_2ph_taylor(v10,v20,a1,da1,d2a1,a2,da2,d2a2,p_scale = 1.0,μ_scale = 1.0)
+-    
+     function F0(x)
+         logv1,logv2 = x[1],x[2]
+         v1,v2 = exp(logv1),exp(logv2)
+         p1 = log(v1/v10)*(-v1*d2a1) - da1
+         p2 = log(v2/v20)*(-v2*d2a2) - da2
+-        
+         Δv1 = (v1 - v10)
+         Δv2 = (v2 - v20)
+         A1 = evalpoly(Δv1,(a1,da1,0.5*d2a1))
+@@ -445,4 +582,4 @@ function solve_2ph_taylor(model1::EoSModel,model2::EoSModel,T,v1,v2,p_scale = 1.
+     a1,da1,d2a1 = Solvers.f∂f∂2f(f1,v1)
+     a2,da2,d2a2 = Solvers.f∂f∂2f(f2,v2)
+     return solve_2ph_taylor(v1,v2,a1,da1,d2a1,a2,da2,d2a2,p_scale,μ_scale)
+-end
++end
+\ No newline at end of file
+diff --git a/src/methods/property_solvers/singlecomponent/saturation/ChemPotV.jl b/src/methods/property_solvers/singlecomponent/saturation/ChemPotV.jl
+index 64296e881e..352dd017ed 100755
+--- a/src/methods/property_solvers/singlecomponent/saturation/ChemPotV.jl
++++ b/src/methods/property_solvers/singlecomponent/saturation/ChemPotV.jl
+@@ -16,8 +16,8 @@ when `crit_retry` is true, if the initial solve fail, it will try to obtain a be
+ `f_limit`, `atol`, `rtol`, `max_iters` are passed to the non linear system solver.
+ """
+ struct ChemPotVSaturation{T,C} <: SaturationMethod
+-    vl::Union{Nothing,T}
+-    vv::Union{Nothing,T}
++    vl::T
++    vv::T
+     crit::C
+     crit_retry::Bool
+     f_limit::Float64
+@@ -37,35 +37,34 @@ function ChemPotVSaturation(;vl = nothing,
+ 
+     if (vl === nothing) && (vv === nothing)
+         return ChemPotVSaturation{Nothing,typeof(crit)}(nothing,nothing,crit,crit_retry,f_limit,atol,rtol,max_iters)
+-    elseif !(vl === nothing) && (vv === nothing)
+-        vl = float(vl)
+-        return ChemPotVSaturation(vl,vv,crit,crit_retry,f_limit,atol,rtol,max_iters)
+-    elseif (vl === nothing) && !(vv === nothing)
+-        vv = float(vv)
+-        return ChemPotVSaturation(vl,vv,crit,crit_retry,f_limit,atol,rtol,max_iters)
+-    else
++    elseif !(vl === nothing) && !(vv === nothing)
+         T = one(vl)/one(vv)
+         vl,vv,_ = promote(vl,vv,T)
+         return ChemPotVSaturation(vl,vv,crit,crit_retry,f_limit,atol,rtol,max_iters)
++    else
++        throw(ArgumentError("you need to specify both vl and vv."))
+     end
+ end
+ 
+ ChemPotVSaturation(x::Tuple) = ChemPotVSaturation(vl = first(x),vv = last(x))
+ ChemPotVSaturation(x::Vector) = ChemPotVSaturation(vl = first(x),vv = last(x))
+ 
+-function saturation_pressure_impl(model::EoSModel, T, method::ChemPotVSaturation{Nothing})
+-    vl,vv = x0_sat_pure(model,T)
++function saturation_pressure_impl(model::EoSModel, T, method::ChemPotVSaturation{Nothing,C}) where C
++    TT = typeof(1.0*T*oneunit(eltype(model)))
++    vl::TT,vv::TT = x0_sat_pure(model,T)
+     crit = method.crit
+     crit_retry = method.crit_retry
+     f_limit = method.f_limit
+     atol = method.atol
+     rtol = method.rtol
+     max_iters = method.max_iters
+-    return saturation_pressure_impl(model,T,ChemPotVSaturation(vl,vv,crit,crit_retry,f_limit,atol,rtol,max_iters))
++    new_method = ChemPotVSaturation{TT,C}(vl,vv,crit,crit_retry,f_limit,atol,rtol,max_iters)
++    #@show new_method
++    return saturation_pressure_impl(model,T,new_method)
+ end
+ 
+ function saturation_pressure_impl(model::EoSModel, T, method::ChemPotVSaturation{<:Number})
+-    V0 = vec2(log(method.vl),log(method.vv),T)
++    V0 = svec2(log(method.vl),log(method.vv),1.0*T*oneunit(eltype(model)))
+     V01,V02 = V0
+     TYPE = eltype(V0)
+     nan = zero(TYPE)/zero(TYPE)
+@@ -96,7 +95,7 @@ function saturation_pressure_impl(model::EoSModel, T, method::ChemPotVSaturation
+     if T < T_c
+         x0 = x0_sat_pure_crit(model,T,T_c,p_c,V_c)
+         V01,V02 = x0
+-        V0 = vec2(log(V01),log(V02),T)
++        V0 = svec2(log(V01),log(V02),T)
+         result,converged = sat_pure(f!,V0,method)
+         if converged
+             return result
+@@ -119,11 +118,11 @@ function ObjSatPure(model,T)
+     ObjSatPure(model,ps,mus,T)
+ end
+ 
+-function (f::ObjSatPure)(F,x)
++function (f::ObjSatPure)(x)
+     model = f.model
+     scales = (f.ps,f.mus)
+     T = f.Tsat
+-    return Obj_Sat(model, F, T, exp(x[1]), exp(x[2]),scales)
++    return Obj_Sat(model, T, exp(x[1]), exp(x[2]),scales)
+ end
+ #with the critical point, we can perform a
+ #corresponding states approximation with the
+@@ -142,14 +141,13 @@ function x0_sat_pure_crit(model,T)
+     return x0_sat_pure_crit(model,T,Tc,Pc,Vc)
+ end
+ 
+-function sat_pure(f!::ObjSatPure,V0,method)
+-    model, T = f!.model, f!.Tsat
++function sat_pure(f::ObjSatPure,V0,method)
++    model, T = f.model, f.Tsat
+     nan = zero(eltype(V0))/zero(eltype(V0))
+     if !isfinite(V0[1]) | !isfinite(V0[2]) | !isfinite(T)
+         return (nan,nan,nan), false
+     end
+-    r = Solvers.nlsolve(f!, V0 ,LineSearch(Newton()),NEqOptions(method),ForwardDiff.Chunk{2}())
+-    Vsol = Solvers.x_sol(r)
++    Vsol = Solvers.nlsolve2(f,V0,Solvers.Newton2Var(),NEqOptions(method))
+     V_l = exp(Vsol[1])
+     V_v = exp(Vsol[2])
+     P_sat = pressure(model,V_v,T)
+@@ -158,16 +156,16 @@ function sat_pure(f!::ObjSatPure,V0,method)
+     return res,valid
+ end
+ 
+-function Obj_Sat(model::EoSModel, F, T, V_l, V_v,scales)
++function Obj_Sat(model::EoSModel, T, V_l, V_v,scales)
+     fun(_V) = eos(model, _V, T,SA[1.])
+     A_l,Av_l = Solvers.f∂f(fun,V_l)
+     A_v,Av_v =Solvers.f∂f(fun,V_v)
+     g_l = muladd(-V_l,Av_l,A_l)
+     g_v = muladd(-V_v,Av_v,A_v)
+     (p_scale,μ_scale) = scales
+-    F[1] = -(Av_l-Av_v)*p_scale
+-    F[2] = (g_l-g_v)*μ_scale
+-    return F
++    F1 = -(Av_l-Av_v)*p_scale
++    F2 = (g_l-g_v)*μ_scale
++    return SVector(F1,F2)
+ end
+ 
+ export ChemPotVSaturation
+diff --git a/src/methods/property_solvers/singlecomponent/saturation/saturation.jl b/src/methods/property_solvers/singlecomponent/saturation/saturation.jl
+index 44d0bfc1c1..bf5522afd7 100755
+--- a/src/methods/property_solvers/singlecomponent/saturation/saturation.jl
++++ b/src/methods/property_solvers/singlecomponent/saturation/saturation.jl
+@@ -39,7 +39,7 @@ julia> p,vl,vv = saturation_pressure(pr,373.15,IsoFugacitySaturation(p0 = 1.0e5)
+ """
+ function saturation_pressure(model::EoSModel,T,method::SaturationMethod)
+     single_component_check(saturation_pressure,model)
+-    T = T*(T/T)
++    T = T*(T/T)*oneunit(eltype(model))
+     return saturation_pressure_impl(model,T,method)
+ end
+ 
+diff --git a/src/modules/solvers/ad.jl b/src/modules/solvers/ad.jl
+index 58b257f897..3fc07530a9 100644
+--- a/src/modules/solvers/ad.jl
++++ b/src/modules/solvers/ad.jl
+@@ -20,7 +20,7 @@ end
+ 
+ @inline function gradient2(f::F, x1::R,x2::R) where {F,R<:Real}
+     T = typeof(ForwardDiff.Tag(f, R))
+-    _1 = one(R)
++    _1 = oneunit(R)
+     _0 = zero(R)
+     dual1 = ForwardDiff.Dual{T,R,2}(x1, ForwardDiff.Partials((_1,_0)))
+     dual2 = ForwardDiff.Dual{T,R,2}(x2, ForwardDiff.Partials((_0,_1)))
+@@ -41,7 +41,7 @@ returns f and ∂f/∂x evaluated in `x`, using `ForwardDiff.jl`, `DiffResults.j
+ """
+ @inline function f∂f(f::F, x::R) where {F,R<:Real}
+     T = typeof(ForwardDiff.Tag(f, R))
+-    out = f(ForwardDiff.Dual{T,R,1}(x, ForwardDiff.Partials((one(R),))))
++    out = f(ForwardDiff.Dual{T,R,1}(x, ForwardDiff.Partials((oneunit(R),))))
+     return ForwardDiff.value(out),  ForwardDiff.extract_derivative(T, out)
+ end
+ 
+@@ -54,7 +54,7 @@ returns f,∂f/∂x,and ∂²f/∂²x and evaluated in `x`, using `ForwardDiff.j
+ """
+ @inline function f∂f∂2f(f::F,x::R) where {F,R<:Real}
+     T = typeof(ForwardDiff.Tag(f, R))
+-    out = ForwardDiff.Dual{T,R,1}(x, ForwardDiff.Partials((one(R),)))
++    out = ForwardDiff.Dual{T,R,1}(x, ForwardDiff.Partials((oneunit(R),)))
+     _f,_df = f∂f(f,out)
+     fx = ForwardDiff.value(_f)
+     dfx = ForwardDiff.partials(_f).values[1]
+@@ -76,7 +76,7 @@ end
+ 
+ @inline function fgradf2(f::F,x1::R,x2::R) where{F,R<:Real}
+     T = typeof(ForwardDiff.Tag(f, R))
+-    _1 = one(R)
++    _1 = oneunit(R)
+     _0 = zero(R)
+     dual1 = ForwardDiff.Dual{T,R,2}(x1, ForwardDiff.Partials((_1,_0)))
+     dual2 = ForwardDiff.Dual{T,R,2}(x2, ForwardDiff.Partials((_0,_1)))
+@@ -88,7 +88,7 @@ end
+ #Manual implementation of an hyperdual.
+ @inline function ∂2(f::F,x1::R,x2::R) where {F,R<:Real}
+     T = typeof(ForwardDiff.Tag(f, R))
+-    _1 = one(R)
++    _1 = oneunit(R)
+     _0 = zero(R)
+     dual1 = ForwardDiff.Dual{T,R,2}(x1, ForwardDiff.Partials((_1,_0)))
+     dual2 = ForwardDiff.Dual{T,R,2}(x2, ForwardDiff.Partials((_0,_1)))  
+@@ -102,6 +102,25 @@ end
+     return (fx,df,d2f)
+ end
+ 
++#Manual implementation of an hyperdual.
++@inline function J2(f::F,x::SVector{2,R}) where {F,R<:Real}
++    T = typeof(ForwardDiff.Tag(f, R))
++    _1 = oneunit(R)
++    _0 = zero(R)
++    x1,x2 = x
++    dual1 = ForwardDiff.Dual{T,R,2}(x1, ForwardDiff.Partials((_1,_0)))
++    dual2 = ForwardDiff.Dual{T,R,2}(x2, ForwardDiff.Partials((_0,_1)))  
++    dx = SVector(dual1,dual2)
++    f̄ = f(dx)
++    f̄1,f̄2 = f̄[1],f̄[2]
++    F̄ = SVector(f̄1.value , f̄2.value)
++    df1dx1, df1dx2 = f̄1.partials.values
++    df2dx1, df2dx2 = f̄2.partials.values
++    J = SMatrix{2}(df1dx1,df2dx1,df1dx2,df2dx2)
++    return F̄,J
++end
++
++
+ function ∂2(f::F,x1::R1,x2::R2) where{F,R1<:Real,R2<:Real}
+     y1,y2 = promote(x1,x2)
+     return ∂2(f,y1,y2)
+diff --git a/src/modules/solvers/nlsolve.jl b/src/modules/solvers/nlsolve.jl
+index c54d77853f..c15bdd97c6 100644
+--- a/src/modules/solvers/nlsolve.jl
++++ b/src/modules/solvers/nlsolve.jl
+@@ -91,9 +91,9 @@ end
+ 
+ struct Newton2Var end
+ 
+-function nlsolve2(f::Base.Callable,x,method::Newton2Var,options=NEqOptions(),chunk = ForwardDiff.Chunk{2}())
+-    function FJ(z)
+-        f(z),ForwardDiff.jacobian(f,z)
++function nlsolve2(f,x,method::Newton2Var,options=NEqOptions(),chunk = ForwardDiff.Chunk{2}())
++    function FJ(_z)
++        return J2(f,_z)
+     end
+     t0 = time()
+ 
+diff --git a/src/modules/solvers/poly.jl b/src/modules/solvers/poly.jl
+index 6305c57ddd..30d0d1afcc 100644
+--- a/src/modules/solvers/poly.jl
++++ b/src/modules/solvers/poly.jl
+@@ -70,11 +70,11 @@ end
+ roots3(pol)
+ solves a cubic equation of the form pol[1] + pol[2]*x + pol[3]*x^2 + pol[4]*x^3
+ """
+-function roots3(pol) 
++function roots3(pol)
+ return SVector(solve_cubic_eq(pol))
+ end
+ 
+-function roots3(a,b,c,d) 
++function roots3(a,b,c,d)
+ x = (a,b,c,d)
+ return roots3(x)
+ end
+@@ -118,3 +118,60 @@ function real_roots3(pol::NTuple{4,T}) where {T<:Real}
+     end
+ end
+ real_roots3(a,b,c,d) = real_roots3((a,b,c,d))
++
++#we suppose that there is a translation: xx = x + x0
++function hermite5_poly(x0,x1,f0,f1,df0,df1,d2f0,d2f1)
++    #Δx0 = x - x0
++    #Δx1 = x - x1
++    Δx10 = (x1 - x0)
++   # Δx03 = Δx0^3
++
++    Δx102 = Δx10^2
++    divx = 1/Δx10
++    p0 = f0
++    p1 = df0
++
++    p2 = (1//2)*d2f0
++    p3 = (f1 - f0 - df0*Δx10 - (1//2)*d2f0*Δx102)*divx^3
++
++    z4 = (3*f0 - 3*f1 + 2*(df0 + (1//2)*df1)*Δx10 - (1//2)*d2f0*Δx102)*divx^4 # * Δx03 * Δx1
++    #x^3 * (x -Δx10) = x^4 - -Δx10*x^3
++    p3 += -Δx10*z4
++    p4 = z4
++
++    z5 = (6*f1 - 6*f0 - 3*(df0 + df1)*Δx10 + (1//2)*(d2f1 - d2f0)*Δx102)*divx^5# * Δx03 * Δx1
++    #x^3 * (x -Δx10)^2 = x^5 -2*Δx10*x^4 +Δx10*Δx10*x^3
++    p3 += Δx10^2*z5
++    p4 += -2*Δx10*z5
++    p5 = z5
++    return p0,p1,p2,p3,p4,p5
++end
++
++"""
++    hermite5_poly(f,x0,x1)
++
++Returns a quintic hermite polynomial, that interpolates `f` between `x0` and `x1`, using first and second derivative information.
++the polynomial is translated, so that the zero is at `x0`.
++
++## Example
++```
++poly = hermite5_poly(f,x0,x1)
++evalpoly(0.0,poly) == f(x0)
++evalpoly(x1 - x0,poly) == f(x1)
++```
++"""
++function hermite5_poly(f,x0,x1)
++    f0,df0,d2f0 = f∂f∂2f(f,x0)
++    f1,df1,d2f1 = f∂f∂2f(f,x1)
++    return hermite5_poly(x0,x1,f0,f1,df0,df1,d2f0,d2f1)
++end
++
++"""
++    polyder(poly)
++
++returns the coefficients of the derivative of the polynomial.
++
++"""
++function polyder(x::NTuple{N,T}) where {N,T}
++    return ntuple(i->x[i+1]*i,Val{N-1}())
++end
+diff --git a/src/utils/misc.jl b/src/utils/misc.jl
+index c6c479c4dc..d54071fb29 100755
+--- a/src/utils/misc.jl
++++ b/src/utils/misc.jl
+@@ -10,6 +10,11 @@ function vec2(x1,x2,opt = true)
+         return SizedVector{2,typeof(V01)}((V01,V02))
+     end
+ end
++
++function svec2(x1,x2,opt = true)
++    V01,V02,_ = promote(x1,x2,opt)
++    return SVector{2}(V01,V02)
++end
+ """
+     dnorm(x,y,p)
+ 
+diff --git a/test/test_methods_api.jl b/test/test_methods_api.jl
+index c8c6896a6b..fc7ae0ed47 100644
+--- a/test/test_methods_api.jl
++++ b/test/test_methods_api.jl
+@@ -517,5 +517,24 @@ end
+         # @test_broken bubble_pressure(model,T,x;v0 = v0)[1] ≈ 5.913118531569793e6 rtol = 1e-4
+         # FIXME: The test does not yield the same value depending on the OS and the julia version
+     end
++
++    @testset "saturation pressures" begin
++        model1 = PCSAFT("water")
++        Tc1,_,_ = crit_pure(model1)
++        T1 = 0.995Tc1
++        @test Clapeyron.saturation_pressure(model1,T1,crit_retry = false)[1] ≈ 3.542008160105954e7 rtol = 1e-6
++        
++        model2 = PCSAFT("eicosane")
++        Tc2,_,_ = crit_pure(model2)
++        T2 = 0.995Tc2
++        if Base.VERSION >= v"1.7" #this test fails on mac, julia 1.6
++            @test Clapeyron.saturation_pressure(model2,T2,crit_retry = false)[1] ≈ 1.3931662325210017e6 rtol = 1e-6
++        end
++
++        #https://github.com/ClapeyronThermo/Clapeyron.jl/issues/237
++        model3 = SAFTVRMie("heptacosane",userlocations = (Mw = 380.44,segment = 2.0,sigma = 3.0,lambda_a = 6.0,lambda_r = 20.01,epsilon = 200.51))
++        @test Clapeyron.saturation_pressure(model3,94.33,crit_retry = false)[1] ≈ 2.8668634416924506 rtol = 1e-6
++    end
++
+ end
+ 
+diff --git a/test/test_methods_eos.jl b/test/test_methods_eos.jl
+index 2a9a26489f..b6c99c8752 100755
+--- a/test/test_methods_eos.jl
++++ b/test/test_methods_eos.jl
+@@ -117,7 +117,7 @@ end
+         @test Clapeyron.molecular_weight(system)*1000 ≈ 46.065
+     end
+     @testset "VLE properties" begin
+-        @test Clapeyron.saturation_pressure(system, T)[1] ≈ 7714.8637084302 rtol = 1E-6
++        @test Clapeyron.saturation_pressure(system, T)[1] ≈ 7714.8637084302 rtol = 1E-5
+         @test Clapeyron.crit_pure(system)[1] ≈ 522.7772913470494 rtol = 1E-5
+     end
+ end

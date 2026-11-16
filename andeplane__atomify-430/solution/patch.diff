@@ -1,0 +1,147 @@
+diff --git a/e2e/atom-tags.spec.ts b/e2e/atom-tags.spec.ts
+new file mode 100644
+index 00000000..e3f36791
+--- /dev/null
++++ b/e2e/atom-tags.spec.ts
+@@ -0,0 +1,49 @@
++import { expect, test } from "@playwright/test";
++import { createBlankProject, gotoApp, waitForEngine } from "./helpers";
++
++const data = `Persistent tags\n\n3 atoms\n3 atom types\n\n0 4 xlo xhi\n0 4 ylo yhi\n0 4 zlo zhi\n\nAtoms # atomic\n\n42 2 3 1 1\n7 1 1 1 1\n99 3 2 1 1\n`;
++const script = `units lj\natom_style atomic\natom_modify map array sort 1 0.5\nread_data tags.data\nmass * 1\npair_style zero 0.5\npair_coeff * *\nrun 100000\n`;
++
++test("real engine tags remain attached to atoms when LAMMPS sorts its arrays", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  await createBlankProject(page, "Atom tags", "atom-tags");
++  await page.getByTestId("upload-input").setInputFiles([
++    { name: "tags.data", mimeType: "text/plain", buffer: Buffer.from(data) },
++    { name: "in.tags", mimeType: "text/plain", buffer: Buffer.from(script) },
++  ]);
++  await waitForEngine(page);
++  await page.getByTestId("run-file-in.tags").click();
++  await expect
++    .poll(
++      () =>
++        page.evaluate(async () => {
++          const modulePath = "/atomify/src/store/index.ts";
++          const store = (await import(modulePath)).default;
++          const particles = store.getState().render.particles as
++            | {
++                count: number;
++                indices: Float32Array;
++                types: Float32Array;
++                positions: Float32Array;
++              }
++            | undefined;
++          if (!particles || particles.count !== 3) return [];
++          return Array.from(particles.indices.subarray(0, particles.count))
++            .map((id, i) => ({
++              id,
++              type: particles.types[i],
++              x: particles.positions[i * 3],
++            }))
++            .sort((a, b) => a.id - b.id);
++        }),
++      { timeout: 60_000 },
++    )
++    .toEqual([
++      { id: 7, type: 1, x: 1 },
++      { id: 42, type: 2, x: 3 },
++      { id: 99, type: 3, x: 2 },
++    ]);
++  await page.getByRole("button", { name: "Stop", exact: true }).click();
++});
+diff --git a/src/modifiers/syncparticlesmodifier.test.ts b/src/modifiers/syncparticlesmodifier.test.ts
+new file mode 100644
+index 00000000..ecd821e6
+--- /dev/null
++++ b/src/modifiers/syncparticlesmodifier.test.ts
+@@ -0,0 +1,73 @@
++import { describe, expect, it, vi } from "vitest";
++import SyncParticlesModifier from "./syncparticlesmodifier";
++import type { ModifierInput, ModifierOutput } from "./types";
++
++vi.mock("omovi", () => ({
++  Particles: class {
++    capacity: number;
++    count = 0;
++    positions: Float32Array;
++    types: Float32Array;
++    indices: Float32Array;
++    constructor(count: number) {
++      this.capacity = count;
++      this.positions = new Float32Array(3 * count);
++      this.types = new Float32Array(count);
++      this.indices = new Float32Array(count);
++    }
++    dispose() {}
++    markNeedsUpdate() {}
++  },
++}));
++
++describe("persistent LAMMPS atom tags", () => {
++  it("keeps sparse tags paired with positions and types after engine reordering", () => {
++    const heap = new ArrayBuffer(256);
++    const floats = new Float32Array(heap);
++    const ints = new Int32Array(heap);
++    const input = {
++      wasm: { HEAPF32: floats, HEAP32: ints },
++      lammps: {
++        computeParticles: () => 3,
++        getPositionsPointer: () => 0,
++        getTypePointer: () => 64,
++        getIdPointer: () => 96,
++      },
++    } as unknown as ModifierInput;
++    const output = {} as ModifierOutput;
++    const modifier = new SyncParticlesModifier({
++      name: "Particles",
++      active: true,
++    });
++    const sync = (atoms: { id: number; type: number; x: number }[]) => {
++      floats.set(atoms.flatMap((a) => [a.x, 0, 0]));
++      ints.set(
++        atoms.map((a) => a.type),
++        64 / 4,
++      );
++      ints.set(
++        atoms.map((a) => a.id),
++        96 / 4,
++      );
++      modifier.run(input, output);
++      return Array.from(output.particles!.indices).map((id, index) => ({
++        id,
++        type: output.particles!.types[index],
++        x: output.particles!.positions[3 * index],
++      }));
++    };
++    const initial = [
++      { id: 42, type: 2, x: 1 },
++      { id: 7, type: 1, x: 3 },
++      { id: 99, type: 3, x: 2 },
++    ];
++    expect(sync(initial)).toEqual(initial);
++    const reordered = [
++      { ...initial[2], x: 2.5 },
++      { ...initial[0], x: 1.5 },
++      { ...initial[1], x: 3.5 },
++    ];
++    expect(sync(reordered)).toEqual(reordered);
++    expect(Array.from(output.particles!.indices)).not.toEqual([0, 1, 2]);
++  });
++});
+diff --git a/src/wasm/lammpsAdapter.ts b/src/wasm/lammpsAdapter.ts
+index 3aa41046..60998b51 100644
+--- a/src/wasm/lammpsAdapter.ts
++++ b/src/wasm/lammpsAdapter.ts
+@@ -443,6 +443,8 @@ export class LammpsAdapter implements LammpsWeb {
+     return this.particleSnapshot?.types.ptr ?? 0;
+   }
+ 
++  // lammps.js reads lammps_extract_atom(..., "id"), the LAMMPS atom tag
++  // array. These are persistent IDs, not offsets in the sorted atom arrays.
+   getIdPointer(): number {
+     return this.particleSnapshot?.ids.ptr ?? 0;
+   }

@@ -1,0 +1,211 @@
+diff --git a/deepblast/dataset/dataset.py b/deepblast/dataset/dataset.py
+index 0e2cee7..1c9a6e8 100644
+--- a/deepblast/dataset/dataset.py
++++ b/deepblast/dataset/dataset.py
+@@ -56,7 +56,8 @@ class TMAlignDataset(AlignmentDataset):
+     """
+     def __init__(self, path, tokenizer=UniprotTokenizer(),
+                  tm_threshold=0.4, max_len=1024, pad_ends=False,
+-                 clip_ends=True, mask_gaps=True, construct_paths=False):
++                 clip_ends=True, mask_gaps=True, return_names=False,
++                 construct_paths=False):
+         """ Read in pairs of proteins.
+ 
+ 
+@@ -81,6 +82,8 @@ def __init__(self, path, tokenizer=UniprotTokenizer(),
+             Specifies if the ends of the alignments should be clipped or not.
+         mask_gaps : bool
+             Specifies if the mask for the gaps should be constructed.
++        return_names : bool
++            Specifies if the names of the proteins should be returned.
+         construct_paths : bool
+             Specifies if path distances should be calculated.
+ 
+@@ -110,6 +113,7 @@ def __init__(self, path, tokenizer=UniprotTokenizer(),
+         self.pad_ends = pad_ends
+         self.clip_ends = clip_ends
+         self.mask_gaps = mask_gaps
++        self.return_names = return_names
+ 
+     def __len__(self):
+         return self.pairs.shape[0]
+@@ -165,7 +169,13 @@ def __getitem__(self, i):
+ 
+         alignment_matrix = reshape(alignment_matrix, len(gene), len(pos))
+         g_mask = reshape(g_mask, len(gene), len(pos))
+-        return gene, pos, states, alignment_matrix, path_matrix, g_mask
++        if not self.return_names:
++            return gene, pos, states, alignment_matrix, path_matrix, g_mask
++        else:
++            gene_name = self.pairs.iloc[i]['chain1_name']
++            pos_name = self.pairs.iloc[i]['chain2_name']
++            return (gene, pos, states, alignment_matrix,
++                    path_matrix, g_mask, gene_name, pos_name)
+ 
+ 
+ class MaliAlignmentDataset(AlignmentDataset):
+diff --git a/deepblast/dataset/utils.py b/deepblast/dataset/utils.py
+index c319815..a2e53f2 100644
+--- a/deepblast/dataset/utils.py
++++ b/deepblast/dataset/utils.py
+@@ -261,6 +261,30 @@ def collate_f(batch):
+     return genes, others, states, dm, p, G
+ 
+ 
++def test_collate_f(batch):
++    genes = [x[0] for x in batch]
++    others = [x[1] for x in batch]
++    states = [x[2] for x in batch]
++    alignments = [x[3] for x in batch]
++    paths = [x[4] for x in batch]
++    masks = [x[5] for x in batch]
++    gene_names = [x[6] for x in batch]
++    other_names = [x[7] for x in batch]
++    max_x = max(map(len, genes))
++    max_y = max(map(len, others))
++    B = len(genes)
++    dm = torch.zeros((B, max_x, max_y))
++    p = torch.zeros((B, max_x, max_y))
++    G = torch.zeros((B, max_x, max_y)).bool()
++    G.requires_grad = False
++    for b in range(B):
++        n, m = len(genes[b]), len(others[b])
++        dm[b, :n, :m] = alignments[b]
++        p[b, :n, :m] = paths[b]
++        G[b, :n, :m] = masks[b].bool()
++    return genes, others, states, dm, p, G, gene_names, other_names
++
++
+ def path_distance_matrix(pi):
+     """ Builds a min path distance matrix.
+ 
+diff --git a/deepblast/trainer.py b/deepblast/trainer.py
+index 4bfe3d2..b09989f 100644
+--- a/deepblast/trainer.py
++++ b/deepblast/trainer.py
+@@ -13,8 +13,8 @@
+ from deepblast.dataset.alphabet import UniprotTokenizer
+ from deepblast.dataset import TMAlignDataset
+ from deepblast.dataset.utils import (
+-    decode, states2edges, collate_f, unpack_sequences,
+-    pack_sequences, revstate_f)
++    decode, states2edges, collate_f, test_collate_f,
++    unpack_sequences, pack_sequences, revstate_f)
+ from deepblast.losses import (
+     SoftAlignmentLoss, SoftPathLoss, MatrixCrossEntropy)
+ from deepblast.score import (roc_edges, alignment_visualization,
+@@ -110,11 +110,11 @@ def val_dataloader(self):
+ 
+     def test_dataloader(self):
+         test_dataset = TMAlignDataset(
+-            self.hparams.test_pairs,
++            self.hparams.test_pairs, return_names=True,
+             construct_paths=isinstance(self.loss_func, SoftPathLoss))
+         test_dataloader = DataLoader(
+             test_dataset, self.hparams.batch_size, shuffle=False,
+-            collate_fn=collate_f, num_workers=self.hparams.num_workers,
++            collate_fn=test_collate_f, num_workers=self.hparams.num_workers,
+             pin_memory=True)
+         return test_dataloader
+ 
+@@ -193,12 +193,10 @@ def validation_stats(self, x, y, xlen, ylen, gen,
+                     print(theta[b])
+                     print(xlen[b], ylen[b])
+                     raise e
+-                statistics.append(stats)
++            statistics.append(stats)
+         return statistics
+ 
+     def validation_step(self, batch, batch_idx):
+-        # TODO: something weird is going on with the lengths
+-        # Need to make sure that they are being sorted properly
+         genes, others, s, A, P, G = batch
+         seq, order = pack_sequences(genes, others)
+         predA, theta, gap = self.aligner(seq, order)
+@@ -223,30 +221,35 @@ def validation_step(self, batch, batch_idx):
+                 'log': tensorboard_logs}
+ 
+     def test_step(self, batch, batch_idx):
+-        result = self.validation_step(batch, batch_idx)
+-        val_cols = [
+-            'val_tp', 'val_fp', 'val_fn', 'val_perc_id',
+-            'val_ppv', 'val_fnr', 'val_fdr', 'valid_loss'
+-        ]
+-        test_cols = [
+-            'test_tp', 'test_fp', 'test_fn', 'test_perc_id',
+-            'test_ppv', 'test_fnr', 'test_fdr', 'test_loss'
+-        ]
+-        test_vals = [result['log'][k] for k in val_cols]
+-        return dict(zip(test_cols, test_vals))
+-
+-    def test_epoch_end(self, outputs):
+-        loss_f = lambda x: x['validation_loss']
+-        losses = list(map(loss_f, outputs))
+-        metrics = ['test_tp', 'test_fp', 'test_fn', 'test_perc_id',
+-                   'test_ppv', 'test_fnr', 'test_fdr', 'test_loss']
+-        scores = []
+-        for i, m in enumerate(metrics):
+-            loss_f = lambda x: x['log'][m]
+-            losses = list(map(loss_f, outputs))
+-            scalar = sum(losses) / len(losses)
+-            scores.append(scalar)
+-        return dict(zip(metrics, scores))
++        genes, others, s, A, P, G, gene_names, other_names = batch
++        seq, order = pack_sequences(genes, others)
++        predA, theta, gap = self.aligner(seq, order)
++        x, xlen, y, ylen = unpack_sequences(seq, order)
++        loss = self.compute_loss(xlen, ylen, predA, A, P, G, theta)
++        assert torch.isnan(loss).item() is False
++        # Obtain alignment statistics + visualizations
++        gen = self.aligner.traceback(seq, order)
++        # TODO: compare the traceback and the forward
++        statistics = self.validation_stats(
++            x, y, xlen, ylen, gen, s, A, predA, theta, gap, batch_idx)
++        assert len(statistics) > 0, (batch_idx, s)
++        genes = list(map(
++            lambda x: self.tokenizer.alphabet.decode(
++                x.detach().cpu().numpy()).decode("utf-8"),
++            genes))
++        others = list(map(
++            lambda x: self.tokenizer.alphabet.decode(
++                x.detach().cpu().numpy()).decode("utf-8"),
++            others))
++        statistics = pd.DataFrame(
++            statistics, columns=[
++                'test_tp', 'test_fp', 'test_fn', 'test_perc_id',
++                'test_ppv', 'test_fnr', 'test_fdr'
++            ]
++        )
++        statistics['query_name'] = gene_names
++        statistics['key_name'] = other_names
++        return statistics
+ 
+     def validation_epoch_end(self, outputs):
+         loss_f = lambda x: x['validation_loss']
+diff --git a/scripts/deepblast-evaluate b/scripts/deepblast-evaluate
+index 799449c..9966479 100644
+--- a/scripts/deepblast-evaluate
++++ b/scripts/deepblast-evaluate
+@@ -2,7 +2,7 @@
+ 
+ import argparse
+ import os
+-
++import pandas as pd
+ import torch
+ from pytorch_lightning import Trainer
+ from deepblast.trainer import LightningAligner
+@@ -25,9 +25,12 @@ def main(args):
+         # auto_scale_batch_size='power',
+         # profiler=profiler,
+     )
++    # something weird is going on with the test function
+     test_res = trainer.test(model)
+     fname = os.path.basename(args.test_pairs)
+-    pd.Series(test_res).to_csv(
++    test_res = list(map(pd.DataFrame, test_res))
++    test_res = pd.concat(test_res, axis=0)
++    test_res.to_csv(
+         f'{args.output_directory}/{fname}-results.csv'
+     )
+ 

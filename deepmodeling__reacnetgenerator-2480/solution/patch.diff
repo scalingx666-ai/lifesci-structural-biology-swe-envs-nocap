@@ -1,0 +1,779 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e0423c193..d75db9a2a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -48,6 +48,7 @@ dependencies = [
+     "openbabel>=3.2.0",
+     "rdkit",
+     "packaging",
++    "scipy",
+ ]
+ requires-python = ">=3.10"
+ readme = "README.md"
+diff --git a/reacnetgenerator/_detect.py b/reacnetgenerator/_detect.py
+index c4a0c4537..49bc24380 100644
+--- a/reacnetgenerator/_detect.py
++++ b/reacnetgenerator/_detect.py
+@@ -41,6 +41,7 @@
+ from ase import Atom, Atoms
+ from ase.neighborlist import natural_cutoffs, neighbor_list
+ from packaging import version
++from scipy.spatial import cKDTree  # ty: ignore[unresolved-import]
+ 
+ from .dps import dps  # type:ignore
+ from .utils import SharedRNGData, WriteBuffer, listtobytes, run_mp
+@@ -50,6 +51,12 @@
+ 
+ openbabel.obErrorLog.StopLogging()
+ 
++_OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS = 2048
++_OPENBABEL_COVALENT_RADIUS_TOLERANCE = 0.45
++_OPENBABEL_MIN_BOND_DISTANCE = 0.4
++_OPENBABEL_MIN_BOND_ANGLE = 45.0
++_OPENBABEL_DISTANCE_AMBIGUITY = 1e-7
++
+ 
+ class _Detect(SharedRNGData, metaclass=ABCMeta):
+     """Detect molecules.
+@@ -475,6 +482,247 @@ def _getbondfromase(self, step_atoms: Atoms, cell: np.ndarray):
+ 
+         return bond, bondlevel
+ 
++    def _new_openbabel_molecule(
++        self,
++        step_atoms: Atoms,
++        cell: np.ndarray,
++    ):
++        """Create an Open Babel molecule while preserving input atom IDs."""
++        mol = openbabel.OBMol()
++        mol.BeginModify()
++        for idx, (num, position) in enumerate(
++            zip(step_atoms.get_atomic_numbers(), step_atoms.positions, strict=True)
++        ):
++            atom = mol.NewAtom(idx)
++            atom.SetAtomicNum(int(num))
++            atom.SetVector(*position)
++        if self.pbc:
++            unit_cell = openbabel.OBUnitCell()
++            unit_cell.SetData(
++                openbabel.vector3(*cell[0]),
++                openbabel.vector3(*cell[1]),
++                openbabel.vector3(*cell[2]),
++            )
++            mol.CloneData(unit_cell)
++            mol.SetPeriodicMol()
++        return mol
++
++    @staticmethod
++    def _getbondlistsfromopenbabel(mol, atomnumber):
++        """Convert one perceived Open Babel molecule to adjacency lists."""
++        bond = [[] for _ in range(atomnumber)]
++        bondlevel = [[] for _ in range(atomnumber)]
++        for obbond in openbabel.OBMolBondIter(mol):
++            atom1 = obbond.GetBeginAtom().GetId()
++            atom2 = obbond.GetEndAtom().GetId()
++            level = obbond.GetBondOrder()
++            if level == 5:
++                # aromatic, 5 in openbabel but 12 in rdkit
++                level = 12
++            bond[atom1].append(atom2)
++            bond[atom2].append(atom1)
++            bondlevel[atom1].append(level)
++            bondlevel[atom2].append(level)
++        return bond, bondlevel
++
++    def _getbondfromopenbabel(
++        self,
++        step_atoms: Atoms,
++        cell: np.ndarray,
++    ) -> tuple[list[list[int]], list[list[int]]]:
++        """Run the original Open Babel coordinate-bond perception path."""
++        mol = self._new_openbabel_molecule(step_atoms, cell)
++        mol.ConnectTheDots()
++        mol.PerceiveBondOrders()
++        mol.EndModify()
++        return self._getbondlistsfromopenbabel(mol, len(step_atoms))
++
++    @staticmethod
++    def _orthorhombic_cell_lengths(cell):
++        """Return positive axis-aligned cell lengths when safely supported."""
++        cell = np.asarray(cell, dtype=np.float64)
++        if cell.shape != (3, 3) or not np.all(np.isfinite(cell)):
++            return None
++        lengths = np.diag(cell)
++        if np.any(lengths <= 0.0) or not np.allclose(
++            cell,
++            np.diag(lengths),
++            rtol=0.0,
++            atol=1e-12,
++        ):
++            return None
++        return lengths
++
++    def _getperiodicbondcandidates(
++        self,
++        step_atoms: Atoms,
++        cell: np.ndarray,
++    ) -> tuple[np.ndarray, np.ndarray] | None:
++        """Return Open Babel-ordered periodic bond candidates when safe."""
++        atomnumber = len(step_atoms)
++        positions = np.asarray(step_atoms.positions, dtype=np.float64)
++        atomic_numbers = np.asarray(step_atoms.get_atomic_numbers())
++        if (
++            positions.shape != (atomnumber, 3)
++            or not np.all(np.isfinite(positions))
++            or atomic_numbers.shape != (atomnumber,)
++        ):
++            return None
++        radii = np.fromiter(
++            (
++                openbabel.GetCovalentRad(int(atomic_number))
++                for atomic_number in atomic_numbers
++            ),
++            dtype=np.float64,
++            count=atomnumber,
++        )
++        if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
++            return None
++
++        cell_lengths = self._orthorhombic_cell_lengths(cell)
++        maximum_pair_cutoff = (
++            2.0 * float(np.max(radii)) + _OPENBABEL_COVALENT_RADIUS_TOLERANCE
++        )
++        if cell_lengths is None:
++            return None
++        if np.min(cell_lengths) <= 2.0 * (
++            maximum_pair_cutoff + _OPENBABEL_DISTANCE_AMBIGUITY
++        ):
++            # Avoid duplicate lattice images and unbounded neighbor-list growth
++            # in cells narrower than twice the largest possible bond distance.
++            return None
++
++        z_order = np.argsort(positions[:, 2], kind="stable")
++        # Open Babel leaves equal-z ordering to the C++ standard library, and
++        # bond insertion order can affect its later connectivity cleanup.
++        sorted_z = positions[z_order, 2]
++        if np.any(sorted_z[1:] == sorted_z[:-1]):
++            return None
++
++        wrapped_positions = np.mod(positions, cell_lengths)
++        # Floating-point modulo can round a tiny negative coordinate to the
++        # excluded upper edge of cKDTree's periodic box.
++        if np.any(wrapped_positions >= cell_lengths):
++            return None
++        candidate_pairs = cKDTree(
++            wrapped_positions,
++            boxsize=cell_lengths,
++        ).query_pairs(
++            maximum_pair_cutoff + _OPENBABEL_DISTANCE_AMBIGUITY,
++            output_type="ndarray",
++        )
++        atom_indices = candidate_pairs[:, 0]
++        neighbor_indices = candidate_pairs[:, 1]
++        distance_vectors = (
++            wrapped_positions[neighbor_indices] - wrapped_positions[atom_indices]
++        )
++        distance_vectors -= np.rint(distance_vectors / cell_lengths) * cell_lengths
++        distances = np.sqrt(np.einsum("ij,ij->i", distance_vectors, distance_vectors))
++
++        pair_cutoffs = (
++            radii[atom_indices]
++            + radii[neighbor_indices]
++            + _OPENBABEL_COVALENT_RADIUS_TOLERANCE
++        )
++        boundary_ambiguous = (
++            np.abs(distances - pair_cutoffs) <= _OPENBABEL_DISTANCE_AMBIGUITY
++        ) | (
++            np.abs(distances - _OPENBABEL_MIN_BOND_DISTANCE)
++            <= _OPENBABEL_DISTANCE_AMBIGUITY
++        )
++        if np.any(boundary_ambiguous):
++            return None
++
++        accepted = (distances <= pair_cutoffs) & (
++            distances >= _OPENBABEL_MIN_BOND_DISTANCE
++        )
++        atom_indices = atom_indices[accepted]
++        neighbor_indices = neighbor_indices[accepted]
++
++        z_rank = np.empty(atomnumber, dtype=np.intp)
++        z_rank[z_order] = np.arange(atomnumber, dtype=np.intp)
++        reverse_pair = z_rank[atom_indices] > z_rank[neighbor_indices]
++        first_atoms = np.where(reverse_pair, neighbor_indices, atom_indices)
++        second_atoms = np.where(reverse_pair, atom_indices, neighbor_indices)
++        insertion_order = np.lexsort((z_rank[second_atoms], z_rank[first_atoms]))
++        return first_atoms[insertion_order], second_atoms[insertion_order]
++
++    @staticmethod
++    def _add_openbabel_candidate_bonds(mol, first_atoms, second_atoms):
++        """Insert candidates and preserve Open Babel's connectivity cleanup."""
++        for atom_index, neighbor_index in zip(first_atoms, second_atoms, strict=True):
++            atom = mol.GetAtom(int(atom_index) + 1)
++            neighbor = mol.GetAtom(int(neighbor_index) + 1)
++            if (
++                openbabel.GetMaxBonds(atom.GetAtomicNum()) == 0
++                or openbabel.GetMaxBonds(neighbor.GetAtomicNum()) == 0
++            ):
++                continue
++            if atom.GetAtomicNum() == 15 and atom.GetExplicitValence() == 5:
++                if neighbor.GetAtomicNum() not in (9, 17):
++                    continue
++            if neighbor.GetAtomicNum() == 15 and neighbor.GetExplicitValence() == 5:
++                if atom.GetAtomicNum() not in (9, 17):
++                    continue
++            mol.AddBond(int(atom_index) + 1, int(neighbor_index) + 1, 1)
++
++        for atom in openbabel.OBMolAtomIter(mol):
++            while (
++                atom.GetExplicitValence() > openbabel.GetMaxBonds(atom.GetAtomicNum())
++                or atom.SmallestBondAngle() < _OPENBABEL_MIN_BOND_ANGLE
++            ):
++                bonds = list(openbabel.OBAtomBondIter(atom))
++                if not bonds:
++                    break
++                if atom.GetAtomicNum() == 1:
++                    hydrogen_bond = next(
++                        (
++                            bond
++                            for bond in bonds
++                            if bond.GetNbrAtom(atom).GetAtomicNum() == 1
++                        ),
++                        None,
++                    )
++                    if hydrogen_bond is not None:
++                        mol.DeleteBond(hydrogen_bond)
++                        continue
++                longest_bond = bonds[0]
++                longest_length = longest_bond.GetLength()
++                for bond in bonds[1:]:
++                    length = bond.GetLength()
++                    if length > longest_length:
++                        longest_bond = bond
++                        longest_length = length
++                mol.DeleteBond(longest_bond)
++
++    def _getbondfromperiodicneighborlist(
++        self,
++        step_atoms: Atoms,
++        cell: np.ndarray,
++    ) -> tuple[list[list[int]], list[list[int]]] | None:
++        """Accelerate periodic Open Babel connectivity with bounded candidates.
++
++        A periodic cKDTree supplies nearby atom pairs for axis-aligned cells,
++        then Open Babel retains responsibility for insertion rules,
++        valence/angle cleanup, and bond-order perception. Unsupported or
++        numerically ambiguous geometries return ``None`` so the caller can use
++        ``ConnectTheDots`` without changing its historical result.
++        """
++        atomnumber = len(step_atoms)
++        if atomnumber < 2:
++            return ([[] for _ in range(atomnumber)], [[] for _ in range(atomnumber)])
++
++        candidates = self._getperiodicbondcandidates(step_atoms, cell)
++        if candidates is None:
++            return None
++
++        mol = self._new_openbabel_molecule(step_atoms, cell)
++        self._add_openbabel_candidate_bonds(mol, *candidates)
++
++        mol.PerceiveBondOrders()
++        mol.EndModify()
++        return self._getbondlistsfromopenbabel(mol, atomnumber)
++
+     def _getbondfromcrd(
+         self, step_atoms: Atoms, cell: np.ndarray
+     ) -> tuple[list[list[int]], list[list[int]]]:
+@@ -498,45 +746,16 @@ def _getbondfromcrd(
+         if self.use_ase:
+             return self._getbondfromase(step_atoms, cell)
+ 
+-        # Otherwise, use the original OpenBabel logic
+         atomnumber = len(step_atoms)
+-        # Use openbabel to connect atoms
+-        mol = openbabel.OBMol()
+-        mol.BeginModify()
+-        for idx, (num, position) in enumerate(
+-            zip(step_atoms.get_atomic_numbers(), step_atoms.positions)
++        if (
++            self.pbc
++            and atomnumber >= _OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS
++            and self._orthorhombic_cell_lengths(cell) is not None
+         ):
+-            a = mol.NewAtom(idx)
+-            a.SetAtomicNum(int(num))
+-            a.SetVector(*position)
+-        # Apply period boundary conditions
+-        # openbabel#1853, supported in v3.1.0
+-        if self.pbc:
+-            uc = openbabel.OBUnitCell()
+-            uc.SetData(
+-                openbabel.vector3(cell[0][0], cell[0][1], cell[0][2]),
+-                openbabel.vector3(cell[1][0], cell[1][1], cell[1][2]),
+-                openbabel.vector3(cell[2][0], cell[2][1], cell[2][2]),
+-            )
+-            mol.CloneData(uc)
+-            mol.SetPeriodicMol()
+-        mol.ConnectTheDots()
+-        mol.PerceiveBondOrders()
+-        mol.EndModify()
+-        bond = [[] for i in range(atomnumber)]
+-        bondlevel = [[] for i in range(atomnumber)]
+-        for b in openbabel.OBMolBondIter(mol):
+-            s1 = b.GetBeginAtom().GetId()
+-            s2 = b.GetEndAtom().GetId()
+-            level = b.GetBondOrder()
+-            if level == 5:
+-                # aromatic, 5 in openbabel but 12 in rdkit
+-                level = 12
+-            bond[s1].append(s2)
+-            bond[s2].append(s1)
+-            bondlevel[s1].append(level)
+-            bondlevel[s2].append(level)
+-        return bond, bondlevel
++            accelerated = self._getbondfromperiodicneighborlist(step_atoms, cell)
++            if accelerated is not None:
++                return accelerated
++        return self._getbondfromopenbabel(step_atoms, cell)
+ 
+ 
+ @_Detect.register_subclass("dump")
+diff --git a/tests/test_detect.py b/tests/test_detect.py
+index bef442663..9ff21c3f5 100644
+--- a/tests/test_detect.py
++++ b/tests/test_detect.py
+@@ -8,6 +8,7 @@
+ import pytest
+ 
+ from reacnetgenerator import ReacNetGenerator
++from reacnetgenerator import _detect as detect_module
+ from reacnetgenerator._detect import _Detect
+ 
+ p_inputs = Path(__file__).parent / "inputs"
+@@ -111,6 +112,427 @@ def test_extxyz_uses_each_frames_lattice(self, tmp_path, mocker):
+ from reacnetgenerator._detect import _DetectLAMMPSdump
+ 
+ 
++@pytest.mark.skipif(not ASE_AVAILABLE, reason="ASE is not available")
++class TestPeriodicOpenBabelCandidates:
++    """Keep periodic cKDTree candidates equivalent to Open Babel."""
++
++    @pytest.fixture
++    def detect_instance(self):
++        """Create a periodic detector that retains Open Babel bond orders."""
++        rng = ReacNetGenerator(
++            inputfiletype="lammpsdumpfile",
++            inputfilename="dummy",
++            atomname=["H", "C", "N", "O", "F", "P", "Cl"],
++            pbc=True,
++            use_ase=False,
++            max_component_atoms=0,
++        )
++        return _DetectLAMMPSdump(rng)
++
++    @staticmethod
++    def _molecule_records(detect_instance, result):
++        assert result is not None
++        return detect_instance._connectmolecule(*result)
++
++    def _assert_matches_reference(self, detect_instance, atoms, cell):
++        """Return the accelerated result after checking molecule semantics."""
++        reference = detect_instance._getbondfromopenbabel(atoms, cell)
++        accelerated = detect_instance._getbondfromperiodicneighborlist(atoms, cell)
++
++        assert accelerated is not None
++        assert self._molecule_records(
++            detect_instance, accelerated
++        ) == self._molecule_records(detect_instance, reference)
++        return accelerated
++
++    @staticmethod
++    def _pad_to_acceleration_threshold(atoms, cell):
++        """Add isolated atoms with unique z values up to the dispatch threshold."""
++        padding_count = detect_module._OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS - len(
++            atoms
++        )
++        padding_indices = np.arange(padding_count)
++        grid_width = 13
++        padding_positions = np.column_stack(
++            (
++                100.0 + 5.0 * (padding_indices % grid_width),
++                100.0 + 5.0 * ((padding_indices // grid_width) % grid_width),
++                100.0
++                + 5.0 * (padding_indices // grid_width**2)
++                + 1e-6 * padding_indices,
++            )
++        )
++        return Atoms(
++            numbers=np.concatenate(
++                (atoms.get_atomic_numbers(), np.ones(padding_count, dtype=int))
++            ),
++            positions=np.vstack((atoms.positions, padding_positions)),
++            cell=cell,
++            pbc=True,
++        )
++
++    def test_matches_reference_across_periodic_boundary(self, detect_instance):
++        """Find neighbors on opposite faces without changing molecule records."""
++        cell = np.eye(3) * 12.0
++        atoms = Atoms(
++            "CHOH",
++            positions=[
++                [0.2, 1.0, 1.0],
++                [11.3, 1.0, 1.01],
++                [6.0, 6.0, 6.0],
++                [6.8, 6.0, 6.01],
++            ],
++            cell=cell,
++            pbc=True,
++        )
++
++        accelerated = self._assert_matches_reference(detect_instance, atoms, cell)
++        assert 1 in accelerated[0][0]
++
++    def test_matches_reference_when_openbabel_removes_excess_bonds(
++        self,
++        detect_instance,
++    ):
++        """Reuse Open Babel's valence and angle cleanup after candidate search."""
++        cell = np.eye(3) * 12.0
++        atoms = Atoms(
++            "CHHHHH",
++            positions=np.array(
++                [
++                    [6.00, 6.00, 6.000],
++                    [6.90, 6.00, 6.001],
++                    [5.05, 6.00, 6.002],
++                    [6.00, 7.00, 6.003],
++                    [6.00, 4.95, 6.004],
++                    [6.00, 6.00, 7.080],
++                ]
++            ),
++            cell=cell,
++            pbc=True,
++        )
++
++        self._assert_matches_reference(detect_instance, atoms, cell)
++
++    def test_falls_back_for_equal_z_coordinates(self, detect_instance):
++        """Leave backend-dependent equal-z insertion order to Open Babel."""
++        cell = np.eye(3) * 12.0
++        atoms = Atoms(
++            "CHHHHH",
++            positions=np.array(
++                [
++                    [6.00, 6.00, 6.00],
++                    [6.90, 6.00, 6.00],
++                    [5.05, 6.00, 6.00],
++                    [6.00, 7.00, 6.00],
++                    [6.00, 4.95, 6.00],
++                    [6.00, 6.00, 7.08],
++                ]
++            ),
++            cell=cell,
++            pbc=True,
++        )
++
++        assert detect_instance._getbondfromperiodicneighborlist(atoms, cell) is None
++
++    def test_large_equal_z_frame_matches_reference_through_fallback(
++        self,
++        detect_instance,
++    ):
++        """Preserve backend connectivity when a large frame contains z ties."""
++        cell = np.eye(3) * 200.0
++        angles = np.arange(6) * np.pi / 3.0
++        positions = np.concatenate(
++            (
++                [[20.0, 20.0, 20.0]],
++                np.column_stack(
++                    (
++                        20.0 + 1.6 * np.cos(angles),
++                        20.0 + 1.6 * np.sin(angles),
++                        np.full(6, 20.0),
++                    )
++                ),
++            )
++        )
++        atoms = self._pad_to_acceleration_threshold(
++            Atoms("PFFFFFH", positions=positions),
++            cell,
++        )
++
++        reference = detect_instance._getbondfromopenbabel(atoms, cell)
++        result = detect_instance._getbondfromcrd(atoms, cell)
++
++        assert detect_instance._getperiodicbondcandidates(atoms, cell) is None
++        assert self._molecule_records(
++            detect_instance, result
++        ) == self._molecule_records(detect_instance, reference)
++
++    def test_large_frame_with_zero_valence_atom_matches_reference(
++        self,
++        detect_instance,
++    ):
++        """Do not let a temporary argon bond remove a valid hydrogen bond."""
++        cell = np.eye(3) * 200.0
++        atoms = self._pad_to_acceleration_threshold(
++            Atoms(
++                "HHAr",
++                positions=[
++                    [20.0, 20.0, 20.000],
++                    [20.0, 20.0, 20.740],
++                    [20.0, 20.0, 18.300],
++                ],
++            ),
++            cell,
++        )
++
++        accelerated = self._assert_matches_reference(detect_instance, atoms, cell)
++        assert 1 in accelerated[0][0]
++
++    def test_large_frame_with_rounded_upper_boundary_falls_back(
++        self,
++        detect_instance,
++    ):
++        """Fall back when modulo rounding reaches cKDTree's excluded upper edge."""
++        cell = np.eye(3) * 200.0
++        atoms = self._pad_to_acceleration_threshold(
++            Atoms(
++                "HH",
++                positions=[
++                    [-1e-16, 20.0, 20.000],
++                    [0.74, 20.0, 20.001],
++                ],
++            ),
++            cell,
++        )
++
++        reference = detect_instance._getbondfromopenbabel(atoms, cell)
++        result = detect_instance._getbondfromcrd(atoms, cell)
++
++        assert detect_instance._getperiodicbondcandidates(atoms, cell) is None
++        assert self._molecule_records(
++            detect_instance, result
++        ) == self._molecule_records(detect_instance, reference)
++
++    def test_matches_reference_for_phosphorus_sixth_bond_rule(
++        self,
++        detect_instance,
++    ):
++        """Preserve Open Babel's element-specific phosphorus insertion rule."""
++        cell = np.eye(3) * 12.0
++        angles = np.arange(6) * np.pi / 3.0
++        positions = np.concatenate(
++            (
++                [[6.0, 6.0, 6.0]],
++                np.column_stack(
++                    (
++                        6.0 + 1.6 * np.cos(angles),
++                        6.0 + 1.6 * np.sin(angles),
++                        6.01 + np.arange(6) * 0.01,
++                    )
++                ),
++            )
++        )
++        atoms = Atoms("PFFFFFH", positions=positions, cell=cell, pbc=True)
++
++        accelerated = self._assert_matches_reference(detect_instance, atoms, cell)
++        assert accelerated[0][0] == [1, 2, 3, 4, 5]
++        assert accelerated[0][6] == []
++
++    @pytest.mark.parametrize("seed", range(3))
++    def test_matches_reference_for_seeded_mixed_elements(
++        self,
++        detect_instance,
++        seed,
++    ):
++        """Differentially cover insertion, cleanup, and bond-order perception."""
++        random = np.random.default_rng(seed)
++        atomic_numbers = random.choice(
++            np.array([1, 6, 7, 8, 9, 15, 17]),
++            size=96,
++        )
++        positions = random.uniform(0.0, 18.0, size=(96, 3))
++        cell = np.eye(3) * 18.0
++        atoms = Atoms(
++            numbers=atomic_numbers,
++            positions=positions,
++            cell=cell,
++            pbc=True,
++        )
++
++        self._assert_matches_reference(detect_instance, atoms, cell)
++
++    def test_benchmark_large_periodic_frame(self, detect_instance, benchmark):
++        """Benchmark real periodic dispatch after verifying molecule equivalence."""
++        random = np.random.default_rng(2026)
++        cell = np.eye(3) * 40.0
++        atoms = Atoms(
++            numbers=random.choice([1, 6, 7, 8], size=2048),
++            positions=random.uniform(0.0, 40.0, size=(2048, 3)),
++            cell=cell,
++            pbc=True,
++        )
++
++        assert len(atoms) >= detect_module._OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS
++        assert detect_instance._getperiodicbondcandidates(atoms, cell) is not None
++        reference = detect_instance._getbondfromopenbabel(atoms, cell)
++        result = detect_instance._getbondfromcrd(atoms, cell)
++        assert self._molecule_records(
++            detect_instance, result
++        ) == self._molecule_records(detect_instance, reference)
++
++        @benchmark
++        def bench():
++            return detect_instance._getbondfromcrd(atoms, cell)
++
++    @pytest.mark.parametrize(
++        ("atoms", "cell"),
++        [
++            (
++                Atoms("HH", positions=[[0, 0, 0], [0, 0, 1.07]]),
++                np.eye(3) * 10.0,
++            ),
++            (
++                Atoms("CH", positions=[[0, 0, 0], [1, 0, 0.1]]),
++                np.eye(3) * 2.0,
++            ),
++            (
++                Atoms("HH", positions=[[0, 0, 0], [np.nan, 0, 1.0]]),
++                np.eye(3) * 10.0,
++            ),
++            (
++                Atoms(numbers=[0, 1], positions=[[0, 0, 0], [0, 0, 1.0]]),
++                np.eye(3) * 10.0,
++            ),
++        ],
++        ids=[
++            "cutoff-boundary",
++            "narrow-cell",
++            "invalid-coordinate",
++            "invalid-radius",
++        ],
++    )
++    def test_falls_back_for_ambiguous_or_unsupported_geometry(
++        self,
++        detect_instance,
++        atoms,
++        cell,
++    ):
++        """Leave unsafe geometries to the historical Open Babel path."""
++        atoms.set_cell(cell)
++        atoms.set_pbc(True)
++
++        assert detect_instance._getbondfromperiodicneighborlist(atoms, cell) is None
++
++    @pytest.mark.parametrize(
++        "cell",
++        [
++            np.array(
++                [
++                    [10.0, 0.0, 0.0],
++                    [2.0, 9.0, 0.0],
++                    [1.0, 1.5, 8.0],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 10.0, 0.0],
++                    [-9.0, 0.0, 0.0],
++                    [0.0, 0.0, 8.0],
++                ]
++            ),
++            np.diag([10.0, 0.0, 10.0]),
++            np.diag([10.0, -9.0, 8.0]),
++            np.array(
++                [
++                    [np.nan, 0.0, 0.0],
++                    [0.0, 9.0, 0.0],
++                    [0.0, 0.0, 8.0],
++                ]
++            ),
++        ],
++        ids=["triclinic", "rotated", "zero-length", "negative-length", "nonfinite"],
++    )
++    def test_falls_back_for_unsupported_cells(self, detect_instance, cell):
++        """Leave unsupported cells to the reference implementation."""
++        atoms = Atoms("CHOH", positions=np.zeros((4, 3)), pbc=True)
++
++        assert detect_instance._getbondfromperiodicneighborlist(atoms, cell) is None
++
++    def test_dispatches_only_safe_large_periodic_frames(
++        self,
++        detect_instance,
++        monkeypatch,
++    ):
++        """Use cKDTree only above its crossover and preserve every fallback."""
++        atoms = Atoms("HH", positions=[[0, 0, 0], [0, 0, 1]], cell=np.eye(3) * 10)
++        accelerated = ([[1], [0]], [[1], [1]])
++        reference = ([[], []], [[], []])
++        calls = []
++        monkeypatch.setattr(
++            detect_module,
++            "_OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS",
++            2,
++        )
++        monkeypatch.setattr(
++            detect_instance,
++            "_getbondfromperiodicneighborlist",
++            lambda *args: calls.append("fast") or accelerated,
++        )
++        monkeypatch.setattr(
++            detect_instance,
++            "_getbondfromopenbabel",
++            lambda *args: calls.append("reference") or reference,
++        )
++
++        assert detect_instance._getbondfromcrd(atoms, np.eye(3) * 10) == accelerated
++        assert calls == ["fast"]
++
++        calls.clear()
++        monkeypatch.setattr(
++            detect_instance,
++            "_getbondfromperiodicneighborlist",
++            lambda *args: calls.append("fast") or None,
++        )
++        assert detect_instance._getbondfromcrd(atoms, np.eye(3) * 10) == reference
++        assert calls == ["fast", "reference"]
++
++        calls.clear()
++        monkeypatch.setattr(
++            detect_module,
++            "_OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS",
++            3,
++        )
++        assert detect_instance._getbondfromcrd(atoms, np.eye(3) * 10) == reference
++        assert calls == ["reference"]
++
++        calls.clear()
++        monkeypatch.setattr(
++            detect_module,
++            "_OPENBABEL_PERIODIC_NEIGHBOR_MIN_ATOMS",
++            2,
++        )
++        triclinic_cell = np.array(
++            [[10.0, 0.0, 0.0], [1.0, 10.0, 0.0], [0.0, 0.0, 10.0]]
++        )
++        assert detect_instance._getbondfromcrd(atoms, triclinic_cell) == reference
++        assert calls == ["reference"]
++
++        calls.clear()
++        detect_instance.pbc = False
++        assert detect_instance._getbondfromcrd(atoms, np.eye(3) * 10) == reference
++        assert calls == ["reference"]
++
++        calls.clear()
++        detect_instance.pbc = True
++        detect_instance.use_ase = True
++        monkeypatch.setattr(
++            detect_instance,
++            "_getbondfromase",
++            lambda *args: calls.append("ase") or accelerated,
++        )
++        assert detect_instance._getbondfromcrd(atoms, np.eye(3) * 10) == accelerated
++        assert calls == ["ase"]
++
++
+ class TestParseCustomCutoffs:
+     """Test the _parse_custom_cutoffs method."""
+ 

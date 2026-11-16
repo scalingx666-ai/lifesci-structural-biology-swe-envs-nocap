@@ -1,0 +1,230 @@
+diff --git a/e2e/no-run-script.spec.ts b/e2e/no-run-script.spec.ts
+new file mode 100644
+index 00000000..67f6115c
+--- /dev/null
++++ b/e2e/no-run-script.spec.ts
+@@ -0,0 +1,57 @@
++/**
++ * A script that defines analysis computes but never issues run/minimize
++ * (the library's "fly around the structure" examples) must still complete
++ * as a zero-step structure view. LAMMPS never initializes such computes, and
++ * invoking e.g. `compute rdf` in the final snapshot throws "Trying to build
++ * an occasional neighbor list before initialization is complete" — that must
++ * be absorbed, not reported as a failed run.
++ */
++
++import { test, expect } from "@playwright/test";
++import {
++  createFastLjProject,
++  gotoApp,
++  readContentsRecord,
++  waitForEngine,
++  waitRunCompleted,
++} from "./helpers";
++
++const NO_RUN_RDF_SCRIPT = `units lj
++lattice fcc 0.8442
++region box block 0 3 0 3 0 3
++create_box 1 box
++create_atoms 1 box
++mass 1 1.0
++pair_style lj/cut 2.5
++pair_coeff 1 1 1.0 1.0 2.5
++compute rdf all rdf 50
++fix 1 all nve
++print "structure only"
++`;
++
++test("a script with computes but no run completes as a structure view", async ({
++  page,
++}) => {
++  await gotoApp(page);
++  await createFastLjProject(
++    page,
++    "No run",
++    "no-run",
++    "in.structure",
++    NO_RUN_RDF_SCRIPT,
++  );
++  await waitForEngine(page);
++  await page.getByTestId("editor-save-and-run").click();
++  await waitRunCompleted(page);
++  await expect(page.getByTestId("status-pill-failed")).toHaveCount(0);
++  // The final snapshot still captured the initialized structure.
++  await expect(page.getByTestId("run-frame")).toBeVisible();
++  const meta = await readContentsRecord(
++    page,
++    "no-run/runs/run-001/.atomify/run.json",
++  );
++  expect(meta?.content).toMatchObject({
++    status: "completed",
++    stats: { timesteps: 0, numAtoms: 108 },
++  });
++});
+diff --git a/src/wasm/lammpsAdapter.test.ts b/src/wasm/lammpsAdapter.test.ts
+new file mode 100644
+index 00000000..4de763f9
+--- /dev/null
++++ b/src/wasm/lammpsAdapter.test.ts
+@@ -0,0 +1,72 @@
++import { describe, it, expect, vi } from "vitest";
++import type {
++  LAMMPSWeb as NativeLammps,
++  ModifierInfo,
++  ModifierSnapshot,
++} from "lammps.js";
++import { LammpsAdapter } from "./lammpsAdapter";
++import type { AtomifyWasmModule } from "./types";
++
++const info = (
++  category: ModifierInfo["category"],
++  name: string,
++  style: string,
++): ModifierInfo => ({
++  name,
++  category,
++  style,
++  isPerAtom: false,
++  hasScalar: true,
++  clearPerSync: false,
++  xLabel: "",
++  yLabel: "",
++});
++
++const snapshot = (base: ModifierInfo, scalar: number): ModifierSnapshot => ({
++  ...base,
++  scalar,
++  series: [],
++});
++
++describe("LammpsAdapter.snapshotModifiers", () => {
++  it("skips a modifier LAMMPS cannot invoke yet and keeps the rest", () => {
++    // Arrange: a script that defined `compute rdf` but never ran, so LAMMPS
++    // never initialized it. Invoking it throws (embind surfaces LAMMPS
++    // errors as a raw exception pointer) — the post-run snapshot must not
++    // let that error fail the run.
++    const rdf = info("compute", "rdf", "rdf");
++    const temp = info("compute", "thermo_temp", "temp");
++    const syncModifier = vi.fn(
++      (category: ModifierInfo["category"], name: string) => {
++        if (name === "rdf") throw 2665104;
++        if (name === "thermo_temp") return snapshot(temp, 300);
++        return null;
++      },
++    );
++    const native: Partial<NativeLammps> = {
++      setAsyncStepCallback: vi.fn(),
++      syncModifiers: vi.fn(),
++      listModifiers: vi.fn(() => [rdf, temp]),
++      syncModifier,
++    };
++    const module: Partial<AtomifyWasmModule> = {
++      HEAPF32: new Float32Array(0),
++      HEAPF64: new Float64Array(0),
++    };
++    const adapter = new LammpsAdapter(
++      module as AtomifyWasmModule,
++      native as NativeLammps,
++    );
++
++    // Act
++    const { modifiers } = adapter.snapshotModifiers(null, 0);
++
++    // Assert: both are reported; the uninitialized one falls back to its
++    // static info with no data, the other carries its synced value.
++    expect(modifiers.map((m) => m.name)).toEqual(["rdf", "thermo_temp"]);
++    expect(modifiers[0]).toMatchObject({ scalar: 0, series: [] });
++    expect(modifiers[1]).toMatchObject({ scalar: 300 });
++    expect(syncModifier).toHaveBeenCalledWith("compute", "rdf");
++    expect(syncModifier).toHaveBeenCalledWith("compute", "thermo_temp");
++  });
++});
+diff --git a/src/wasm/lammpsAdapter.ts b/src/wasm/lammpsAdapter.ts
+index 7c81ad96..6fa00f8c 100644
+--- a/src/wasm/lammpsAdapter.ts
++++ b/src/wasm/lammpsAdapter.ts
+@@ -132,7 +132,13 @@ class ModifierAdapter implements LMPModifier {
+   execute = () => true;
+ 
+   sync = () => {
+-    this.snapshot = this.native.syncModifier(this.category, this.name);
++    // A modifier LAMMPS cannot invoke yet (never-initialized compute) throws;
++    // keep the last snapshot rather than surfacing it as a run failure.
++    try {
++      this.snapshot = this.native.syncModifier(this.category, this.name);
++    } catch {
++      /* no data yet */
++    }
+   };
+ 
+   getData1DNames = () =>
+@@ -635,6 +641,29 @@ export class LammpsAdapter implements LammpsWeb {
+    * the proxy replays it through lightweight LMPModifier-shaped objects.
+    * Must run in the synchronous step window (touches the heap).
+    */
++  /**
++   * Invoke and sync one modifier, treating a LAMMPS error as "no data yet".
++   *
++   * The final snapshot the worker takes after every script (so `run 0`
++   * structure views get a frame) can reach computes LAMMPS never
++   * initialized: a script without any run/minimize never calls init(), so
++   * e.g. `compute rdf` has no neighbor list and invoking it throws "Trying
++   * to build an occasional neighbor list before initialization is
++   * complete". LAMMPS errors are recoverable exceptions in library mode, so
++   * skip that modifier (the caller falls back to its static info) instead of
++   * failing the whole snapshot — and with it the run.
++   */
++  private trySyncModifier(
++    category: ModifierCategory,
++    name: string,
++  ): ModifierSnapshot | null {
++    try {
++      return this.native.syncModifier(category, name);
++    } catch {
++      return null;
++    }
++  }
++
+   snapshotModifiers(
+     perAtomTarget: { category: ModifierCategory; name: string } | null,
+     particleCount: number,
+@@ -647,10 +676,9 @@ export class LammpsAdapter implements LammpsWeb {
+     this.native.syncModifiers();
+     let infos = this.native.listModifiers();
+     const hasNativeRadii =
+-      this.native.syncModifier("variable", this.radiusFlagName)?.scalar === 1;
++      this.trySyncModifier("variable", this.radiusFlagName)?.scalar === 1;
+     let radii: Float32Array | null = null;
+-    if (hasNativeRadii) {
+-      this.native.syncModifier("variable", this.radiusName);
++    if (hasNativeRadii && this.trySyncModifier("variable", this.radiusName)) {
+       const view = this.native.getModifierPerAtom("variable", this.radiusName);
+       radii = new Float32Array(
+         this.module.HEAPF64.subarray(view.ptr / 8, view.ptr / 8 + view.length),
+@@ -665,7 +693,7 @@ export class LammpsAdapter implements LammpsWeb {
+     this.modifierInfos = infos;
+ 
+     const modifiers: WorkerModifierData[] = infos.map((info) => {
+-      const snap = this.native.syncModifier(info.category, info.name);
++      const snap = this.trySyncModifier(info.category, info.name);
+       const series = (snap?.series ?? []).map((s) => {
+         const xBase = s.x.ptr / 4;
+         const yBase = s.y.ptr / 4;
+@@ -703,7 +731,7 @@ export class LammpsAdapter implements LammpsWeb {
+     const activeGroups = new Map(
+       [...this.groups].filter(
+         ([, group]) =>
+-          this.native.syncModifier("variable", group.flag)?.scalar === 1,
++          this.trySyncModifier("variable", group.flag)?.scalar === 1,
+       ),
+     );
+     for (const [name] of activeGroups) {
+@@ -756,7 +784,7 @@ export class LammpsAdapter implements LammpsWeb {
+         continue;
+       }
+       const group = activeGroups.get(names[bit])!;
+-      this.native.syncModifier("variable", group.values);
++      if (!this.trySyncModifier("variable", group.values)) continue;
+       const view = this.native.getModifierPerAtom("variable", group.values);
+       const values = this.module.HEAPF64.subarray(
+         view.ptr / 8,

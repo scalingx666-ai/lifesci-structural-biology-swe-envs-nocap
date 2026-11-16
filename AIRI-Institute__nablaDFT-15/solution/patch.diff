@@ -1,0 +1,406 @@
+diff --git a/config/datamodule/nablaDFT_ase.yaml b/config/datamodule/nablaDFT_ase.yaml
+index 82c355a..7b10ea7 100644
+--- a/config/datamodule/nablaDFT_ase.yaml
++++ b/config/datamodule/nablaDFT_ase.yaml
+@@ -2,6 +2,7 @@
+ _target_: nablaDFT.dataset.NablaDFT
+ 
+ type_of_nn: ASE
++split: ${job_type}
+ datapath: ./datasets/nablaDFT/train/raw
+ dataset_name: ${dataset_name}
+ data_workdir: ./spk_logs
+diff --git a/config/datamodule/nablaDFT_ase_test.yaml b/config/datamodule/nablaDFT_ase_test.yaml
+index 09878bb..3907e44 100644
+--- a/config/datamodule/nablaDFT_ase_test.yaml
++++ b/config/datamodule/nablaDFT_ase_test.yaml
+@@ -2,6 +2,7 @@
+ _target_: nablaDFT.dataset.NablaDFT
+ 
+ type_of_nn: ASE
++split: ${job_type}
+ datapath: ./datasets/nablaDFT/test/raw
+ dataset_name: ${dataset_name}
+ data_workdir: ./spk_logs
+diff --git a/nablaDFT/ase_model/task.py b/nablaDFT/ase_model/task.py
+index bcc25f7..2e90685 100644
+--- a/nablaDFT/ase_model/task.py
++++ b/nablaDFT/ase_model/task.py
+@@ -4,6 +4,7 @@
+ import schnetpack as spk
+ import torch
+ from schnetpack.model.base import AtomisticModel
++from schnetpack.task import UnsupervisedModelOutput
+ from torch import nn
+ 
+ 
+@@ -35,6 +36,22 @@ def __init__(
+         self.warmup_steps = warmup_steps
+         self.save_hyperparameters(ignore=["model"])
+ 
++    def predict_step(self, batch, batch_idx):
++        torch.set_grad_enabled(self.grad_enabled)
++
++        targets = {
++            output.target_property: batch[output.target_property]
++            for output in self.outputs
++            if not isinstance(output, UnsupervisedModelOutput)
++        }
++        try:
++            targets["considered_atoms"] = batch["considered_atoms"]
++        except:
++            pass
++        pred = self.predict_without_postprocessing(batch)
++        pred, targets = self.apply_constraints(pred, targets)
++        return pred
++
+     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+         # reshape model.postprocessors (AddOffsets)
+         #  otherwise during test error will occur
+diff --git a/nablaDFT/dataset/atoms_datamodule.py b/nablaDFT/dataset/atoms_datamodule.py
+new file mode 100644
+index 0000000..b3130a5
+--- /dev/null
++++ b/nablaDFT/dataset/atoms_datamodule.py
+@@ -0,0 +1,154 @@
++# Overrided AtomsDataModule from SchNetPack
++from copy import copy
++from typing import List, Dict, Optional, Union
++
++import pytorch_lightning as pl
++import torch
++
++from schnetpack.data import (
++    AtomsDataFormat,
++    load_dataset,
++    AtomsLoader,
++    SplittingStrategy,
++    AtomsDataModule
++)
++
++
++class AtomsDataModule(AtomsDataModule):
++    """
++    Overrided AtomsDataModule from SchNetPack with additional
++    methods for prediction task.
++    """
++
++    def __init__(
++        self,
++        split: str,
++        datapath: str,
++        batch_size: int,
++        num_train: Union[int, float] = None,
++        num_val: Union[int, float] = None,
++        num_test: Optional[Union[int, float]] = None,
++        split_file: Optional[str] = "split.npz",
++        format: Optional[AtomsDataFormat] = None,
++        load_properties: Optional[List[str]] = None,
++        val_batch_size: Optional[int] = None,
++        test_batch_size: Optional[int] = None,
++        transforms: Optional[List[torch.nn.Module]] = None,
++        train_transforms: Optional[List[torch.nn.Module]] = None,
++        val_transforms: Optional[List[torch.nn.Module]] = None,
++        test_transforms: Optional[List[torch.nn.Module]] = None,
++        num_workers: int = 8,
++        num_val_workers: Optional[int] = None,
++        num_test_workers: Optional[int] = None,
++        property_units: Optional[Dict[str, str]] = None,
++        distance_unit: Optional[str] = None,
++        data_workdir: Optional[str] = None,
++        cleanup_workdir_stage: Optional[str] = "test",
++        splitting: Optional[SplittingStrategy] = None,
++        pin_memory: Optional[bool] = False,
++    ):
++        """
++        Args:
++            split: string contains type of task/dataset, must be one of ['train', 'test', 'predict']
++            datapath: path to dataset
++            batch_size: (train) batch size
++            num_train: number of training examples (absolute or relative)
++            num_val: number of validation examples (absolute or relative)
++            num_test: number of test examples (absolute or relative)
++            split_file: path to npz file with data partitions
++            format: dataset format
++            load_properties: subset of properties to load
++            val_batch_size: validation batch size. If None, use test_batch_size, then
++                batch_size.
++            test_batch_size: test batch size. If None, use val_batch_size, then
++                batch_size.
++            transforms: Preprocessing transform applied to each system separately before
++                batching.
++            train_transforms: Overrides transform_fn for training.
++            val_transforms: Overrides transform_fn for validation.
++            test_transforms: Overrides transform_fn for testing.
++            num_workers: Number of data loader workers.
++            num_val_workers: Number of validation data loader workers
++                (overrides num_workers).
++            num_test_workers: Number of test data loader workers
++                (overrides num_workers).
++            property_units: Dictionary from property to corresponding unit as a string
++                (eV, kcal/mol, ...).
++            distance_unit: Unit of the atom positions and cell as a string
++                (Ang, Bohr, ...).
++            data_workdir: Copy data here as part of setup, e.g. to a local file
++                system for faster performance.
++            cleanup_workdir_stage: Determines after which stage to remove the data
++                workdir
++            splitting: Method to generate train/validation/test partitions
++                (default: RandomSplit)
++            pin_memory: If true, pin memory of loaded data to GPU. Default: Will be
++                set to true, when GPUs are used.
++        """
++        super().__init__(
++            datapath=datapath,
++            batch_size=batch_size,
++            num_train=num_train,
++            num_val=num_val,
++            num_test=num_test,
++            split_file=split_file,
++            format=format,
++            load_properties=load_properties,
++            val_batch_size=val_batch_size,
++            test_batch_size=test_batch_size,
++            transforms=transforms,
++            train_transforms=train_transforms,
++            val_transforms=val_transforms,
++            test_transforms=test_transforms,
++            num_workers=num_workers,
++            num_val_workers=num_val_workers,
++            num_test_workers=num_test_workers,
++            property_units=property_units,
++            distance_unit=distance_unit,
++            data_workdir=data_workdir,
++            cleanup_workdir_stage=cleanup_workdir_stage,
++            splitting=splitting,
++            pin_memory=pin_memory
++        )
++        self.split = split
++        self._predict_dataloader = None
++        
++    def setup(self, stage: Optional[str] = None):
++        # check whether data needs to be copied
++        if self.data_workdir is None:
++            datapath = self.datapath
++        else:
++            datapath = self._copy_to_workdir()
++        # (re)load datasets
++        if self.dataset is None:
++            self.dataset = load_dataset(
++                datapath,
++                self.format,
++                property_units=self.property_units,
++                distance_unit=self.distance_unit,
++                load_properties=self.load_properties,
++            )
++
++            # load and generate partitions if needed
++            if self.train_idx is None:
++                self._load_partitions()
++
++            # partition dataset
++            self._train_dataset = self.dataset.subset(self.train_idx)
++            self._val_dataset = self.dataset.subset(self.val_idx)
++            if self.split == "preidct":
++                self._predict_dataset = self.dataset.subset(self.test_idx)
++            else:
++                self._test_dataset = self.dataset.subset(self.test_idx)
++            self._setup_transforms()
++
++    def predict_dataloader(self) -> AtomsLoader:
++        if self._predict_dataloader is None:
++            self._predict_dataloader = AtomsLoader(
++                self.test_dataset,
++                batch_size=self.test_batch_size,
++                num_workers=self.num_test_workers,
++                pin_memory=self._pin_memory,
++                shuffle=False
++            )
++        return self._predict_dataloader
+diff --git a/nablaDFT/dataset/nablaDFT_dataset.py b/nablaDFT/dataset/nablaDFT_dataset.py
+index 8d2ae77..369f53a 100644
+--- a/nablaDFT/dataset/nablaDFT_dataset.py
++++ b/nablaDFT/dataset/nablaDFT_dataset.py
+@@ -9,8 +9,11 @@
+ from torch.utils.data import Subset
+ from torch_geometric.data.lightning import LightningDataset
+ from torch_geometric.data import InMemoryDataset, Data
+-from schnetpack.data import AtomsDataFormat, AtomsDataModule, load_dataset
++from schnetpack.data import AtomsDataFormat, load_dataset
++
+ import nablaDFT
++from nablaDFT.dataset.atoms_datamodule import AtomsDataModule
++
+ 
+ 
+ from nablaDFT.phisnet.training.hamiltonian_dataset import HamiltonianDataset
+@@ -20,6 +23,7 @@
+ class ASENablaDFT(AtomsDataModule):
+     def __init__(
+         self,
++        split: str,
+         dataset_name: str = "dataset_train_2k",
+         datapath: str = "database",
+         data_workdir: Optional[str] = "logs",
+@@ -34,6 +38,7 @@ def __init__(
+         **kwargs,
+     ):
+         super().__init__(
++            split=split,
+             datapath=datapath,
+             data_workdir=data_workdir,
+             batch_size=batch_size,
+@@ -53,15 +58,18 @@ def prepare_data(self):
+         suffix = os.path.splitext(self.datapath)[1]
+         if not os.path.exists(datapath_with_no_suffix):
+             os.makedirs(datapath_with_no_suffix)
+-        with open(nablaDFT.__path__[0] + "/links/energy_databases_v2.json") as f:
+-            data = json.load(f)
+-            if self.train_ratio != 0:
+-                url = data["train_databases"][self.dataset_name]
+-            else:
+-                url = data["test_databases"][self.dataset_name]
+         self.datapath = datapath_with_no_suffix + "/" + self.dataset_name + suffix
+-        if not os.path.exists(self.datapath):  # skip if already downloaded
+-            request.urlretrieve(url, self.datapath)
++        exists = os.path.exists(self.datapath)
++        if self.split == "predict" and not exists:
++            raise FileNotFoundError("Specified dataset not found")
++        elif self.split != "predict" and not exists:
++            with open(nablaDFT.__path__[0] + "/links/energy_databases_v2.json") as f:
++                data = json.load(f)
++                if self.train_ratio != 0:
++                    url = data["train_databases"][self.dataset_name]
++                else:
++                    url = data["test_databases"][self.dataset_name]
++                request.urlretrieve(url, self.datapath)
+         with connect(self.datapath) as ase_db:
+             if not ase_db.metadata:
+                 atomrefs = np.load(
+@@ -305,15 +313,22 @@ def get_PyG_nablaDFT_datasets(
+         train_dataset = Subset(dataset, idx_train)
+         val_dataset = Subset(dataset, idx_val)
+         test_dataset = None
++        pred_dataset = None
+     else:
+         train_dataset = None
+         val_dataset = None
+-        test_dataset = dataset
++        if split == "predict":
++            pred_dataset = dataset
++            test_dataset = None
++        else:
++            test_dataset = dataset
++            pred_dataset = None
+ 
+     pl_datamodule = LightningDataset(
+         train_dataset=train_dataset,
+         val_dataset=val_dataset,
+         test_dataset=test_dataset,
++        pred_dataset=pred_dataset,
+         batch_size=batch_size,
+         num_workers=num_workers,
+         pin_memory=True,
+diff --git a/nablaDFT/graphormer/graphormer_3d.py b/nablaDFT/graphormer/graphormer_3d.py
+index 4082fd9..1e970c7 100644
+--- a/nablaDFT/graphormer/graphormer_3d.py
++++ b/nablaDFT/graphormer/graphormer_3d.py
+@@ -456,7 +456,7 @@ def test_step(self, batch, batch_idx):
+         return loss
+ 
+     def predict_step(self, data, **kwargs):
+-        energy_out, forces_out = self(data)
++        energy_out, forces_out, _ = self(data)
+         return energy_out, forces_out
+ 
+     def configure_optimizers(self):
+diff --git a/nablaDFT/pipelines.py b/nablaDFT/pipelines.py
+index 91442cc..835b1ec 100644
+--- a/nablaDFT/pipelines.py
++++ b/nablaDFT/pipelines.py
+@@ -3,6 +3,7 @@
+ 
+ import hydra
+ from omegaconf import DictConfig
++import torch
+ from pytorch_lightning.loggers import Logger
+ from pytorch_lightning import (
+     LightningDataModule,
+@@ -13,21 +14,55 @@
+ )
+ 
+ from nablaDFT.utils import close_loggers, load_model
+-from nablaDFT.dataset import NablaDFT
++
++
++JOB_TYPES = ['train', 'test', 'predict', 'optimize']
++
++
++def predict(trainer: Trainer,
++            model: LightningModule,
++            datamodule: LightningDataModule,
++            ckpt_path: str,
++            config: DictConfig
++        ):
++    """Function for prediction loop execution.
++       Saves model prediction to "predictions" directory.
++    """
++    trainer.logger = False # need this to disable save_hyperparameters during predict, otherwise OmegaConf DictConf can't be dumped to YAML
++    pred_path = os.path.join(os.getcwd(), "predictions")
++    os.makedirs(pred_path, exist_ok=True)
++    predictions = trainer.predict(model=model, datamodule=datamodule.dataset, ckpt_path=ckpt_path)
++    torch.save(predictions, f"{pred_path}/{config.name}_{config.dataset_name}.pt")
++
++def optimize(config: DictConfig):
++    """Function for batched molecules optimization.
++       Uses model defined in config.
++    """
++    pass
+ 
+ 
+ def run(config: DictConfig):
+     if config.get("seed"):
+         seed_everything(config.seed)
+     job_type = config.get("job_type")
++    if job_type not in JOB_TYPES:
++        raise ValueError(f"job_type must be one of {JOB_TYPES}, got {job_type}")
++    if job_type == "optimize":
++        optimize(config)
++
+     if config.get("ckpt_path"):
+         ckpt_path = os.path.join(
+             hydra.utils.get_original_cwd(), config.get("ckpt_path")
+         )
+     else:
+         ckpt_path = None
+-    if job_type == "test" and ckpt_path is not None:
+-        model = load_model(config, ckpt_path)
++    if job_type in ["test", "predict"]:
++        if ckpt_path is None:
++            raise RuntimeError(
++                f"Job type is {job_type}, but ckpt_path is {ckpt_path}. Specify checkpoint path in model config"
++            )
++        else:
++            model = load_model(config, ckpt_path)
+     else:
+         model: LightningModule = hydra.utils.instantiate(config.model)
+     # Callbacks
+@@ -44,13 +79,14 @@ def run(config: DictConfig):
+     )
+     # Datamodule
+     datamodule: LightningDataModule = hydra.utils.instantiate(config.datamodule)
+-
+-    if job_type == "train":
++    if job_type == 'train':
+         trainer.fit(model=model, datamodule=datamodule.dataset, ckpt_path=ckpt_path)
+-    else:
++    elif job_type == 'test':
+         trainer.test(model=model, datamodule=datamodule.dataset, ckpt_path=ckpt_path)
+-
++    elif job_type == 'predict':
++        predict(trainer, model, datamodule, ckpt_path, config)
+     # Finalize
+     close_loggers(
+         logger=loggers,
+     )
++

@@ -1,0 +1,385 @@
+diff --git a/meeko/molsetup.py b/meeko/molsetup.py
+index 07eb8a17..7ad5b764 100644
+--- a/meeko/molsetup.py
++++ b/meeko/molsetup.py
+@@ -1900,6 +1900,13 @@ def get_smiles_and_order(self):
+         order = json.loads(order_string)  # mol_noH to smiles
+         order = list(np.argsort(order))
+         order = {noH_to_H[i]: order[i] + 1 for i in range(len(order))}  # 1-index
++        
++        # remove polar hydrogen isotopes from order 
++        # this prevents them to appear in SMILES IDX but rather in H PARENT
++        for atom in mol_noH.GetAtoms():
++            if atom.GetAtomicNum() == 1 and atom.GetIsotope() > 0:
++                order.pop(atom.GetIdx())
++        
+         return smiles, order
+ 
+     # region Ring Construction
+diff --git a/meeko/rdkit_mol_create.py b/meeko/rdkit_mol_create.py
+index c98ae077..0e1637b2 100644
+--- a/meeko/rdkit_mol_create.py
++++ b/meeko/rdkit_mol_create.py
+@@ -8,6 +8,7 @@
+ from rdkit import Chem
+ from rdkit.Geometry import Point3D
+ from rdkit.Chem import AllChem
++from meeko.utils.rdkitutils import set_h_isotope_atom_coords
+ from io import StringIO
+ import json
+ 
+@@ -321,17 +322,19 @@ def add_pose_to_mol(cls, mol, ligand_coordinates, index_map):
+             x, y, z = [float(coord) for coord in ligand_coordinates[pdbqt_index]]
+             conf.SetAtomPosition(mol_index, Point3D(x, y, z))
+             coord_is_set[mol_index] = True
+-        mol.AddConformer(conf, assignId=True)
++
+         # some hydrogens (isotopes) may have no coordinate set yet
++        h_isotope_pos_assignment = set_h_isotope_atom_coords(mol, conf = conf)
++        if h_isotope_pos_assignment:
++            for idx in h_isotope_pos_assignment: 
++                conf.SetAtomPosition(idx, h_isotope_pos_assignment[idx])
++                coord_is_set[idx] = True
++        mol.AddConformer(conf, assignId=True)
++        
+         for i, is_set in enumerate(coord_is_set):
+             if not is_set:
+-                atom = mol.GetAtomWithIdx(i)
+-                if atom.GetAtomicNum() != 1:
+-                    raise RuntimeError("Only H allowed to be in SMILES but not in PDBQT")
+-                neigh = atom.GetNeighbors()
+-                if len(neigh) != 1:
+-                    raise RuntimeError("Expected H to have one neighbor")
+-                AllChem.SetTerminalAtomCoords(mol, i, neigh[0].GetIdx())
++                raise RuntimeError(f"Unable to set position for atom # {i} from docked pose in the created RDKit mol. ")
++
+         return mol
+     
+     
+@@ -494,4 +497,4 @@ def write_sd_string(pdbqt_mol, only_cluster_leads=False, keep_flexres=False):
+             f.write(combined_mol, i)
+         f.close()
+         output_string = sio.getvalue()
+-        return output_string, failures
++        return output_string, failures
+\ No newline at end of file
+diff --git a/meeko/utils/rdkitutils.py b/meeko/utils/rdkitutils.py
+index 8c8851d1..1eb89e83 100644
+--- a/meeko/utils/rdkitutils.py
++++ b/meeko/utils/rdkitutils.py
+@@ -20,7 +20,215 @@
+ source: https://sourceforge.net/p/rdkit/mailman/message/36404394/
+ """
+ 
++def set_h_isotope_atom_coords(mol: Chem.Mol, conf: Chem.Conformer) -> dict[int, Point3D]: 
+ 
++    """
++    use AddHs() and RemoveHs() to generate H isotopes coordinates
++    in a mol copy as if they were regular Hs
++    returns a dict of H isotope atom idx and assigned position as Point3D
++    """
++
++    # check if molecule has H isotopes
++    def is_h_isotope(atom: Chem.Atom) -> bool:
++        return atom.GetAtomicNum() == 1 and atom.GetIsotope() > 0
++    def has_h_isotopes(mol: Chem.Mol) -> bool:
++        for atom in mol.GetAtoms():
++            if is_h_isotope(atom):
++                return True
++        return False
++    
++    if not has_h_isotopes(mol): 
++        return {}
++    
++    # create a nested dictionary for index mapping, isotope type and chirality flag
++    def get_h_isotope_data(mol: Chem.Mol) -> dict: 
++        """
++        example output: 
++        isotope_data = {
++            'H_isotope_idx': {  
++                1: {'parent': 0, 'Isotope': 2}, 
++                2: {'parent': 0, 'Isotope': 3}, 
++                3: {'parent': 4, 'Isotope': 3}, 
++            },
++            'parent_idx': {  
++                0: {'kids': [1, 2], 'CIPCode': 'R'}, 
++                4: {'kids': [3], 'CIPCode': None}, 
++            }
++        }
++        """
++        
++        # initialize 
++        isotope_data = {
++            'H_isotope_idx': {}, 
++            'parent_idx': {}
++        }
++        H_isotope_idxs = [
++            atom.GetIdx() for atom in mol.GetAtoms() 
++            if is_h_isotope(atom)
++        ]
++        parent_idxs = []
++        
++        # populate H_isotope section
++        for idx in H_isotope_idxs: 
++            atom = mol.GetAtomWithIdx(idx)
++            parent_idx = [nei.GetIdx() for nei in atom.GetNeighbors()][0]
++            isotope_data['H_isotope_idx'][idx] = {
++                'parent': parent_idx, 'Isotope': atom.GetIsotope()
++            }
++            if parent_idx not in parent_idxs:
++                parent_idxs.append(parent_idx)
++        
++        # re-compute CIP labels in a copy
++        mol_copy = Chem.Mol(mol)
++        Chem.rdCIPLabeler.AssignCIPLabels(mol_copy)
++        
++        # populate parent section
++        for idx in parent_idxs: 
++            atom = mol.GetAtomWithIdx(idx)
++            kids = [nei.GetIdx() for nei in atom.GetNeighbors() if is_h_isotope(nei)]
++            cip_code = atom.GetProp("_CIPCode") if atom.HasProp("_CIPCode") else None
++            isotope_data['parent_idx'][idx] = {
++                'kids': kids, 'CIPCode': cip_code
++            }
++
++        return isotope_data
++    
++    isotope_data = get_h_isotope_data(mol)
++    H_isotope_idxs = list(isotope_data["H_isotope_idx"].keys())
++    parent_idxs = list(isotope_data["parent_idx"].keys())
++
++    # in an editable copy, remove isotopes and convert to explicit Hs
++    editable_mol = Chem.RWMol(mol)
++    idxs_to_remove = sorted(H_isotope_idxs, reverse=True)
++    for idx in idxs_to_remove:
++        parent_atom = editable_mol.GetAtomWithIdx(
++            isotope_data['H_isotope_idx'][idx]['parent']
++        )
++        editable_mol.RemoveAtom(idx)
++        parent_atom.SetNumExplicitHs(parent_atom.GetNumExplicitHs() + 1)
++    copy_mol = editable_mol.GetMol()
++
++    # track idx shift after isotope removal
++    # mapping original idx to shifted idx
++    atom_idx_trace = {}
++    shifted_conf = Chem.Conformer(copy_mol.GetNumAtoms())
++    for i in range(mol.GetNumAtoms()): 
++        if i not in idxs_to_remove: 
++            shift = len([idx for idx in idxs_to_remove if idx < i])
++            atom_idx_trace[i] = i - shift
++            # make a conformer copy with shifted idx
++            atom_idx_shifted,  atom_idx_original = (atom_idx_trace[i], i)
++            shifted_conf.SetAtomPosition(atom_idx_shifted, 
++                                        conf.GetAtomPosition(atom_idx_original))
++    
++    # reset conformers, setup new conformer in mol copy, add Hs
++    copy_mol.RemoveAllConformers()
++    copy_mol.AddConformer(shifted_conf)
++    copy_mol = Chem.AddHs(copy_mol, addCoords=True)
++
++    # reorder atoms, make sure to have regular Hs at the isotopes positions
++    # as placeholders in order to restore the original ordering of all 
++    # heavy atoms AND explicit H isotopes
++    placeholders = {}
++    for parent_idx in isotope_data["parent_idx"]: 
++        # get current (shifted) idx of parent atom that has isotope kids
++        parent_idx_shifted = atom_idx_trace[parent_idx]
++        # get parent atom
++        parent_atom = copy_mol.GetAtomWithIdx(parent_idx_shifted)
++        # get isotope kids' original idxs
++        isotope_kid_idxs = isotope_data["parent_idx"][parent_idx]["kids"]
++        # get just enough current (shifted) idxs of avail kids of the parent atom
++        avail_kids_idxs_shifted = [kid.GetIdx() for kid in parent_atom.GetNeighbors() 
++                                   if kid.GetAtomicNum()==1][:len(isotope_kid_idxs)]
++        # re-order move these regular Hs
++        for i in range(len(isotope_kid_idxs)): 
++            # for the absent isotope (key)
++            # move avail regular H (value) to the position as a placeholder
++            placeholders[isotope_kid_idxs[i]] = avail_kids_idxs_shifted[i]
++    # merge the expected ordering placeholders into the tracked idx of heavy atoms
++    # so we get the mapping to restore the original ordering of all heavy atoms
++    # AND explicit H isotopes 
++    atom_idx_trace = placeholders | atom_idx_trace
++    # prepare a list of wanted order
++    wanted_order = [v for k, v in sorted(atom_idx_trace.items())]
++    # extend the list with no additional moves of un-used hydrogens
++    for i in range(copy_mol.GetNumAtoms()): 
++        if i not in wanted_order: 
++            wanted_order.append(i)
++    # re-order and overwrite the copy_mol
++    copy_mol = Chem.RenumberAtoms(copy_mol, wanted_order)
++    copy_conf = copy_mol.GetConformer()
++
++    # assign H isotope coordinates from the regularized equivalent H
++    assigned_isotope_pos = {}
++    for parent_idx in parent_idxs:
++
++        # get parent atom in mol copy
++        parent_atom = copy_mol.GetAtomWithIdx(parent_idx)
++        # get avail Hs of parent atom
++        kids_all = [nei for nei in parent_atom.GetNeighbors() if nei.GetAtomicNum() == 1]
++        # get regular Hs idx
++        kids_idxs_all = [nei.GetIdx() for nei in kids_all]
++        
++        # initial assignment, in an uncontrolled order
++        for ik, kid in enumerate(isotope_data['parent_idx'][parent_idx]['kids']):
++            copy_mol.GetAtomWithIdx(kids_idxs_all[ik]).SetIsotope(
++                isotope_data["H_isotope_idx"][kid]['Isotope']
++            )
++            assigned_isotope_pos[kid] = copy_conf.GetAtomPosition(kids_idxs_all[ik])
++        
++        # make correction to recover CIPCode (chirality)
++        expected_cip_code = isotope_data['parent_idx'][parent_idx]['CIPCode']
++        if len(kids_all) >1 and expected_cip_code is not None: 
++            # evalaute current CIPCode from 3D
++            Chem.AssignStereochemistryFrom3D(copy_mol)
++            current_cip_code = parent_atom.GetProp('_CIPCode') if parent_atom.HasProp('_CIPCode') else None
++            if current_cip_code==expected_cip_code: 
++                continue
++            # get a list of isotope types on current parent
++            kids_types = [nei.GetIsotope() for nei in kids_all]
++            # in case the chirality can't be inverted due to unsolvable problems
++            if len(set(kids_types)) <= 1: # not enough isotopes
++                raise RuntimeError(
++                    f"Unable to recover original chirality by manipulating H sotope positions: \n"
++                    f"Atom # ({parent_idx}) \n"
++                    f"Current CIPCode ({current_cip_code}) \n" 
++                    f"Expected CIPCode: ({expected_cip_code})\n"
++                    "Its chirality might have changed due to re-arrangements of heavy atoms, "
++                    "or become ambiguous to Chem.rdmolops.AssignStereochemistry due to strained geometry. "
++                )
++            # swap assignment of max and min isotope, re-evaluate CIPCode
++            # find the max and min isotope type values
++            max_isotope_type, min_isotope_type = (max(kids_types), min(kids_types))
++            # get kiw (kid's index with) max and min isotope types
++            kiw_max_isotope = kids_idxs_all[kids_types.index(max(kids_types))]
++            kiw_min_isotope = kids_idxs_all[kids_types.index(min(kids_types))]
++            copy_mol.GetAtomWithIdx(kiw_max_isotope).SetIsotope(min_isotope_type)
++            copy_mol.GetAtomWithIdx(kiw_min_isotope).SetIsotope(max_isotope_type)
++            # re-evaluate current CIPCode from 3D
++            Chem.AssignStereochemistryFrom3D(copy_mol)
++            current_cip_code = parent_atom.GetProp('_CIPCode') if parent_atom.HasProp('_CIPCode') else None
++            # a single swap of max and min isotopes normally inverts the chirality, in case not
++            if current_cip_code!=expected_cip_code: 
++                raise RuntimeError(
++                    "Failed to recover original chirality after attempts to manipulate H sotope positions: \n"
++                    f"Atom # ({parent_idx}) \n"
++                    f"Current CIPCode ({current_cip_code}) \n" 
++                    f"Expected CIPCode: ({expected_cip_code})\n"
++                    "Its chirality might have changed due to re-arrangements of heavy atoms, "
++                    "or become ambiguous to Chem.rdmolops.AssignStereochemistry due to strained geometry. "
++                )
++            # apply the swap 
++            max_pos = copy_conf.GetAtomPosition(kiw_max_isotope)
++            min_pos = copy_conf.GetAtomPosition(kiw_min_isotope)
++            assigned_isotope_pos[kiw_max_isotope] = min_pos
++            # only assign positions if min isotope type is greater than 0 (not regular Hs)
++            if min_isotope_type>0: 
++                assigned_isotope_pos[kiw_min_isotope] = max_pos
++
++    return assigned_isotope_pos
++
++        
+ def getPdbInfoNoNull(atom):
+     """extract information for populating an ATOM/HETATM line
+     in the PDB"""
+diff --git a/test/rdkitmol_from_docking_data/chiral_deutorated_D_gly.sdf b/test/rdkitmol_from_docking_data/chiral_deutorated_D_gly.sdf
+new file mode 100644
+index 00000000..9216f6cc
+--- /dev/null
++++ b/test/rdkitmol_from_docking_data/chiral_deutorated_D_gly.sdf
+@@ -0,0 +1,30 @@
++
++     RDKit          3D
++
++ 10  9  0  0  0  0  0  0  0  0999 V2000
++    0.0637   -0.5329    0.3772 C   0  0  1  0  0  0  0  0  0  0  0  0
++   -1.0503    0.4459    0.0734 N   0  0  0  0  0  4  0  0  0  0  0  0
++    1.3247   -0.1271   -0.4210 C   0  0  0  0  0  0  0  0  0  0  0  0
++    0.2430   -0.4867    1.4541 H   0  0  0  0  0  0  0  0  0  0  0  0
++    2.3432   -0.8337   -0.2853 O   0  0  0  0  0  0  0  0  0  0  0  0
++    1.0676    0.9170   -1.1085 O   0  0  0  0  0  1  0  0  0  0  0  0
++   -0.2927   -1.5225    0.0814 H   0  0  0  0  0  0  0  0  0  0  0  0
++   -1.3201    1.0221    0.8694 H   0  0  0  0  0  0  0  0  0  0  0  0
++   -0.5489    1.0825   -0.6026 H   0  0  0  0  0  0  0  0  0  0  0  0
++   -1.8303    0.0355   -0.4380 H   0  0  0  0  0  0  0  0  0  0  0  0
++  1  2  1  0
++  1  3  1  0
++  1  4  1  1
++  3  5  2  0
++  3  6  1  0
++  1  7  1  0
++  2  8  1  0
++  2  9  1  0
++  2 10  1  0
++M  CHG  2   2   1   6  -1
++M  ISO  1   4   2
++M  END
++>  <ScrubInfo>  (1) 
++{"isomerGroup": 0, "isomerId": 0, "confId": 0, "nr_conformers:": 1, "nr_isomers:": 1}
++
++$$$$
+diff --git a/test/rdkitmol_from_docking_data/chiral_deutorated_L_gly.sdf b/test/rdkitmol_from_docking_data/chiral_deutorated_L_gly.sdf
+new file mode 100644
+index 00000000..2eb15347
+--- /dev/null
++++ b/test/rdkitmol_from_docking_data/chiral_deutorated_L_gly.sdf
+@@ -0,0 +1,30 @@
++
++     RDKit          3D
++
++ 10  9  0  0  0  0  0  0  0  0999 V2000
++    0.0471    0.5781   -0.3064 C   0  0  2  0  0  0  0  0  0  0  0  0
++   -1.0887   -0.2783    0.2110 N   0  0  0  0  0  4  0  0  0  0  0  0
++    1.3895   -0.1318   -0.0134 C   0  0  0  0  0  0  0  0  0  0  0  0
++   -0.0165    1.5379    0.2119 H   0  0  0  0  0  0  0  0  0  0  0  0
++    1.1580   -1.2373    0.5810 O   0  0  0  0  0  0  0  0  0  0  0  0
++    2.4350    0.4423   -0.3772 O   0  0  0  0  0  1  0  0  0  0  0  0
++   -0.1112    0.7016   -1.3805 H   0  0  0  0  0  0  0  0  0  0  0  0
++   -1.5930    0.1361    0.9935 H   0  0  0  0  0  0  0  0  0  0  0  0
++   -0.5371   -1.0880    0.6034 H   0  0  0  0  0  0  0  0  0  0  0  0
++   -1.6832   -0.6605   -0.5232 H   0  0  0  0  0  0  0  0  0  0  0  0
++  1  2  1  0
++  1  3  1  0
++  1  4  1  1
++  3  5  2  0
++  3  6  1  0
++  1  7  1  0
++  2  8  1  0
++  2  9  1  0
++  2 10  1  0
++M  CHG  2   2   1   6  -1
++M  ISO  1   4   2
++M  END
++>  <ScrubInfo>  (1) 
++{"isomerGroup": 0, "isomerId": 0, "confId": 0, "nr_conformers:": 1, "nr_isomers:": 1}
++
++$$$$
+diff --git a/test/rdkitmol_from_docking_test.py b/test/rdkitmol_from_docking_test.py
+index 86fb015e..b97410e5 100644
+--- a/test/rdkitmol_from_docking_test.py
++++ b/test/rdkitmol_from_docking_test.py
+@@ -163,3 +163,23 @@ def test_offsite_charges():
+     smiles = Chem.MolToSmiles(rdkit_mols[0])
+     assert type(smiles) == str
+     assert len(smiles) > 0
++
++def test_chiral_deutorated():
++    def export_wrapper(mk_prep, mol):
++        molsetup = mk_prep(mol)[0]
++        pdbqt_str, is_ok, err = PDBQTWriterLegacy.write_string(molsetup)
++        assert is_ok
++        pdbqt_mol = PDBQTMolecule(pdbqt_str, skip_typing=True)
++        mol_list = RDKitMolCreate.from_pdbqt_mol(pdbqt_mol)
++        return mol_list[0]  # not multi-mol or flexrex
++    mk_prep = MoleculePreparation()
++    l_gly_fn = str(datadir / "chiral_deutorated_L_gly.sdf")
++    d_gly_fn = str(datadir / "chiral_deutorated_D_gly.sdf")
++    l_gly = next(Chem.SDMolSupplier(l_gly_fn, removeHs=False))
++    d_gly = next(Chem.SDMolSupplier(d_gly_fn, removeHs=False))
++    l_gly_exported = export_wrapper(mk_prep, l_gly)
++    d_gly_exported = export_wrapper(mk_prep, d_gly)
++    Chem.AssignStereochemistryFrom3D(l_gly_exported)
++    Chem.AssignStereochemistryFrom3D(d_gly_exported)
++    assert Chem.MolToSmiles(l_gly_exported) == Chem.MolToSmiles(l_gly)
++    assert Chem.MolToSmiles(d_gly_exported) == Chem.MolToSmiles(d_gly)

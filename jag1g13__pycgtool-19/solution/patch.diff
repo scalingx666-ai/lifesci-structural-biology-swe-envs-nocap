@@ -1,0 +1,530 @@
+diff --git a/doc/source/index.rst b/doc/source/index.rst
+index 5eece82..d6b31bd 100644
+--- a/doc/source/index.rst
++++ b/doc/source/index.rst
+@@ -90,6 +90,21 @@ Note that bead charges in the MARTINI framework are by convention integers and a
+    [SOL]
+    W P4 OW HW1 HW2
+ 
++The Martini 3.0 force field has now introduced the use of virtual sites for polycylic compounds or polysaccharides
++in order to improve numerical stability for highly constrained structures. Below is an example of how virtual sites
++can be included in the mapping file for naphthalene (see ``/test/data/martini3/naphthalene.map`` ). Similar to the previously
++described mapping syntax, a virtual site is defined with a prefix of ``@v`` as follows ``@v [name] [type] [charge] [constructing beads]``.
++The constructing beads refer to a list of space delimited coarse grained bead names from which the position of the
++virtual site will be calculated. Currently virtual sites can be constructed from either the center of geometry or mass of
++the constructing sites via the --advanced flag.::
++
++   [ NAPH ]
++   R1 TC4 C8 H8 C9 H9
++   R2 TC4 C6 H6 C7 H7
++   @v R3 TC4 R1 R2 R4 R5
++   R4 TC4 C1 H1 C2 H2
++   R5 TC4 C3 H3 C4 H4
++
+ Bond Definition
+ ~~~~~~~~~~~~~~~
+ An example bond definition file for the monosaccharide allose taken from ``test/data/sugar.bnd`` is shown below.
+@@ -122,6 +137,8 @@ If no angles are defined for a molecule, PyCGTOOL will construct all angles from
+    O5 C1 C2 C3
+ 
+ 
++
++
+ Advanced Usage
+ --------------
+ 
+@@ -163,6 +180,7 @@ output               Coordinate output format                     **gro**
+ output_xtc           Should a pseudo-CG XTC be created            **False**, True
+ map_only             Run in mapping-only mode                     **False**, True
+ map_center           Mapping method                               **geom**, mass
++virtual_map_center   Virtual site mapping method                  **geom**, mass
+ constr_threshold     Convert stiff bonds to constraints over      **100000**, any number
+ dump_measurements    Whether to output bond measurements          **False**, True
+ dump_n_values        How many measurements to output              **10000**, any number
+diff --git a/pycgtool.py b/pycgtool.py
+index 3a95b86..140a92a 100755
+--- a/pycgtool.py
++++ b/pycgtool.py
+@@ -34,6 +34,7 @@
+         ("output_xtc", args.outputxtc),
+         ("map_only", not bool(args.bnd)),
+         ("map_center", "geom"),
++        ("virtual_map_center", "geom"),
+         ("constr_threshold", 100000),
+         ("dump_measurements", bool(args.bnd) and not bool(args.map)),
+         ("dump_n_values", 10000),
+diff --git a/pycgtool/bondset.py b/pycgtool/bondset.py
+index fa23f42..f330986 100644
+--- a/pycgtool/bondset.py
++++ b/pycgtool/bondset.py
+@@ -7,7 +7,6 @@
+ import itertools
+ import math
+ import logging
+-
+ import numpy as np
+ 
+ 
+@@ -16,11 +15,20 @@
+ except ImportError:
+     from .util import tqdm_dummy as tqdm
+ 
+-from .util import sliding, dist_with_pbc, transpose_and_sample
+-from .util import extend_graph_chain, file_write_lines
+-from .util import vector_len, vector_cross, vector_angle, vector_angle_signed
+-from .parsers.cfg import CFG
++from .mapping import VirtualMap
+ from .functionalforms import FunctionalForms
++from .parsers.cfg import CFG
++from .util import (
++    dist_with_pbc,
++    extend_graph_chain,
++    file_write_lines,
++    sliding,
++    transpose_and_sample,
++    vector_angle,
++    vector_angle_signed,
++    vector_cross,
++    vector_len
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -248,6 +256,14 @@ def get_bond_dihedrals(self, mol):
+         """
+         return [bond for bond in self._molecules[mol] if len(bond.atoms) == 4]
+ 
++    def get_virtual_beads(self, mapping):
++        """
++        Return list of all virtual beads in molecule
++        :param mapping:
++        :return: list of virtual beads
++        """
++        return [bead for bead in mapping if isinstance(bead, VirtualMap)]
++
+     def _populate_atom_numbers(self, mapping):
+         """
+         Add atom numbers to all bonds.
+@@ -265,6 +281,7 @@ def _populate_atom_numbers(self, mapping):
+ 
+             index = [bead.name for bead in molmap]
+             for bond in self._molecules[mol]:
++                # TODO this causes issue #8
+                 try:
+                     bond.atom_numbers = [index.index(atom.lstrip("+-")) for atom in bond.atoms]
+                 except ValueError as e:
+@@ -328,6 +345,15 @@ def write_bond_angle_dih(bonds, section_header, print_fconst=True, multiplicity=
+                     i, bead.type, 1, mol, bead.name, i, bead.charge
+                 ))
+ 
++            virtual_beads = self.get_virtual_beads(mapping[mol])
++            if len(virtual_beads) != 0:
++                ret_lines.append("\n[ virtual_sitesn ]")
++                for vbead in virtual_beads:
++                    CGids = [bead.num + 1 for bead in mapping[mol] if bead.name in vbead.atoms]
++                    CGids.sort()
++                    CGids_string = " ".join(map(str, CGids))
++                    ret_lines.append("{0:^6d} {1:^6d} {2}".format(vbead.num+1, vbead.gromacs_type_id, CGids_string))
++
+             ret_lines.extend(write_bond_angle_dih(self.get_bond_lengths(mol), "bonds"))
+             ret_lines.extend(write_bond_angle_dih(self.get_bond_angles(mol), "angles", rad2deg=True))
+             ret_lines.extend(write_bond_angle_dih(self.get_bond_dihedrals(mol), "dihedrals", multiplicity=1, rad2deg=True))
+@@ -408,7 +434,7 @@ def boltzmann_invert(self, progress=False):
+     def _get_lines_for_bond_dump(bonds, target_number=None, rad2deg=False):
+         """
+         Return a dump of bond measurements as a list of lines of text.
+-        
++
+         :param bonds: Iterable of bonds
+         :param int target_number: Sample size of bonds to dump - None will dump all bonds
+         :param bool rad2deg: Should bond measurements be converted from radians to degrees?
+diff --git a/pycgtool/interface.py b/pycgtool/interface.py
+index 829d6bd..4d1e818 100644
+--- a/pycgtool/interface.py
++++ b/pycgtool/interface.py
+@@ -291,7 +291,7 @@ def run(self):
+ 
+     @property
+     def _bar(self):
+-        done = int(self._length * (self._its / self._maxits))
++        done = self._length if self._maxits == 0 else int(self._length * (self._its / self._maxits))
+         left = self._length - done
+         width = len(str(self._maxits))
+         return "{0:-{width}} [".format(self._its, width=width) + done * "#" + left * "-" + "] {0}".format(self._maxits)
+diff --git a/pycgtool/mapping.py b/pycgtool/mapping.py
+index a5668b1..31a29ef 100644
+--- a/pycgtool/mapping.py
++++ b/pycgtool/mapping.py
+@@ -62,6 +62,24 @@ def __getitem__(self, item):
+         return self.atoms[item]
+ 
+ 
++class VirtualMap(BeadMap):
++    __slots__ = ["name", "type", "atoms", "charge", "mass", "weights", "weights_dict", "gromacs_type_id_dict",
++                                                                                       "gromacs_type_id"]
++    def __init__(self, name, num, type=None, atoms=None, charge=0):
++        """
++        Create a single bead mapping.
++
++        :param str name: The name of the bead
++        :param int num: The number of the bead
++        :param str type: The bead type
++        :param List[str] atoms: The CG bead names from which the bead position is determined
++        :param float charge: The net charge on the bead
++        """
++        BeadMap.__init__(self, name, num, type=type, atoms=atoms, charge=charge, mass=0.)
++        self.gromacs_type_id_dict = {"geom":1, "mass":2}
++        self.gromacs_type_id = self.gromacs_type_id_dict["geom"]
++
++
+ class EmptyBeadError(Exception):
+     """
+     Exception used to indicate that none of the required atoms are present.
+@@ -84,6 +102,7 @@ def __init__(self, filename, options, itp=None):
+         """
+         self._mappings = {}
+         self._map_center = options.map_center
++        self._virtual_map_center = options.virtual_map_center
+         self._masses_are_set = False
+ 
+         with CFG(filename) as cfg:
+@@ -91,9 +110,19 @@ def __init__(self, filename, options, itp=None):
+             for mol_name, mol_section in cfg.items():
+                 self._mappings[mol_name] = []
+                 self._manual_charges[mol_name] = False
++                virtual = False
+                 molmap = self._mappings[mol_name]
+                 for i, (name, typ, first, *atoms) in enumerate(mol_section):
++                    virtual = False
+                     charge = 0
++                    if name.startswith('@'):
++                        if name == '@v':
++                            virtual = True
++                            name, typ, first, *atoms=mol_section[i][1:]
++                        #TODO ADD CUSTOM ERROR HERE LATER?
++                        else:
++                            raise SyntaxError('"{}" line prefix invalid'.format(name))
++
+                     try:
+                         # Allow optional charge in mapping file
+                         charge = float(first)
+@@ -101,7 +130,10 @@ def __init__(self, filename, options, itp=None):
+                     except ValueError:
+                         atoms.insert(0, first)
+                     assert atoms, "Bead {0} specification contains no atoms".format(name)
+-                    newbead = BeadMap(name, i, type=typ, atoms=atoms, charge=charge)
++                    if not virtual:
++                        newbead = BeadMap(name, i, type=typ, atoms=atoms, charge=charge)
++                    else:
++                        newbead = VirtualMap(name, i, type=typ, atoms=atoms, charge=charge)
+                     molmap.append(newbead)
+ 
+         # TODO this only works with one moleculetype in one itp - extend this
+@@ -114,24 +146,46 @@ def __init__(self, filename, options, itp=None):
+ 
+                 molname = itp["moleculetype"][0][0]
+                 for bead in self._mappings[molname]:
+-                    mass_array = np.array([[atoms[atom][1]] for atom in bead], dtype=np.float32)
+-                    bead.mass = sum(mass_array)
+-                    mass_array /= bead.mass
+-                    bead.weights_dict["mass"] = mass_array
++                    if not isinstance(bead, VirtualMap):
++                        mass_array = np.array([[atoms[atom][1]] for atom in bead], dtype=np.float32)
++                        bead.mass = sum(mass_array)
++                        mass_array /= bead.mass
++                        bead.weights_dict["mass"] = mass_array
++
++                        for atom in bead:
++                            if self._manual_charges[molname]:
++                                logger.warning("Charges assigned in mapping for molecule {0}, ignoring itp charges.".format(molname))
++                            else:
++                                bead.charge += atoms[atom][0]
+ 
+-                    for atom in bead:
++                for bead in self._mappings[molname]:
++                    if isinstance(bead, VirtualMap):
++                        mass_array = np.array(
++                            [real_bead.mass for real_bead in self._mappings[molname] if real_bead.name in bead], dtype=np.float32)
++                        weights_array = mass_array / sum(mass_array)
++                        bead.weights_dict["mass"] = weights_array
+                         if self._manual_charges[molname]:
+-                            logger.warning("Charges assigned in mapping for molecule {0}, ignoring itp charges.".format(molname))
++                            logger.warning(
++                                "Charges assigned in mapping for molecule {0}, ignoring itp charges.".format(molname))
+                         else:
+-                            bead.charge += atoms[atom][0]
+-
++                            charges = [real_bead.charge for real_bead in self._mappings[molname] if real_bead.name in bead]
++                            bead.charge = sum(charges)
+                 self._masses_are_set = True
+ 
+-        if self._map_center == "mass" and not self._masses_are_set:
+-            self._guess_atom_masses()
++        if not self._masses_are_set:
++            if self._map_center == "mass":
++                self._guess_atom_masses()
++
++            if self._virtual_map_center == "mass":
++                    self._guess_atom_masses()
++
+         for molname, mapping in self._mappings.items():
+             for bmap in mapping:
+-                bmap.weights = bmap.weights_dict[self._map_center]
++                if isinstance(bmap, VirtualMap):
++                    bmap.weights = bmap.weights_dict[self._virtual_map_center]
++                    bmap.gromacs_type_id = bmap.gromacs_type_id_dict[self._virtual_map_center]
++                else:
++                    bmap.weights = bmap.weights_dict[self._map_center]
+ 
+     def __len__(self):
+         return len(self._mappings)
+@@ -159,7 +213,7 @@ def _guess_atom_masses(self):
+ 
+         for mol_mapping in self._mappings.values():
+             for bead in mol_mapping:
+-                if bead.mass == 0:
++                if bead.mass == 0 and not isinstance(bead, VirtualMap):
+                     mass_array = np.zeros((len(bead.atoms), 1), dtype=np.float32)
+                     for i, atom in enumerate(bead.atoms):
+                         try:
+@@ -180,6 +234,13 @@ def _guess_atom_masses(self):
+                     mass_array /= bead.mass
+                     bead.weights_dict["mass"] = mass_array
+ 
++            #set virtual bead masses#
++            for bead in mol_mapping:
++                if isinstance(bead, VirtualMap):
++                    mass_array = np.array([real_bead.mass for real_bead in mol_mapping if real_bead.name in bead], dtype=np.float32)
++                    weights_array = mass_array / sum(mass_array)
++                    bead.weights_dict["mass"] = weights_array
++
+         self._masses_are_set = True
+ 
+     def _cg_frame_setup(self, aa_residues, name=None):
+@@ -241,7 +302,14 @@ def apply(self, frame, cgframe=None):
+         for aares, cgres in zip(frame.yield_resname_in(self._mappings), cgframe):
+             molmap = self._mappings[aares.name]
+ 
++            virtual_beads= []
++            virtual_bmap = []
+             for i, (bead, bmap) in enumerate(zip(cgres, molmap)):
++                if isinstance(bmap, VirtualMap):
++                    virtual_beads.append(bead)
++                    virtual_bmap.append(bmap)
++                    continue
++
+                 ref_coords = aares[bmap[0]].coords
+                 if len(bmap) == 1:
+                     bead.coords = ref_coords
+@@ -250,6 +318,10 @@ def apply(self, frame, cgframe=None):
+                 coords = np.asarray([aares[atom].coords for atom in bmap], dtype=np.float32)
+                 bead.coords = coord_func(ref_coords, coords, cgframe.box, bmap.weights)
+ 
++            for bead, bmap in zip(virtual_beads, virtual_bmap):
++                coords = np.asarray([cgres[atom].coords for atom in bmap], dtype=np.float32)
++                bead.coords = coord_func(ref_coords, coords, cgframe.box, bmap.weights)
++
+         return cgframe
+ 
+ 
+diff --git a/pycgtool/util.py b/pycgtool/util.py
+index e4f98e5..72fa77e 100644
+--- a/pycgtool/util.py
++++ b/pycgtool/util.py
+@@ -388,7 +388,6 @@ def wrap(*args, **kwargs):
+     return wrap
+ 
+ 
+-# TODO this gives code analysis warnings from PyCharm when committing changes
+ class SimpleEnum(object):
+     class Enum(object):
+         def __iter__(self):
+diff --git a/test/data/martini3/four.gro b/test/data/martini3/four.gro
+new file mode 100644
+index 0000000..5c67ba9
+--- /dev/null
++++ b/test/data/martini3/four.gro
+@@ -0,0 +1,7 @@
++Test
++    4
++    1FOUR    C1    1   2.000   2.000   2.000
++    1FOUR    H1    2   1.000   1.000   1.000
++    1FOUR    C2    3   3.000   3.000   3.000
++    1FOUR    N2    4   4.000   4.000   4.000
++   5.00000   5.00000   5.00000
+diff --git a/test/data/martini3/four.itp b/test/data/martini3/four.itp
+new file mode 100644
+index 0000000..6544cc7
+--- /dev/null
++++ b/test/data/martini3/four.itp
+@@ -0,0 +1,9 @@
++[ moleculetype ]
++FOUR   1
++
++[ atoms ]
++  1 C 1 FOUR  C1   1 0.000  1.00
++  2 H 1 FOUR  H1   1 0.000  0.00
++  3 C 1 FOUR  C2   1 0.000  0.00
++  4 N 1 FOUR  N2   1 0.000  3.00
++
+diff --git a/test/data/martini3/four.map b/test/data/martini3/four.map
+new file mode 100644
+index 0000000..21c9521
+--- /dev/null
++++ b/test/data/martini3/four.map
+@@ -0,0 +1,4 @@
++[FOUR]
++CD1 C C1 H1
++CD2 C C2 N2
++@v CV1 C CD1 CD2
+diff --git a/test/data/martini3/naphthalene.gro b/test/data/martini3/naphthalene.gro
+new file mode 100644
+index 0000000..27fec36
+--- /dev/null
++++ b/test/data/martini3/naphthalene.gro
+@@ -0,0 +1,21 @@
++GROup of MAchos and Cynical Suckers
++   18
++    1NAP     C1    1   0.001   0.243  -0.000
++    1NAP     H1    2  -0.052   0.337  -0.000
++    1NAP     C2    3   0.141   0.242   0.000
++    1NAP     H2    4   0.195   0.336   0.000
++    1NAP     C3    5   0.211   0.121   0.000
++    1NAP     H3    6   0.319   0.121   0.000
++    1NAP     C4    7   0.141  -0.001   0.000
++    1NAP     H4    8   0.197  -0.093   0.000
++    1NAP     C5    9   0.001  -0.001   0.000
++    1NAP     C6   10  -0.070  -0.122   0.000
++    1NAP     H6   11  -0.018  -0.217   0.000
++    1NAP     C7   12  -0.210  -0.122   0.000
++    1NAP     H7   13  -0.264  -0.215   0.000
++    1NAP     C8   14  -0.280  -0.001   0.000
++    1NAP     H8   15  -0.388  -0.001   0.000
++    1NAP     C9   16  -0.211   0.121   0.000
++    1NAP     H9   17  -0.266   0.214   0.000
++    1NAP    C10   18  -0.070   0.122   0.000
++   0.00000   0.00000   0.00000
+diff --git a/test/data/martini3/naphthalene.map b/test/data/martini3/naphthalene.map
+new file mode 100644
+index 0000000..04ef992
+--- /dev/null
++++ b/test/data/martini3/naphthalene.map
+@@ -0,0 +1,6 @@
++[ NAPH ]
++R1 TC4 C8 H8 C9 H9
++R2 TC4 C6 H6 C7 H7
++@v R3 TC4 R1 R2 R4 R5
++R4 TC4 C1 H1 C2 H2
++R5 TC4 C3 H3 C4 H4
+diff --git a/test/test_bondset.py b/test/test_bondset.py
+index 1c57452..9c945c5 100644
+--- a/test/test_bondset.py
++++ b/test/test_bondset.py
+@@ -19,6 +19,7 @@
+ class DummyOptions:
+     constr_threshold = 100000
+     map_center = "geom"
++    virtual_map_center = "geom"
+     angle_default_fc = False
+     generate_angles = True
+     generate_dihedrals = False
+diff --git a/test/test_mapping.py b/test/test_mapping.py
+index c0b7e56..c7ad95d 100644
+--- a/test/test_mapping.py
++++ b/test/test_mapping.py
+@@ -4,12 +4,13 @@
+ 
+ import numpy as np
+ 
+-from pycgtool.mapping import Mapping
++from pycgtool.mapping import Mapping, VirtualMap
+ from pycgtool.frame import Frame
+ 
+ 
+ class DummyOptions:
+     map_center = "geom"
++    virtual_map_center = "geom"
+ 
+ 
+ class MappingTest(unittest.TestCase):
+@@ -21,6 +22,18 @@ def test_mapping_create(self):
+         self.assertEqual(3, len(mapping["SOL"][0].atoms))
+         self.assertEqual("OW", mapping["SOL"][0].atoms[0])
+ 
++    def test_virtual_mapping_create(self):
++        mapping = Mapping("test/data/martini3/naphthalene.map", DummyOptions)
++        self.assertEqual(1, len(mapping))
++        self.assertTrue("NAPH" in mapping)
++        self.assertEqual(5, len(mapping["NAPH"]))
++        self.assertTrue(isinstance(mapping["NAPH"][2], VirtualMap))
++        self.assertEqual(4, len(mapping["NAPH"][2].atoms))
++        self.assertEqual("R1", mapping["NAPH"][2].atoms[0])
++        self.assertEqual(1, [isinstance(bead, VirtualMap) for bead in mapping["NAPH"]].count(True))
++
++
++
+     def test_mapping_apply(self):
+         mapping = Mapping("test/data/water.map", DummyOptions)
+         frame = Frame("test/data/water.gro")
+@@ -51,6 +64,12 @@ def test_mapping_weights_geom(self):
+         cg = mapping.apply(frame)
+         np.testing.assert_allclose(np.array([1.5, 1.5, 1.5]), cg[0][0].coords)
+ 
++    def test_virtual_mapping_weights_geom(self):
++        frame = Frame("test/data/martini3/four.gro")
++        mapping = Mapping("test/data/martini3/four.map", DummyOptions)
++        cg = mapping.apply(frame)
++        np.testing.assert_allclose(np.array([2.5, 2.5, 2.5]), cg[0][2].coords)
++
+     def test_mapping_weights_mass(self):
+         frame = Frame("test/data/two.gro")
+         options = DummyOptions()
+@@ -60,6 +79,14 @@ def test_mapping_weights_mass(self):
+         cg = mapping.apply(frame)
+         np.testing.assert_allclose(np.array([2., 2., 2.]), cg[0][0].coords)
+ 
++    def test_virtual_mapping_weights_mass(self):
++        frame = Frame("test/data/martini3/four.gro")
++        options = DummyOptions()
++        options.virtual_map_center = "mass"
++        mapping = Mapping("test/data/martini3/four.map", options, itp="test/data/martini3/four.itp")
++        cg = mapping.apply(frame)
++        np.testing.assert_allclose(np.array([3.0, 3.0, 3.0]), cg[0][2].coords)
++
+     def test_mapping_weights_guess_mass(self):
+         frame = Frame("test/data/two.gro")
+         options = DummyOptions()
+@@ -70,6 +97,16 @@ def test_mapping_weights_guess_mass(self):
+         np.testing.assert_allclose(np.array([1.922575,  1.922575,  1.922575], dtype=np.float32),
+                                    cg[0][0].coords, rtol=0.01)
+ 
++    def test_virtual_mapping_weights_guess_mass(self):
++        frame = Frame("test/data/martini3/four.gro")
++        options = DummyOptions()
++        options.virtual_map_center = "mass"
++        mapping = Mapping("test/data/martini3/four.map", options)
++        cg = mapping.apply(frame)
++        np.testing.assert_allclose(np.array([2.83337, 2.83337, 2.83337], dtype=np.float32),
++                                   cg[0][2].coords, rtol=0.01)
++
++
+     def test_mapping_weights_first(self):
+         frame = Frame("test/data/two.gro")
+         options = DummyOptions()
+@@ -81,3 +118,4 @@ def test_mapping_weights_first(self):
+ 
+ 
+ 
++
+diff --git a/test/test_pycgtool.py b/test/test_pycgtool.py
+index c18396e..1b4c6eb 100644
+--- a/test/test_pycgtool.py
++++ b/test/test_pycgtool.py
+@@ -35,6 +35,7 @@ class PycgtoolTest(unittest.TestCase):
+                       ("output_xtc", True),
+                       ("map_only", False),
+                       ("map_center", "geom"),
++                      ("virtual_map_center", "geom"),
+                       ("constr_threshold", 100000),
+                       ("dump_measurements", False),
+                       ("dump_n_values", 10000),

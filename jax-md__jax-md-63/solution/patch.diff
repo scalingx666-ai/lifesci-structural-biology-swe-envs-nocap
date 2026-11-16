@@ -1,0 +1,204 @@
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index e3b64338..b77b11a7 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -24,11 +24,11 @@
+ 
+ from jax_md import space, smap, partition
+ from jax_md.interpolate import spline
+-from jax_md.util import *
++from jax_md.util import f32
++from jax_md.util import check_kwargs_time_dependence
+ 
+ 
+-def simple_spring(
+-    dr, length=f32(1), epsilon=f32(1), alpha=f32(2), **unused_kwargs):
++def simple_spring(dr, length=1, epsilon=1, alpha=2, **unused_kwargs):
+   """Isotropic spring potential with a given rest length.
+ 
+   We define `simple_spring` to be a generalized Hookian spring with
+@@ -54,8 +54,7 @@ def simple_spring_bond(
+     alpha=alpha)
+ 
+ 
+-def soft_sphere(
+-    dr, sigma=f32(1.0), epsilon=f32(1.0), alpha=f32(2.0), **unused_kwargs):
++def soft_sphere(dr, sigma=1, epsilon=1, alpha=2, **unused_kwargs):
+   """Finite ranged repulsive interaction between soft spheres.
+ 
+   Args:
+@@ -78,7 +77,7 @@ def soft_sphere(
+ 
+ 
+ def soft_sphere_pair(
+-    displacement_or_metric, species=None, sigma=1.0, epsilon=1.0, alpha=2.0): 
++    displacement_or_metric, species=None, sigma=1.0, epsilon=1.0, alpha=2.0):
+   """Convenience wrapper to compute soft sphere energy over a system."""
+   sigma = np.array(sigma, dtype=f32)
+   epsilon = np.array(epsilon, dtype=f32)
+@@ -119,7 +118,7 @@ def soft_sphere_neighbor_list(
+   return neighbor_fn, energy_fn
+ 
+ 
+-def lennard_jones(dr, sigma=f32(1), epsilon=f32(1), **unused_kwargs):
++def lennard_jones(dr, sigma=1, epsilon=1, **unused_kwargs):
+   """Lennard-Jones interaction between particles with a minimum at sigma.
+ 
+   Args:
+diff --git a/jax_md/smap.py b/jax_md/smap.py
+index 0f018bed..4f1236a5 100644
+--- a/jax_md/smap.py
++++ b/jax_md/smap.py
+@@ -380,6 +380,10 @@ def _neighborhood_kwargs_to_params(idx, species=None, **kwargs):
+       out_dict[k] = _get_neighborhood_species_params(idx, species, kwargs[k])
+   return out_dict
+ 
++def _vectorized_cond(pred, fn, operand):
++  masked = np.where(pred, operand, 1)
++  return np.where(pred, fn(masked), 0)
++
+ def pair_neighbor_list(
+     fn, metric, species=None, reduce_axis=None, keepdims=False, **kwargs):
+   """Promotes a function a pair of particles to one using neighbor lists.
+@@ -428,6 +432,6 @@ def fn_mapped(R, neighbor_idx, **dynamic_kwargs):
+     if out.ndim > mask.ndim:
+       ddim = out.ndim - mask.ndim
+       mask = np.reshape(mask, mask.shape + (1,) * ddim)
+-    out = out * mask
++    out = mask * out
+     return _high_precision_sum(out, reduce_axis, keepdims) / 2.
+   return fn_mapped
+diff --git a/jax_md/space.py b/jax_md/space.py
+index dde78eaa..10c4d5d3 100644
+--- a/jax_md/space.py
++++ b/jax_md/space.py
+@@ -29,7 +29,11 @@
+ 
+ import jax.numpy as np
+ 
+-from jax_md.util import *
++from jax_md.util import f32
++from jax_md.util import f64
++from jax_md.util import safe_mask
++from jax_md.util import check_kwargs_time_dependence
++from jax_md.util import check_kwargs_empty
+ 
+ # Primitive Spatial Transforms
+ 
+@@ -188,7 +192,8 @@ def distance(dR):
+   Returns:
+     Matrix of distances; ndarray(shape=[...]).
+   """
+-  return np.sqrt(square_distance(dR))
++  dr = square_distance(dR)
++  return safe_mask(dr > 0, np.sqrt, dr)
+ 
+ 
+ def periodic_shift(side, R, dR):
+diff --git a/jax_md/test_util.py b/jax_md/test_util.py
+index 2825a0c5..a6e9fc2d 100644
+--- a/jax_md/test_util.py
++++ b/jax_md/test_util.py
+@@ -17,9 +17,11 @@
+ import jax.test_util as jtu
+ import jax.numpy as np
+ 
+-def update_test_tolerance(f32_tolerance, f64_tolerance):
+-  jtu._default_tolerance[np.onp.dtype(np.onp.float32)] = f32_tolerance
+-  jtu._default_tolerance[np.onp.dtype(np.onp.float64)] = f64_tolerance
++def update_test_tolerance(f32_tolerance=None, f64_tolerance=None):
++  if f32_tolerance is not None:
++    jtu._default_tolerance[np.onp.dtype(np.onp.float32)] = f32_tolerance
++  if f64_tolerance is not None:
++    jtu._default_tolerance[np.onp.dtype(np.onp.float64)] = f64_tolerance
+   def default_tolerance():
+     if jtu.device_under_test() != 'tpu':
+       return jtu._default_tolerance
+diff --git a/jax_md/util.py b/jax_md/util.py
+index ff0c87c1..92266a8b 100644
+--- a/jax_md/util.py
++++ b/jax_md/util.py
+@@ -70,3 +70,8 @@ def merge_dicts(a, b):
+   merged = dict(a)
+   merged.update(b)
+   return merged
++
++
++def safe_mask(mask, fn, operand, placeholder=0):
++  masked = np.where(mask, operand, 0)
++  return np.where(mask, fn(masked), placeholder)
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index c98bd92e..bb8f8f13 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -182,6 +182,8 @@ def test_soft_sphere(self, spatial_dimension, alpha, dtype):
+   def test_lennard_jones(self, spatial_dimension, dtype):
+     key = random.PRNGKey(0)
+ 
++    tol = None if dtype is np.float64 else 5e-6
++
+     for _ in range(STOCHASTIC_SAMPLES):
+       key, split_sigma, split_epsilon = random.split(key, 3)
+       sigma = dtype(random.uniform(
+@@ -193,7 +195,7 @@ def test_lennard_jones(self, spatial_dimension, dtype):
+         energy.lennard_jones(dr, sigma, epsilon),
+         np.array(-epsilon, dtype=dtype), True)
+       g = grad(energy.lennard_jones)(dr, sigma, epsilon)
+-      self.assertAllClose(g, np.array(0, dtype=dtype), True)
++      self.assertAllClose(g, np.array(0, dtype=dtype), True, tol, tol)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -290,16 +292,16 @@ def test_lennard_jones_neighbor_list_force(self, spatial_dimension, dtype):
+     metric = space.metric(displacement)
+     exact_force_fn = quantity.force(energy.lennard_jones_pair(displacement))
+ 
+-    R = box_size * random.uniform(
++    r = box_size * random.uniform(
+       key, (PARTICLE_COUNT, spatial_dimension), dtype=dtype)
+     neighbor_fn, energy_fn = energy.lennard_jones_neighbor_list(
+-      displacement, box_size, R)
++      displacement, box_size, r)
+     force_fn = quantity.force(energy_fn)
+ 
+-    idx = neighbor_fn(R)
++    idx = neighbor_fn(r)
+     self.assertAllClose(
+-      np.array(exact_force_fn(R), dtype=dtype),
+-      force_fn(R, idx), True)
++      np.array(exact_force_fn(r), dtype=dtype),
++      force_fn(r, neighbor_idx=idx), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+diff --git a/tests/partition_test.py b/tests/partition_test.py
+index 8538c959..a7716bf0 100644
+--- a/tests/partition_test.py
++++ b/tests/partition_test.py
+@@ -205,7 +205,8 @@ def test_neighbor_list_build(self, dtype, dim):
+     dR_exact = d_exact(R, R)
+ 
+     dR = np.where(dR < cutoff, dR, f32(0)) * mask
+-    dR_exact = np.where(dR_exact < cutoff, dR_exact, f32(0))
++    mask_exact = 1. - np.eye(dR_exact.shape[0])
++    dR_exact = np.where(dR_exact < cutoff, dR_exact, f32(0)) * mask_exact
+ 
+     dR = np.sort(dR, axis=1)
+     dR_exact = np.sort(dR_exact, axis=1)
+diff --git a/tests/smap_test.py b/tests/smap_test.py
+index b4b0a882..9c3de84a 100644
+--- a/tests/smap_test.py
++++ b/tests/smap_test.py
+@@ -33,10 +33,12 @@
+ 
+ from jax_md import smap, space, energy, quantity, partition
+ from jax_md.util import *
++from jax_md import test_util
+ 
+ jax_config.parse_flags_with_absl()
+ FLAGS = jax_config.FLAGS
+ 
++test_util.update_test_tolerance(f32_tolerance=2e-6)
+ 
+ PARTICLE_COUNT = 1000
+ STOCHASTIC_SAMPLES = 10

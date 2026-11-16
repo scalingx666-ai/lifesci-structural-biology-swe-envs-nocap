@@ -1,0 +1,83 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bba71d0..16eb5ca 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -45,6 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ ### Fixed
+ 
+ - Excluded the local weight cache (`aimnet/calculators/assets/`) from wheels and sdists explicitly, instead of relying on hatchling's `.gitignore` handling.
++- Fixed embedded-LR models failing with `KeyError: nbmat_lr` on every flattened evaluation (molecules above `nb_threshold` on CUDA, any size on CPU, PBC, or Hessians): when metadata declared `has_embedded_lr` but neither dispersion nor Coulomb could be identified, the calculator built no long-range neighbor list at all despite resolving an all-pairs `cutoff_lr` for exactly that case. The shared LR list is now built with that cutoff (issue #118).
+ - Trusted the `aimnet.modules.lr.D3TS` submodule spelling of the D3TS class in the default artifact allowlist, alongside the existing `aimnet.modules.D3TS` barrel spelling. The loader machinery that detects D3TS by class name matches the "D3TS" substring regardless of spelling, so an artifact using this spelling was recognized as D3TS by the export layer but rejected by the exact-match allowlist.
+ - Fixed `DataGroup.cv_split` corrupting cross-validation folds: building each fold's train split mutated the shared parts in place via `cat()`, so later folds contained duplicated samples and validation splits larger than the dataset. Folds are now built without mutating the shared parts.
+ - Fixed a crash when torch has CUDA but warp-lang does not (possible with conda-forge variant packages): the AEV kernel gate now checks warp CUDA availability and falls back to the pure-torch path with a one-time warning.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 31b0f2b..2a4d174 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -595,6 +595,19 @@ def _update_lr_nblists(self) -> None:
+         has_dftd3 = self.external_dftd3 is not None or self._has_embedded_dispersion()
+         has_coulomb = self.external_coulomb is not None or self._has_embedded_coulomb()
+ 
++        if not has_dftd3 and not has_coulomb:
++            # self.lr is set (embedded LR via metadata or a model cutoff_lr
++            # attribute) but neither dispersion nor Coulomb could be identified.
++            # The constructor resolves this case to an all-pairs cutoff_lr
++            # ("unknown legacy LR modules need all pairs"); mirror it here.
++            # Leaving every LR list None makes any flattened (mode-1)
++            # evaluation KeyError on nbmat_lr inside the embedded module.
++            cutoff = self.cutoff_lr if self.cutoff_lr is not None and math.isfinite(self.cutoff_lr) else 1e6
++            self._nblist_lr = AdaptiveNeighborList(cutoff=cutoff)
++            self._nblist_dftd3 = None
++            self._nblist_coulomb = None
++            return
++
+         # Determine effective cutoffs (None means no neighbor list needed for that module)
+         dftd3_cutoff = self._dftd3_cutoff if has_dftd3 else 0.0
+         coulomb_cutoff = self._coulomb_cutoff if has_coulomb and self._coulomb_cutoff is not None else 0.0
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index 4d627b0..af51ad4 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -2363,3 +2363,42 @@ def test_from_legacy_jit_routes_once(monkeypatch):
+ 
+     with pytest.raises(TypeError, match="model"):
+         AIMNet2Calculator.from_legacy_jit("custom.jpt", model=model)
++
++
++def test_unknown_embedded_lr_metadata_builds_all_pairs_nblist(monkeypatch):
++    """Issue #118: metadata with has_embedded_lr=True but no identifiable
++    dispersion or Coulomb module must still yield an LR neighbor list.
++
++    The constructor resolves this shape to an all-pairs cutoff_lr, but
++    _update_lr_nblists left every LR list as None, so any flattened (mode-1)
++    evaluation KeyError'd on nbmat_lr inside the embedded module -- observed
++    as embedded-D3TS models failing for every molecule above nb_threshold.
++    """
++    calc = AIMNet2Calculator("aimnet2", device="cpu")
++    patched = {
++        "format_version": 2,
++        "cutoff": 5.0,
++        "needs_coulomb": False,
++        "needs_dispersion": False,
++        "coulomb_mode": "none",
++        "has_embedded_lr": True,
++        "implemented_species": [1, 6],
++    }
++    monkeypatch.setattr(type(calc), "metadata", property(lambda self: patched))
++    calc.external_coulomb = None
++    calc.external_dftd3 = None
++    calc.lr = True
++    calc.cutoff_lr = float("inf")
++    calc._update_lr_nblists()
++
++    assert calc._nblist_lr is not None
++
++    # The flattened path must deliver the shared LR matrices to embedded modules.
++    n = 16
++    coord = torch.zeros(n, 3)
++    coord[:, 0] = torch.arange(n, dtype=torch.float32) * 1.5
++    data = {"coord": coord, "mol_idx": torch.zeros(n, dtype=torch.long)}
++    calc._max_mol_size = n
++    data = calc.make_nbmat(data)
++    assert "nbmat_lr" in data
++    assert "nbmat_dftd3" in data

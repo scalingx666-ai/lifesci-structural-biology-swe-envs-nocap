@@ -1,0 +1,1208 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ebd7c8e..a84cc78 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ ### Fixed
+ 
+ - **Batched gas-phase Coulomb memory:** with `mol_idx` and the default `simple` Coulomb, the all-pairs neighbor buffer was sized by the batch's total atom count, so a flat batch of many molecules allocated an `N × N` matrix (about 14 GB at 60k atoms). It is now sized by the largest molecule, and memory grows linearly with the batch. Energies and forces are unchanged; periodic inputs keep the previous sizing ([#151](https://github.com/isayevlab/aimnetcentral/issues/151)).
++- **Reproducible forces on the packed layout:** with `deterministic=True` and `torch.use_deterministic_algorithms(True)`, packed-layout forces on CUDA are now bitwise identical across repeated runs, as energies already were. This covers periodic inputs and forces with `train=True` (not parameter gradients). The Warp ConvSV backward and double backward previously accumulated atom gradients with atomic adds; they now gather them in a fixed order through a CSR transpose of the neighbor list. The calculator builds the transpose only in this mode and only for calls that can run a backward; in a molecular-dynamics-style loop with forces at every step it added 1 to 2% per step at 113 and 1008 atoms. Default behavior and speed are unchanged. The PyTorch flag is still required for the per-molecule sums and the neighbor-gather backward. Caller-supplied batched `(B, N, M)` neighbor matrices and legacy `.jpt` models are not covered ([#140](https://github.com/isayevlab/aimnetcentral/issues/140)).
+ 
+ ## [0.2.5] - 2026-10-23
+ 
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 66422f1..dcbe232 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -93,11 +93,13 @@ class AIMNet2Calculator:
+         Hessian, and no caller-supplied ``mol_idx`` or ``nbmat``. On the
+         packed neighbor-list layout used otherwise, the calculator sorts the
+         neighbor rows it builds into a canonical order (a caller-supplied
+-        ``nbmat`` is used as given), so energies are also bitwise
+-        reproducible on CUDA once ``torch.use_deterministic_algorithms(True)``
+-        is enabled (a one-time warning fires without it); forces there keep
+-        run-to-run noise of ~1e-6 eV/A (issue #140). CPU always uses the
+-        packed layout;
++        ``nbmat`` is used as given) and the Warp convolution backward
++        gathers each atom's gradient in a fixed order instead of using
++        atomics, so energies and forces are also bitwise reproducible on CUDA
++        once ``torch.use_deterministic_algorithms(True)`` is enabled (a
++        one-time warning fires without it; the flag covers the per-molecule
++        ``scatter_add_`` sums and the backward of the neighbor gathers). CPU
++        always uses the packed layout;
+         repeated CPU evaluations have been bitwise identical in testing, but
+         that is not yet guaranteed. Ewald/PME Coulomb is not covered (a
+         one-time warning fires). Reproducibility also requires
+@@ -1211,6 +1213,15 @@ def _evaluate_prepared(self, data, *, forces=False, stress=False, hessian=False,
+         else:
+             data = self.set_grad_tensors(data, forces=forces, stress=stress, hessian=hessian)
+             saved = self._saved_for_grad
++        # Only when a backward through ConvSV can run; Hessians keep the atomic kernels.
++        if (
++            self._deterministic
++            and not hessian
++            and (
++                forces or stress or self._train or any(isinstance(t, Tensor) and t.requires_grad for t in data.values())
++            )
++        ):
++            self._add_nbmat_transpose(data)
+         if model_prepared:
+             data = self.model.forward_prepared(data)
+         elif isinstance(self.model, torch.jit.ScriptModule):
+@@ -1405,6 +1416,21 @@ def prepare_input(self, data: dict[str, Any], *, hessian: bool = False) -> dict[
+             data = self.pad_input(data)
+         return data
+ 
++    @staticmethod
++    def _add_nbmat_transpose(data: dict[str, Tensor]) -> None:
++        """Store the CSR transpose of the packed ``nbmat`` beside it for the deterministic Warp ConvSV backward.
++
++        With it, the backward gathers each atom's gradient in a fixed order
++        instead of accumulating it with atomics.
++        """
++        nbmat = data.get("nbmat")
++        if nbmat is None or nbmat.device.type != "cuda" or nbmat.ndim != 2 or data["coord"].ndim != 2:
++            return
++        from aimnet.kernels import WARP_CUDA_AVAILABLE, conv_sv_2d_sp_transpose
++
++        if WARP_CUDA_AVAILABLE:
++            data["_nbmat_csr_ptr"], data["_nbmat_csr_idx"] = conv_sv_2d_sp_transpose(nbmat, nbmat.shape[0])
++
+     def _warn_deterministic_packed(self) -> None:
+         """Warn once that packed-layout determinism needs torch's deterministic mode."""
+         if (
+@@ -1416,9 +1442,8 @@ def _warn_deterministic_packed(self) -> None:
+             return
+         warnings.warn(
+             "deterministic=True on the packed neighbor-list layout gives bitwise-reproducible "
+-            "energies only with torch.use_deterministic_algorithms(True) (set "
+-            "CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA starts, or pass warn_only=True); "
+-            "forces are not yet covered (issue #140).",
++            "energies and forces only with torch.use_deterministic_algorithms(True) (set "
++            "CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA starts, or pass warn_only=True).",
+             stacklevel=5,  # the caller of __call__
+         )
+         self._warned_deterministic_packed = True
+diff --git a/aimnet/kernels/__init__.py b/aimnet/kernels/__init__.py
+index 5d46351..18f1b7e 100644
+--- a/aimnet/kernels/__init__.py
++++ b/aimnet/kernels/__init__.py
+@@ -23,7 +23,7 @@
+ import torch
+ import warp as wp
+ 
+-from .conv_sv_2d_sp_wp import conv_sv_2d_sp  # type: ignore[attr-defined]
++from .conv_sv_2d_sp_wp import conv_sv_2d_sp, conv_sv_2d_sp_transpose  # type: ignore[attr-defined]
+ 
+ # Computed once after wp.init(); conda-forge can legally solve a CUDA pytorch
+ # together with a CPU-only warp-lang build, so torch.cuda alone is not proof
+@@ -51,12 +51,16 @@ def load_ops():
+ 
+     # Verify ops are available
+     if hasattr(torch.ops, "aimnet"):
+-        if hasattr(torch.ops.aimnet, "conv_sv_2d_sp_fwd"):
+-            available_ops.append("aimnet::conv_sv_2d_sp_fwd")
+-        if hasattr(torch.ops.aimnet, "conv_sv_2d_sp_bwd"):
+-            available_ops.append("aimnet::conv_sv_2d_sp_bwd")
+-        if hasattr(torch.ops.aimnet, "conv_sv_2d_sp_bwd_bwd"):
+-            available_ops.append("aimnet::conv_sv_2d_sp_bwd_bwd")
++        for name in (
++            "conv_sv_2d_sp_fwd",
++            "conv_sv_2d_sp_bwd",
++            "conv_sv_2d_sp_bwd_bwd",
++            "conv_sv_2d_sp_det_fwd",
++            "conv_sv_2d_sp_det_bwd",
++            "conv_sv_2d_sp_det_bwd_bwd",
++        ):
++            if hasattr(torch.ops.aimnet, name):
++                available_ops.append(f"aimnet::{name}")
+ 
+     return available_ops
+ 
+@@ -64,5 +68,6 @@ def load_ops():
+ __all__ = [
+     "WARP_CUDA_AVAILABLE",
+     "conv_sv_2d_sp",
++    "conv_sv_2d_sp_transpose",
+     "load_ops",
+ ]
+diff --git a/aimnet/kernels/conv_sv_2d_sp_wp.py b/aimnet/kernels/conv_sv_2d_sp_wp.py
+index 5f27a25..26d459a 100644
+--- a/aimnet/kernels/conv_sv_2d_sp_wp.py
++++ b/aimnet/kernels/conv_sv_2d_sp_wp.py
+@@ -134,6 +134,31 @@ def _conv_sv_2d_sp_backward_a_kernel(
+         wp.atomic_add(grad_a, _idx, _a, _g, val)
+ 
+ 
++@wp.kernel(enable_backward=False)
++def _conv_sv_2d_sp_backward_a_gather_kernel(
++    grad_output: wp.array3d(dtype=wp.vec4f),  # (B, A, G, D)
++    g: wp.array3d(dtype=wp.vec4f),  # (B, M, G, D)
++    csr_ptr: wp.array1d(dtype=wp.int32),  # (K + 1,)
++    csr_idx: wp.array1d(dtype=wp.int32),  # (B * M,) flat b * M + m, grouped by idx[b, m]
++    grad_a: wp.array3d(dtype=wp.float32),  # (K, A, G)
++):
++    """Deterministic backward w.r.t. a: grad_a[j,a,g] = sum_{idx[b,m]==j} dot(grad_output[b,a,g], g[b,m,g])
++
++    Each thread owns one output element and walks its contributors in the fixed
++    order of the CSR transpose, so no atomics are needed.
++    """
++    M = g.shape[1]
++    _j, _a, _g = wp.tid()
++
++    acc = wp.float32(0.0)
++    for _k in range(csr_ptr[_j], csr_ptr[_j + 1]):
++        bm = csr_idx[_k]
++        _b = bm // M
++        _m = bm - _b * M
++        acc += wp.dot(grad_output[_b, _a, _g], g[_b, _m, _g])
++    grad_a[_j, _a, _g] = acc
++
++
+ @wp.kernel(enable_backward=False)
+ def _conv_sv_2d_sp_backward_g_kernel(
+     grad_output: wp.array3d(dtype=wp.vec4f),  # (B, A, G, D)
+@@ -251,13 +276,16 @@ def _validate_conv_sv_sizes(a: Tensor, idx: Tensor, padding_value: int, num_cent
+         raise ValueError("num_centers must be in [0, idx.shape[0]].")
+ 
+ 
+-@torch.library.custom_op(
+-    "aimnet::conv_sv_2d_sp_fwd",
+-    mutates_args=(),
+-    device_types=["cuda"],
+-)
+-def _(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> Tensor:
+-    """Forward primitive for conv_sv_2d_sp."""
++def _validate_transpose(a: Tensor, idx: Tensor, csr_ptr: Tensor, csr_idx: Tensor, num_centers: int) -> None:
++    """Check the CSR transpose metadata against ``a`` and ``idx`` (shapes only, no device sync)."""
++    if csr_ptr.dtype != torch.int32 or csr_idx.dtype != torch.int32:
++        raise TypeError("The conv_sv_2d_sp transpose must be int32 tensors.")
++    if csr_ptr.shape != (a.shape[0] + 1,) or csr_idx.shape != (num_centers * idx.shape[1],):
++        raise ValueError("The conv_sv_2d_sp transpose does not match a and idx; rebuild it for this idx.")
++
++
++def _conv_sv_2d_sp_fwd_impl(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> Tensor:
++    """Launch the forward kernel. It gathers per output row, so it is deterministic as is."""
+     _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
+     stream = _get_stream(a.device)
+     device = wp.device_from_torch(a.device)
+@@ -281,46 +309,119 @@ def _(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -
+     return output
+ 
+ 
+-@torch.library.register_fake("aimnet::conv_sv_2d_sp_fwd")
+-def _(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> Tensor:
++def _fake_fwd(a: Tensor, idx: Tensor, padding_value: int, num_centers: int) -> Tensor:
+     _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
+     _B, A, G = a.shape
+     return torch.empty(idx.shape[0], A, G, 4, dtype=a.dtype, device=a.device)
+ 
+ 
+ @torch.library.custom_op(
+-    "aimnet::conv_sv_2d_sp_bwd",
++    "aimnet::conv_sv_2d_sp_fwd",
+     mutates_args=(),
+     device_types=["cuda"],
+ )
+-def _(grad_output: Tensor, a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> list[Tensor]:
+-    """Backward primitive for conv_sv_2d_sp."""
+-    _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
+-    stream = _get_stream(a.device)
+-    device = wp.device_from_torch(a.device)
+-    _B, A, G = a.shape
+-    B_out, M = idx.shape
++def _(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> Tensor:
++    """Forward primitive for conv_sv_2d_sp."""
++    return _conv_sv_2d_sp_fwd_impl(a, idx, g, padding_value, num_centers)
+ 
+-    grad_a = torch.zeros_like(a)
+-    grad_g = torch.zeros(B_out, M, G, 4, dtype=g.dtype, device=g.device)
+ 
+-    grad_output_contig = grad_output.detach().contiguous()
++@torch.library.register_fake("aimnet::conv_sv_2d_sp_fwd")
++def _(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> Tensor:
++    return _fake_fwd(a, idx, padding_value, num_centers)
++
+ 
+-    # Launch backward w.r.t. a
++@torch.library.custom_op(
++    "aimnet::conv_sv_2d_sp_det_fwd",
++    mutates_args=(),
++    device_types=["cuda"],
++)
++def _(
++    a: Tensor, idx: Tensor, g: Tensor, csr_ptr: Tensor, csr_idx: Tensor, padding_value: int, num_centers: int
++) -> Tensor:
++    """Forward primitive of the deterministic variant; only its backward differs."""
++    _validate_transpose(a, idx, csr_ptr, csr_idx, num_centers)
++    return _conv_sv_2d_sp_fwd_impl(a, idx, g, padding_value, num_centers)
++
++
++@torch.library.register_fake("aimnet::conv_sv_2d_sp_det_fwd")
++def _(
++    a: Tensor, idx: Tensor, g: Tensor, csr_ptr: Tensor, csr_idx: Tensor, padding_value: int, num_centers: int
++) -> Tensor:
++    _validate_transpose(a, idx, csr_ptr, csr_idx, num_centers)
++    return _fake_fwd(a, idx, padding_value, num_centers)
++
++
++def _launch_backward_a(
++    grad_output: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    a: Tensor,
++    padding_value: int,
++    num_centers: int,
++    csr_ptr: Tensor | None,
++    csr_idx: Tensor | None,
++) -> Tensor:
++    """grad_a[idx[b,m]] += dot(grad_output[b], g[b,m]): atomic scatter, or a fixed-order gather with a transpose."""
++    _B, A, G = a.shape
++    stream = _get_stream(a.device)
++    device = wp.device_from_torch(a.device)
++    if csr_ptr is None or csr_idx is None:
++        grad_a = torch.zeros_like(a)
++        wp.launch(
++            _conv_sv_2d_sp_backward_a_kernel,
++            dim=(num_centers, A, G),
++            stream=stream,
++            device=device,
++            inputs=(
++                wp.from_torch(grad_output, return_ctype=True, dtype=wp.vec4f),
++                wp.from_torch(idx.to(torch.int32), return_ctype=True),
++                wp.from_torch(g.detach(), return_ctype=True, dtype=wp.vec4f),
++                wp.from_torch(grad_a, return_ctype=True),
++                padding_value,
++            ),
++        )
++        return grad_a
++    # The gather writes every row of grad_a, including rows with no contributors.
++    grad_a = torch.empty_like(a)
+     wp.launch(
+-        _conv_sv_2d_sp_backward_a_kernel,
+-        dim=(num_centers, A, G),
++        _conv_sv_2d_sp_backward_a_gather_kernel,
++        dim=(a.shape[0], A, G),
+         stream=stream,
+         device=device,
+         inputs=(
+-            wp.from_torch(grad_output_contig, return_ctype=True, dtype=wp.vec4f),
+-            wp.from_torch(idx.to(torch.int32), return_ctype=True),
++            wp.from_torch(grad_output, return_ctype=True, dtype=wp.vec4f),
+             wp.from_torch(g.detach(), return_ctype=True, dtype=wp.vec4f),
++            wp.from_torch(csr_ptr, return_ctype=True),
++            wp.from_torch(csr_idx, return_ctype=True),
+             wp.from_torch(grad_a, return_ctype=True),
+-            padding_value,
+         ),
+     )
++    return grad_a
++
++
++def _conv_sv_2d_sp_bwd_impl(
++    grad_output: Tensor,
++    a: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    padding_value: int,
++    num_centers: int,
++    csr_ptr: Tensor | None = None,
++    csr_idx: Tensor | None = None,
++) -> list[Tensor]:
++    """First-order backward; with a CSR transpose every launch is atomic-free."""
++    _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
++    stream = _get_stream(a.device)
++    device = wp.device_from_torch(a.device)
++    G = a.shape[2]
++    B_out, M = idx.shape
++
++    grad_output_contig = grad_output.detach().contiguous()
+ 
++    # Backward w.r.t. a
++    grad_a = _launch_backward_a(grad_output_contig, idx, g, a, padding_value, num_centers, csr_ptr, csr_idx)
++
++    grad_g = torch.zeros(B_out, M, G, 4, dtype=g.dtype, device=g.device)
+     # Launch backward w.r.t. g
+     wp.launch(
+         _conv_sv_2d_sp_backward_g_kernel,
+@@ -339,8 +440,7 @@ def _(grad_output: Tensor, a: Tensor, idx: Tensor, g: Tensor, padding_value: int
+     return [grad_a, grad_g]
+ 
+ 
+-@torch.library.register_fake("aimnet::conv_sv_2d_sp_bwd")
+-def _(grad_output: Tensor, a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> list[Tensor]:
++def _fake_bwd(a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> list[Tensor]:
+     B_out, M = idx.shape
+     G = a.shape[2]
+     _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
+@@ -351,11 +451,56 @@ def _(grad_output: Tensor, a: Tensor, idx: Tensor, g: Tensor, padding_value: int
+ 
+ 
+ @torch.library.custom_op(
+-    "aimnet::conv_sv_2d_sp_bwd_bwd",
++    "aimnet::conv_sv_2d_sp_bwd",
++    mutates_args=(),
++    device_types=["cuda"],
++)
++def _(grad_output: Tensor, a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> list[Tensor]:
++    """Backward primitive for conv_sv_2d_sp."""
++    return _conv_sv_2d_sp_bwd_impl(grad_output, a, idx, g, padding_value, num_centers)
++
++
++@torch.library.register_fake("aimnet::conv_sv_2d_sp_bwd")
++def _(grad_output: Tensor, a: Tensor, idx: Tensor, g: Tensor, padding_value: int, num_centers: int) -> list[Tensor]:
++    return _fake_bwd(a, idx, g, padding_value, num_centers)
++
++
++@torch.library.custom_op(
++    "aimnet::conv_sv_2d_sp_det_bwd",
+     mutates_args=(),
+     device_types=["cuda"],
+ )
+ def _(
++    grad_output: Tensor,
++    a: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    csr_ptr: Tensor,
++    csr_idx: Tensor,
++    padding_value: int,
++    num_centers: int,
++) -> list[Tensor]:
++    """Deterministic backward primitive: grad_a is gathered through the CSR transpose."""
++    _validate_transpose(a, idx, csr_ptr, csr_idx, num_centers)
++    return _conv_sv_2d_sp_bwd_impl(grad_output, a, idx, g, padding_value, num_centers, csr_ptr, csr_idx)
++
++
++@torch.library.register_fake("aimnet::conv_sv_2d_sp_det_bwd")
++def _(
++    grad_output: Tensor,
++    a: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    csr_ptr: Tensor,
++    csr_idx: Tensor,
++    padding_value: int,
++    num_centers: int,
++) -> list[Tensor]:
++    _validate_transpose(a, idx, csr_ptr, csr_idx, num_centers)
++    return _fake_bwd(a, idx, g, padding_value, num_centers)
++
++
++def _conv_sv_2d_sp_bwd_bwd_impl(
+     grad_output: Tensor,
+     grad2_a: Tensor,
+     grad2_g: Tensor,
+@@ -364,8 +509,10 @@ def _(
+     g: Tensor,
+     padding_value: int,
+     num_centers: int,
++    csr_ptr: Tensor | None = None,
++    csr_idx: Tensor | None = None,
+ ) -> list[Tensor]:
+-    """Double backward primitive for conv_sv_2d_sp."""
++    """Double backward; only the grad_a_double launch scatters, so the transpose makes it atomic-free."""
+     _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
+     stream = _get_stream(a.device)
+     device = wp.device_from_torch(a.device)
+@@ -373,7 +520,6 @@ def _(
+     B_out, M = idx.shape
+ 
+     grad_grad_output = torch.zeros(B_out, A, G, 4, dtype=a.dtype, device=a.device)
+-    grad_a_double = torch.zeros_like(a)
+     grad_g_double = torch.zeros(B_out, M, G, 4, dtype=a.dtype, device=a.device)
+ 
+     grad_output_contig = grad_output.detach().contiguous()
+@@ -428,23 +574,43 @@ def _(
+     )
+ 
+     # Mixed partial: d(grad_g)/da -> grad_a_double
+-    wp.launch(
+-        _conv_sv_2d_sp_backward_a_kernel,
+-        dim=(num_centers, A, G),
+-        stream=stream,
+-        device=device,
+-        inputs=(
+-            wp.from_torch(grad_output_contig, return_ctype=True, dtype=wp.vec4f),
+-            wp.from_torch(idx.to(torch.int32), return_ctype=True),
+-            wp.from_torch(grad2_g_contig, return_ctype=True, dtype=wp.vec4f),
+-            wp.from_torch(grad_a_double, return_ctype=True),
+-            padding_value,
+-        ),
++    grad_a_double = _launch_backward_a(
++        grad_output_contig, idx, grad2_g_contig, a, padding_value, num_centers, csr_ptr, csr_idx
+     )
+ 
+     return [grad_grad_output, grad_a_double, grad_g_double]
+ 
+ 
++def _fake_bwd_bwd(a: Tensor, idx: Tensor, padding_value: int, num_centers: int) -> list[Tensor]:
++    _B, A, G = a.shape
++    B_out, M = idx.shape
++    _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
++    return [
++        torch.empty(B_out, A, G, 4, dtype=a.dtype, device=a.device),
++        torch.empty_like(a),
++        torch.empty(B_out, M, G, 4, dtype=a.dtype, device=a.device),
++    ]
++
++
++@torch.library.custom_op(
++    "aimnet::conv_sv_2d_sp_bwd_bwd",
++    mutates_args=(),
++    device_types=["cuda"],
++)
++def _(
++    grad_output: Tensor,
++    grad2_a: Tensor,
++    grad2_g: Tensor,
++    a: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    padding_value: int,
++    num_centers: int,
++) -> list[Tensor]:
++    """Double backward primitive for conv_sv_2d_sp."""
++    return _conv_sv_2d_sp_bwd_bwd_impl(grad_output, grad2_a, grad2_g, a, idx, g, padding_value, num_centers)
++
++
+ @torch.library.register_fake("aimnet::conv_sv_2d_sp_bwd_bwd")
+ def _(
+     grad_output: Tensor,
+@@ -456,14 +622,48 @@ def _(
+     padding_value: int,
+     num_centers: int,
+ ) -> list[Tensor]:
+-    _B, A, G = a.shape
+-    B_out, M = idx.shape
+-    _validate_conv_sv_sizes(a, idx, padding_value, num_centers)
+-    return [
+-        torch.empty(B_out, A, G, 4, dtype=a.dtype, device=a.device),
+-        torch.empty_like(a),
+-        torch.empty(B_out, M, G, 4, dtype=a.dtype, device=a.device),
+-    ]
++    return _fake_bwd_bwd(a, idx, padding_value, num_centers)
++
++
++@torch.library.custom_op(
++    "aimnet::conv_sv_2d_sp_det_bwd_bwd",
++    mutates_args=(),
++    device_types=["cuda"],
++)
++def _(
++    grad_output: Tensor,
++    grad2_a: Tensor,
++    grad2_g: Tensor,
++    a: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    csr_ptr: Tensor,
++    csr_idx: Tensor,
++    padding_value: int,
++    num_centers: int,
++) -> list[Tensor]:
++    """Deterministic double backward primitive: grad_a_double is gathered through the CSR transpose."""
++    _validate_transpose(a, idx, csr_ptr, csr_idx, num_centers)
++    return _conv_sv_2d_sp_bwd_bwd_impl(
++        grad_output, grad2_a, grad2_g, a, idx, g, padding_value, num_centers, csr_ptr, csr_idx
++    )
++
++
++@torch.library.register_fake("aimnet::conv_sv_2d_sp_det_bwd_bwd")
++def _(
++    grad_output: Tensor,
++    grad2_a: Tensor,
++    grad2_g: Tensor,
++    a: Tensor,
++    idx: Tensor,
++    g: Tensor,
++    csr_ptr: Tensor,
++    csr_idx: Tensor,
++    padding_value: int,
++    num_centers: int,
++) -> list[Tensor]:
++    _validate_transpose(a, idx, csr_ptr, csr_idx, num_centers)
++    return _fake_bwd_bwd(a, idx, padding_value, num_centers)
+ 
+ 
+ # =============================================================================
+@@ -519,6 +719,66 @@ def _conv_sv_2d_sp_bwd_bwd(ctx, *grad_outputs):
+     return outputs[0], outputs[1], None, outputs[2], None, None
+ 
+ 
++def _conv_sv_2d_sp_det_setup_fwd_context(ctx, inputs, output):
++    """Setup context for the deterministic forward pass."""
++    a, idx, g, csr_ptr, csr_idx, padding_value, num_centers = inputs
++    ctx.save_for_backward(a, idx, g, csr_ptr, csr_idx)
++    ctx.padding_value = padding_value
++    ctx.num_centers = num_centers
++
++
++def _conv_sv_2d_sp_det_setup_bwd_context(ctx, inputs, output):
++    """Setup context for the deterministic backward pass."""
++    grad_output, a, idx, g, csr_ptr, csr_idx, padding_value, num_centers = inputs
++    ctx.save_for_backward(grad_output, a, idx, g, csr_ptr, csr_idx)
++    ctx.padding_value = padding_value
++    ctx.num_centers = num_centers
++
++
++@torch.compiler.allow_in_graph
++def _conv_sv_2d_sp_det_bwd(ctx, grad_output):
++    """Backward pass for the deterministic conv_sv_2d_sp."""
++    a, idx, g, csr_ptr, csr_idx = ctx.saved_tensors
++    grad_a, grad_g = torch.ops.aimnet.conv_sv_2d_sp_det_bwd(
++        grad_output.contiguous(), a, idx, g, csr_ptr, csr_idx, ctx.padding_value, ctx.num_centers
++    )
++    return grad_a, None, grad_g, None, None, None, None
++
++
++@torch.compiler.allow_in_graph
++def _conv_sv_2d_sp_det_bwd_bwd(ctx, *grad_outputs):
++    """Double backward pass for the deterministic conv_sv_2d_sp."""
++    grad2_a = grad_outputs[0][0]
++    grad2_g = grad_outputs[0][1]
++
++    grad_output_saved, a, idx, g, csr_ptr, csr_idx = ctx.saved_tensors
++
++    if grad2_a is None:
++        grad2_a = torch.zeros_like(a)
++    if grad2_g is None:
++        B_out, M = idx.shape
++        G = a.shape[2]
++        grad2_g = torch.zeros(B_out, M, G, 4, dtype=g.dtype, device=g.device)
++
++    outputs = torch.ops.aimnet.conv_sv_2d_sp_det_bwd_bwd(
++        grad_output_saved, grad2_a, grad2_g, a, idx, g, csr_ptr, csr_idx, ctx.padding_value, ctx.num_centers
++    )
++
++    return outputs[0], outputs[1], None, outputs[2], None, None, None, None
++
++
++torch.library.register_autograd(
++    "aimnet::conv_sv_2d_sp_det_fwd",
++    _conv_sv_2d_sp_det_bwd,
++    setup_context=_conv_sv_2d_sp_det_setup_fwd_context,
++)
++
++torch.library.register_autograd(
++    "aimnet::conv_sv_2d_sp_det_bwd",
++    _conv_sv_2d_sp_det_bwd_bwd,
++    setup_context=_conv_sv_2d_sp_det_setup_bwd_context,
++)
++
+ torch.library.register_autograd(
+     "aimnet::conv_sv_2d_sp_fwd",
+     _conv_sv_2d_sp_bwd,
+@@ -554,6 +814,19 @@ def _vmap_slice(t: Tensor, d: int | None, k: int) -> Tensor:
+     return t.movedim(d, 0)[k].contiguous()
+ 
+ 
++def _vmap_loop(op, batch_size: int, in_dims, tensors: tuple[Tensor, ...], scalars: tuple[int, ...]):
++    """Call ``op`` once per vmap slice and stack every output along a new leading dim."""
++    outs: list[list[Tensor]] | None = None
++    for k in range(batch_size):
++        result = op(*(_vmap_slice(t, d, k) for t, d in zip(tensors, in_dims, strict=False)), *scalars)
++        if outs is None:
++            outs = [[] for _ in result]
++        for out, value in zip(outs, result, strict=True):
++            out.append(value)
++    assert outs is not None
++    return [torch.stack(out, dim=0) for out in outs], [0] * len(outs)
++
++
+ @torch.library.register_vmap("aimnet::conv_sv_2d_sp_bwd")
+ def _vmap_conv_sv_2d_sp_bwd(info, in_dims, grad_output, a, idx, g, padding_value, num_centers):
+     """vmap rule for the first-backward primitive.
+@@ -572,25 +845,12 @@ def _vmap_conv_sv_2d_sp_bwd(info, in_dims, grad_output, a, idx, g, padding_value
+     """
+     if any(dim is not None for dim in in_dims[1:]):
+         raise RuntimeError(f"aimnet::conv_sv_2d_sp_bwd vmap supports batching only grad_output; got in_dims={in_dims}")
+-    K = info.batch_size
+-
+-    out0: list[Tensor] = []
+-    out1: list[Tensor] = []
+-    for k in range(K):
+-        outs = torch.ops.aimnet.conv_sv_2d_sp_bwd(
+-            _vmap_slice(grad_output, in_dims[0], k),
+-            _vmap_slice(a, in_dims[1], k),
+-            _vmap_slice(idx, in_dims[2], k),
+-            _vmap_slice(g, in_dims[3], k),
+-            padding_value,
+-            num_centers,
+-        )
+-        out0.append(outs[0])
+-        out1.append(outs[1])
+-
+-    return (
+-        [torch.stack(out0, dim=0), torch.stack(out1, dim=0)],
+-        [0, 0],
++    return _vmap_loop(
++        torch.ops.aimnet.conv_sv_2d_sp_bwd,
++        info.batch_size,
++        in_dims,
++        (grad_output, a, idx, g),
++        (padding_value, num_centers),
+     )
+ 
+ 
+@@ -619,29 +879,47 @@ def _vmap_conv_sv_2d_sp_bwd_bwd(info, in_dims, grad_output, grad2_a, grad2_g, a,
+             "aimnet::conv_sv_2d_sp_bwd_bwd vmap supports batching only grad_output, "
+             f"grad2_a, and grad2_g; got in_dims={in_dims}"
+         )
+-    K = info.batch_size
+-
+-    out0: list[Tensor] = []
+-    out1: list[Tensor] = []
+-    out2: list[Tensor] = []
+-    for k in range(K):
+-        outs = torch.ops.aimnet.conv_sv_2d_sp_bwd_bwd(
+-            _vmap_slice(grad_output, in_dims[0], k),
+-            _vmap_slice(grad2_a, in_dims[1], k),
+-            _vmap_slice(grad2_g, in_dims[2], k),
+-            _vmap_slice(a, in_dims[3], k),
+-            _vmap_slice(idx, in_dims[4], k),
+-            _vmap_slice(g, in_dims[5], k),
+-            padding_value,
+-            num_centers,
++    return _vmap_loop(
++        torch.ops.aimnet.conv_sv_2d_sp_bwd_bwd,
++        info.batch_size,
++        in_dims,
++        (grad_output, grad2_a, grad2_g, a, idx, g),
++        (padding_value, num_centers),
++    )
++
++
++@torch.library.register_vmap("aimnet::conv_sv_2d_sp_det_bwd")
++def _vmap_conv_sv_2d_sp_det_bwd(info, in_dims, grad_output, a, idx, g, csr_ptr, csr_idx, padding_value, num_centers):
++    """vmap rule for the deterministic first-backward primitive; same contract as the atomic rule."""
++    if any(dim is not None for dim in in_dims[1:]):
++        raise RuntimeError(
++            f"aimnet::conv_sv_2d_sp_det_bwd vmap supports batching only grad_output; got in_dims={in_dims}"
+         )
+-        out0.append(outs[0])
+-        out1.append(outs[1])
+-        out2.append(outs[2])
++    return _vmap_loop(
++        torch.ops.aimnet.conv_sv_2d_sp_det_bwd,
++        info.batch_size,
++        in_dims,
++        (grad_output, a, idx, g, csr_ptr, csr_idx),
++        (padding_value, num_centers),
++    )
++
+ 
+-    return (
+-        [torch.stack(out0, dim=0), torch.stack(out1, dim=0), torch.stack(out2, dim=0)],
+-        [0, 0, 0],
++@torch.library.register_vmap("aimnet::conv_sv_2d_sp_det_bwd_bwd")
++def _vmap_conv_sv_2d_sp_det_bwd_bwd(
++    info, in_dims, grad_output, grad2_a, grad2_g, a, idx, g, csr_ptr, csr_idx, padding_value, num_centers
++):
++    """vmap rule for the deterministic double-backward primitive; same contract as the atomic rule."""
++    if any(dim is not None for dim in in_dims[3:]):
++        raise RuntimeError(
++            "aimnet::conv_sv_2d_sp_det_bwd_bwd vmap supports batching only grad_output, "
++            f"grad2_a, and grad2_g; got in_dims={in_dims}"
++        )
++    return _vmap_loop(
++        torch.ops.aimnet.conv_sv_2d_sp_det_bwd_bwd,
++        info.batch_size,
++        in_dims,
++        (grad_output, grad2_a, grad2_g, a, idx, g, csr_ptr, csr_idx),
++        (padding_value, num_centers),
+     )
+ 
+ 
+@@ -656,6 +934,7 @@ def conv_sv_2d_sp(
+     g: Tensor,
+     padding_value: int | None = None,
+     num_centers: int | None = None,
++    transpose: tuple[Tensor, Tensor] | None = None,
+ ) -> Tensor:
+     """Compute conv_sv_2d_sp with support for 1st and 2nd order derivatives.
+ 
+@@ -671,6 +950,13 @@ def conv_sv_2d_sp(
+         Sentinel threshold in the atom dimension. Defaults to ``K - 1``.
+     num_centers : int, optional
+         Number of centers launched by Warp. Defaults to ``C - 1``.
++    transpose : tuple[Tensor, Tensor], optional
++        CSR transpose of ``idx`` from :func:`conv_sv_2d_sp_transpose`, built
++        with the same ``padding_value`` and ``num_centers``. When given, the
++        backward and double backward gather each ``grad_a`` row in a fixed
++        order instead of scattering with atomics, so they are bitwise
++        reproducible run to run. These deterministic primitives are not
++        vmap-registered.
+ 
+     Notes
+     -----
+@@ -716,4 +1002,53 @@ def conv_sv_2d_sp(
+         idx = idx.contiguous()
+     if not g.is_contiguous():
+         g = g.contiguous()
++    if transpose is not None:
++        csr_ptr, csr_idx = transpose
++        return torch.ops.aimnet.conv_sv_2d_sp_det_fwd(a, idx, g, csr_ptr, csr_idx, padding_value, num_centers)
+     return torch.ops.aimnet.conv_sv_2d_sp_fwd(a, idx, g, padding_value, num_centers)
++
++
++def conv_sv_2d_sp_transpose(
++    idx: Tensor,
++    num_atoms: int,
++    padding_value: int | None = None,
++    num_centers: int | None = None,
++) -> tuple[Tensor, Tensor]:
++    """Build the CSR transpose of ``idx`` used by the deterministic conv_sv_2d_sp backward.
++
++    Parameters
++    ----------
++    idx : Tensor
++        Index tensor of shape (C, M), as passed to :func:`conv_sv_2d_sp`.
++    num_atoms : int
++        Atom capacity K, the leading dimension of ``a``.
++    padding_value : int, optional
++        Sentinel threshold. Defaults to ``K - 1``.
++    num_centers : int, optional
++        Number of center rows read. Defaults to ``C - 1``.
++
++    Returns
++    -------
++    tuple[Tensor, Tensor]
++        ``csr_ptr`` of shape (K + 1,) and ``csr_idx`` of shape (num_centers * M,),
++        both int32. The contributors to atom ``j`` are the flat slots
++        ``b * M + m`` in ``csr_idx[csr_ptr[j]:csr_ptr[j + 1]]``, in ascending
++        order. Slots from a row's first sentinel on are padding, matching the
++        kernels' early exit, and sort to the end, past ``csr_ptr[K]``. Built with a
++        stable sort and ``searchsorted``, so the result is deterministic.
++    """
++    if (padding_value is None) != (num_centers is None):
++        raise ValueError("padding_value and num_centers must be supplied together.")
++    if padding_value is None:
++        padding_value = num_atoms - 1
++        num_centers = idx.shape[0] - 1
++    rows = idx[:num_centers]
++    if rows.numel() >= 2**31:
++        raise ValueError("conv_sv_2d_sp_transpose supports fewer than 2**31 neighbor slots (int32 offsets).")
++    # Drop every slot from a row's first sentinel on, exactly as the kernels stop scanning there.
++    is_padding = (rows >= padding_value).to(torch.uint8).cummax(dim=1).values.bool()
++    keys = rows.masked_fill(is_padding, num_atoms).reshape(-1)
++    sorted_keys, order = torch.sort(keys, stable=True)
++    bounds = torch.arange(num_atoms + 1, device=idx.device, dtype=sorted_keys.dtype)
++    csr_ptr = torch.searchsorted(sorted_keys, bounds).to(torch.int32)
++    return csr_ptr, order.to(torch.int32)
+diff --git a/aimnet/modules/aev.py b/aimnet/modules/aev.py
+index 7e2c50b..7dff77f 100644
+--- a/aimnet/modules/aev.py
++++ b/aimnet/modules/aev.py
+@@ -250,7 +250,7 @@ def forward(self, data: dict[str, Tensor], a: Tensor) -> Tensor:
+             # conda-forge); anything else falls through to the pure-torch einsum.
+             if mode > 0 and a.device.type == "cuda" and a.dtype == torch.float32 and g_sv.dtype == torch.float32:
+                 if WARP_CUDA_AVAILABLE:
+-                    avf_sv = conv_sv_2d_sp(a, data["nbmat"], g_sv)
++                    avf_sv = conv_sv_2d_sp(a, data["nbmat"], g_sv, transpose=_nbmat_transpose(data))
+                 else:
+                     _warn_warp_cuda_unavailable()
+                     a_j = a.index_select(0, data["nbmat"].flatten()).unflatten(0, data["nbmat"].shape)
+@@ -338,6 +338,18 @@ def _warn_warp_cuda_unavailable() -> None:
+     )
+ 
+ 
++def _nbmat_transpose(data: dict[str, Tensor]) -> tuple[Tensor, Tensor] | None:
++    """CSR transpose of ``nbmat`` for the deterministic Warp backward, if the caller built one.
++
++    The calculator adds it beside ``nbmat`` only with ``deterministic=True``.
++    """
++    csr_ptr = data.get("_nbmat_csr_ptr")
++    csr_idx = data.get("_nbmat_csr_idx")
++    if csr_ptr is None or csr_idx is None:
++        return None
++    return csr_ptr, csr_idx
++
++
+ def _flatten_mode2(tensor: Tensor, name: str) -> Tensor:
+     """Flatten system and atom dimensions without allocating."""
+     flattened = tensor.flatten(0, 1)
+diff --git a/docs/calculator.md b/docs/calculator.md
+index 0065122..92be1f3 100644
+--- a/docs/calculator.md
++++ b/docs/calculator.md
+@@ -290,15 +290,17 @@ For ordinary energy/force/charge inference (including external autograd through
+ 
+ Route external DFT-D3 (and DSF Coulomb) through their differentiable pure-torch paths instead of the atomics-based nvalchemiops CUDA kernels. Default: `False`.
+ 
+-The kernel defaults accumulate pairwise terms with atomic adds, so repeated identical evaluations differ at the float32 rounding level (~1e-7 eV in energies). That noise is physically negligible but is amplified chaotically by iterative optimizers: batched geometry optimizations from byte-identical inputs can follow different trajectories. With `deterministic=True`, identical inputs give bitwise-identical energies and forces on the same machine and build **on the dense layout only**, at negligible cost for typical batched workloads.
++The kernel defaults accumulate pairwise terms with atomic adds, so repeated identical evaluations differ at the float32 rounding level (~1e-7 eV in energies). That noise is physically negligible but is amplified chaotically by iterative optimizers: batched geometry optimizations from byte-identical inputs can follow different trajectories. With `deterministic=True`, identical inputs give bitwise-identical energies and forces on the same machine and build. On the dense layout this needs nothing else and costs little for typical batched workloads; the packed layout also needs PyTorch's deterministic mode (below).
+ 
+-The dense layout is used on CUDA for 3D input with at most `nb_threshold` atoms per system (default 120), no `cell`, no Hessian, and no caller-supplied `mol_idx` or `nbmat`. Everything else runs on the packed neighbor-list layout. There, `deterministic=True` sorts each row of the neighbor lists the calculator builds into a canonical order (a caller-supplied `nbmat` is used in the order given), which makes energies bitwise reproducible on CUDA once PyTorch's deterministic mode is also on; without it a one-time `UserWarning` fires. Forces on the packed layout are not yet covered: the ConvSV backward kernel still accumulates in varying order, leaving run-to-run noise of about 1e-6 eV/Å ([#140](https://github.com/isayevlab/aimnetcentral/issues/140)). CPU evaluations always use the packed layout; they have been bitwise repeatable in testing, but that is not yet guaranteed.
++The dense layout is used on CUDA for 3D input with at most `nb_threshold` atoms per system (default 120), no `cell`, no Hessian, and no caller-supplied `mol_idx` or `nbmat`. Everything else runs on the packed neighbor-list layout. There, `deterministic=True` sorts each row of the neighbor lists the calculator builds into a canonical order (a caller-supplied `nbmat` is used in the order given), and the backward of the Warp ConvSV kernel gathers each atom's gradient in a fixed order through a transposed copy of the neighbor list instead of accumulating it with atomic adds. Together with PyTorch's deterministic mode, which the calculator does not switch on, this makes energies and forces bitwise reproducible on CUDA, including periodic inputs and forces with `train=True` ([#140](https://github.com/isayevlab/aimnetcentral/issues/140)). The PyTorch mode is still needed for two reductions outside the Warp kernel: the per-molecule `scatter_add_` sums (energies) and the backward of the neighbor-list `index_select` gathers (forces). Without it, a one-time `UserWarning` fires and both energies and forces keep run-to-run noise.
++
++The fixed-order backward is not used for a caller-supplied batched `(B, N, M)` neighbor matrix or for a legacy TorchScript `.jpt` model, so their forces are not covered. CPU evaluations always use the packed layout; they have been bitwise repeatable in testing, but that is not yet guaranteed.
+ 
+ ```python
+ calc = AIMNet2Calculator("aimnet2", deterministic=True)
+ ```
+ 
+-For reproducible energies on the packed layout, enable PyTorch's deterministic mode as well. It is process-wide, so the calculator leaves that choice to you:
++For reproducible energies and forces on the packed layout, enable PyTorch's deterministic mode as well. It is process-wide, so the calculator leaves that choice to you:
+ 
+ ```python
+ import os
+@@ -307,7 +309,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # before CUDA is first used
+ torch.use_deterministic_algorithms(True)  # or (True, warn_only=True) without the variable
+ ```
+ 
+-PyTorch's deterministic reductions are slower; in one measurement on an L40S they roughly doubled the cost of an energy-and-forces call for a batch of 32 molecules, so benchmark your workload.
++PyTorch's deterministic reductions are slower, so benchmark your workload. In one measurement on an L40S they roughly doubled the cost of an energy-and-forces call for a batch of 32 molecules. For single systems of 100 to 5000 atoms (packed layout, DFT-D3 detached), `deterministic=True` with that mode made the force backward about 3.5 to 6 times slower in CUDA time than the default and raised peak memory by up to about 0.9 GB at 5000 atoms. Most of that cost is PyTorch's deterministic `index_put_`. The fixed-order ConvSV backward costs much less: the calculator rebuilds its transposed neighbor list (about 0.3 ms) on each call that can run a backward (forces, stress, `train=True`, or inputs that require grad), and in a molecular-dynamics-style loop with forces at every step this added 1 to 2% per step at 113 and 1008 atoms. The list adds less than 1 MB of memory at 5000 atoms.
+ 
+ Notes:
+ 
+@@ -318,6 +320,7 @@ Notes:
+ - Reproducibility also requires the same batch composition and order. Adding an unrelated molecule to a batch, or switching between the dense and packed layouts, changes forces at the rounding level (about 1e-6 eV/Å), and an optimizer can amplify that into a different local minimum.
+ - For conformer ranking, converge tightly (for example `fmax` of 1e-3 eV/Å) before ranking, and re-optimize the finalists one at a time on the dense layout (raise `nb_threshold` above the molecule size if needed; peak memory grows, roughly 3x at 128 atoms).
+ - The `cache_static` DFTD3 term cache does not apply in this mode.
++- With `train=True`, parameter gradients are outside the bitwise guarantee; in testing on the packed layout they matched from the third call on but not on the first two.
+ 
+ #### `ensemble_member`
+ 
+diff --git a/tests/test_calculator_gpu.py b/tests/test_calculator_gpu.py
+index d379b8d..c25232e 100644
+--- a/tests/test_calculator_gpu.py
++++ b/tests/test_calculator_gpu.py
+@@ -781,7 +781,7 @@ def test_batched_evals_bitwise_reproducible(self):
+     _REPEATS = 10
+ 
+     @staticmethod
+-    def _repeat_taxol(nb_threshold: int) -> list[dict[str, torch.Tensor]]:
++    def _repeat_taxol(nb_threshold: int, train: bool = False) -> list[dict[str, torch.Tensor]]:
+         """Evaluate taxol (113 atoms) repeatedly on the dense or packed layout."""
+         mol = load_mol(TAXOL_FILE)
+         data = {
+@@ -789,7 +789,7 @@ def _repeat_taxol(nb_threshold: int) -> list[dict[str, torch.Tensor]]:
+             "numbers": torch.as_tensor(mol["numbers"], device="cuda").unsqueeze(0),
+             "charge": torch.zeros(1, device="cuda"),
+         }
+-        calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=nb_threshold)
++        calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=nb_threshold, train=train)
+         return [calc(dict(data), forces=True) for _ in range(TestDeterministicMode._REPEATS)]
+ 
+     @pytest.mark.ase
+@@ -824,11 +824,114 @@ def test_packed_layout_periodic_energy_bitwise_reproducible(self, torch_determin
+         assert all(torch.equal(e, energies[0]) for e in energies[1:])
+ 
+     @pytest.mark.ase
+-    @pytest.mark.xfail(strict=True, reason="#140: the Warp conv_sv_2d_sp backward accumulates with atomics")
+     def test_packed_layout_forces_bitwise_reproducible(self, torch_deterministic):
+         outs = self._repeat_taxol(nb_threshold=0)
+         assert all(torch.equal(out["forces"], outs[0]["forces"]) for out in outs[1:])
+ 
++    @pytest.mark.ase
++    def test_packed_layout_training_forces_bitwise_reproducible(self, torch_deterministic):
++        """train=True keeps the force graph (create_graph), so the deterministic double backward is recorded."""
++        outs = self._repeat_taxol(nb_threshold=0, train=True)
++        assert all(torch.equal(out["forces"], outs[0]["forces"]) for out in outs[1:])
++
++    @pytest.mark.ase
++    @pytest.mark.slow
++    def test_packed_layout_training_hessian_from_forces(self, monkeypatch):
++        """A Hessian built from train=True forces vmaps through the deterministic double backward."""
++        mol = load_mol(CAFFEINE_FILE)
++        data = {
++            "coord": torch.as_tensor(mol["coord"], dtype=torch.float32, device="cuda"),
++            "numbers": torch.as_tensor(mol["numbers"], device="cuda"),
++            "charge": torch.zeros(1, device="cuda"),
++        }
++
++        def hessian() -> torch.Tensor:
++            calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=0, train=True)
++            with warnings.catch_warnings():
++                warnings.simplefilter("ignore")  # packed layout without torch's deterministic mode
++                out = calc(dict(data), forces=True)
++            return calc.calculate_hessian(out["forces"], calc._saved_for_grad["coord"])
++
++        gathered = hessian()
++        # Reference: the same evaluation through the atomic kernels.
++        monkeypatch.setattr(AIMNet2Calculator, "_add_nbmat_transpose", staticmethod(lambda *args, **kwargs: None))
++        torch.testing.assert_close(gathered, hessian(), atol=1e-3, rtol=1e-3)
++
++    @pytest.mark.ase
++    def test_packed_layout_periodic_forces_bitwise_reproducible(self, torch_deterministic):
++        crystal = load_mol(CIF_SPIRO)
++        calc = AIMNet2Calculator("aimnet2", deterministic=True)
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")  # the DSF auto-switch for periodic input
++            forces = [calc(dict(crystal), forces=True)["forces"] for _ in range(self._REPEATS)]
++        assert all(torch.equal(f, forces[0]) for f in forces[1:])
++
++    @pytest.mark.ase
++    @pytest.mark.slow
++    def test_packed_layout_periodic_forces_match_default_path(self):
++        crystal = load_mol(CIF_SPIRO)
++        forces = []
++        for deterministic in (False, True):
++            calc = AIMNet2Calculator("aimnet2", deterministic=deterministic)
++            with warnings.catch_warnings():
++                warnings.simplefilter("ignore")  # the DSF auto-switch for periodic input
++                forces.append(calc(dict(crystal), forces=True)["forces"])
++        torch.testing.assert_close(forces[1], forces[0], atol=1e-4, rtol=1e-4)
++
++    @staticmethod
++    def _caffeine_packed() -> dict[str, torch.Tensor]:
++        mol = load_mol(CAFFEINE_FILE)
++        return {
++            "coord": torch.as_tensor(mol["coord"], dtype=torch.float32, device="cuda"),
++            "numbers": torch.as_tensor(mol["numbers"], device="cuda"),
++            "charge": torch.zeros(1, device="cuda"),
++        }
++
++    @pytest.mark.ase
++    @pytest.mark.parametrize("deterministic", [False, True])
++    def test_only_deterministic_mode_dispatches_deterministic_kernels(self, deterministic):
++        from torch.profiler import ProfilerActivity, profile
++
++        calc = AIMNet2Calculator("aimnet2", deterministic=deterministic, nb_threshold=0)
++        data = self._caffeine_packed()
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")  # packed layout without torch's deterministic mode
++            calc(dict(data), forces=True)
++            with profile(activities=[ProfilerActivity.CPU]) as prof:
++                calc(dict(data), forces=True)
++        ops = {e.key for e in prof.key_averages() if e.key.startswith("aimnet::conv_sv_2d_sp")}
++        assert ops, "the packed layout must use the Warp ConvSV kernel"
++        assert all(("_det_" in op) == deterministic for op in ops), ops
++
++    @pytest.mark.ase
++    @pytest.mark.parametrize(
++        ("case", "builds"),
++        [("energy", False), ("forces", True), ("coord_requires_grad", True), ("train_energy", True)],
++    )
++    def test_transpose_is_built_only_when_a_backward_can_run(self, monkeypatch, case, builds):
++        import aimnet.kernels
++
++        calls = []
++        build = aimnet.kernels.conv_sv_2d_sp_transpose
++
++        def spy(*args, **kwargs):
++            calls.append(1)
++            return build(*args, **kwargs)
++
++        monkeypatch.setattr(aimnet.kernels, "conv_sv_2d_sp_transpose", spy)
++        calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=0, train=case == "train_energy")
++        data = self._caffeine_packed()
++        if case == "coord_requires_grad":
++            data["coord"].requires_grad_(True)
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")  # packed layout without torch's deterministic mode
++            out = calc(dict(data), forces=case == "forces")
++        assert bool(calls) == builds
++        if case == "coord_requires_grad":
++            # External autograd through the calculator reaches the gather backward.
++            (grad,) = torch.autograd.grad(out["energy"].sum(), data["coord"])
++            assert torch.isfinite(grad).all()
++
+     @staticmethod
+     def _packed_warnings(calc: AIMNet2Calculator, batched: bool = False) -> list[warnings.WarningMessage]:
+         """Packed-layout warnings from two evaluations of caffeine.
+diff --git a/tests/test_conv_sv_2d_sp.py b/tests/test_conv_sv_2d_sp.py
+index d1bdb61..c2635dd 100644
+--- a/tests/test_conv_sv_2d_sp.py
++++ b/tests/test_conv_sv_2d_sp.py
+@@ -592,3 +592,185 @@ def test_global_mode2_empty_and_all_sentinel_rows():
+     idx = torch.full((a.shape[0], g.shape[1]), padding_value, device="cuda", dtype=torch.int64)
+     actual = conv_sv_2d_sp(a, idx, g, padding_value, num_centers)
+     assert torch.equal(actual, torch.zeros_like(actual))
++
++
++def _contended_conv_data(seed: int = 0):
++    """Packed-layout inputs where every atom has many contributors, so atomic adds race.
++
++    K = 257 atoms (last row is padding), M = 34 slots with 24 real neighbors,
++    A = G = 16 as in AIMNet2; neighbors repeat across rows.
++    """
++    torch.manual_seed(seed)
++    K, A, G, M = 257, 16, 16, 34
++    a = torch.randn(K, A, G, device="cuda")
++    idx = generate_valid_neighbor_idx(K, M, num_neighbors=24, device="cuda").to(torch.int32)
++    g = torch.randn(K, M, G, 4, device="cuda") * (idx < K - 1).unsqueeze(-1).unsqueeze(-1)
++    go = torch.randn(K, A, G, 4, device="cuda")
++    return a, idx, g, go
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++def test_transpose_lists_each_atoms_contributors_in_slot_order():
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp_transpose
++
++    a, idx, _g, padding_value, num_centers = _generalized_conv_data()
++    csr_ptr, csr_idx = conv_sv_2d_sp_transpose(idx, a.shape[0], padding_value, num_centers)
++    assert csr_ptr.dtype == csr_idx.dtype == torch.int32
++    assert csr_ptr.shape == (a.shape[0] + 1,)
++    assert csr_idx.shape == (num_centers * idx.shape[1],)
++    flat = idx[:num_centers].flatten().tolist()
++    for j in range(a.shape[0]):
++        expected = [slot for slot, value in enumerate(flat) if value == j]
++        assert csr_idx[csr_ptr[j] : csr_ptr[j + 1]].tolist() == expected
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++def test_transpose_rejects_mismatched_shapes():
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp, conv_sv_2d_sp_transpose
++
++    a, idx, g, _go = _contended_conv_data()
++    transpose = conv_sv_2d_sp_transpose(idx[:-1], a.shape[0] - 1)
++    with pytest.raises(ValueError, match="transpose does not match"):
++        conv_sv_2d_sp(a, idx, g, transpose=transpose)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++@pytest.mark.parametrize("layout", ["mode1", "generalized"])
++def test_deterministic_backward_matches_atomic(layout):
++    """The gather backward agrees with the atomic one to float32 rounding; grad_g is the same kernel."""
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp_transpose
++
++    if layout == "mode1":
++        a, idx, g, go = _contended_conv_data()
++        padding_value, num_centers = a.shape[0] - 1, idx.shape[0] - 1
++    else:
++        a, idx, g, padding_value, num_centers = _generalized_conv_data()
++        a, g, idx = a.detach(), g.detach(), idx.to(torch.int32)
++        go = torch.randn(idx.shape[0], a.shape[1], a.shape[2], 4, device="cuda")
++    transpose = conv_sv_2d_sp_transpose(idx, a.shape[0], padding_value, num_centers)
++    ops = torch.ops.aimnet
++
++    grad_a, grad_g = ops.conv_sv_2d_sp_bwd(go, a, idx, g, padding_value, num_centers)
++    det_a, det_g = ops.conv_sv_2d_sp_det_bwd(go, a, idx, g, *transpose, padding_value, num_centers)
++    torch.testing.assert_close(det_a, grad_a, atol=1e-5, rtol=1e-5)
++    assert torch.equal(det_g, grad_g)
++
++    grad2_a, grad2_g = torch.randn_like(a), torch.randn_like(g)
++    atomic = ops.conv_sv_2d_sp_bwd_bwd(go, grad2_a, grad2_g, a, idx, g, padding_value, num_centers)
++    det = ops.conv_sv_2d_sp_det_bwd_bwd(go, grad2_a, grad2_g, a, idx, g, *transpose, padding_value, num_centers)
++    assert torch.equal(det[0], atomic[0])
++    torch.testing.assert_close(det[1], atomic[1], atol=1e-5, rtol=1e-5)
++    assert torch.equal(det[2], atomic[2])
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++def test_deterministic_backward_is_bitwise_repeatable():
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp_transpose
++
++    a, idx, g, go = _contended_conv_data()
++    pv, nc = a.shape[0] - 1, idx.shape[0] - 1
++    grad2_a, grad2_g = torch.randn_like(a), torch.randn_like(g)
++    ops = torch.ops.aimnet
++    first = None
++    for _ in range(10):
++        # Rebuilt every time: the transpose itself must be deterministic too.
++        transpose = conv_sv_2d_sp_transpose(idx, a.shape[0])
++        outs = [
++            *ops.conv_sv_2d_sp_det_bwd(go, a, idx, g, *transpose, pv, nc),
++            *ops.conv_sv_2d_sp_det_bwd_bwd(go, grad2_a, grad2_g, a, idx, g, *transpose, pv, nc),
++        ]
++        if first is None:
++            first = outs
++        assert all(torch.equal(out, ref) for out, ref in zip(outs, first, strict=True))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++def test_deterministic_autograd_matches_default_through_second_order():
++    """conv_sv_2d_sp(transpose=...) wires both autograd levels to the deterministic primitives."""
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp, conv_sv_2d_sp_transpose
++
++    a0, idx, g0, go = _contended_conv_data()
++    u, v = torch.randn_like(a0), torch.randn_like(g0)
++
++    def second_order(transpose):
++        a = a0.clone().requires_grad_(True)
++        g = g0.clone().requires_grad_(True)
++        out = conv_sv_2d_sp(a, idx, g, transpose=transpose)
++        grad_a, grad_g = torch.autograd.grad(out, (a, g), go, create_graph=True)
++        second = torch.autograd.grad((grad_a * u).sum() + (grad_g * v).sum(), (a, g))
++        return out, grad_a, grad_g, *second
++
++    reference = second_order(None)
++    deterministic = second_order(conv_sv_2d_sp_transpose(idx, a0.shape[0]))
++    for actual, expected in zip(deterministic, reference, strict=True):
++        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
++
++
++# Rows the calculator can see from a caller-supplied nbmat. Sentinel is 4.
++_IRREGULAR_ROWS = {
++    # The kernels stop at the first sentinel, so the 2 after it is not a neighbor.
++    "interleaved_padding": [[1, 4, 2, 3], [0, 2, 4, 4], [4, 0, 1, 3], [0, 1, 2, 4], [4, 4, 4, 4]],
++    # Periodic images repeat a neighbor index within a row.
++    "repeated_neighbors": [[1, 1, 2, 4], [0, 0, 0, 4], [3, 3, 1, 1], [2, 2, 2, 2], [4, 4, 4, 4]],
++}
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++@pytest.mark.parametrize("rows", sorted(_IRREGULAR_ROWS))
++def test_deterministic_backward_matches_atomic_on_irregular_rows(rows):
++    """The transpose must list exactly the slots the forward reads, as the atomic backward does."""
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp_transpose
++
++    torch.manual_seed(0)
++    idx = torch.tensor(_IRREGULAR_ROWS[rows], device="cuda", dtype=torch.int32)
++    K, M = idx.shape
++    a = torch.randn(K, 2, 3, device="cuda")
++    g = torch.randn(K, M, 3, 4, device="cuda")
++    go = torch.randn(K, 2, 3, 4, device="cuda")
++    pv, nc = K - 1, K - 1
++    transpose = conv_sv_2d_sp_transpose(idx, K)
++    ops = torch.ops.aimnet
++
++    atomic = ops.conv_sv_2d_sp_bwd(go, a, idx, g, pv, nc)
++    det = ops.conv_sv_2d_sp_det_bwd(go, a, idx, g, *transpose, pv, nc)
++    for actual, expected in zip(det, atomic, strict=True):
++        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
++
++    grad2_a, grad2_g = torch.randn_like(a), torch.randn_like(g)
++    atomic = ops.conv_sv_2d_sp_bwd_bwd(go, grad2_a, grad2_g, a, idx, g, pv, nc)
++    det = ops.conv_sv_2d_sp_det_bwd_bwd(go, grad2_a, grad2_g, a, idx, g, *transpose, pv, nc)
++    for actual, expected in zip(det, atomic, strict=True):
++        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++def test_deterministic_kernels_have_vmap_rules():
++    """vmap over the cotangents of det_bwd and det_bwd_bwd matches a loop over the atomic ops."""
++    from aimnet.kernels.conv_sv_2d_sp_wp import conv_sv_2d_sp_transpose
++
++    a, idx, g, go = _contended_conv_data()
++    pv, nc = a.shape[0] - 1, idx.shape[0] - 1
++    transpose = conv_sv_2d_sp_transpose(idx, a.shape[0])
++    ops = torch.ops.aimnet
++    gos = torch.randn(3, *go.shape, device="cuda")
++    grad2_a = torch.randn(3, *a.shape, device="cuda")
++    grad2_g = torch.randn(3, *g.shape, device="cuda")
++
++    batched = torch.func.vmap(lambda c: ops.conv_sv_2d_sp_det_bwd(c, a, idx, g, *transpose, pv, nc))(gos)
++    for k in range(3):
++        expected = ops.conv_sv_2d_sp_bwd(gos[k], a, idx, g, pv, nc)
++        for actual, ref in zip(batched, expected, strict=True):
++            torch.testing.assert_close(actual[k], ref, atol=1e-5, rtol=1e-5)
++
++    batched = torch.func.vmap(lambda x, y: ops.conv_sv_2d_sp_det_bwd_bwd(go, x, y, a, idx, g, *transpose, pv, nc))(
++        grad2_a, grad2_g
++    )
++    for k in range(3):
++        expected = ops.conv_sv_2d_sp_bwd_bwd(go, grad2_a[k], grad2_g[k], a, idx, g, pv, nc)
++        for actual, ref in zip(batched, expected, strict=True):
++            torch.testing.assert_close(actual[k], ref, atol=1e-5, rtol=1e-5)
++
++    with pytest.raises(RuntimeError, match="supports batching only"):
++        torch.func.vmap(lambda c: ops.conv_sv_2d_sp_det_bwd(go, a, idx, g, c, transpose[1], pv, nc))(
++            transpose[0].unsqueeze(0)
++        )
+diff --git a/tests/test_kernel_registration.py b/tests/test_kernel_registration.py
+index 3718b7a..b1aa0bf 100644
+--- a/tests/test_kernel_registration.py
++++ b/tests/test_kernel_registration.py
+@@ -13,6 +13,9 @@
+     "aimnet::conv_sv_2d_sp_fwd",
+     "aimnet::conv_sv_2d_sp_bwd",
+     "aimnet::conv_sv_2d_sp_bwd_bwd",
++    "aimnet::conv_sv_2d_sp_det_fwd",
++    "aimnet::conv_sv_2d_sp_det_bwd",
++    "aimnet::conv_sv_2d_sp_det_bwd_bwd",
+ }
+ 
+ 

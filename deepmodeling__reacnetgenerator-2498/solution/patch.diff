@@ -1,0 +1,1734 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 32007966e..31e532437 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,6 +39,11 @@ add_custom_target(run ALL DEPENDS bundle.html)
+ install(
+   FILES ${CMAKE_CURRENT_SOURCE_DIR}/reacnetgenerator/static/webpack/bundle.html
+   DESTINATION reacnetgenerator/static/webpack/)
++install(
++  FILES
++    ${CMAKE_CURRENT_SOURCE_DIR}/reacnetgenerator/schemas/__init__.py
++    ${CMAKE_CURRENT_SOURCE_DIR}/reacnetgenerator/schemas/timed-output-schema.json
++  DESTINATION reacnetgenerator/schemas/)
+ 
+ # dps
+ add_custom_command(
+diff --git a/docs/guide/timed-output-schema.md b/docs/guide/timed-output-schema.md
+index b6ec6068c..706c1b69f 100644
+--- a/docs/guide/timed-output-schema.md
++++ b/docs/guide/timed-output-schema.md
+@@ -19,6 +19,29 @@ contain coordinates or instance-level reaction participants/bond-change evidence
+ It does not change the existing text outputs or enable the legacy CSV switches.
+ Those switches can still be selected separately.
+ 
++## Why validation is part of the format
++
++A saved analysis result is useful beyond the process that wrote it only when a
++user or another program can establish what it contains and whether its tables
++still agree. Opening an HDF5 file proves neither. The schema 1.0 validator makes
++the timeline a verifiable software boundary:
++
++- CI and scientific regression tests can reject a result with broken offsets,
++  dangling IDs, nonmaximal ranges, or inconsistent reaction totals even when the
++  file remains readable.
++- Collaborators and archives can record a compact semantic manifest and compare
++  results without depending on HDF5 compression, chunking, or local file paths.
++- Downstream consumers, including visualization and analysis applications, can
++  validate producer output before interpreting it and discover the contract from
++  an installed JSON descriptor.
++- Future schema migrations have a concrete 1.0 baseline against which changed
++  structure and meaning can be reviewed.
++
++This is an artifact-integrity and reproducibility check. It does not establish
++chemical truth, transition states, barriers, kinetics, or agreement with the raw
++trajectory. Source paths, sizes, and modification times are provenance hints;
++they are not content hashes.
++
+ ## Meaning of time and identity
+ 
+ - A frame is a zero-based **analyzed** frame. `frames/source_id` and
+@@ -122,12 +145,72 @@ Definitions include `atom_index` and `(atom1, atom2, order)` bond tuples.
+ Source paths and atom-type tables can be accessed directly with h5py under the
+ public contract above.
+ 
++## Validation and semantic comparison
++
++Validate the complete structural and cross-table contract before consuming an
++artifact:
++
++```python
++from reacnetgenerator.timedoutput import validate_timed_output
++
++summary = validate_timed_output("timeline.h5")
++print(summary.frames, summary.reaction_events)
++```
++
++The validator checks required attributes and datasets, strict JSON configuration,
++agreement between `runHMM` and the declared range basis, one-dimensional column
++types and alignment, frame mappings against the configured global sampling
++stride, offset bounds, dictionary and frame references, molecule bond membership,
++range ordering/maximality, event ordering and uniqueness, and reaction-type
++totals. Numeric scans use `block_rows`; one molecule definition or dictionary can
++still exceed that working-memory budget.
++
++Create and compare deterministic manifests in Python:
++
++```python
++from reacnetgenerator.timedoutput import (
++    compare_semantic_manifests,
++    semantic_manifest,
++)
++
++reference = semantic_manifest("reference.h5")
++candidate = semantic_manifest("candidate.h5")
++differences = compare_semantic_manifests(reference, candidate)
++```
++
++The default manifest hashes canonical dataset values, non-location configuration,
++and interpretation metadata. HDF5 compression and chunk layout do not affect it.
++It omits source paths/sizes/timestamps, creation time, RNG build version, and
++path-valued configuration so that relocating an otherwise identical analysis does
++not create a difference. Set `include_provenance=True` when those fields must also
++match.
++The manifest SHA-256 is a deterministic comparison key, not a signature or a
++raw-input integrity guarantee.
++
++The same operations are available to shell scripts and CI:
++
++```sh
++reacnetgenerator-check-timed-output timeline.h5
++reacnetgenerator-check-timed-output timeline.h5 \
++    --write-manifest timeline.manifest.json
++reacnetgenerator-check-timed-output candidate.h5 \
++    --compare-manifest timeline.manifest.json
++```
++
++Successful commands print a compact JSON summary and return 0. Invalid artifacts
++or manifest differences are written to standard error and return 1; command-line
++usage errors return 2. Manifest writes use an atomic sibling replacement.
++
++`read_schema_descriptor()` returns the installed
++`schemas/timed-output-schema.json` contract for tools that need to inspect the
++schema without scraping this guide.
++
+ Numeric rows are read in blocks, ranges are not expanded into frame rows, and
+ counts are not expanded into individual events. Dictionary strings are read one
+ at a time. One molecule definition or one string can exceed the block budget.
+ Call `.close()` on an iterator when stopping early, or use `contextlib.closing`.
+-Header/type/alignment checks are not a full structural or semantic validator;
+-a dedicated validator and semantic manifest are a later batch.
++The compact readers perform local checks needed to read their requested table;
++call `validate_timed_output()` when the complete artifact contract matters.
+ 
+ ## Publication and resource behavior
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 4c98227b7..04c55bc7e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -63,6 +63,7 @@ repository = "https://github.com/deepmodeling/reacnetgenerator"
+ 
+ [project.scripts]
+ reacnetgenerator = "reacnetgenerator.commandline:_commandline"
++reacnetgenerator-check-timed-output = "reacnetgenerator.timedoutputcheck:main"
+ 
+ [project.gui-scripts]
+ reacnetgeneratorgui = "reacnetgenerator.gui:gui"
+@@ -109,6 +110,7 @@ fallback_version = "0.0.0"
+ test-command = [
+   "reacnetgenerator -h",
+   "reacnetgenerator --version",
++  "reacnetgenerator-check-timed-output -h",
+ ]
+ build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*"]
+ skip = ["*-win32", "*-manylinux_i686", "*-musllinux*"]
+diff --git a/reacnetgenerator/_timedoutputcontract.py b/reacnetgenerator/_timedoutputcontract.py
+new file mode 100644
+index 000000000..39c93b9e3
+--- /dev/null
++++ b/reacnetgenerator/_timedoutputcontract.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Dependency-free public contract types for timeline validation."""
++
++from dataclasses import dataclass
++
++SCHEMA_VERSION = "1.0"
++
++
++@dataclass(frozen=True)
++class ValidationSummary:
++    """Row counts established by a successful schema 1.0 validation."""
++
++    schema_version: str
++    sources: int
++    frames: int
++    atoms: int
++    atom_types: int
++    species: int
++    molecules: int
++    molecule_ranges: int
++    reaction_types: int
++    reaction_events: int
++
++
++class TimedOutputValidationError(ValueError):
++    """A timeline violates the declared structural or semantic contract."""
+diff --git a/reacnetgenerator/_timedoutputmanifest.py b/reacnetgenerator/_timedoutputmanifest.py
+new file mode 100644
+index 000000000..262f51943
+--- /dev/null
++++ b/reacnetgenerator/_timedoutputmanifest.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Canonical semantic manifests for validated timeline artifacts."""
++
++import hashlib
++import hmac
++import json
++import struct
++from collections.abc import Mapping
++from dataclasses import asdict
++
++import h5py
++import numpy as np
++
++from ._timedoutputvalidate import _root_metadata, validate_timed_output
++
++_MANIFEST_FORMAT = "reacnetgenerator-timeline-semantic-manifest"
++_MANIFEST_VERSION = "1.0"
++_PATH_PARAMETERS = {
++    "atomroutefilename",
++    "imagefilename",
++    "inputfilename",
++    "jsonfilename",
++    "moleculefilename",
++    "moleculetimelinefilename",
++    "output_dir",
++    "reactionabcdfilename",
++    "reactioneventfilename",
++    "reactionfilename",
++    "resultfilename",
++    "speciesfilename",
++    "tablefilename",
++    "timed_output",
++}
++_DATASETS = (
++    "sources/path",
++    "sources/size_bytes",
++    "sources/mtime_ns",
++    "frames/source_id",
++    "frames/source_frame",
++    "frames/timestep",
++    "atoms/type",
++    "atoms/type_name",
++    "species/name",
++    "molecules/species_id",
++    "molecules/atom_offsets",
++    "molecules/atom_index",
++    "molecules/bond_offsets",
++    "molecules/bond_atom_index_1",
++    "molecules/bond_atom_index_2",
++    "molecules/bond_order",
++    "molecule_ranges/molecule_id",
++    "molecule_ranges/start_frame",
++    "molecule_ranges/end_frame",
++    "reaction_types/reactant",
++    "reaction_types/product",
++    "reaction_types/total_count",
++    "reaction_events/transition",
++    "reaction_events/reaction_type_id",
++    "reaction_events/count",
++)
++_PROVENANCE_DATASETS = {
++    "sources/path",
++    "sources/size_bytes",
++    "sources/mtime_ns",
++}
++
++
++def _normalized_configuration(configuration):
++    """Remove location-only values while retaining interpretation settings."""
++    parameters = {
++        key: value
++        for key, value in configuration["parameters"].items()
++        if key not in _PATH_PARAMETERS
++    }
++    explicit = sorted(
++        key
++        for key in configuration["explicit_parameters"]
++        if key not in _PATH_PARAMETERS
++    )
++    return {"parameters": parameters, "explicit_parameters": explicit}
++
++
++def _dataset_digest(dataset, block_rows):
++    digest = hashlib.sha256()
++    string = h5py.check_string_dtype(dataset.dtype)
++    for start in range(0, len(dataset), block_rows):
++        if string is None:
++            values = np.asarray(dataset[start : start + block_rows], dtype="<i8")
++            digest.update(values.tobytes(order="C"))
++        else:
++            values = dataset.asstr()[start : start + block_rows]
++            for value in values:
++                encoded = value.encode("utf-8")
++                digest.update(struct.pack("<Q", len(encoded)))
++                digest.update(encoded)
++    return digest.hexdigest()
++
++
++def _canonical_hash(value):
++    payload = json.dumps(
++        value,
++        ensure_ascii=False,
++        allow_nan=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    ).encode("utf-8")
++    return hashlib.sha256(payload).hexdigest()
++
++
++def semantic_manifest(filename, *, include_provenance=False, block_rows=8192):
++    """Build a storage-independent manifest after full contract validation."""
++    summary = validate_timed_output(filename, block_rows=block_rows)
++    with h5py.File(filename, "r") as file:
++        configuration = _root_metadata(file)
++        metadata = {
++            "atom_index_convention": file.attrs["atom_index_convention"],
++            "capabilities": json.loads(file.attrs["capabilities"]),
++            "configuration": configuration
++            if include_provenance
++            else _normalized_configuration(configuration),
++            "molecule_range_basis": file.attrs["molecule_range_basis"],
++        }
++        if include_provenance:
++            metadata.update(
++                created_utc=file.attrs["created_utc"],
++                rng_version=file.attrs["rng_version"],
++            )
++        datasets = {}
++        for path in _DATASETS:
++            if not include_provenance and path in _PROVENANCE_DATASETS:
++                continue
++            dataset = file[path]
++            datasets[path] = {
++                "rows": len(dataset),
++                "sha256": _dataset_digest(dataset, block_rows),
++            }
++
++    manifest = {
++        "manifest_format": _MANIFEST_FORMAT,
++        "manifest_version": _MANIFEST_VERSION,
++        "timeline_schema_version": summary.schema_version,
++        "provenance_included": bool(include_provenance),
++        "metadata": metadata,
++        "summary": asdict(summary),
++        "datasets": datasets,
++    }
++    manifest["semantic_sha256"] = _canonical_hash(manifest)
++    return manifest
++
++
++def _pointer_token(value):
++    return str(value).replace("~", "~0").replace("/", "~1")
++
++
++def _differences(left, right, path):
++    if isinstance(left, Mapping) and isinstance(right, Mapping):
++        for key in sorted(set(left) | set(right)):
++            child = f"{path}/{_pointer_token(key)}"
++            if key not in left or key not in right:
++                yield child
++            else:
++                yield from _differences(left[key], right[key], child)
++        return
++    if isinstance(left, list) and isinstance(right, list):
++        for position in range(max(len(left), len(right))):
++            child = f"{path}/{position}"
++            if position >= len(left) or position >= len(right):
++                yield child
++            else:
++                yield from _differences(left[position], right[position], child)
++        return
++    if type(left) is not type(right) or left != right:
++        yield path or "/"
++
++
++def compare_semantic_manifests(left, right):
++    """Validate manifest envelopes and locate all value differences."""
++    for name, manifest in (("left", left), ("right", right)):
++        if not isinstance(manifest, Mapping):
++            raise ValueError(f"The {name} manifest must be a mapping")
++        if manifest.get("manifest_format") != _MANIFEST_FORMAT:
++            raise ValueError(f"The {name} manifest has an unsupported format")
++        if manifest.get("manifest_version") != _MANIFEST_VERSION:
++            raise ValueError(f"The {name} manifest has an unsupported version")
++        checksum = manifest.get("semantic_sha256")
++        content = dict(manifest)
++        content.pop("semantic_sha256", None)
++        expected = _canonical_hash(content)
++        if (
++            not isinstance(checksum, str)
++            or not checksum.isascii()
++            or not hmac.compare_digest(checksum, expected)
++        ):
++            raise ValueError(f"The {name} manifest checksum is invalid")
++    return tuple(_differences(left, right, ""))
+diff --git a/reacnetgenerator/_timedoutputschema.py b/reacnetgenerator/_timedoutputschema.py
+new file mode 100644
+index 000000000..ff394c56f
+--- /dev/null
++++ b/reacnetgenerator/_timedoutputschema.py
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Installed machine-readable contract for the timeline format."""
++
++import json
++from importlib.resources import files
++
++
++def read_schema_descriptor():
++    """Return a fresh mapping so callers cannot mutate shared schema state."""
++    resource = files("reacnetgenerator.schemas").joinpath("timed-output-schema.json")
++    with resource.open(encoding="utf-8") as file:
++        return json.load(file)
+diff --git a/reacnetgenerator/_timedoutputvalidate.py b/reacnetgenerator/_timedoutputvalidate.py
+new file mode 100644
+index 000000000..4874cad5a
+--- /dev/null
++++ b/reacnetgenerator/_timedoutputvalidate.py
+@@ -0,0 +1,442 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Bounded structural and cross-table validation for timeline schema 1.0."""
++
++import json
++import sys
++from collections import Counter
++from datetime import datetime, timezone
++from operator import index
++
++import h5py
++
++from ._timedoutputcontract import (
++    SCHEMA_VERSION,
++    TimedOutputValidationError,
++    ValidationSummary,
++)
++
++_CAPABILITIES = ["molecule_ranges", "reaction_events"]
++_ATOM_CONVENTION = "zero-based RNG canonical atom order"
++_RANGE_BASES = {"HMM signal", "observed signal"}
++
++
++def _reject_json_constant(value):
++    raise ValueError(f"Non-standard JSON constant {value}")
++
++
++def _error(message):
++    raise TimedOutputValidationError(message)
++
++
++def _dataset(file, path):
++    try:
++        dataset = file[path]
++    except KeyError:
++        _error(f"Missing dataset {path}")
++    if not isinstance(dataset, h5py.Dataset) or dataset.ndim != 1:
++        _error(f"{path} must be a one-dimensional dataset")
++    return dataset
++
++
++def _numeric(file, path):
++    dataset = _dataset(file, path)
++    byteorder = dataset.dtype.byteorder
++    little_endian = byteorder == "<" or (byteorder == "=" and sys.byteorder == "little")
++    if dataset.dtype.kind != "i" or dataset.dtype.itemsize != 8 or not little_endian:
++        _error(f"{path} must contain little-endian signed 64-bit integers")
++    return dataset
++
++
++def _text(file, path):
++    dataset = _dataset(file, path)
++    string = h5py.check_string_dtype(dataset.dtype)
++    if string is None or string.encoding != "utf-8" or string.length is not None:
++        _error(f"{path} must contain variable-length UTF-8 strings")
++    return dataset
++
++
++def _aligned(table, datasets):
++    lengths = {len(dataset) for dataset in datasets}
++    if len(lengths) != 1:
++        paths = ", ".join(dataset.name.lstrip("/") for dataset in datasets)
++        _error(f"{table} has misaligned columns: {paths}")
++
++
++def _integer_blocks(dataset, block_rows):
++    for start in range(0, len(dataset), block_rows):
++        for raw in dataset[start : start + block_rows]:
++            yield int(raw)
++
++
++def _text_blocks(dataset, block_rows):
++    values = dataset.asstr()
++    for start in range(0, len(dataset), block_rows):
++        yield from values[start : start + block_rows]
++
++
++def _bounded(dataset, *, lower, upper, block_rows):
++    for position, value in enumerate(_integer_blocks(dataset, block_rows)):
++        if value < lower or value >= upper:
++            _error(
++                f"{dataset.name.lstrip('/')}[{position}]={value} is outside "
++                f"[{lower}, {upper})"
++            )
++
++
++def _nonnegative(dataset, block_rows):
++    for position, value in enumerate(_integer_blocks(dataset, block_rows)):
++        if value < 0:
++            _error(f"{dataset.name.lstrip('/')}[{position}] must be nonnegative")
++
++
++def _unique_text(dataset, block_rows):
++    seen = set()
++    for position, value in enumerate(_text_blocks(dataset, block_rows)):
++        if value in seen:
++            _error(f"{dataset.name.lstrip('/')}[{position}] duplicates {value!r}")
++        seen.add(value)
++
++
++def _offsets(dataset, *, payload, table, block_rows):
++    """Check one offset column without retaining its complete contents."""
++    previous = None
++    for position, value in enumerate(_integer_blocks(dataset, block_rows)):
++        if position == 0 and value != 0:
++            _error(f"{table} must start at zero")
++        if previous is not None and value < previous:
++            _error(f"{table} must be nondecreasing")
++        previous = value
++    final = 0 if previous is None else previous
++    if final != len(payload):
++        _error(
++            f"{table} endpoint {final} does not match {payload.name.lstrip('/')} "
++            f"length {len(payload)}"
++        )
++
++
++def _root_metadata(file):
++    required = {
++        "format": "reacnetgenerator-timeline",
++        "schema_version": SCHEMA_VERSION,
++        "status": "complete",
++        "atom_index_convention": _ATOM_CONVENTION,
++    }
++    for name, expected in required.items():
++        if name not in file.attrs:
++            _error(f"Missing root attribute {name}")
++        if file.attrs[name] != expected:
++            _error(f"Invalid root attribute {name}: expected {expected!r}")
++    range_basis = file.attrs.get("molecule_range_basis")
++    if range_basis not in _RANGE_BASES:
++        _error("Invalid root attribute molecule_range_basis")
++    for name in ("rng_version", "created_utc", "configuration", "capabilities"):
++        if not isinstance(file.attrs.get(name), str) or not file.attrs[name]:
++            _error(f"Invalid root attribute {name}")
++    try:
++        created = datetime.fromisoformat(file.attrs["created_utc"])
++    except ValueError:
++        _error("Invalid root attribute created_utc")
++    if created.utcoffset() != timezone.utc.utcoffset(created):
++        _error("Root attribute created_utc must identify UTC")
++    try:
++        capabilities = json.loads(
++            file.attrs["capabilities"], parse_constant=_reject_json_constant
++        )
++    except (TypeError, ValueError):
++        _error("Root attribute capabilities must be valid JSON")
++    if capabilities != _CAPABILITIES:
++        _error(f"Root attribute capabilities must equal {_CAPABILITIES!r}")
++    try:
++        configuration = json.loads(
++            file.attrs["configuration"], parse_constant=_reject_json_constant
++        )
++    except (TypeError, ValueError):
++        _error("Root attribute configuration must be valid JSON")
++    if not isinstance(configuration, dict):
++        _error("Root attribute configuration must be a JSON object")
++    parameters = configuration.get("parameters")
++    if not isinstance(parameters, dict):
++        _error("configuration/parameters must be a JSON object")
++    explicit = configuration.get("explicit_parameters")
++    if not isinstance(explicit, list) or not all(isinstance(x, str) for x in explicit):
++        _error("configuration/explicit_parameters must be an array of strings")
++    run_hmm = parameters.get("runHMM")
++    expected_basis = (
++        "HMM signal"
++        if run_hmm is True
++        else "observed signal"
++        if run_hmm is False
++        else None
++    )
++    if expected_basis != range_basis:
++        _error(
++            "configuration/parameters/runHMM must be boolean and agree with "
++            "molecule_range_basis"
++        )
++    stepinterval = parameters.get("stepinterval")
++    if (
++        not isinstance(stepinterval, int)
++        or isinstance(stepinterval, bool)
++        or stepinterval <= 0
++    ):
++        _error("configuration/parameters/stepinterval must be a positive integer")
++    return configuration
++
++
++def _validate_frames(file, *, source_count, stepinterval, block_rows):
++    source_id = _numeric(file, "frames/source_id")
++    source_frame = _numeric(file, "frames/source_frame")
++    timestep = _numeric(file, "frames/timestep")
++    _aligned("frames", (source_id, source_frame, timestep))
++    _bounded(source_id, lower=0, upper=source_count, block_rows=block_rows)
++    _nonnegative(source_frame, block_rows)
++    previous_source = previous_frame = None
++    for position, (source, frame) in enumerate(
++        zip(
++            _integer_blocks(source_id, block_rows),
++            _integer_blocks(source_frame, block_rows),
++            strict=True,
++        )
++    ):
++        if previous_source is None:
++            if frame != 0:
++                _error(
++                    "frames/source_frame[0] must start at zero for the declared "
++                    "stepinterval"
++                )
++        elif source < previous_source:
++            _error(f"frames/source_id[{position}] breaks source order")
++        elif source == previous_source:
++            if frame != previous_frame + stepinterval:
++                _error(
++                    f"frames/source_frame[{position}] is inconsistent with "
++                    "configuration/parameters/stepinterval"
++                )
++        elif frame >= stepinterval:
++            _error(
++                f"frames/source_frame[{position}] is inconsistent with "
++                "configuration/parameters/stepinterval at a source boundary"
++            )
++        previous_source, previous_frame = source, frame
++    return source_id
++
++
++def _validate_atoms(file, *, block_rows):
++    atom_type = _numeric(file, "atoms/type")
++    type_name = _text(file, "atoms/type_name")
++    _unique_text(type_name, block_rows)
++    _bounded(atom_type, lower=0, upper=len(type_name), block_rows=block_rows)
++    return atom_type, type_name
++
++
++def _validate_molecules(file, *, atom_count, species_count, block_rows):
++    species_id = _numeric(file, "molecules/species_id")
++    atom_offsets = _numeric(file, "molecules/atom_offsets")
++    atom_index = _numeric(file, "molecules/atom_index")
++    bond_offsets = _numeric(file, "molecules/bond_offsets")
++    bond_atom_1 = _numeric(file, "molecules/bond_atom_index_1")
++    bond_atom_2 = _numeric(file, "molecules/bond_atom_index_2")
++    bond_order = _numeric(file, "molecules/bond_order")
++    if len(atom_offsets) != len(species_id) + 1:
++        _error(
++            "molecules/atom_offsets must have one more row than molecules/species_id"
++        )
++    if len(bond_offsets) != len(species_id) + 1:
++        _error(
++            "molecules/bond_offsets must have one more row than molecules/species_id"
++        )
++    _aligned("molecules bond payload", (bond_atom_1, bond_atom_2, bond_order))
++    _offsets(
++        atom_offsets,
++        payload=atom_index,
++        table="molecules/atom_offsets",
++        block_rows=block_rows,
++    )
++    _offsets(
++        bond_offsets,
++        payload=bond_atom_1,
++        table="molecules/bond_offsets",
++        block_rows=block_rows,
++    )
++    _bounded(species_id, lower=0, upper=species_count, block_rows=block_rows)
++    _bounded(atom_index, lower=0, upper=atom_count, block_rows=block_rows)
++    _bounded(bond_atom_1, lower=0, upper=atom_count, block_rows=block_rows)
++    _bounded(bond_atom_2, lower=0, upper=atom_count, block_rows=block_rows)
++
++    for molecule in range(len(species_id)):
++        atom_start, atom_stop = (int(x) for x in atom_offsets[molecule : molecule + 2])
++        bond_start, bond_stop = (int(x) for x in bond_offsets[molecule : molecule + 2])
++        atoms = [int(x) for x in atom_index[atom_start:atom_stop]]
++        if len(atoms) != len(set(atoms)):
++            _error(
++                f"molecules/atom_index contains duplicates for molecule {molecule + 1}"
++            )
++        members = set(atoms)
++        for column in (bond_atom_1, bond_atom_2):
++            for endpoint in (int(x) for x in column[bond_start:bond_stop]):
++                if endpoint not in members:
++                    _error(
++                        f"{column.name.lstrip('/')} endpoint {endpoint} is not in "
++                        f"molecule {molecule + 1}"
++                    )
++    return species_id
++
++
++def _validate_ranges(file, *, molecule_count, frame_count, block_rows):
++    molecule_id = _numeric(file, "molecule_ranges/molecule_id")
++    start_frame = _numeric(file, "molecule_ranges/start_frame")
++    end_frame = _numeric(file, "molecule_ranges/end_frame")
++    _aligned("molecule_ranges", (molecule_id, start_frame, end_frame))
++    _bounded(molecule_id, lower=1, upper=molecule_count + 1, block_rows=block_rows)
++    previous = None
++    rows = zip(
++        _integer_blocks(molecule_id, block_rows),
++        _integer_blocks(start_frame, block_rows),
++        _integer_blocks(end_frame, block_rows),
++        strict=True,
++    )
++    for position, row in enumerate(rows):
++        molecule, start, end = row
++        if start < 0 or end < start or end >= frame_count:
++            _error(
++                "molecule_ranges/start_frame or molecule_ranges/end_frame is "
++                f"invalid at row {position}"
++            )
++        if previous is not None:
++            old_molecule, old_start, old_end = previous
++            if (molecule, start) < (old_molecule, old_start):
++                _error(f"molecule_ranges row {position} breaks declared ordering")
++            if molecule == old_molecule and start <= old_end + 1:
++                _error(f"molecule_ranges row {position} is overlapping or not maximal")
++        previous = row
++    return molecule_id
++
++
++def _validate_reactions(file, *, frame_count, block_rows):
++    reactant = _text(file, "reaction_types/reactant")
++    product = _text(file, "reaction_types/product")
++    total_count = _numeric(file, "reaction_types/total_count")
++    _aligned("reaction_types", (reactant, product, total_count))
++    pairs = set()
++    for position, pair in enumerate(
++        zip(
++            _text_blocks(reactant, block_rows),
++            _text_blocks(product, block_rows),
++            strict=True,
++        )
++    ):
++        if pair in pairs:
++            _error(f"reaction_types row {position} duplicates a reactant/product pair")
++        pairs.add(pair)
++    for position, total in enumerate(_integer_blocks(total_count, block_rows)):
++        if total <= 0:
++            _error(f"reaction_types/total_count[{position}] must be positive")
++
++    transition = _numeric(file, "reaction_events/transition")
++    reaction_type_id = _numeric(file, "reaction_events/reaction_type_id")
++    count = _numeric(file, "reaction_events/count")
++    _aligned("reaction_events", (transition, reaction_type_id, count))
++    _bounded(
++        reaction_type_id,
++        lower=0,
++        upper=len(total_count),
++        block_rows=block_rows,
++    )
++    sums = Counter()
++    previous_transition = None
++    seen_at_transition = set()
++    rows = zip(
++        _integer_blocks(transition, block_rows),
++        _integer_blocks(reaction_type_id, block_rows),
++        _integer_blocks(count, block_rows),
++        strict=True,
++    )
++    for position, (frame, type_id, value) in enumerate(rows):
++        if frame < 0 or frame >= frame_count - 1:
++            _error(
++                f"reaction_events/transition[{position}]={frame} is outside the timeline"
++            )
++        if value <= 0:
++            _error(f"reaction_events/count[{position}] must be positive")
++        if previous_transition is not None and frame < previous_transition:
++            _error(f"reaction_events/transition[{position}] breaks declared ordering")
++        if frame != previous_transition:
++            seen_at_transition.clear()
++        if type_id in seen_at_transition:
++            _error(
++                f"reaction_events/reaction_type_id[{position}] duplicates type {type_id} "
++                f"at transition {frame}"
++            )
++        seen_at_transition.add(type_id)
++        sums[type_id] += value
++        previous_transition = frame
++    for type_id, expected in enumerate(_integer_blocks(total_count, block_rows)):
++        if sums[type_id] != expected:
++            _error(
++                f"reaction_types/total_count[{type_id}]={expected} does not match "
++                f"reaction_events sum {sums[type_id]}"
++            )
++    return transition, total_count
++
++
++def validate_timed_output(filename, *, block_rows=8192):
++    """Implement the public validator while keeping HDF5 details private."""
++    try:
++        size = index(block_rows)
++    except TypeError as exc:
++        raise TimedOutputValidationError(
++            "block_rows must be a positive integer"
++        ) from exc
++    if size <= 0:
++        raise TimedOutputValidationError("block_rows must be a positive integer")
++
++    try:
++        with h5py.File(filename, "r") as file:
++            configuration = _root_metadata(file)
++            source_path = _text(file, "sources/path")
++            source_size = _numeric(file, "sources/size_bytes")
++            source_mtime = _numeric(file, "sources/mtime_ns")
++            _aligned("sources", (source_path, source_size, source_mtime))
++            _nonnegative(source_size, size)
++
++            frames = _validate_frames(
++                file,
++                source_count=len(source_path),
++                stepinterval=configuration["parameters"]["stepinterval"],
++                block_rows=size,
++            )
++            atoms, atom_types = _validate_atoms(file, block_rows=size)
++            species = _text(file, "species/name")
++            _unique_text(species, size)
++            molecules = _validate_molecules(
++                file,
++                atom_count=len(atoms),
++                species_count=len(species),
++                block_rows=size,
++            )
++            ranges = _validate_ranges(
++                file,
++                molecule_count=len(molecules),
++                frame_count=len(frames),
++                block_rows=size,
++            )
++            events, reaction_types = _validate_reactions(
++                file, frame_count=len(frames), block_rows=size
++            )
++
++            return ValidationSummary(
++                schema_version=SCHEMA_VERSION,
++                sources=len(source_path),
++                frames=len(frames),
++                atoms=len(atoms),
++                atom_types=len(atom_types),
++                species=len(species),
++                molecules=len(molecules),
++                molecule_ranges=len(ranges),
++                reaction_types=len(reaction_types),
++                reaction_events=len(events),
++            )
++    except TimedOutputValidationError:
++        raise
++    except (OSError, TypeError, ValueError) as exc:
++        raise TimedOutputValidationError(str(exc)) from exc
+diff --git a/reacnetgenerator/schemas/__init__.py b/reacnetgenerator/schemas/__init__.py
+new file mode 100644
+index 000000000..8185db446
+--- /dev/null
++++ b/reacnetgenerator/schemas/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Installed machine-readable ReacNetGenerator schema resources."""
+diff --git a/reacnetgenerator/schemas/timed-output-schema.json b/reacnetgenerator/schemas/timed-output-schema.json
+new file mode 100644
+index 000000000..a746e63a8
+--- /dev/null
++++ b/reacnetgenerator/schemas/timed-output-schema.json
+@@ -0,0 +1,179 @@
++{
++  "descriptor_format": "reacnetgenerator-timeline-schema",
++  "descriptor_version": "1.0",
++  "timeline_format": "reacnetgenerator-timeline",
++  "schema_version": "1.0",
++  "capabilities": [
++    "molecule_ranges",
++    "reaction_events"
++  ],
++  "root_attributes": {
++    "format": {
++      "type": "string",
++      "const": "reacnetgenerator-timeline"
++    },
++    "schema_version": {
++      "type": "string",
++      "const": "1.0"
++    },
++    "status": {
++      "type": "string",
++      "const": "complete"
++    },
++    "capabilities": {
++      "type": "json-array"
++    },
++    "rng_version": {
++      "type": "string"
++    },
++    "created_utc": {
++      "type": "utc-datetime"
++    },
++    "configuration": {
++      "type": "json-object"
++    },
++    "atom_index_convention": {
++      "type": "string",
++      "const": "zero-based RNG canonical atom order"
++    },
++    "molecule_range_basis": {
++      "type": "string",
++      "enum": [
++        "HMM signal",
++        "observed signal"
++      ]
++    }
++  },
++  "datasets": {
++    "sources/path": {
++      "dtype": "utf8-vlen",
++      "table": "sources"
++    },
++    "sources/size_bytes": {
++      "dtype": "int64-le",
++      "table": "sources"
++    },
++    "sources/mtime_ns": {
++      "dtype": "int64-le",
++      "table": "sources"
++    },
++    "frames/source_id": {
++      "dtype": "int64-le",
++      "table": "frames"
++    },
++    "frames/source_frame": {
++      "dtype": "int64-le",
++      "table": "frames"
++    },
++    "frames/timestep": {
++      "dtype": "int64-le",
++      "table": "frames"
++    },
++    "atoms/type": {
++      "dtype": "int64-le",
++      "table": "atoms"
++    },
++    "atoms/type_name": {
++      "dtype": "utf8-vlen",
++      "table": "atom_types"
++    },
++    "species/name": {
++      "dtype": "utf8-vlen",
++      "table": "species"
++    },
++    "molecules/species_id": {
++      "dtype": "int64-le",
++      "table": "molecules"
++    },
++    "molecules/atom_offsets": {
++      "dtype": "int64-le",
++      "table": "molecule_atom_offsets"
++    },
++    "molecules/atom_index": {
++      "dtype": "int64-le",
++      "table": "molecule_atoms"
++    },
++    "molecules/bond_offsets": {
++      "dtype": "int64-le",
++      "table": "molecule_bond_offsets"
++    },
++    "molecules/bond_atom_index_1": {
++      "dtype": "int64-le",
++      "table": "molecule_bonds"
++    },
++    "molecules/bond_atom_index_2": {
++      "dtype": "int64-le",
++      "table": "molecule_bonds"
++    },
++    "molecules/bond_order": {
++      "dtype": "int64-le",
++      "table": "molecule_bonds"
++    },
++    "molecule_ranges/molecule_id": {
++      "dtype": "int64-le",
++      "table": "molecule_ranges"
++    },
++    "molecule_ranges/start_frame": {
++      "dtype": "int64-le",
++      "table": "molecule_ranges"
++    },
++    "molecule_ranges/end_frame": {
++      "dtype": "int64-le",
++      "table": "molecule_ranges"
++    },
++    "reaction_types/reactant": {
++      "dtype": "utf8-vlen",
++      "table": "reaction_types"
++    },
++    "reaction_types/product": {
++      "dtype": "utf8-vlen",
++      "table": "reaction_types"
++    },
++    "reaction_types/total_count": {
++      "dtype": "int64-le",
++      "table": "reaction_types"
++    },
++    "reaction_events/transition": {
++      "dtype": "int64-le",
++      "table": "reaction_events"
++    },
++    "reaction_events/reaction_type_id": {
++      "dtype": "int64-le",
++      "table": "reaction_events"
++    },
++    "reaction_events/count": {
++      "dtype": "int64-le",
++      "table": "reaction_events"
++    }
++  },
++  "constraints": [
++    {
++      "id": "one-dimensional-columns",
++      "description": "Every dataset is one-dimensional and ordinary table columns have equal lengths."
++    },
++    {
++      "id": "offset-endpoints",
++      "description": "Atom and bond offsets start at zero, are nondecreasing, and end at their payload length."
++    },
++    {
++      "id": "frame-stride-consistency",
++      "description": "Frame-to-source mappings follow the positive global stepinterval recorded in configuration."
++    },
++    {
++      "id": "reference-integrity",
++      "description": "All source, atom-type, species, molecule, reaction-type, frame, and bond references resolve."
++    },
++    {
++      "id": "signal-basis-consistency",
++      "description": "configuration.parameters.runHMM is boolean and agrees with molecule_range_basis."
++    },
++    {
++      "id": "maximal-ranges",
++      "description": "Molecule ranges are ordered, in frame bounds, disjoint, and maximal for each molecule."
++    },
++    {
++      "id": "reaction-totals",
++      "description": "Reaction counts are positive and each reaction-type total equals its event-count sum."
++    }
++  ]
++}
+diff --git a/reacnetgenerator/timedoutput.py b/reacnetgenerator/timedoutput.py
+index c34ee9d9c..bd1d00bdc 100644
+--- a/reacnetgenerator/timedoutput.py
++++ b/reacnetgenerator/timedoutput.py
+@@ -13,7 +13,11 @@
+ 
+ import h5py
+ 
+-SCHEMA_VERSION = "1.0"
++from . import _timedoutputcontract as _contract
++
++SCHEMA_VERSION = _contract.SCHEMA_VERSION
++TimedOutputValidationError = _contract.TimedOutputValidationError
++ValidationSummary = _contract.ValidationSummary
+ 
+ 
+ @dataclass(frozen=True)
+@@ -79,6 +83,38 @@ def read_metadata(filename):
+         return result
+ 
+ 
++def validate_timed_output(filename, *, block_rows=8192):
++    """Validate one complete timeline and return its verified table sizes."""
++    from ._timedoutputvalidate import validate_timed_output as _validate
++
++    return _validate(filename, block_rows=block_rows)
++
++
++def semantic_manifest(filename, *, include_provenance=False, block_rows=8192):
++    """Return a deterministic manifest for a validated timeline's meaning."""
++    from ._timedoutputmanifest import semantic_manifest as _manifest
++
++    return _manifest(
++        filename,
++        include_provenance=include_provenance,
++        block_rows=block_rows,
++    )
++
++
++def compare_semantic_manifests(left, right):
++    """Return JSON-pointer paths whose values differ between two manifests."""
++    from ._timedoutputmanifest import compare_semantic_manifests as _compare
++
++    return _compare(left, right)
++
++
++def read_schema_descriptor():
++    """Read the installed machine-readable descriptor for schema 1.0."""
++    from ._timedoutputschema import read_schema_descriptor as _read
++
++    return _read()
++
++
+ def _dataset(container, name):
+     """Return one one-dimensional dataset or reject a malformed table header."""
+     try:
+diff --git a/reacnetgenerator/timedoutputcheck.py b/reacnetgenerator/timedoutputcheck.py
+new file mode 100644
+index 000000000..96a6a8b30
+--- /dev/null
++++ b/reacnetgenerator/timedoutputcheck.py
+@@ -0,0 +1,126 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Command-line validation and semantic comparison for timeline artifacts."""
++
++import argparse
++import json
++import os
++import sys
++import tempfile
++from contextlib import suppress
++from dataclasses import asdict
++from pathlib import Path
++
++from .timedoutput import (
++    TimedOutputValidationError,
++    compare_semantic_manifests,
++    semantic_manifest,
++    validate_timed_output,
++)
++
++
++def _parser():
++    parser = argparse.ArgumentParser(
++        description="Validate a ReacNetGenerator timeline and compare its meaning."
++    )
++    parser.add_argument("timeline", help="timeline.h5 artifact to validate")
++    parser.add_argument(
++        "--write-manifest",
++        metavar="PATH",
++        help="atomically write the validated semantic manifest as JSON",
++    )
++    parser.add_argument(
++        "--compare-manifest",
++        metavar="PATH",
++        help="return exit code 1 if the artifact differs from this manifest",
++    )
++    parser.add_argument(
++        "--include-provenance",
++        action="store_true",
++        help="include paths, source metadata, build version, and creation time",
++    )
++    parser.add_argument(
++        "--block-rows",
++        type=int,
++        default=8192,
++        help="maximum numeric rows read per validation/hash block (default: 8192)",
++    )
++    return parser
++
++
++def _write_json_atomic(path, value):
++    destination = Path(path).expanduser()
++    handle, temporary = tempfile.mkstemp(
++        prefix=f".{destination.name}.",
++        suffix=".incomplete",
++        dir=destination.parent,
++    )
++    try:
++        with os.fdopen(handle, "w", encoding="utf-8") as file:
++            json.dump(value, file, ensure_ascii=False, sort_keys=True, indent=2)
++            file.write("\n")
++            file.flush()
++            os.fsync(file.fileno())
++        os.replace(temporary, destination)
++    except BaseException:
++        with suppress(OSError):
++            os.close(handle)
++        with suppress(FileNotFoundError):
++            os.unlink(temporary)
++        raise
++
++
++def main(argv=None):
++    """Run validation; return 0 for success and 1 for invalid or different data."""
++    args = _parser().parse_args(argv)
++    try:
++        timeline = Path(args.timeline).expanduser().resolve()
++        manifest_path = (
++            Path(args.write_manifest).expanduser().resolve()
++            if args.write_manifest
++            else None
++        )
++        comparison_path = (
++            Path(args.compare_manifest).expanduser().resolve()
++            if args.compare_manifest
++            else None
++        )
++        if manifest_path == timeline:
++            raise ValueError("--write-manifest must not overwrite the input timeline")
++        if manifest_path is not None and manifest_path == comparison_path:
++            raise ValueError(
++                "--write-manifest must not overwrite the comparison manifest"
++            )
++        manifest = None
++        if args.write_manifest or args.compare_manifest:
++            manifest = semantic_manifest(
++                timeline,
++                include_provenance=args.include_provenance,
++                block_rows=args.block_rows,
++            )
++            summary = manifest["summary"]
++        else:
++            summary = asdict(
++                validate_timed_output(timeline, block_rows=args.block_rows)
++            )
++
++        if args.compare_manifest:
++            assert comparison_path is not None
++            with comparison_path.open(encoding="utf-8") as file:
++                reference = json.load(file)
++            differences = compare_semantic_manifests(reference, manifest)
++            if differences:
++                for path in differences:
++                    print(f"manifest differs at {path}", file=sys.stderr)
++                return 1
++        if args.write_manifest:
++            _write_json_atomic(manifest_path, manifest)
++        status = "equivalent" if args.compare_manifest else "valid"
++        print(json.dumps({"status": status, "summary": summary}, sort_keys=True))
++        return 0
++    except (OSError, TimedOutputValidationError, ValueError) as exc:
++        print(f"timed-output validation failed: {exc}", file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_timedoutput.py b/tests/test_timedoutput.py
+index fe1338266..e8d67c2bb 100644
+--- a/tests/test_timedoutput.py
++++ b/tests/test_timedoutput.py
+@@ -25,6 +25,7 @@
+     iter_reaction_types,
+     iter_species,
+     read_metadata,
++    validate_timed_output,
+ )
+ from reacnetgenerator.utils import bytestolist, read_compressed_block
+ 
+@@ -99,6 +100,7 @@ def test_pipeline(tmp_path, run_hmm, nproc):
+     metadata = read_metadata(path)
+     assert metadata["schema_version"] == "1.0"
+     assert metadata["configuration"]["parameters"]["runHMM"] is run_hmm
++    assert validate_timed_output(path, block_rows=2).frames == rng.step
+     assert not list(tmp_path.glob("*.incomplete"))
+ 
+ 
+@@ -148,6 +150,7 @@ def test_source_occurrences_and_stride(tmp_path):
+         (1, 7),
+     ]
+     assert [x.timestep for x in iter_frames(path)] == [0, 3, 6, 1, 4, 7]
++    assert validate_timed_output(path, block_rows=2).frames == rng.step
+ 
+ 
+ def test_empty_source_occurrences(tmp_path):
+@@ -173,6 +176,7 @@ def test_empty_source_occurrences(tmp_path):
+         (3, 4),
+         (3, 7),
+     ]
++    assert validate_timed_output(path, block_rows=2).frames == rng.step
+ 
+ 
+ def test_atomic_failure(tmp_path, monkeypatch):
+diff --git a/tests/test_timedoutput_validation.py b/tests/test_timedoutput_validation.py
+new file mode 100644
+index 000000000..e14b8e43d
+--- /dev/null
++++ b/tests/test_timedoutput_validation.py
+@@ -0,0 +1,467 @@
++# SPDX-License-Identifier: LGPL-3.0-or-later
++"""Public validation contracts for persisted timeline artifacts."""
++
++import json
++import shutil
++from pathlib import Path
++
++import h5py
++import pytest
++
++from reacnetgenerator import ReacNetGenerator
++from reacnetgenerator._detect import _Detect
++from reacnetgenerator._hmmfilter import _HMMFilter
++from reacnetgenerator._path import _CollectPaths
++from reacnetgenerator._timedoutput import _TimedOutputWriter
++from reacnetgenerator.timedoutput import (
++    TimedOutputValidationError,
++    ValidationSummary,
++    compare_semantic_manifests,
++    read_schema_descriptor,
++    semantic_manifest,
++    validate_timed_output,
++)
++from reacnetgenerator.timedoutputcheck import main as check_timed_output
++
++INPUT = Path(__file__).parent / "inputs" / "reaction.bond"
++
++
++@pytest.fixture(scope="module")
++def valid_timeline(tmp_path_factory):
++    """Build one small artifact through the real analysis and writer pipeline."""
++    directory = tmp_path_factory.mktemp("timed-output-validation")
++    path = directory / "timeline.h5"
++    rng = ReacNetGenerator(
++        inputfilename=str(INPUT),
++        inputfiletype="bond",
++        atomname=["H", "He"],
++        nproc=1,
++        runHMM=False,
++        output_dir=directory,
++        timed_output=path,
++    )
++    _Detect.gettype(rng).detect()
++    _HMMFilter(rng).filter()
++    rng.timed_output = directory / "empty-tables.h5"
++    with _TimedOutputWriter(rng):
++        pass
++    rng.timed_output = path
++    _CollectPaths.getstype(rng).collect()
++    return path
++
++
++def test_validate_real_artifact_and_reject_broken_offsets(valid_timeline, tmp_path):
++    """Accept writer output and identify the malformed public column by name."""
++    summary = validate_timed_output(valid_timeline, block_rows=2)
++
++    assert isinstance(summary, ValidationSummary)
++    assert summary.schema_version == "1.0"
++    assert summary.sources == 1
++    assert summary.frames == 8
++    assert summary.atoms == 3
++    assert summary.atom_types == 2
++    assert summary.molecules > 0
++
++    malformed = tmp_path / "malformed.h5"
++    shutil.copyfile(valid_timeline, malformed)
++    with h5py.File(malformed, "r+") as file:
++        file["molecules/atom_offsets"][-1] += 1
++
++    with pytest.raises(
++        TimedOutputValidationError, match=r"molecules/atom_offsets.*atom_index"
++    ):
++        validate_timed_output(malformed, block_rows=2)
++
++
++def test_validate_accepts_declared_empty_tables(valid_timeline):
++    """Keep zero-row dictionaries and payloads valid without sentinel records."""
++    summary = validate_timed_output(
++        valid_timeline.with_name("empty-tables.h5"), block_rows=2
++    )
++
++    assert summary.molecules == 0
++    assert summary.molecule_ranges == 0
++    assert summary.reaction_types == 0
++    assert summary.reaction_events == 0
++
++
++@pytest.mark.parametrize(
++    "run_hmm,basis",
++    [
++        (True, "observed signal"),
++        (False, "HMM signal"),
++        ("false", "observed signal"),
++    ],
++)
++def test_validate_rejects_conflicting_signal_basis(
++    valid_timeline, tmp_path, run_hmm, basis
++):
++    """Reject metadata that gives one range two incompatible meanings."""
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        configuration = json.loads(file.attrs["configuration"])
++        configuration["parameters"]["runHMM"] = run_hmm
++        file.attrs["configuration"] = json.dumps(configuration)
++        file.attrs["molecule_range_basis"] = basis
++
++    with pytest.raises(
++        TimedOutputValidationError,
++        match=r"configuration/parameters/runHMM.*molecule_range_basis",
++    ):
++        validate_timed_output(malformed, block_rows=2)
++
++
++def test_validate_rejects_nonstandard_json_constants(valid_timeline, tmp_path):
++    """Fail before consumers disagree about non-finite configuration values."""
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        file.attrs["configuration"] = (
++            '{"parameters":{"runHMM":false,"cutoff":NaN},"explicit_parameters":[]}'
++        )
++
++    with pytest.raises(
++        TimedOutputValidationError,
++        match=r"configuration must be valid JSON",
++    ):
++        validate_timed_output(malformed, block_rows=2)
++
++
++def test_validate_rejects_a_frame_stride_that_conflicts_with_configuration(
++    valid_timeline, tmp_path
++):
++    """Reject frame mappings that cannot result from the declared sampling stride."""
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        configuration = json.loads(file.attrs["configuration"])
++        configuration["parameters"]["stepinterval"] = 2
++        file.attrs["configuration"] = json.dumps(configuration)
++
++    with pytest.raises(
++        TimedOutputValidationError,
++        match=r"frames/source_frame.*stepinterval",
++    ):
++        validate_timed_output(malformed, block_rows=2)
++
++
++def _copy_timeline(valid_timeline, tmp_path):
++    path = tmp_path / "mutated.h5"
++    shutil.copyfile(valid_timeline, path)
++    return path
++
++
++@pytest.mark.parametrize(
++    "dataset",
++    [
++        "sources/path",
++        "frames/source_frame",
++        "molecules/bond_order",
++        "reaction_types/product",
++    ],
++)
++def test_validate_requires_declared_column_types_and_alignment(
++    valid_timeline, tmp_path, dataset
++):
++    """Reject wrong public types and row alignment before interpreting values."""
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        values = file[dataset][:]
++        del file[dataset]
++        if dataset in {"sources/path", "reaction_types/product"}:
++            file.create_dataset(dataset, data=list(range(len(values))), dtype="<i8")
++        else:
++            file.create_dataset(dataset, data=values[:-1], dtype="<i8")
++
++    with pytest.raises(TimedOutputValidationError, match=dataset):
++        validate_timed_output(malformed, block_rows=2)
++
++
++@pytest.mark.parametrize(
++    "dataset,value",
++    [
++        ("frames/source_id", 1),
++        ("atoms/type", 2),
++        ("molecules/species_id", 3),
++        ("molecule_ranges/molecule_id", 0),
++        ("reaction_events/reaction_type_id", 1),
++    ],
++)
++def test_validate_rejects_dangling_references(valid_timeline, tmp_path, dataset, value):
++    """Reject IDs that cannot be joined to their declared dictionary table."""
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        file[dataset][0] = value
++
++    with pytest.raises(TimedOutputValidationError, match=dataset):
++        validate_timed_output(malformed, block_rows=2)
++
++
++def test_validate_rejects_nonmaximal_ranges_and_wrong_event_totals(
++    valid_timeline, tmp_path
++):
++    """Enforce compact-range and aggregate-count meaning across public tables."""
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        ranges = file["molecule_ranges"]
++        for name in ("molecule_id", "start_frame", "end_frame"):
++            column = ranges[name]
++            column.resize((len(column) + 1,))
++        ranges["molecule_id"][-1] = ranges["molecule_id"][-2]
++        ranges["start_frame"][-1] = ranges["end_frame"][-2]
++        ranges["end_frame"][-1] = ranges["start_frame"][-1]
++
++    with pytest.raises(TimedOutputValidationError, match=r"molecule_ranges.*maximal"):
++        validate_timed_output(malformed, block_rows=2)
++
++    malformed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(malformed, "r+") as file:
++        file["reaction_types/total_count"][0] += 1
++
++    with pytest.raises(
++        TimedOutputValidationError,
++        match=r"reaction_types/total_count.*reaction_events",
++    ):
++        validate_timed_output(malformed, block_rows=2)
++
++
++def _repack_timeline(source, destination):
++    """Copy values through h5py while deliberately changing storage layout."""
++    with h5py.File(source) as old, h5py.File(destination, "w") as new:
++        new.attrs.update(old.attrs)
++
++        def copy(name, item):
++            if isinstance(item, h5py.Group):
++                new.require_group(name)
++            else:
++                parent, _, leaf = name.rpartition("/")
++                group = new.require_group(parent) if parent else new
++                string = h5py.check_string_dtype(item.dtype)
++                if string is None:
++                    group.create_dataset(
++                        leaf,
++                        data=item[:],
++                        maxshape=(None,),
++                        chunks=True,
++                        compression="gzip",
++                    )
++                else:
++                    group.create_dataset(
++                        leaf,
++                        data=item.asstr()[:],
++                        maxshape=(None,),
++                        dtype=h5py.string_dtype("utf-8"),
++                        chunks=True,
++                    )
++
++        old.visititems(copy)
++
++
++def test_semantic_manifest_ignores_layout_and_relocation(valid_timeline, tmp_path):
++    """Identify equivalent science despite HDF5 layout and path provenance changes."""
++    relocated = tmp_path / "relocated.h5"
++    _repack_timeline(valid_timeline, relocated)
++    with h5py.File(relocated, "r+") as file:
++        file.attrs["created_utc"] = "2025-01-01T00:00:00+00:00"
++        file.attrs["rng_version"] = "different-build"
++        file["sources/path"][0] = "/relocated/input.bond"
++        file["sources/size_bytes"][0] += 10
++        file["sources/mtime_ns"][0] += 10
++        configuration = json.loads(file.attrs["configuration"])
++        for key in ("inputfilename", "output_dir", "timed_output"):
++            configuration["parameters"][key] = f"/relocated/{key}"
++        file.attrs["configuration"] = json.dumps(configuration)
++
++    original = semantic_manifest(valid_timeline, block_rows=2)
++    moved = semantic_manifest(relocated, block_rows=3)
++
++    assert original["manifest_format"] == (
++        "reacnetgenerator-timeline-semantic-manifest"
++    )
++    assert original["manifest_version"] == "1.0"
++    assert original["semantic_sha256"] == moved["semantic_sha256"]
++    assert compare_semantic_manifests(original, moved) == ()
++
++    original_provenance = semantic_manifest(
++        valid_timeline, include_provenance=True, block_rows=2
++    )
++    moved_provenance = semantic_manifest(
++        relocated, include_provenance=True, block_rows=3
++    )
++    assert compare_semantic_manifests(original_provenance, moved_provenance)
++
++
++def test_semantic_manifest_locates_result_changes(valid_timeline, tmp_path):
++    """Report the public dataset whose values changed, independent of HDF5 bytes."""
++    changed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(changed, "r+") as file:
++        file["frames/timestep"][0] += 1
++
++    differences = compare_semantic_manifests(
++        semantic_manifest(valid_timeline, block_rows=2),
++        semantic_manifest(changed, block_rows=2),
++    )
++
++    assert "/datasets/frames~1timestep/sha256" in differences
++    assert "/semantic_sha256" in differences
++
++
++def test_semantic_manifest_preserves_analysis_settings(valid_timeline, tmp_path):
++    """Report interpretation-relevant configuration changes by JSON pointer."""
++    changed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(changed, "r+") as file:
++        configuration = json.loads(file.attrs["configuration"])
++        configuration["parameters"]["max_component_atoms"] += 1
++        file.attrs["configuration"] = json.dumps(configuration)
++
++    differences = compare_semantic_manifests(
++        semantic_manifest(valid_timeline, block_rows=2),
++        semantic_manifest(changed, block_rows=2),
++    )
++
++    assert "/metadata/configuration/parameters/max_component_atoms" in differences
++    assert "/semantic_sha256" in differences
++
++
++def test_compare_rejects_a_manifest_with_a_stale_checksum(valid_timeline):
++    """Detect manual or partial edits to a stored reference before comparison."""
++    manifest = semantic_manifest(valid_timeline)
++    stale = dict(manifest)
++    stale["semantic_sha256"] = "0" * 64
++
++    with pytest.raises(ValueError, match="checksum"):
++        compare_semantic_manifests(manifest, stale)
++
++
++def test_compare_rejects_a_non_ascii_checksum():
++    """Treat malformed external checksum text as an invalid manifest."""
++    malformed = {
++        "manifest_format": "reacnetgenerator-timeline-semantic-manifest",
++        "manifest_version": "1.0",
++        "semantic_sha256": "é",
++    }
++
++    with pytest.raises(ValueError, match="The left manifest checksum is invalid"):
++        compare_semantic_manifests(malformed, malformed)
++
++
++def test_schema_descriptor_lists_the_public_contract(valid_timeline):
++    """Expose the installed schema to consumers without requiring source docs."""
++    descriptor = read_schema_descriptor()
++
++    assert descriptor["descriptor_format"] == "reacnetgenerator-timeline-schema"
++    assert descriptor["descriptor_version"] == "1.0"
++    assert descriptor["timeline_format"] == "reacnetgenerator-timeline"
++    assert descriptor["schema_version"] == "1.0"
++    assert descriptor["datasets"]["molecules/atom_offsets"]["dtype"] == "int64-le"
++    assert descriptor["datasets"]["species/name"]["dtype"] == "utf8-vlen"
++    assert {item["id"] for item in descriptor["constraints"]} >= {
++        "offset-endpoints",
++        "frame-stride-consistency",
++        "reference-integrity",
++        "reaction-totals",
++        "signal-basis-consistency",
++    }
++    manifest = semantic_manifest(valid_timeline, include_provenance=True)
++    assert set(descriptor["datasets"]) == set(manifest["datasets"])
++
++
++def test_validation_and_manifest_scan_numeric_columns_in_blocks(
++    valid_timeline, monkeypatch
++):
++    """Keep ordinary numeric scans within the caller's row budget."""
++    unbounded_per_molecule = {
++        "/molecules/atom_index",
++        "/molecules/bond_atom_index_1",
++        "/molecules/bond_atom_index_2",
++    }
++    checked = set()
++    getitem = h5py.Dataset.__getitem__
++
++    def bounded(dataset, key, *args, **kwargs):
++        if (
++            dataset.dtype.kind == "i"
++            and dataset.name not in unbounded_per_molecule
++            and isinstance(key, slice)
++        ):
++            assert key.start is not None and key.stop is not None
++            assert key.stop - key.start <= 2
++            checked.add(dataset.name)
++        return getitem(dataset, key, *args, **kwargs)
++
++    monkeypatch.setattr(h5py.Dataset, "__getitem__", bounded)
++
++    validate_timed_output(valid_timeline, block_rows=2)
++    semantic_manifest(valid_timeline, block_rows=2)
++
++    assert {"/frames/timestep", "/reaction_events/count"} <= checked
++
++
++def test_cli_writes_and_compares_manifests(valid_timeline, tmp_path, capsys):
++    """Provide CI-friendly exit codes and atomic reference-manifest output."""
++    reference = tmp_path / "reference.json"
++    assert (
++        check_timed_output(
++            [
++                str(valid_timeline),
++                "--write-manifest",
++                str(reference),
++                "--block-rows",
++                "2",
++            ]
++        )
++        == 0
++    )
++    result = json.loads(capsys.readouterr().out)
++    assert result["status"] == "valid"
++    assert reference.exists()
++    assert not list(tmp_path.glob("*.incomplete"))
++
++    changed = _copy_timeline(valid_timeline, tmp_path)
++    with h5py.File(changed, "r+") as file:
++        file["frames/timestep"][0] += 1
++
++    assert (
++        check_timed_output(
++            [str(changed), "--compare-manifest", str(reference), "--block-rows", "2"]
++        )
++        == 1
++    )
++    captured = capsys.readouterr()
++    assert captured.out == ""
++    assert "/datasets/frames~1timestep/sha256" in captured.err
++
++
++def test_cli_removes_an_incomplete_manifest_after_publish_failure(
++    valid_timeline, tmp_path, monkeypatch, capsys
++):
++    """Clean the atomic sibling even after fdopen has closed its descriptor."""
++    reference = tmp_path / "reference.json"
++
++    def fail_replace(*args):
++        raise OSError("publish failed")
++
++    monkeypatch.setattr("reacnetgenerator.timedoutputcheck.os.replace", fail_replace)
++
++    assert (
++        check_timed_output(
++            [
++                str(valid_timeline),
++                "--write-manifest",
++                str(reference),
++                "--block-rows",
++                "2",
++            ]
++        )
++        == 1
++    )
++    assert "publish failed" in capsys.readouterr().err
++    assert not reference.exists()
++    assert not list(tmp_path.glob("*.incomplete"))
++
++
++def test_cli_never_replaces_an_input_artifact(valid_timeline, tmp_path, capsys):
++    """Reject an output alias before an atomic JSON publish can destroy HDF5."""
++    artifact = _copy_timeline(valid_timeline, tmp_path)
++
++    assert check_timed_output([str(artifact), "--write-manifest", str(artifact)]) == 1
++    assert "must not overwrite" in capsys.readouterr().err
++    assert validate_timed_output(artifact).frames == 8

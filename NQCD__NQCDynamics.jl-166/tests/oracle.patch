@@ -1,0 +1,208 @@
+diff --git a/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl b/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl
+index b81c147d8..c0fcc9930 100644
+--- a/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl
++++ b/src/DynamicsMethods/MappingVariableMethods/MappingVariableMethods.jl
+@@ -17,4 +17,7 @@ using NonadiabaticDynamicsBase: Atoms
+ include("nrpmd.jl")
+ export NRPMD
+ 
++include("cmm.jl")
++export CMM2
++
+ end # module
+diff --git a/src/DynamicsMethods/MappingVariableMethods/cmm.jl b/src/DynamicsMethods/MappingVariableMethods/cmm.jl
+new file mode 100644
+index 000000000..1d49f14b6
+--- /dev/null
++++ b/src/DynamicsMethods/MappingVariableMethods/cmm.jl
+@@ -0,0 +1,91 @@
++using LinearAlgebra: lmul!
++
++"""
++    CMM2{T} <: DynamicsMethods.Method
++
++Classical mapping model 2 from Xin He and Jian Liu (2019).
++"""
++struct CMM2{T} <: DynamicsMethods.Method
++    temp_q::Vector{T}
++    temp_p::Vector{T}
++    function CMM2{T}(n_states::Integer) where {T}
++        new{T}(zeros(n_states), zeros(n_states))
++    end
++end
++
++function NonadiabaticMolecularDynamics.Simulation{CMM2}(atoms::Atoms{S,T}, model::Model; kwargs...) where {S,T}
++    NonadiabaticMolecularDynamics.Simulation(atoms, model, CMM2{T}(NonadiabaticModels.nstates(model)); kwargs...)
++end
++
++function DynamicsMethods.DynamicsVariables(sim::Simulation{<:CMM2}, v, r, state::Integer; type=:diabatic)
++
++    qmap = zeros(NonadiabaticModels.nstates(sim))
++    pmap = zeros(NonadiabaticModels.nstates(sim))
++
++    θ = rand() * 2π
++    qmap[state] = cos(θ) * sqrt(2)
++    pmap[state] = sin(θ) * sqrt(2)
++
++    ComponentVector(v=v, r=r, pmap=pmap, qmap=qmap)
++end
++
++function DynamicsMethods.motion!(du, u, sim::Simulation{<:CMM2}, t)
++    dr = DynamicsUtils.get_positions(du)
++    dv = DynamicsUtils.get_velocities(du)
++    r = DynamicsUtils.get_positions(u)
++    v = DynamicsUtils.get_velocities(u)
++
++    DynamicsUtils.velocity!(dr, v, r, sim, t)
++    acceleration!(dv, u, sim)
++    set_mapping_force!(du, u, sim)
++end
++
++function acceleration!(dv, u, sim::Simulation{<:CMM2})
++
++    Calculators.evaluate_derivative!(sim.calculator, DynamicsUtils.get_positions(u))
++    qmap = get_mapping_positions(u)
++	pmap = get_mapping_momenta(u)
++    for I in eachindex(dv)
++        D = sim.calculator.derivative[I]
++        mul!(sim.method.temp_q, D, qmap)
++        mul!(sim.method.temp_p, D, pmap)
++        dv[I] = dot(qmap, sim.method.temp_q)
++        dv[I] += dot(pmap, sim.method.temp_p)
++    end
++    lmul!(-1/2, dv)
++    DynamicsUtils.divide_by_mass!(dv, sim.atoms.masses)
++end
++
++function set_mapping_force!(du, u, sim::Simulation{<:CMM2})
++    Calculators.evaluate_potential!(sim.calculator, DynamicsUtils.get_positions(u))
++    V = sim.calculator.potential
++    mul!(get_mapping_positions(du), V, get_mapping_momenta(u))
++    mul!(get_mapping_momenta(du), V, get_mapping_positions(u))
++    lmul!(-1, get_mapping_momenta(du))
++end
++
++function Estimators.diabatic_population(sim::Simulation{<:CMM2}, u)
++    qmap = get_mapping_positions(u)
++    pmap = get_mapping_momenta(u)
++    out = zero(qmap)
++    for i=1:NonadiabaticModels.nstates(sim)
++        out[i] = (qmap[i]^2 + pmap[i]^2) / 2
++    end
++    out
++end
++
++function DynamicsUtils.classical_hamiltonian(sim::Simulation{<:CMM2}, u)
++    r = DynamicsUtils.get_positions(u)
++    v = DynamicsUtils.get_velocities(u)
++
++    kinetic = DynamicsUtils.classical_kinetic_energy(sim, v)
++
++    Calculators.evaluate_potential!(sim.calculator, r)
++    V = sim.calculator.potential
++    qmap = get_mapping_positions(u)
++    pmap = get_mapping_momenta(u)
++    potential = (pmap'V*pmap + qmap'V*qmap) / 2
++
++    H = kinetic + potential
++    return H
++end
+diff --git a/src/Ensembles/Ensembles.jl b/src/Ensembles/Ensembles.jl
+index 7d4c62984..9a30d7696 100644
+--- a/src/Ensembles/Ensembles.jl
++++ b/src/Ensembles/Ensembles.jl
+@@ -47,6 +47,10 @@ function select_u0(sim::AbstractSimulation{<:DynamicsMethods.SurfaceHoppingMetho
+     DynamicsMethods.DynamicsVariables(sim, v, r)
+ end
+ 
++function select_u0(sim::Simulation{<:DynamicsMethods.MappingVariableMethods.CMM2}, v, r, state, type)
++    DynamicsMethods.DynamicsVariables(sim, v, r, state; type=type)
++end
++
+ include("selections.jl")
+ include("reductions.jl")
+ include("outputs.jl")
+diff --git a/src/InitialConditions/distributions/harmonic_wigner.jl b/src/InitialConditions/distributions/harmonic_wigner.jl
+index b5cfaaba8..6d1bcf4ab 100644
+--- a/src/InitialConditions/distributions/harmonic_wigner.jl
++++ b/src/InitialConditions/distributions/harmonic_wigner.jl
+@@ -16,9 +16,9 @@ end
+ 
+ Wigner distribution in a 1D harmonic potential for the position
+ """
+-function PositionHarmonicWigner(ω, β)
+-    σ = sqrt(Q(ω, β) / β) / ω  
+-    Normal(0, σ)
++function PositionHarmonicWigner(ω, β, m; centre=0)
++    σ = sqrt(Q(ω, β) / β / m) / ω  
++    Normal(centre, σ)
+ end
+ 
+ """
+diff --git a/test/dynamics/cmm.jl b/test/dynamics/cmm.jl
+new file mode 100644
+index 000000000..f5971fca4
+--- /dev/null
++++ b/test/dynamics/cmm.jl
+@@ -0,0 +1,29 @@
++
++using Test
++using NonadiabaticMolecularDynamics
++using FiniteDiff
++
++function test_motion!(sim::Simulation{<:CMM2}, u)
++    f(x) = DynamicsUtils.classical_hamiltonian(sim, x)
++
++    grad = FiniteDiff.finite_difference_gradient(f, u)
++
++    du = zero(u)
++    DynamicsMethods.motion!(du, u, sim, 0.0)
++
++    @test DynamicsUtils.get_positions(du) ≈ DynamicsUtils.get_velocities(grad) ./ sim.atoms.masses' rtol=1e-3
++    @test DynamicsUtils.get_velocities(du) ≈ -DynamicsUtils.get_positions(grad) ./ sim.atoms.masses' rtol=1e-3
++    @test DynamicsMethods.MappingVariableMethods.get_mapping_positions(du) ≈ DynamicsMethods.MappingVariableMethods.get_mapping_momenta(grad) rtol=1e-3
++    @test DynamicsMethods.MappingVariableMethods.get_mapping_momenta(du) ≈ -DynamicsMethods.MappingVariableMethods.get_mapping_positions(grad) rtol=1e-3
++end
++
++sim = Simulation{CMM2}(Atoms(1), DoubleWell())
++
++v = randn(1,1)
++r = randn(1,1)
++u = DynamicsVariables(sim, v, r, 1)
++
++test_motion!(sim, u)
++
++sol = run_trajectory(u, (0, 100.0), sim; output=(:hamiltonian, :position), reltol=1e-10, abstol=1e-10)
++@test sol.hamiltonian[1] ≈ sol.hamiltonian[end] rtol=1e-3
+diff --git a/test/dynamics/dynamics.jl b/test/dynamics/dynamics.jl
+index 9c24032e7..05b9079d6 100644
+--- a/test/dynamics/dynamics.jl
++++ b/test/dynamics/dynamics.jl
+@@ -8,6 +8,7 @@ using Test
+ @time @safetestset "RPMDEF Tests" begin include("rpmdef.jl") end
+ @time @safetestset "FSSH Tests" begin include("fssh.jl") end
+ @time @safetestset "NRPMD Tests" begin include("nrpmd.jl") end
++@time @safetestset "CMM Tests" begin include("cmm.jl") end
+ @time @safetestset "Cell Boundary Callback Tests" begin include("cell_boundary_callback.jl") end
+ @time @safetestset "Ehrenfest Tests" begin include("ehrenfest.jl") end
+ @time @safetestset "IESH Tests" begin include("iesh.jl") end
+diff --git a/test/harmonic_wigner.jl b/test/harmonic_wigner.jl
+index d82034da0..d3c8b6aac 100644
+--- a/test/harmonic_wigner.jl
++++ b/test/harmonic_wigner.jl
+@@ -5,12 +5,12 @@ using Test, NonadiabaticMolecularDynamics.InitialConditions
+ β = 5
+ m = 10
+ mom = MomentumHarmonicWigner(ω, β)
+-pos = PositionHarmonicWigner(ω, β)
++pos = PositionHarmonicWigner(ω, β, m)
+ vel = VelocityHarmonicWigner(ω, β, m)
+ 
+ norm = tanh(β*ω/2) / π
+-@test norm ≈ 1 / (mom.σ * pos.σ * 2π)
+-@test norm ≈ 1 / (vel.σ * pos.σ * 2π) / m
++@test norm ≈ 1 / (mom.σ * pos.σ * 2π) / sqrt(m)
++@test norm ≈ 1 / (vel.σ * pos.σ * 2π) / sqrt(m) / m
+ 
+ vec = MomentumHarmonicWigner.([1, 2, 3, 4, 5], β)
+ 

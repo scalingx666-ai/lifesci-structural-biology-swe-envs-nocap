@@ -1,0 +1,206 @@
+diff --git a/modules/algebra/include/Gaussian3D.h b/modules/algebra/include/Gaussian3D.h
+index 9cdbad842f..42e2b8d681 100644
+--- a/modules/algebra/include/Gaussian3D.h
++++ b/modules/algebra/include/Gaussian3D.h
+@@ -18,6 +18,7 @@
+ 
+ IMPALGEBRA_BEGIN_NAMESPACE
+ 
++typedef DenseGrid3D<double> DensityGrid;
+ //! A Gaussian distribution in 3D.
+ /** The variances are along the axis of the reference frame.
+ */
+@@ -25,10 +26,10 @@ class Gaussian3D : public GeometricPrimitiveD<3> {
+   ReferenceFrame3D tr_;
+   Vector3D variances_;
+ 
+- public:
++public:
+   Gaussian3D() {
+     tr_ = ReferenceFrame3D();
+-    variances_=Vector3D(0,0,0);
++    variances_ = Vector3D(0, 0, 0);
+   }
+   Gaussian3D(const ReferenceFrame3D &tr, const Vector3D &variances)
+       : tr_(tr), variances_(variances) {}
+@@ -48,14 +49,21 @@ IMPALGEBRAEXPORT IMP_Eigen::Matrix3d get_covariance(const Gaussian3D &g);
+ 
+ //! Return a Gaussian centered at the origin from a covariance matrix.
+ IMPALGEBRAEXPORT Gaussian3D
+-    get_gaussian_from_covariance(const IMP_Eigen::Matrix3d &covariance,
+-                                 const Vector3D &center);
++get_gaussian_from_covariance(const IMP_Eigen::Matrix3d &covariance,
++                             const Vector3D &center);
+ 
+ //! Rasterize the Gaussians to a grid.
+-IMPALGEBRAEXPORT DenseGrid3D<float> get_rasterized(const Gaussian3Ds &gmm,
+-                                                   const Floats &weights,
+-                                                   double cell_width,
+-                                                   const BoundingBox3D &bb);
++IMPALGEBRAEXPORT DensityGrid
++get_rasterized(const Gaussian3Ds &gmm, const Floats &weights, double cell_width,
++               const BoundingBox3D &bb);
++
++//! Rasterize the Gaussians to a grid.
++/** The result is an approximation, but is obtained significantly faster.
++ * Good for quickly checking a GMM.
++ */
++IMPALGEBRAEXPORT DensityGrid
++get_rasterized_fast(const Gaussian3Ds &gmm, const Floats &weights,
++                    double cell_width, const BoundingBox3D &bb);
+ 
+ IMPALGEBRA_END_NAMESPACE
+ 
+diff --git a/modules/algebra/src/Gaussian3D.cpp b/modules/algebra/src/Gaussian3D.cpp
+index c9d341e21a..83ee61bf8d 100644
+--- a/modules/algebra/src/Gaussian3D.cpp
++++ b/modules/algebra/src/Gaussian3D.cpp
+@@ -11,6 +11,8 @@
+ #include <IMP/algebra/eigen3/Eigen/LU>
+ #include <IMP/algebra/eigen3/Eigen/Eigenvalues>
+ 
++#include <IMP/algebra/grid_utility.h>
++
+ IMPALGEBRA_BEGIN_NAMESPACE
+ 
+ IMP_Eigen::Matrix3d get_covariance(const Gaussian3D &g) {
+@@ -54,38 +56,82 @@ Gaussian3D get_gaussian_from_covariance(const IMP_Eigen::Matrix3d &covar,
+   rot = Rotation3D(eq.w(), eq.x(), eq.y(), eq.z());
+   return Gaussian3D(ReferenceFrame3D(Transformation3D(rot, center)), radii);
+ }
++namespace {
++double get_gaussian_eval_prefactor(double determinant) {
++  return 1.0 / pow(2 * algebra::PI, 2.0 / 3.0) / std::sqrt(determinant);
++}
++IMP_Eigen::Vector3d get_vec_from_center(GridIndex3D i, DensityGrid const &g,
++                                        IMP_Eigen::Vector3d const &center) {
++  Vector3D aloc = g.get_center(i);
++  IMP_Eigen::Vector3d loc(aloc[0], aloc[1], aloc[2]);
++  IMP_Eigen::Vector3d r(loc - center);
++  return r;
++}
++void update_value(DensityGrid *g, DensityGrid::Index i, IMP_Eigen::Vector3d r,
++                  IMP_Eigen::Matrix3d inverse, double pre, Float weight) {
++  double d(r.transpose() * (inverse * r));
++  double score(pre * weight * std::exp(-0.5 * (d)));
++  (*g)[i] += score;
++}
++}
+ 
+-DenseGrid3D<float> get_rasterized(const Gaussian3Ds &gmm, const Floats &weights,
+-                                  double cell_width, const BoundingBox3D &bb) {
+-  DenseGrid3D<float> ret(cell_width, bb, 0);
++DensityGrid get_rasterized(const Gaussian3Ds &gmm, const Floats &weights,
++                           double cell_width, const BoundingBox3D &bb) {
++  DensityGrid ret(cell_width, bb, 0);
+   for (unsigned int ng = 0; ng < gmm.size(); ng++) {
+     IMP_Eigen::Matrix3d covar = get_covariance(gmm[ng]);
+-    // suppress warning
+     IMP_Eigen::Matrix3d inverse = IMP_Eigen::Matrix3d::Zero(3, 3);
++
+     double determinant;
+     bool invertible;
+     covar.computeInverseAndDetWithCheck(inverse, determinant, invertible);
+-    double pre = 1.0 / pow(2 * algebra::PI, 2.0 / 3.0) / std::sqrt(determinant);
+-    if (!invertible || determinant < 0) {
+-      std::cout << "\n\n\n->>>>not proper matrix!!\n\n\n" << std::endl;
+-    }
++    IMP_INTERNAL_CHECK((!invertible || determinant < 0),
++                       "\n\n\n->>>>not proper matrix!!\n\n\n");
++    double pre(get_gaussian_eval_prefactor(determinant));
+     IMP_Eigen::Vector3d center(gmm[ng].get_center().get_data());
+     IMP_INTERNAL_CHECK(invertible, "matrix wasn't invertible! uh oh!");
+-    IMP_FOREACH(const DenseGrid3D<float>::Index & i, ret.get_all_indexes()) {
+-      Vector3D aloc = ret.get_center(i);
+-      IMP_Eigen::Vector3d loc(aloc[0], aloc[1], aloc[2]);
+-      IMP_Eigen::Vector3d r = loc - center;
+-      double d = r.transpose() * (inverse * r);
+-      double score = pre * weights[ng] * std::exp(-0.5 * (d));
+-      if (score > 1e10) {
+-        score = 100;
+-      }
+-      if (score > 0) {
+-        ret[i] += score;
+-      }
++    IMP_FOREACH(const DensityGrid::Index & i, ret.get_all_indexes()) {
++      IMP_Eigen::Vector3d r(get_vec_from_center(i, ret, center));
++      update_value(&ret, i, r, inverse, pre, weights[ng]);
+     }
+   }
+   return ret;
+ }
+ 
++DensityGrid get_rasterized_fast(const Gaussian3Ds &gmm, const Floats &weights,
++                                double cell_width, const BoundingBox3D &bb) {
++  DensityGrid ret(cell_width, bb, 0);
++  for (unsigned int ng = 0; ng < gmm.size(); ng++) {
++    IMP_Eigen::Matrix3d covar = get_covariance(gmm[ng]);
++    IMP_Eigen::Matrix3d inverse = IMP_Eigen::Matrix3d::Zero(3, 3);
++
++    double determinant;
++    bool invertible;
++    covar.computeInverseAndDetWithCheck(inverse, determinant, invertible);
++    IMP_INTERNAL_CHECK((!invertible || determinant < 0),
++                       "\n\n\n->>>>not proper matrix!!\n\n\n");
++    double pre(get_gaussian_eval_prefactor(determinant));
++    IMP_Eigen::Vector3d evals = covar.eigenvalues().real();
++    double maxeval = sqrt(evals.maxCoeff());
++    double cutoff = 2.5 * maxeval;
++    double cutoff2 = cutoff * cutoff;
++    Vector3D c = gmm[ng].get_center();
++    Vector3D lower = c - Vector3D(cutoff, cutoff, cutoff);
++    Vector3D upper = c + Vector3D(cutoff, cutoff, cutoff);
++    GridIndex3D lowerindex = ret.get_nearest_index(lower);
++    GridIndex3D upperindex = ret.get_nearest_index(upper);
++    IMP_Eigen::Vector3d center(c.get_data());
++    IMP_INTERNAL_CHECK(invertible, "matrix wasn't invertible! uh oh!");
++    IMP_GRID3D_FOREACH_SMALLER_EXTENDED_INDEX_RANGE(ret, upperindex, lowerindex,
++                                                    upperindex, {
++      GridIndex3D i(voxel_index[0], voxel_index[1], voxel_index[2]);
++      IMP_Eigen::Vector3d r(get_vec_from_center(i, ret, center));
++      if (r.squaredNorm() < cutoff2) {
++        update_value(&ret, i, r, inverse, pre, weights[ng]);
++      }
++    })
++  }
++  return ret;
++}
++
+ IMPALGEBRA_END_NAMESPACE
+diff --git a/modules/algebra/test/test_gaussian.py b/modules/algebra/test/test_gaussian.py
+index 4422d96b09..d5875b63eb 100644
+--- a/modules/algebra/test/test_gaussian.py
++++ b/modules/algebra/test/test_gaussian.py
+@@ -29,6 +29,7 @@ def check_gauss(g):
+         check_gauss(g2)
+         bb = IMP.algebra.BoundingBox3D(t, t)
+         grid = IMP.algebra.get_rasterized([g], [1.0], 1.0, bb)
++        grid_fast = IMP.algebra.get_rasterized_fast([g], [1.0], 1.0, bb)
+ 
+ if __name__ == '__main__':
+     IMP.test.main()
+diff --git a/modules/isd/pyext/src/gmm_tools.py b/modules/isd/pyext/src/gmm_tools.py
+index 71a174b02f..a95fc8fe62 100644
+--- a/modules/isd/pyext/src/gmm_tools.py
++++ b/modules/isd/pyext/src/gmm_tools.py
+@@ -77,7 +77,7 @@ def write_gmm_to_text(ps,out_fn):
+                 #python 2.6 and below
+                 outf.write('|{0}|{1}|{2} {3} {4}|{5} {6} {7} {8} {9} {10} {11} {12} {13}|\n'.format(*fm))
+ 
+-def write_gmm_to_map(to_draw,out_fn,voxel_size,bounding_box=None,origin=None):
++def write_gmm_to_map(to_draw,out_fn,voxel_size,bounding_box=None,origin=None, fast=False):
+     """write density map from GMM. input can be either particles or gaussians"""
+     if type(to_draw[0]) in (IMP.Particle,IMP.atom.Hierarchy,IMP.core.Hierarchy):
+         ps=to_draw
+@@ -101,7 +101,10 @@ def write_gmm_to_map(to_draw,out_fn,voxel_size,bounding_box=None,origin=None):
+         shapes.append(IMP.core.Gaussian(p).get_gaussian())
+         weights.append(IMP.atom.Mass(p).get_mass())
+     print('rasterizing')
+-    grid=IMP.algebra.get_rasterized(shapes,weights,voxel_size,bounding_box)
++    if fast:
++        grid=IMP.algebra.get_rasterized_fast(shapes,weights,voxel_size,bounding_box)
++    else:
++        grid=IMP.algebra.get_rasterized(shapes,weights,voxel_size,bounding_box)
+     print('creating map')
+     d1=IMP.em.create_density_map(grid)
+     print('writing')

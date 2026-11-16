@@ -1,0 +1,665 @@
+diff --git a/docs/examples.rst b/docs/examples.rst
+index 0820e96b..6b88b95f 100644
+--- a/docs/examples.rst
++++ b/docs/examples.rst
+@@ -7,6 +7,7 @@ Examples
+    examples/nve_simulation
+    examples/nvt_simulation
+    examples/npt_simulation
++   examples/npt_csvr
+    examples/nve_neighbor_list
+    examples/neural_networks
+    examples/equivariant_neural_networks
+diff --git a/docs/jax_md.simulate.rst b/docs/jax_md.simulate.rst
+index 2e8dbbfe..0f1fc6dd 100644
+--- a/docs/jax_md.simulate.rst
++++ b/docs/jax_md.simulate.rst
+@@ -14,6 +14,7 @@ Stochastic Simulation Environments
+ --------------------------------------
+ .. autofunction:: nvt_langevin
+ .. autofunction:: brownian
++.. autofunction:: npt_csvr
+ .. autofunction:: hybrid_swap_mc
+ 
+ Helper Functions
+@@ -21,6 +22,7 @@ Helper Functions
+ .. autofunction:: velocity_verlet
+ .. autofunction:: nose_hoover_chain
+ .. autofunction:: npt_box
++.. autofunction:: sinhx_x
+ 
+ Testing Functions
+ ------------------
+@@ -35,3 +37,4 @@ Data Types
+ .. autoclass:: NPTNoseHooverState
+ .. autoclass:: NVTLangevinState
+ .. autoclass:: BrownianState
++.. autoclass:: NPTCSVRState
+diff --git a/examples/npt_csvr.py b/examples/npt_csvr.py
+new file mode 100644
+index 00000000..7a48a132
+--- /dev/null
++++ b/examples/npt_csvr.py
+@@ -0,0 +1,68 @@
++"""Run a small Lennard-Jones liquid at two NPT state points using CSVR."""
++
++import os
++
++import jax
++import jax.numpy as jnp
++from jax import lax
++from jax import random
++
++from jax_md import energy
++from jax_md import quantity
++from jax_md import simulate
++from jax_md import space
++
++jax.config.update('jax_enable_x64', True)
++
++SMOKE_TEST = os.environ.get('READTHEDOCS', False)
++NSTEPS_SIM = 1000 if SMOKE_TEST else 50000
++WRITE_EVERY = 100
++STATE_POINTS = ((1.0, 0.4), (1.0, 0.8))
++
++N = 64
++box = (N / 0.7) ** (1 / 3)
++grid = jnp.stack(jnp.meshgrid(*[jnp.arange(4)] * 3, indexing='ij'), axis=-1)
++position = (grid.reshape(-1, 3) + 0.5) / 4
++displacement, shift = space.periodic_general(box)
++energy_fn = energy.lennard_jones_pair(
++  displacement, sigma=1.0, epsilon=1.0, r_onset=1.8, r_cutoff=2.0
++)
++
++for index, (temperature, pressure) in enumerate(STATE_POINTS):
++  init_fn, apply_fn = simulate.npt_csvr(
++    energy_fn,
++    shift,
++    dt=0.002,
++    pressure=pressure,
++    kT=temperature,
++    tau_p=1.0,
++    tau_t=0.1,
++  )
++  state = init_fn(random.PRNGKey(index), position, box=box, mass=1.0)
++
++  def sample(state, _):
++    """Advance 100 steps and record temperature, pressure, and volume."""
++    state = lax.fori_loop(0, WRITE_EVERY, lambda _, s: apply_fn(s), state)
++    kinetic = quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
++    volume = quantity.volume(3, state.box)
++    values = (
++      quantity.temperature(momentum=state.momentum, mass=state.mass),
++      (2 * kinetic - state.dUdV) / (3 * volume),
++      volume,
++    )
++    return state, jnp.asarray(values)
++
++  state, samples = jax.jit(
++    lambda state: lax.scan(
++      sample, state, None, length=NSTEPS_SIM // WRITE_EVERY
++    )
++  )(state)
++  mean_temperature, mean_pressure, mean_volume = jnp.mean(
++    samples[len(samples) // 2 :], axis=0
++  )
++  print(
++    f'T={temperature:.1f}, P={pressure:.1f}: '
++    f'<T>={mean_temperature:.3f}, '
++    f'<P>={mean_pressure:.3f}, '
++    f'<V>={mean_volume:.3f}'
++  )
+diff --git a/jax_md/simulate.py b/jax_md/simulate.py
+index cd21f989..d3c49b18 100644
+--- a/jax_md/simulate.py
++++ b/jax_md/simulate.py
+@@ -760,6 +760,18 @@ def box(self) -> Array:
+     return (V / V_0) ** (1 / dim) * ref
+ 
+ 
++def sinhx_x(x: Array) -> Array:
++  """Taylor series for sinh(x) / x as x -> 0."""
++  return (
++    1
++    + x**2 / 6
++    + x**4 / 120
++    + x**6 / 5040
++    + x**8 / 362_880
++    + x**10 / 39_916_800
++  )
++
++
+ def _npt_box_info(
+   state: NPTNoseHooverState,
+ ) -> Tuple[Array, Callable[[Array | float], Array]]:
+@@ -906,17 +918,6 @@ def box_force(
+ 
+     return alpha * KE2 - dUdV - pressure * vol * dim
+ 
+-  def sinhx_x(x):
+-    """Taylor series for sinh(x) / x as x -> 0."""
+-    return (
+-      1
+-      + x**2 / 6
+-      + x**4 / 120
+-      + x**6 / 5040
+-      + x**8 / 362_880
+-      + x**10 / 39_916_800
+-    )
+-
+   def exp_iL1(box, R, V, V_b, **kwargs):
+     x = V_b * dt
+     x_2 = x / 2
+@@ -1267,6 +1268,309 @@ def apply_fn(state, **kwargs):
+   return init_fn, apply_fn
+ 
+ 
++@dataclasses.dataclass
++class NPTCSVRState:
++  """State information for the unconstrained-COM NPT CSVR integrator.
++
++  The isotropic box is parameterized by ``box_position`` such that
++  ``box_position = log((V / V_0) ** (1 / 3))``. ``box_momentum`` is the
++  momentum conjugate to this coordinate and ``box_mass`` is the piston mass.
++  ``dUdV`` is the derivative of the potential with respect to an isotropic
++  affine perturbation, evaluated at the current state. The state uses the
++  complete particle momentum distribution; no center-of-mass projection is
++  applied.
++  """
++
++  position: Array
++  momentum: Array
++  force: Array
++  mass: Array
++
++  reference_box: Box
++  box_position: Array
++  box_momentum: Array
++  box_mass: Array
++  dUdV: Array
++  potential_energy: Array
++  rng: Array
++  conserved_quantity: Array
++
++  @property
++  def velocity(self) -> Array:
++    return self.momentum / self.mass
++
++  @property
++  def box(self) -> Array:
++    """Get the current box from an NPT CSVR simulation."""
++    dim = self.position.shape[1]
++    ref = self.reference_box
++    V_0 = quantity.volume(dim, ref)
++    V = V_0 * jnp.exp(dim * self.box_position)
++    return (V / V_0) ** (1 / dim) * ref
++
++
++def npt_csvr(
++  energy_fn: Callable[..., Array],
++  shift_fn: ShiftFn,
++  dt: float,
++  pressure: float | Array,
++  kT: ArrayLike,
++  tau_p: float,
++  tau_t: float,
++) -> Simulator:
++  """Simulation in the unconstrained-COM NPT ensemble using CSVR.
++
++  This is the isotropic Bussi-Zykova-Timan-Parrinello integrator [#bzp2009]_.
++  The particle center of mass and total momentum are unconstrained. The
++  particle momenta and the piston velocity are coupled to the same canonical
++  velocity-rescaling thermostat, with ``3 * N + 1`` kinetic degrees of
++  freedom.
++
++  ``energy_fn`` must return a scalar potential energy and accept ``box`` and
++  ``perturbation`` keyword arguments. ``perturbation=1 + eps`` is used to
++  compute the derivative needed for the instantaneous pressure. The pressure
++  is
++
++  ``(2 * kinetic_energy - dUdV) / (3 * volume)``.
++
++  Args:
++    energy_fn: A function returning the scalar potential energy for particle
++      positions of shape ``[n, 3]``.
++    shift_fn: A function from ``space.periodic_general`` that displaces
++      fractional positions by a physical displacement.
++    dt: The integration timestep.
++    pressure: The target external pressure. It can be overridden on a step by
++      passing ``pressure=...`` to ``apply_fn``.
++    kT: The target temperature in energy units. It can be overridden on a step
++      by passing ``kT=...`` to ``apply_fn``.
++    tau_p: The piston relaxation timescale. The piston mass is initialized as
++      ``3 * N * kT * tau_p**2``.
++    tau_t: The CSVR thermostat relaxation timescale.
++
++  Returns:
++    An ``(init_fn, apply_fn)`` pair.
++
++  .. warning::
++    This integrator couples a single global stochastic velocity rescaling to
++    the system plus piston. Hence, there can be scenarios with slow
++    equilibration.
++
++  .. rubric:: References
++  .. [#bzp2009] G. Bussi, T. Zykova-Timan, and M. Parrinello,
++    "Isothermal-isobaric molecular dynamics using stochastic velocity
++    rescaling," *J. Chem. Phys.* 130, 074101 (2009).
++  """
++  dt_2 = dt / 2
++
++  def force_stress_fn(position, box, **kwargs):
++    def U(position, eps):
++      return energy_fn(
++        position,
++        box=box,
++        perturbation=jnp.asarray(1, dtype=position.dtype) + eps,
++        **kwargs,
++      )
++
++    eps = jnp.zeros((), dtype=position.dtype)
++    E, grads = value_and_grad(U, argnums=(0, 1))(position, eps)
++    return E, -grads[0], grads[1]
++
++  def modified_hamiltonian(
++    potential_energy,
++    momentum,
++    mass,
++    box,
++    box_momentum,
++    box_mass,
++    _pressure,
++    _kT,
++  ):
++    volume = quantity.volume(3, box)
++    kinetic = quantity.kinetic_energy(momentum=momentum, mass=mass)
++    piston_kinetic = box_momentum**2 / (2 * box_mass)
++    return (
++      potential_energy
++      + kinetic
++      + piston_kinetic
++      + _pressure * volume
++      - _kT * jnp.log(volume)
++    )
++
++  def init_fn(
++    key,
++    R,
++    box,
++    mass=f32(1.0),
++    momenta=None,
++    box_velocity=None,
++    **kwargs,
++  ):
++    N, dim = R.shape
++    if dim != 3:
++      raise ValueError('npt_csvr currently supports only three dimensions.')
++
++    _kT = kwargs.pop('kT', kT)
++    _pressure = kwargs.pop('pressure', pressure)
++
++    if jnp.isscalar(box) or box.ndim == 0:
++      # TODO(schsam): This is necessary because of JAX issue #5849.
++      box = jnp.eye(dim, dtype=R.dtype) * box
++
++    zero = jnp.zeros((), dtype=R.dtype)
++    box_position = zero
++    box_mass = jnp.asarray(3 * N, dtype=R.dtype) * _kT * tau_p**2
++    box_momentum = zero
++    potential_energy, force, dUdV = force_stress_fn(R, box, **kwargs)
++    momentum_key, piston_key, state_key = random.split(key, 3)
++
++    state = NPTCSVRState(
++      R,
++      tree_map(jnp.zeros_like, R),
++      force,
++      mass,
++      box,
++      box_position,
++      box_momentum,
++      box_mass,
++      dUdV,
++      potential_energy,
++      state_key,
++      zero,
++    )
++    state = canonicalize_mass(state)
++
++    if momenta is None:
++      momentum = jnp.sqrt(state.mass * _kT) * random.normal(
++        momentum_key, R.shape, dtype=R.dtype
++      )
++      state = state.set(momentum=momentum)
++    else:
++      state = canonicalize_momenta(state, momenta)
++
++    if box_velocity is None:
++      box_velocity = jnp.sqrt(_kT / box_mass) * random.normal(
++        piston_key, dtype=R.dtype
++      )
++    else:
++      box_velocity = jnp.asarray(box_velocity, dtype=R.dtype)
++
++    state = state.set(
++      box_momentum=box_mass * box_velocity,
++    )
++    H = modified_hamiltonian(
++      state.potential_energy,
++      state.momentum,
++      state.mass,
++      state.box,
++      state.box_momentum,
++      state.box_mass,
++      _pressure,
++      _kT,
++    )
++    return state.set(conserved_quantity=H)
++
++  def csvr_update(state, _kT):
++    """Apply one exact CSVR half-step to particles and the piston."""
++    next_key, normal_key, chi_square_key = random.split(state.rng, 3)
++    dof = state.position.size + 1
++    kinetic = quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
++    kinetic += state.box_momentum**2 / (2 * state.box_mass)
++    kinetic = jnp.maximum(kinetic, jnp.finfo(state.position.dtype).tiny)
++    mean_kinetic = 0.5 * dof * _kT
++    c = jnp.exp(-dt / (2 * tau_t))
++    r = random.normal(normal_key, dtype=state.position.dtype)
++    S = 2 * random.gamma(
++      chi_square_key, 0.5 * (dof - 1), dtype=state.position.dtype
++    )
++    ratio = (1 - c) * mean_kinetic / (dof * kinetic)
++    alpha_squared = c + ratio * (S + r**2) + 2 * r * jnp.sqrt(c * ratio)
++    sign_argument = r + jnp.sqrt(c / ratio)
++    sign = jnp.where(sign_argument >= 0, 1.0, -1.0)
++    alpha = sign * jnp.sqrt(jnp.maximum(alpha_squared, 0.0))
++    return state.set(
++      momentum=alpha * state.momentum,
++      box_momentum=alpha * state.box_momentum,
++      rng=next_key,
++    )
++
++  def piston_half_step(
++    eta, momentum, force, mass, dUdV, volume, box_mass, pressure, kT
++  ):
++    kinetic = quantity.kinetic_energy(momentum=momentum, mass=mass)
++    internal_pressure = (2 * kinetic - dUdV) / (3 * volume)
++    eta_dot = 3 * (volume * (internal_pressure - pressure) + kT)
++    eta = eta + eta_dot * dt_2 / box_mass
++    eta += util.high_precision_sum(force * momentum / mass) * dt_2**2 / box_mass
++    eta += util.high_precision_sum(force**2 / mass) * dt_2**3 / (3 * box_mass)
++    return eta
++
++  def nph_step(state, _pressure, _kT, **kwargs):
++    """Apply the finite-step NPH part and update its conserved quantity."""
++    R, P, M, F = state.position, state.momentum, state.mass, state.force
++    P_b, M_b = state.box_momentum, state.box_mass
++    volume = quantity.volume(3, state.box)
++    eta = P_b / M_b
++    eta = piston_half_step(
++      eta, P, F, M, state.dUdV, volume, M_b, _pressure, _kT
++    )
++    P = P + dt_2 * F
++
++    old_H = modified_hamiltonian(
++      state.potential_energy,
++      state.momentum,
++      M,
++      state.box,
++      state.box_momentum,
++      M_b,
++      _pressure,
++      _kT,
++    )
++
++    x = eta * dt
++    R_b = state.box_position + x
++    V_0 = quantity.volume(3, state.reference_box)
++    volume = V_0 * jnp.exp(3 * R_b)
++    box = (volume / V_0) ** (1 / 3) * state.reference_box
++    R = shift_fn(R, dt * sinhx_x(x) * P / M, box=box, **kwargs)
++    P = jnp.exp(-x) * P
++
++    potential_energy, F, dUdV = force_stress_fn(R, box, **kwargs)
++    volume = quantity.volume(3, box)
++    eta = piston_half_step(eta, P, F, M, dUdV, volume, M_b, _pressure, _kT)
++    P = P + dt_2 * F
++    P_b = M_b * eta
++
++    new_H = modified_hamiltonian(
++      potential_energy,
++      P,
++      M,
++      box,
++      P_b,
++      M_b,
++      _pressure,
++      _kT,
++    )
++    return state.set(
++      position=R,
++      momentum=P,
++      force=F,
++      box_position=R_b,
++      box_momentum=P_b,
++      dUdV=dUdV,
++      potential_energy=potential_energy,
++      conserved_quantity=state.conserved_quantity + new_H - old_H,
++    )
++
++  def apply_fn(state, **kwargs):
++    _kT = kwargs.pop('kT', kT)
++    _pressure = kwargs.pop('pressure', pressure)
++    state = csvr_update(state, _kT)
++    state = nph_step(state, _pressure, _kT, **kwargs)
++    return csvr_update(state, _kT)
++
++  return init_fn, apply_fn
++
++
+ """Experimental Simulations.
+ 
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 6d179de3..a262ec47 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -39,8 +39,10 @@ dependencies = [
+     "absl-py",
+     "numpy",
+     # Exclude 0.10.2: https://github.com/jax-ml/jax/issues/39103
+-    "jax>=0.5.0,!=0.10.2",
+-    "jaxlib>=0.5.0,!=0.10.2",
++    # Exclude 0.11.1: it drops jax.experimental.hijax.MutableHiType, which
++    # flax 0.12.8 imports at module scope.
++    "jax>=0.5.0,!=0.10.2,!=0.11.1",
++    "jaxlib>=0.5.0,!=0.10.2,!=0.11.1",
+     "flax",
+     "jraph",
+     "einops",
+diff --git a/tests/simulate_test.py b/tests/simulate_test.py
+index 090054bd..8055b9d0 100644
+--- a/tests/simulate_test.py
++++ b/tests/simulate_test.py
+@@ -399,6 +399,181 @@ def step_fn(i, state_energy_pressure):
+     self.assertAllClose(Es, E_initial, rtol=tol, atol=tol)
+     self.assertAllClose(Ps, P_target, rtol=0.05, atol=0.05)
+ 
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dtype={dtype.__name__}',
++        'dtype': dtype,
++      }
++      for dtype in DTYPE
++    )
++  )
++  def test_npt_csvr(self, dtype):
++    particle_count = 64
++    box = dtype((particle_count / 0.7) ** (1 / 3))
++    grid = np.stack(
++      np.meshgrid(*[np.arange(4, dtype=dtype)] * 3, indexing='ij'), axis=-1
++    )
++    position = (grid.reshape(-1, 3) + dtype(0.5)) / dtype(4)
++    displacement, shift = space.periodic_general(box)
++    energy_fn = energy.lennard_jones_pair(
++      displacement,
++      sigma=dtype(1.0),
++      epsilon=dtype(1.0),
++      r_onset=dtype(1.8),
++      r_cutoff=dtype(2.0),
++    )
++    init_fn, apply_fn = simulate.npt_csvr(
++      energy_fn,
++      shift,
++      dt=dtype(2e-3),
++      pressure=dtype(0.4),
++      kT=dtype(1.0),
++      tau_p=dtype(1.0),
++      tau_t=dtype(0.1),
++    )
++    apply_fn = jit(apply_fn)
++    state = init_fn(random.PRNGKey(0), position, box=box)
++    self.assertFalse(np.allclose(np.sum(state.momentum, axis=0), 0))
++    initial_box = state.box
++    initial_conserved = state.conserved_quantity
++
++    def step_fn(i, state_and_conserved):
++      state, conserved = state_and_conserved
++      state = apply_fn(state)
++      return state, conserved.at[i].set(state.conserved_quantity)
++
++    conserved = np.zeros((SHORT_DYNAMICS_STEPS,), dtype=dtype)
++    state, conserved = lax.fori_loop(
++      0, SHORT_DYNAMICS_STEPS, step_fn, (state, conserved)
++    )
++
++    kinetic = quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
++    volume = quantity.volume(3, state.box)
++    pressure = (2 * kinetic - state.dUdV) / (3 * volume)
++    expected_pressure = quantity.pressure(
++      energy_fn, state.position, state.box, kinetic
++    )
++    expected_force = quantity.force(energy_fn)(state.position, box=state.box)
++    expected_energy = energy.lennard_jones_pair(
++      space.periodic_general(state.box)[0],
++      sigma=dtype(1.0),
++      epsilon=dtype(1.0),
++      r_onset=dtype(1.8),
++      r_cutoff=dtype(2.0),
++    )(state.position)
++    tol = 2e-4 if dtype is f32 else 1e-10
++
++    self.assertEqual(state.position.dtype, dtype)
++    self.assertEqual(state.box.dtype, dtype)
++    self.assertFalse(np.allclose(state.box, initial_box))
++    self.assertAllClose(
++      state.potential_energy,
++      expected_energy,
++      rtol=tol,
++      atol=tol,
++    )
++    self.assertAllClose(state.force, expected_force, rtol=tol, atol=tol)
++    self.assertAllClose(pressure, expected_pressure, rtol=tol, atol=tol)
++    self.assertAllClose(
++      conserved,
++      np.full_like(conserved, initial_conserved),
++      rtol=2e-4,
++      atol=2e-4,
++    )
++    for value in (
++      state.position,
++      state.momentum,
++      state.force,
++      state.potential_energy,
++      state.dUdV,
++      state.box,
++      pressure,
++    ):
++      self.assertTrue(np.all(np.isfinite(value)))
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dtype={dtype.__name__}',
++        'dtype': dtype,
++      }
++      for dtype in DTYPE
++    )
++  )
++  def test_npt_csvr_initialization(self, dtype):
++    particle_count = 8
++    position = (
++      np.stack(
++        np.meshgrid(*[np.arange(2, dtype=dtype)] * 3, indexing='ij'),
++        axis=-1,
++      ).reshape(-1, 3)
++      + dtype(0.5)
++    ) / dtype(2)
++    mass = np.arange(1, particle_count + 1, dtype=dtype)
++    momenta = np.arange(1, position.size + 1, dtype=dtype).reshape(
++      position.shape
++    ) / dtype(10)
++    temperature = dtype(1.2)
++    tau_p = dtype(0.7)
++    box_velocity = dtype(0.2)
++
++    for box in (dtype(5.0), np.eye(3, dtype=dtype) * dtype(5.0)):
++      displacement, shift = space.periodic_general(box)
++      energy_fn = energy.lennard_jones_pair(displacement)
++      init_fn, _ = simulate.npt_csvr(
++        energy_fn,
++        shift,
++        dt=dtype(1e-3),
++        pressure=dtype(0.4),
++        kT=temperature,
++        tau_p=tau_p,
++        tau_t=dtype(0.1),
++      )
++      state = init_fn(
++        random.PRNGKey(0),
++        position,
++        box=box,
++        mass=mass,
++        momenta=momenta,
++        box_velocity=box_velocity,
++      )
++      expected_box = np.eye(3, dtype=dtype) * box if np.ndim(box) == 0 else box
++      expected_box_mass = dtype(3 * particle_count) * temperature * tau_p**2
++
++      self.assertAllClose(state.momentum, momenta)
++      self.assertAllClose(state.velocity, momenta / mass[:, None])
++      self.assertAllClose(state.box, expected_box)
++      self.assertAllClose(state.box_mass, expected_box_mass)
++      self.assertAllClose(state.box_momentum, expected_box_mass * box_velocity)
++      self.assertFalse(np.allclose(np.sum(state.momentum, axis=0), 0))
++
++  @parameterized.named_parameters(
++    test_util.cases_from_list(
++      {
++        'testcase_name': f'_dtype={dtype.__name__}',
++        'dtype': dtype,
++      }
++      for dtype in DTYPE
++    )
++  )
++  def test_npt_csvr_requires_three_dimensions(self, dtype):
++    box = np.eye(2, dtype=dtype) * dtype(5.0)
++    _, shift = space.periodic_general(box)
++    energy_fn = lambda position, **kwargs: np.sum(position**2)
++    init_fn, _ = simulate.npt_csvr(
++      energy_fn,
++      shift,
++      dt=dtype(1e-3),
++      pressure=dtype(0.4),
++      kT=dtype(1.0),
++      tau_p=dtype(1.0),
++      tau_t=dtype(0.1),
++    )
++
++    with self.assertRaisesRegex(ValueError, 'only three dimensions'):
++      init_fn(random.PRNGKey(0), np.zeros((4, 2), dtype=dtype), box=box)
++
+   @parameterized.named_parameters(
+     test_util.cases_from_list(
+       {

@@ -1,0 +1,684 @@
+diff --git a/README.md b/README.md
+index 54e57684..23cd25b3 100755
+--- a/README.md
++++ b/README.md
+@@ -336,6 +336,8 @@ constraints:
+ 
+ ```
+ 
++Bond constraints and `leaving_atoms` use the same atom-selection rules. Use unique input chain IDs where possible. If a duplicate ID is automatically renamed, the original ID selects its most recently renamed occurrence; an unshadowed final ID can select an earlier occurrence. Renaming is applied once, so a later input that reuses a generated name does not redirect an earlier alias again. Sampled inline sequences use specification positions as described above; file chains keep their stored residue positions. A uniquely named fused inline donor can be selected by its donor ID. Donor IDs that conflict with another chain or alias are rejected.
++
+ ## Symmetric complex design (inverse-folding only)
+ 
+ For symmetric complexes (e.g., homo-dimers), the you can tie sequence generation during inverse folding by specifying the `symmetric_group` for each symmetric chain. The `protein-redesign` protocol allows for scoring complexes without separate binders/targets.
+diff --git a/src/boltzgen/data/parse/schema.py b/src/boltzgen/data/parse/schema.py
+index c1e5012f..065c2974 100644
+--- a/src/boltzgen/data/parse/schema.py
++++ b/src/boltzgen/data/parse/schema.py
+@@ -1430,7 +1430,6 @@ def recursive_check(data):
+ 
+             # Keep a mapping of (chain_name, residue_idx, atom_name) to atom_idx
+             atom_idx_map = {}
+-            local_atom_idx_map = {}
+             total_renaming = {}
+             extra_mols = {}
+             res_bind_type = []
+@@ -1448,8 +1447,10 @@ def recursive_check(data):
+             res_aa_constraint_mask = np.zeros((0, len(const.canonical_tokens)), dtype=np.float32)
+             chain_to_msa = {}
+ 
+-            global_asym_id = 0
+             for item in items_list:
++                renaming = {}
++                incoming_atom_idx_map = {}
++                local_atom_idx_map = {}
+                 sym_id = 0
+                 entity_type = next(iter(item.keys())).lower()
+                 if entity_type != "file":
+@@ -1473,7 +1474,6 @@ def recursive_check(data):
+                     ) = parse_entity(
+                         item, mols, mol_dir, ligand_id, is_msa_custom, is_msa_auto
+                     )
+-                    all_parsed_chains.update(parsed_chains)
+ 
+                     extra_mols.update(new_extra_mols)
+                     res_bind_type = np.concatenate([res_bind_type, new_res_bind_type])
+@@ -1547,8 +1547,8 @@ def recursive_check(data):
+ 
+                             for atom in res.atoms:
+                                 # Add atom to map
+-                                atom_idx_map[(chain_name, res.idx, atom.name)] = (
+-                                    global_asym_id + asym_id,
++                                incoming_atom_idx_map[(chain_name, res.idx, atom.name)] = (
++                                    len(data.chains) + asym_id,
+                                     data.residues.shape[0] + res_idx,
+                                     data.atoms.shape[0] + atom_idx,
+                                 )
+@@ -1621,6 +1621,16 @@ def recursive_check(data):
+                         [res_design_mask, new_res_design_mask]
+                     )
+                     if fuse_info["fuse"]:
++                        donor_name = str(new_data.chains[0]["name"])
++                        if (
++                            donor_name in all_parsed_chains
++                            or donor_name in data.chains["name"]
++                            or donor_name in total_renaming
++                        ):
++                            raise ValueError(
++                                f"Fused donor chain {donor_name} has an ambiguous alias; "
++                                "use a unique donor id."
++                            )
+                         source_context = source_context_utils.merge(
+                             source_context,
+                             incoming_context,
+@@ -1643,13 +1653,13 @@ def recursive_check(data):
+                         if len(renaming) > 0:
+                             msg = f"\nChain ids in non-file sequence conflict with existing chain ids. Renaming them {renaming}."
+                             self.log_once(msg)
+-                        global_asym_id += asym_id + 1
+                     new_chain_to_msa = {}
+                     for chain_id, msa in entity_chain_to_msa.items():
+                         renamed_id = renaming.get(chain_id, chain_id)
+                         if renamed_id in chain_to_msa:
+-                            raise KeyError(
+-                                f"Key '{renamed_id}' already exists in chain_to_msa."
++                            raise ValueError(
++                                f"Chain {renamed_id} conflicts with an existing chain or fused donor alias; "
++                                "use unique input chain ids."
+                             )
+                         new_chain_to_msa[renamed_id] = msa
+                     chain_to_msa.update(new_chain_to_msa)
+@@ -1694,7 +1704,6 @@ def recursive_check(data):
+                             data, new_data, return_renaming=True
+                         )
+                         total_renaming.update(renaming)
+-                        global_asym_id += max(new_data.chains["asym_id"]) + 1
+                     structure_groups = np.concatenate([structure_groups, new_groups])
+                     res_design_mask = np.concatenate([res_design_mask, new_design_mask])
+                     res_bind_type = np.concatenate([res_bind_type, fbind_types])
+@@ -1710,8 +1719,9 @@ def recursive_check(data):
+                     for chain_id, msa in file_chain_to_msa.items():
+                         renamed_id = renaming.get(chain_id, chain_id)
+                         if renamed_id in chain_to_msa:
+-                            raise KeyError(
+-                                f"Key '{renamed_id}' already exists in chain_to_msa."
++                            raise ValueError(
++                                f"Chain {renamed_id} conflicts with an existing chain or fused donor alias; "
++                                "use unique input chain ids."
+                             )
+                         new_chain_to_msa[renamed_id] = msa
+                     chain_to_msa.update(new_chain_to_msa)
+@@ -1745,165 +1755,110 @@ def recursive_check(data):
+                     res_bind_type = res_bind_type[order]
+                     ss_type = ss_type[order]
+                     res_aa_constraint_mask = res_aa_constraint_mask[order]
+-                    # Constraint keys retain the original specification's
+-                    # chain names, including aliases for fused inline donors.
++                    # Existing endpoints move when the donor is inserted into
++                    # an earlier chain. Incoming endpoints use donor-local offsets.
+                     atom_count = len(new_data.atoms)
+                     atom_boundary = int(
+                         fused_chain["atom_idx"] + fused_chain["atom_num"]
+                     ) - atom_count
+-                    donor_name = (
+-                        str(new_data.chains[0]["name"])
+-                        if entity_type != "file"
+-                        else None
+-                    )
+                     for key, endpoint in atom_idx_map.items():
+                         chain_index, residue_index, atom_index = endpoint
+-                        if key[0] == donor_name:
+-                            _, local_residue, local_atom = local_atom_idx_map[key]
+-                            atom_idx_map[key] = (
+-                                fused_chain_idx,
+-                                boundary + local_residue,
+-                                atom_boundary + local_atom,
+-                            )
+-                        else:
+-                            atom_idx_map[key] = (
+-                                chain_index,
+-                                residue_index
+-                                + (donor_count if residue_index >= boundary else 0),
+-                                atom_index
+-                                + (atom_count if atom_index >= atom_boundary else 0),
++                        atom_idx_map[key] = (
++                            chain_index,
++                            residue_index + (donor_count if residue_index >= boundary else 0),
++                            atom_index + (atom_count if atom_index >= atom_boundary else 0),
++                        )
++                    for key, (_, local_residue, local_atom) in local_atom_idx_map.items():
++                        incoming_atom_idx_map[key] = (
++                            fused_chain_idx,
++                            boundary + local_residue,
++                            atom_boundary + local_atom,
++                        )
++                if not fuse_info["fuse"]:
++                    for chain_name in new_data.chains["name"]:
++                        final_name = renaming.get(chain_name, chain_name)
++                        if final_name in all_parsed_chains:
++                            raise ValueError(
++                                f"Chain {final_name} conflicts with a fused donor alias; "
++                                "use unique input chain ids."
+                             )
++                if entity_type != "file":
++                    # Register only after renaming, so an incoming duplicate
++                    # cannot overwrite an earlier chain's sampling or atom map.
++                    for chain_name, parsed_chain in parsed_chains.items():
++                        final_name = renaming.get(chain_name, chain_name)
++                        all_parsed_chains[final_name] = parsed_chain
++                    for (chain_name, residue_index, atom_name), endpoint in incoming_atom_idx_map.items():
++                        final_name = renaming.get(chain_name, chain_name)
++                        atom_idx_map[(final_name, residue_index, atom_name)] = endpoint
+             if "total_len" in constraints[0]:
+                 if len(res_bind_type) >= min_len and len(res_bind_type) <= max_len:
+                     break
+             if "total_len" not in constraints[0]:
+                 break
+ 
+-        # Parse constraints
++        def resolve_atom(selection) -> tuple[int, int, int]:
++            """Resolve one input selection to global chain, residue and atom indices."""
++            chain_name, residue_number, atom_name = selection
++            # Preserve the existing single-step alias rule. Recursing can select
++            # a later unrelated chain when a generated name is reused as input.
++            chain_name = total_renaming.get(chain_name, chain_name)
++            residue_index = residue_number - 1
++            parsed_chain = all_parsed_chains.get(chain_name)
++            if parsed_chain is not None:
++                if parsed_chain.sampleidx_to_specidx is not None:
++                    matches = np.flatnonzero(
++                        parsed_chain.sampleidx_to_specidx == residue_index
++                    )
++                    if len(matches) == 0:
++                        raise ValueError(f"Residue in atom selection {selection} does not exist.")
++                    # Expanded variable-length slots share a specification index.
++                    # Constraints use the first match, as in minimum-length input.
++                    residue_index = int(matches[0])
++                try:
++                    return atom_idx_map[(chain_name, residue_index, atom_name)]
++                except KeyError as error:
++                    raise ValueError(f"Atom selection {selection} does not exist.") from error
++
++            matches = np.flatnonzero(data.chains["name"] == chain_name)
++            if len(matches) != 1:
++                raise ValueError(f"Chain {chain_name} in atom selection {selection} does not exist.")
++            chain_index = int(matches[0])
++            chain = data.chains[chain_index]
++            residues = data.residues[chain["res_idx"] : chain["res_idx"] + chain["res_num"]]
++            matches = np.flatnonzero(residues["res_idx"] == residue_index)
++            if len(matches) != 1:
++                raise ValueError(f"Residue in atom selection {selection} does not exist.")
++            residue_index = int(chain["res_idx"]) + int(matches[0])
++            residue = data.residues[residue_index]
++            atoms = data.atoms[residue["atom_idx"] : residue["atom_idx"] + residue["atom_num"]]
++            matches = np.flatnonzero(atoms["name"] == atom_name)
++            if len(matches) != 1:
++                raise ValueError(f"Atom selection {selection} does not exist.")
++            return chain_index, residue_index, int(residue["atom_idx"]) + int(matches[0])
++
++        # Bonds and leaving atoms must use the same chain and residue mapping.
+         for constraint in constraints:
+             if "bond" in constraint:
+-                if (
+-                    "atom1" not in constraint["bond"]
+-                    or "atom2" not in constraint["bond"]
+-                ):
+-                    msg = f"Bond constraint was not properly specified"
+-                    raise ValueError(msg)
+-
+-                c1, r1, a1 = tuple(constraint["bond"]["atom1"])
+-                c2, r2, a2 = tuple(constraint["bond"]["atom2"])
+-                r1 = r1 - 1  # 1-indexed
+-                r2 = r2 - 1  # 1-indexed
+-                if c1 in total_renaming.keys():
+-                    c1 = total_renaming[c1]
+-                if c2 in total_renaming.keys():
+-                    c2 = total_renaming[c2]
+-
+-                if c1 not in all_parsed_chains and c1 not in data.chains["name"]:
+-                    msg = f"Chain {c1} in the specified connection does not exist: {constraint}"
+-                    raise ValueError(msg)
+-                if c2 not in all_parsed_chains and c2 not in data.chains["name"]:
+-                    msg = f"Chain {c2} in the specified connection does not exist: {constraint}"
+-                    raise ValueError(msg)
+-
+-                # Map index
+-                if (
+-                    c1 in all_parsed_chains.keys()
+-                    and all_parsed_chains[c1].sampleidx_to_specidx is not None
+-                ):
+-                    r1 = np.where(all_parsed_chains[c1].sampleidx_to_specidx == r1)[0][
+-                        0
+-                    ].item()
+-                    c1, r1, a1 = atom_idx_map[(c1, r1, a1)]
+-                else:
+-                    # we have a chain coming from a file where we just use the residue index
+-                    chain = data.chains[data.chains["name"] == c1]
+-                    c1 = chain["asym_id"].item()
+-
+-                    res_start = chain["res_idx"].item()
+-                    res_end = chain["res_idx"].item() + chain["res_num"].item()
+-                    residues = data.residues[res_start:res_end]
+-                    residue = residues[residues["res_idx"] == r1]
+-                    r1 = res_start + np.flatnonzero(
+-                        residues["res_idx"] == r1
+-                    ).item()
+-
+-                    atom_start = residue["atom_idx"].item()
+-                    atom_end = residue["atom_idx"].item() + residue["atom_num"].item()
+-                    atoms = data.atoms[atom_start:atom_end]
+-                    assert a1 in atoms["name"], (
+-                        f"Atom {a1} not found in residue {r1} of chain {c1}"
+-                    )
+-                    a1 = np.where(atoms["name"] == a1)[0].item()
+-                    a1 = (
+-                        residue["atom_idx"].item() + a1
+-                    )  # THIS STILL NEEDS TO BE CORRECTED
+-
+-                if (
+-                    c2 in all_parsed_chains.keys()
+-                    and all_parsed_chains[c2].sampleidx_to_specidx is not None
+-                ):
+-                    r2 = np.where(all_parsed_chains[c2].sampleidx_to_specidx == r2)[0][
+-                        0
+-                    ].item()
+-                    c2, r2, a2 = atom_idx_map[(c2, r2, a2)]
+-                else:
+-                    # we have a chain coming from a file where we just use the residue index
+-                    chain = data.chains[data.chains["name"] == c2]
+-                    c2 = chain["asym_id"].item()
+-
+-                    res_start = chain["res_idx"].item()
+-                    res_end = chain["res_idx"].item() + chain["res_num"].item()
+-                    residues = data.residues[res_start:res_end]
+-                    residue = residues[residues["res_idx"] == r2]
+-                    r2 = res_start + np.flatnonzero(
+-                        residues["res_idx"] == r2
+-                    ).item()
+-
+-                    atom_start = residue["atom_idx"].item()
+-                    atom_end = residue["atom_idx"].item() + residue["atom_num"].item()
+-                    atoms = data.atoms[atom_start:atom_end]
+-                    assert a2 in atoms["name"], (
+-                        f"Atom {a2} not found in residue {r2} of chain {c2}"
+-                    )
+-                    a2 = np.where(atoms["name"] == a2)[0].item()
+-                    a2 = (
+-                        residue["atom_idx"].item() + a2
+-                    )  # THIS STILL NEEDS TO BE CORRECTED
++                bond = constraint["bond"]
++                if "atom1" not in bond or "atom2" not in bond:
++                    raise ValueError("Bond constraint was not properly specified")
++                c1, r1, a1 = resolve_atom(bond["atom1"])
++                c2, r2, a2 = resolve_atom(bond["atom2"])
+                 covalents.append((c1, c2, r1, r2, a1, a2))
+-            elif "total_len" in constraints:
+-                continue
+ 
+         covalents = [(*c, const.bond_type_ids["COVALENT"]) for c in covalents]
+         covalents = np.array(covalents, dtype=Bond)
+         data = replace(data, bonds=np.concatenate([data.bonds, covalents]))
+ 
+-        # Parse leaving atoms
+-        leaving_atoms = schema.get("leaving_atoms", [])
+-        for leaving_atom in leaving_atoms:
+-            cidx, ridx, aidx = tuple(leaving_atom["atom"])
+-            ridx = ridx - 1
+-            if (
+-                cidx in all_parsed_chains
+-                and all_parsed_chains[cidx].sampleidx_to_specidx is not None
+-            ):
+-                ridx = np.where(all_parsed_chains[cidx].sampleidx_to_specidx == ridx)[
+-                    0
+-                ][0].item()
+-            if cidx in total_renaming.keys():
+-                cidx = total_renaming[cidx]
+-            chain = data.chains[np.where(data.chains["name"] == cidx)[0].item()]
+-            residues = data.residues[
+-                chain["res_idx"] : chain["res_idx"] + chain["res_num"]
+-            ]
+-            res = residues[np.where(residues["res_idx"] == ridx)[0].item()]
+-            atoms = data.atoms[res["atom_idx"] : res["atom_idx"] + res["atom_num"]]
+-            atom_idx = res["atom_idx"] + np.where(atoms["name"] == aidx)[0].item()
+-            data.atoms["is_present"][atom_idx] = False
+-            chain_index = data.chains["name"].tolist().index(cidx)
++        for leaving_atom in schema.get("leaving_atoms", []):
++            chain_index, residue_index, atom_index = resolve_atom(leaving_atom["atom"])
++            data.atoms["is_present"][atom_index] = False
++            chain = data.chains[chain_index]
++            residue_offset = residue_index - int(chain["res_idx"])
+             context_entry = source_context["chains"][chain_index]
+-            residue_offset = np.where(residues["res_idx"] == ridx)[0].item()
+             context_entry.setdefault("omitted_atoms", []).append(
+-                [context_entry["indices"][residue_offset], aidx]
++                [context_entry["indices"][residue_offset], leaving_atom["atom"][2]]
+             )
+ 
+         # Create metadata
+diff --git a/tests/test_chain_atom_resolution.py b/tests/test_chain_atom_resolution.py
+new file mode 100644
+index 00000000..d9d33994
+--- /dev/null
++++ b/tests/test_chain_atom_resolution.py
+@@ -0,0 +1,321 @@
++"""Public-parser regression expectations for atom selections."""
++
++# Pytest injects the imported molecule fixture.
++# ruff: noqa: F811
++
++from pathlib import Path
++
++import numpy as np
++import pytest
++from test_pdb_parser_integrity import PROTEIN, mols, write_pdb  # noqa: F401
++from test_structure_transform_boundaries import molecule
++
++from boltzgen.data.parse.schema import YamlDesignParser
++
++
++@pytest.fixture(autouse=True)
++def preserve_numpy_random_state():
++    state = np.random.get_state()
++    yield
++    np.random.set_state(state)
++
++
++CASES = [
++    ("inline_file_alias", "R", 4, "A", 4),
++    ("inline_file_final", "A", 4, "A", 4),
++    ("sampled_inline_file_alias", "R", 3, "A", 3),
++    ("sampled_inline_file_final", "A", 3, "A", 3),
++    ("file_sampled_inline_alias", "R", 3, "A", 5),
++    ("file_sampled_inline_final", "A", 3, "A", 5),
++    ("inline_sampled_inline_alias", "R", 3, "A", 5),
++    ("inline_sampled_inline_final", "A", 3, "A", 5),
++    ("fused_donor", "D", 3, "R", 7),
++    ("fused_donor_with_trailing", "D", 3, "R", 7),
++    ("fused_after_collision", "D", 3, "A", 11),
++    ("repeat_file_alias", "R", 4, "B", 4),
++    ("repeat_file_final", "A", 4, "A", 4),
++    ("renaming_chain_alias", "R", 3, "A", 3),
++    ("renaming_chain_final", "A", 3, "B", 5),
++    ("renaming_chain_latest", "B", 3, "B", 5),
++    ("crop_alias", "R", 3, "A", 3),
++    ("crop_final", "A", 3, "A", 3),
++    ("middle_fuse_shifted_sampled", "T", 3, "T", 5),
++    ("later_fuse_shifts_donor", "D", 3, "T", 7),
++    ("later_file_fuse_shifts_inline", "T", 3, "T", 5),
++    ("empty_fusion_target", "D", 3, "R", 5),
++    ("inline_copies_collision_alias", "R", 3, "A", 5),
++    ("inline_copies_collision_final", "A", 3, "A", 5),
++    ("inline_copies_collision_other", "S", 3, "S", 5),
++    ("repeat_inline_earlier_final", "A", 3, "A", 5),
++    ("repeat_inline_latest_alias", "R", 3, "B", 3),
++    ("repeat_inline_latest_final", "B", 3, "B", 3),
++    ("gapped_crop_alias", "R", 4, "A", 4),
++    ("gapped_crop_final", "A", 4, "A", 4),
++]
++
++
++@pytest.mark.parametrize("action", ["bond", "leaving"])
++@pytest.mark.parametrize("case,chain,residue,expected_chain,expected_residue", CASES)
++def test_chain_atom_identity(
++    tmp_path: Path, mols, action, case, chain, residue, expected_chain, expected_residue
++):
++    references = {**mols, "GLY": molecule()}
++    path = write_pdb(tmp_path / "source.pdb", PROTEIN, {"R": [1, 2, 3, 4, 5, 6]})
++
++    def inline(name, sequence, **kw):
++        return {"protein": {"id": name, "sequence": sequence, **kw}}
++
++    def file(crop=False, **kw):
++        selection = {"id": "R"}
++        if crop:
++            selection["res_index"] = "2,4..5" if crop == "gapped" else "2..5"
++        return {"file": {"path": str(path), "include": [{"chain": selection}], **kw}}
++
++    entities = {
++        "inline_file": [inline("R", "GG"), file()],
++        "sampled_inline_file": [inline("R", "G1..3G"), file()],
++        "file_sampled_inline": [file(), inline("R", "G1..3G")],
++        "inline_sampled_inline": [inline("R", "GG"), inline("R", "G1..3G")],
++        "fused_donor": [inline("R", "GG"), inline("D", "G1..3G", fuse="R")],
++        "fused_donor_with_trailing": [
++            inline("R", "GG"),
++            inline("T", "GGG"),
++            inline("D", "G1..3G", fuse="R"),
++        ],
++        "fused_after_collision": [
++            inline("R", "GG"),
++            file(),
++            inline("D", "G1..3G", fuse="A"),
++        ],
++        "repeat_file": [inline("R", "GG"), file(), file()],
++        "renaming_chain": [inline("R", "GG"), file(), inline("A", "G1..3G")],
++        "crop": [inline("R", "G1..3G"), file(crop=True)],
++        "middle_fuse_shifted_sampled": [
++            inline("R", "GG"),
++            inline("T", "G1..3G"),
++            inline("D", "GG", fuse="R"),
++        ],
++        "later_fuse_shifts_donor": [
++            inline("R", "GG"),
++            inline("T", "GG"),
++            inline("D", "G1..3G", fuse="T"),
++            inline("E", "GG", fuse="R"),
++        ],
++        "later_file_fuse_shifts_inline": [
++            file(),
++            inline("T", "G1..3G"),
++            file(fuse="R"),
++        ],
++        "empty_fusion_target": [inline("R", ""), inline("D", "G1..3G", fuse="R")],
++        "inline_copies_collision": [inline("R", "GG"), inline(["R", "S"], "G1..3G")],
++        "repeat_inline_earlier": [
++            inline("R", "GG"),
++            inline("R", "G1..3G"),
++            inline("R", "GGG"),
++        ],
++        "repeat_inline_latest": [
++            inline("R", "GG"),
++            inline("R", "G1..3G"),
++            inline("R", "GGG"),
++        ],
++        "gapped_crop": [inline("R", "GG"), file(crop="gapped")],
++    }
++    key = case
++    for suffix in ("_alias", "_final", "_other"):
++        key = key.removesuffix(suffix)
++    if key == "renaming_chain_latest":
++        key = "renaming_chain"
++    schema = {"entities": entities[key]}
++    if action == "bond":
++        schema["constraints"] = [
++            {"bond": {"atom1": [chain, residue, "O"], "atom2": [chain, residue, "N"]}}
++        ]
++    else:
++        schema["leaving_atoms"] = [{"atom": [chain, residue, "O"]}]
++    # The range samples three slots: spec G1..3G becomes five residues.
++    np.random.seed(3)
++    result = YamlDesignParser(tmp_path).parse_boltzgen_schema(
++        "test", schema, references, tmp_path, tmp_path
++    )
++    structure = result.structure
++    chain_index = np.flatnonzero(structure.chains["name"] == expected_chain).item()
++    selected_chain = structure.chains[chain_index]
++    residues = structure.residues[
++        selected_chain["res_idx"] : selected_chain["res_idx"]
++        + selected_chain["res_num"]
++    ]
++    residue_offset = np.flatnonzero(residues["res_idx"] == expected_residue - 1).item()
++    selected_residue = residues[residue_offset]
++    atoms = structure.atoms[
++        selected_residue["atom_idx"] : selected_residue["atom_idx"]
++        + selected_residue["atom_num"]
++    ]
++    expected_atom = (
++        int(selected_residue["atom_idx"]) + np.flatnonzero(atoms["name"] == "O").item()
++    )
++    if action == "bond":
++        actual = structure.bonds[-1]
++        assert actual["chain_1"] == chain_index
++        assert actual["res_1"] == selected_chain["res_idx"] + residue_offset
++        assert actual["atom_1"] == expected_atom
++    else:
++        absent_oxygen = np.flatnonzero(
++            (structure.atoms["name"] == "O") & ~structure.atoms["is_present"]
++        )
++        np.testing.assert_array_equal(absent_oxygen, [expected_atom])
++        context = result.source_context["chains"][chain_index]
++        assert context["omitted_atoms"] == [[context["indices"][residue_offset], "O"]]
++        assert all(
++            not c.get("omitted_atoms")
++            for i, c in enumerate(result.source_context["chains"])
++            if i != chain_index
++        )
++
++
++@pytest.mark.parametrize(
++    "case", ["target_name", "unrelated_chain", "earlier_donor", "later_chain"]
++)
++def test_fused_donor_alias_collision_rejected(tmp_path: Path, mols, case):
++    def inline(name, sequence="GG", **kw):
++        return {"protein": {"id": name, "sequence": sequence, **kw}}
++
++    entities = {
++        "target_name": [inline("R"), inline("R", fuse="R")],
++        "unrelated_chain": [inline("R"), inline("D"), inline("D", fuse="R")],
++        "earlier_donor": [inline("R"), inline("D", fuse="R"), inline("D", fuse="R")],
++        "later_chain": [inline("R"), inline("D", fuse="R"), inline("D")],
++    }[case]
++    with pytest.raises(
++        ValueError, match="(?i)(alias|ambiguous|collision|conflict|duplicate)"
++    ):
++        YamlDesignParser(tmp_path).parse_boltzgen_schema(
++            "test",
++            {"entities": entities},
++            {**mols, "GLY": molecule()},
++            tmp_path,
++            tmp_path,
++        )
++
++
++@pytest.mark.parametrize("action", ["bond", "leaving"])
++@pytest.mark.parametrize("kind", ["inline", "file"])
++@pytest.mark.parametrize(
++    "selection",
++    [
++        ["R", 0, "O"],
++        ["R", -1, "O"],
++        ["R", 99, "O"],
++        ["R", 1, "MISSING"],
++        ["MISSING", 1, "O"],
++    ],
++)
++def test_invalid_atom_selection_has_context(tmp_path, mols, action, kind, selection):
++    references = {**mols, "GLY": molecule()}
++    if kind == "file":
++        path = write_pdb(tmp_path / "source.pdb", PROTEIN, {"R": [1, 2, 3, 4, 5, 6]})
++        entities = [{"file": {"path": str(path)}}]
++    else:
++        entities = [{"protein": {"id": "R", "sequence": "GG"}}]
++    schema = {"entities": entities}
++    if action == "bond":
++        schema["constraints"] = [{"bond": {"atom1": selection, "atom2": ["R", 1, "N"]}}]
++    else:
++        schema["leaving_atoms"] = [{"atom": selection}]
++    with pytest.raises(ValueError, match="selection"):
++        YamlDesignParser(tmp_path).parse_boltzgen_schema(
++            "test", schema, references, tmp_path, tmp_path
++        )
++
++
++@pytest.mark.parametrize("action", ["bond", "leaving"])
++def test_excluded_file_residue_is_not_reindexed_to_neighbor(tmp_path, mols, action):
++    path = write_pdb(tmp_path / "source.pdb", PROTEIN, {"R": [1, 2, 3, 4, 5, 6]})
++    schema = {
++        "entities": [
++            {
++                "file": {
++                    "path": str(path),
++                    "include": [{"chain": {"id": "R", "res_index": "2,4..5"}}],
++                }
++            }
++        ]
++    }
++    if action == "bond":
++        schema["constraints"] = [
++            {"bond": {"atom1": ["R", 3, "O"], "atom2": ["R", 4, "N"]}}
++        ]
++    else:
++        schema["leaving_atoms"] = [{"atom": ["R", 3, "O"]}]
++    with pytest.raises(ValueError, match="Residue.*does not exist"):
++        YamlDesignParser(tmp_path).parse_boltzgen_schema(
++            "test", schema, mols, tmp_path, tmp_path
++        )
++
++
++@pytest.mark.parametrize("action", ["bond", "leaving"])
++@pytest.mark.parametrize("context", ["inline", "renamed", "fused"])
++@pytest.mark.parametrize(
++    "sequence,position",
++    [
++        ("G1..3G", 2),
++        ("1..3GG", 1),
++        ("GG1..3", 3),
++        ("1..3", 1),
++        ("G0..3G", 1),
++        ("2..3", 2),
++    ],
++)
++def test_expanded_ranges_keep_first_minimum_specification_match(
++    tmp_path, mols, action, context, sequence, position
++):
++    references = {**mols, "GLY": molecule()}
++    inline = {"protein": {"id": "R", "sequence": sequence}}
++    if context == "renamed":
++        path = write_pdb(tmp_path / "source.pdb", PROTEIN, {"R": [1, 2, 3, 4, 5, 6]})
++        entities = [{"file": {"path": str(path)}}, inline]
++        final_chain, offset = "A", 0
++    elif context == "fused":
++        inline["protein"]["fuse"] = "T"
++        entities = [{"protein": {"id": "T", "sequence": "GG"}}, inline]
++        final_chain, offset = "T", 2
++    else:
++        entities = [inline]
++        final_chain, offset = "R", 0
++    schema = {"entities": entities}
++    if action == "bond":
++        schema["constraints"] = [
++            {"bond": {"atom1": ["R", position, "O"], "atom2": ["R", 1, "N"]}}
++        ]
++    else:
++        schema["leaving_atoms"] = [{"atom": ["R", position, "O"]}]
++    np.random.seed(1 if sequence == "2..3" else 3)
++    result = YamlDesignParser(tmp_path).parse_boltzgen_schema(
++        "test", schema, references, tmp_path, tmp_path
++    )
++    structure = result.structure
++    chain_index = np.flatnonzero(structure.chains["name"] == final_chain).item()
++    chain = structure.chains[chain_index]
++    residue_index = int(chain["res_idx"]) + offset + position - 1
++    residue = structure.residues[residue_index]
++    atoms = structure.atoms[
++        residue["atom_idx"] : residue["atom_idx"] + residue["atom_num"]
++    ]
++    atom_index = int(residue["atom_idx"]) + np.flatnonzero(atoms["name"] == "O").item()
++    if action == "bond":
++        bond = structure.bonds[-1]
++        assert (bond["chain_1"], bond["res_1"], bond["atom_1"]) == (
++            chain_index,
++            residue_index,
++            atom_index,
++        )
++    else:
++        np.testing.assert_array_equal(
++            np.flatnonzero(
++                (structure.atoms["name"] == "O") & ~structure.atoms["is_present"]
++            ),
++            [atom_index],
++        )
++        entry = result.source_context["chains"][chain_index]
++        assert entry["omitted_atoms"] == [
++            [entry["indices"][offset + position - 1], "O"]
++        ]

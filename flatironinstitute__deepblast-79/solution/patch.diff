@@ -1,0 +1,212 @@
+diff --git a/deepblast/dataset/parse_mali.py b/deepblast/dataset/parse_mali.py
+index 704c498..5663dc3 100644
+--- a/deepblast/dataset/parse_mali.py
++++ b/deepblast/dataset/parse_mali.py
+@@ -35,8 +35,9 @@ def read_mali(root, tool='manual', report_ids=False):
+                 S = ''.join(
+                     list(map(revstate_f, map(state_f, list(zip(X, Y))))))
+                 res.append((X.replace('-', ''), Y.replace('-', ''), S))
+-                pdbs.append(os.path.basename(f).split('.')[0])
++                pdbs.append(os.path.basename(f).split(f'.{tool}.ali')[0])
+                 dirs.append(os.path.basename(path))
++
+     res = pd.DataFrame(res)
+     if report_ids:
+         res['query_id'] = np.arange(len(res)).astype(np.str)
+@@ -89,7 +90,8 @@ def read_mali_mammoth(root, report_ids=False):
+                 S = ''.join(
+                     list(map(revstate_f, map(state_f, list(zip(X, Y))))))
+                 res.append((X.replace('-', ''), Y.replace('-', ''), S))
+-                pdbs.append(os.path.basename(f).split('.')[0])
++                pdbs.append(os.path.basename(f).split('.mammoth.ali')[0])
++
+     res = pd.DataFrame(res)
+     if report_ids:
+         res['query_id'] = np.arange(len(res)).astype(np.str)
+diff --git a/deepblast/score.py b/deepblast/score.py
+index d4e5c0b..1b54ce5 100644
+--- a/deepblast/score.py
++++ b/deepblast/score.py
+@@ -1,6 +1,8 @@
+ import numpy as np
+ import matplotlib.pyplot as plt
+ from deepblast.dataset.utils import states2alignment, tmstate_f, states2edges
++from deepblast.constants import m as match
++import pandas as pd
+ 
+ 
+ def roc_edges(true_edges, pred_edges):
+@@ -32,11 +34,18 @@ def roc_edges_kernel_identity(true_edges, pred_edges, kernel_width):
+     return perc_id
+ 
+ 
++def filter_gaps(states, edges):
++    data = zip(states, edges)
++    data = filter(lambda x: x[0] == match, data)
++    _, edges = zip(*list(data))
++    return list(edges)
++
++
+ def alignment_score_kernel(true_states: str, pred_states: str,
+                            kernel_widths: list,
+-                           query_offset: int = 0, hit_offset: int = 0):
+-    """
+-    Computes ROC statistics on alignment
++                           query_offset: int = 0, hit_offset: int = 0,
++                           no_gaps=True):
++    """ Computes ROC statistics on alignment.
+ 
+     Parameters
+     ----------
+@@ -45,7 +54,6 @@ def alignment_score_kernel(true_states: str, pred_states: str,
+     pred_states : str
+         Predicted state string
+     """
+-
+     pred_states = list(map(tmstate_f, pred_states))
+     true_states = list(map(tmstate_f, true_states))
+     pred_edges = states2edges(pred_states)
+@@ -56,6 +64,9 @@ def alignment_score_kernel(true_states: str, pred_states: str,
+     pred_edges[:, 0] += query_offset
+     pred_edges[:, 1] += hit_offset
+     pred_edges = list(map(tuple, pred_edges))
++    if no_gaps:
++        pred_edges = filter_gaps(pred_states, pred_edges)
++        true_edges = filter_gaps(true_states, true_edges)
+ 
+     res = []
+     for k in kernel_widths:
+@@ -64,20 +75,26 @@ def alignment_score_kernel(true_states: str, pred_states: str,
+     return res
+ 
+ 
+-def alignment_score(true_states: str, pred_states: str):
+-    """
+-    Computes ROC statistics on alignment
++def alignment_score(true_states: str, pred_states: str, no_gaps=True):
++    """ Computes ROC statistics on alignment.
++
+     Parameters
+     ----------
+     true_states : str
+         Ground truth state string
+     pred_states : str
+         Predicted state string
++    no_gaps : bool
++        Removes all gaps before computing ROC stats.
+     """
+     pred_states = list(map(tmstate_f, pred_states))
+     true_states = list(map(tmstate_f, true_states))
+     pred_edges = states2edges(pred_states)
+     true_edges = states2edges(true_states)
++    if no_gaps:
++        pred_edges = filter_gaps(pred_states, pred_edges)
++        true_edges = filter_gaps(true_states, true_edges)
++
+     stats = roc_edges(true_edges, pred_edges)
+     return stats
+ 
+@@ -163,3 +180,30 @@ def alignment_text(x, y, pred, truth, stats):
+ 
+     s = stats_viz + '\n' + truth_viz + '\n' + pred_viz
+     return s
++
++
++def score_local_identity(x, k):
++    if x['query_start'] < 0:
++        return [0.] * len(k)
++    else:
++        return alignment_score_kernel(x['manual'], x['aln'], kernel_widths=k,
++                                      query_offset=x['query_start'],
++                                      hit_offset=x['hit_start'])
++
++
++def score_local_alignment(df, k, n_cores=4):
++    import dask.dataframe as dd
++    df2 = dd.from_pandas(df, npartitions=n_cores)
++    func = lambda x: score_local_identity(x, k)
++    res = df2.apply(func, axis=1)
++    resdf = res.compute(scheduler='processes')
++    return pd.DataFrame(list(resdf.values), columns=k)
++
++
++def score_global_alignment(df, col, k, n_cores=4):
++    import dask.dataframe as dd
++    df2 = dd.from_pandas(df, npartitions=n_cores)
++    func = lambda x: alignment_score_kernel(x['manual'], x[col], k)
++    res = df2.apply(func, axis=1)
++    resdf = res.compute(scheduler='processes')
++    return pd.DataFrame(list(resdf.values), columns=k)
+diff --git a/deepblast/tests/test_score.py b/deepblast/tests/test_score.py
+new file mode 100644
+index 0000000..0bb7275
+--- /dev/null
++++ b/deepblast/tests/test_score.py
+@@ -0,0 +1,31 @@
++import unittest
++from deepblast.score import alignment_score, alignment_score_kernel
++
++
++class TestScore(unittest.TestCase):
++
++    def setUp(self):
++        pass
++
++    def test_alignment_score(self):
++        s = ":11::21:"
++        p = ":11::12:"
++        alignment_score(s, p)
++
++    def test_alignment_score_no_gaps(self):
++        s = ":11::21:"
++        p = ":11::12:"
++        score = alignment_score(s, p, no_gaps=True)
++        self.assertEqual(score[0], 4)
++        self.assertEqual(score[1], 0)
++        self.assertEqual(score[2], 0)
++
++    def test_alignment_score_kernel(self):
++        s = ":11::21:"
++        p = ":11::12:"
++        k = [1, 2]
++        alignment_score_kernel(s, p, k, no_gaps=True)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/deepblast/trainer.py b/deepblast/trainer.py
+index c89cbc9..4e68201 100644
+--- a/deepblast/trainer.py
++++ b/deepblast/trainer.py
+@@ -18,7 +18,7 @@
+ from deepblast.losses import (
+     SoftAlignmentLoss, SoftPathLoss, MatrixCrossEntropy)
+ from deepblast.score import (roc_edges, alignment_visualization,
+-                             alignment_text)
++                             alignment_text, filter_gaps)
+ 
+ 
+ class LightningAligner(pl.LightningModule):
+@@ -168,9 +168,11 @@ def validation_stats(self, x, y, xlen, ylen, gen,
+             decoded, _ = next(gen)
+             pred_x, pred_y, pred_states = list(zip(*decoded))
+             pred_states = np.array(list(pred_states))
+-            truth_states = states[b].cpu().detach().numpy()
++            true_states = states[b].cpu().detach().numpy()
+             pred_edges = states2edges(pred_states)
+-            true_edges = states2edges(truth_states)
++            true_edges = states2edges(true_states)
++            pred_edges = filter_gaps(pred_states, pred_edges)
++            true_edges = filter_gaps(true_states, true_edges)
+             stats = roc_edges(true_edges, pred_edges)
+             if random.random() < self.hparams.visualization_fraction:
+                 Av = A[b].cpu().detach().numpy().squeeze()
+@@ -184,7 +186,7 @@ def validation_stats(self, x, y, xlen, ylen, gen,
+                     self.global_step, close=True)
+                 try:
+                     text = alignment_text(
+-                        x_str, y_str, pred_states, truth_states, stats)
++                        x_str, y_str, pred_states, true_states, stats)
+                     self.logger.experiment.add_text(
+                         f'alignment/{batch_idx}/{b}', text, self.global_step)
+                 except Exception as e:

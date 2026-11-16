@@ -1,0 +1,303 @@
+diff --git a/.env_example b/.env_example
+new file mode 100644
+index 0000000..8a6b56b
+--- /dev/null
++++ b/.env_example
+@@ -0,0 +1,11 @@
++FLASH_API_KEY=API_KEY_FLASH
++FLASH_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
++FLASH_MODEL=models/gemini-2.0-flash
++
++PRO_API_KEY=API_KEY_PRO
++PRO_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
++PRO_MODEL=models/gemini-2.0-flash
++
++EVALUATION_API_KEY=API_KEY_EVAL
++EVALUATION_BASE_URL=https://api.openai.com/v1
++EVALUATION_MODEL=gpt-4o
+diff --git a/code_generator/agent.py b/code_generator/agent.py
+index 9bbfe78..c11fcbb 100644
+--- a/code_generator/agent.py
++++ b/code_generator/agent.py
+@@ -1,36 +1,49 @@
+-# Code Generator Agent 
+-import google.generativeai as genai
+-from typing import Optional, Dict, Any
++# Code Generator Agent
++import asyncio  # Added for retry sleep
+ import logging
+-import asyncio # Added for retry sleep
+-from google.api_core.exceptions import InternalServerError, GoogleAPIError, DeadlineExceeded # For specific error handling
+-import time
+-import re # Added for diff application
++import re  # Added for diff application
++from typing import Any, Dict, Optional
++
++from openai import (
++    APIError,
++    APITimeoutError,
++    AsyncOpenAI,
++    AuthenticationError,
++    BadRequestError,
++    InternalServerError,
++    RateLimitError,
++)
+ 
+-from core.interfaces import CodeGeneratorInterface, BaseAgent, Program
+ from config import settings
++from core.interfaces import CodeGeneratorInterface
+ 
+ logger = logging.getLogger(__name__)
+ 
+ class CodeGeneratorAgent(CodeGeneratorInterface):
+     def __init__(self, config: Optional[Dict[str, Any]] = None):
+         super().__init__(config)
+-        if not settings.GEMINI_API_KEY:
+-            raise ValueError("GEMINI_API_KEY not found in settings. Please set it in your .env file or config.")
+-        genai.configure(api_key=settings.GEMINI_API_KEY)
+-        self.model_name = settings.GEMINI_PRO_MODEL_NAME # Default to pro, can be overridden by task
+-        self.generation_config = genai.types.GenerationConfig(
+-            temperature=0.7, 
+-            top_p=0.9,
+-            top_k=40
+-        )
+-        logger.info(f"CodeGeneratorAgent initialized with model: {self.model_name}")
+-        # self.max_retries and self.retry_delay_seconds are not used from instance, settings are used directly
++        self.pro_provider = settings.CUSTOM_PROVIDERS.get(settings.PRO_KEY)
++        self.flash_provider = settings.CUSTOM_PROVIDERS.get(settings.FLASH_KEY)
++        self.evaluation_provider = settings.CUSTOM_PROVIDERS.get(settings.EVALUATION_KEY)
++
++
++        for provider in settings.CUSTOM_PROVIDERS:
++            if not settings.CUSTOM_PROVIDERS[provider]['api_key']:
++                raise ValueError(f"{provider} API_KEY not found in settings. Please set it in your .env file or config.")
++
++        self.client = AsyncOpenAI(base_url=settings.CUSTOM_PROVIDERS[settings.FLASH_KEY]['base_url'], api_key=settings.CUSTOM_PROVIDERS[settings.FLASH_KEY]['api_key'])
++        self.generation_config = {
++            "temperature":0.7,
++            "top_p":0.9,
++            "top_k":40,
++            #"max_tokens" : 1000, # optional if needed
++        }
++
++
++    async def generate_code(self, prompt: str, provider_name: Optional[str] = None, temperature: Optional[float] = None, output_format: str = "code") -> str:
++        provider_name = provider_name if provider_name else settings.FLASH_KEY 
++        logger.info(f"Attempting to generate code using model: {provider_name}, output_format: {output_format}")
+ 
+-    async def generate_code(self, prompt: str, model_name: Optional[str] = None, temperature: Optional[float] = None, output_format: str = "code") -> str:
+-        effective_model_name = model_name if model_name else self.model_name
+-        logger.info(f"Attempting to generate code using model: {effective_model_name}, output_format: {output_format}")
+-        
+         # Add diff instructions if requested
+         if output_format == "diff":
+             prompt += '''
+@@ -47,39 +60,35 @@ async def generate_code(self, prompt: str, model_name: Optional[str] = None, tem
+ '''
+         
+         logger.debug(f"Received prompt for code generation (format: {output_format}):\n--PROMPT START--\n{prompt}\n--PROMPT END--")
+-        
+-        current_generation_config = genai.types.GenerationConfig(
+-            temperature=temperature if temperature is not None else self.generation_config.temperature,
+-            top_p=self.generation_config.top_p,
+-            top_k=self.generation_config.top_k
+-        )
++
+         if temperature is not None:
+             logger.debug(f"Using temperature override: {temperature}")
+-        
+-        model_to_use = genai.GenerativeModel(
+-            effective_model_name,
+-            generation_config=current_generation_config
+-        )
+ 
+         retries = settings.API_MAX_RETRIES
+         delay = settings.API_RETRY_DELAY_SECONDS
+         
+         for attempt in range(retries):
+             try:
+-                logger.debug(f"API Call Attempt {attempt + 1} of {retries} to {effective_model_name}.")
+-                response = await model_to_use.generate_content_async(prompt)
+-                
+-                if not response.candidates:
+-                    logger.warning("Gemini API returned no candidates.")
+-                    if response.prompt_feedback and response.prompt_feedback.block_reason:
+-                        logger.error(f"Prompt blocked. Reason: {response.prompt_feedback.block_reason}")
+-                        logger.error(f"Prompt feedback details: {response.prompt_feedback.safety_ratings}")
+-                        raise GoogleAPIError(f"Prompt blocked by API. Reason: {response.prompt_feedback.block_reason}")
+-                    return ""
++                logger.debug(f"API Call Attempt {attempt + 1} of {retries} to {provider_name}.")
++
++                client = self.client
++                client.api_key = settings.CUSTOM_PROVIDERS[provider_name]['api_key']
++                client.base_url = settings.CUSTOM_PROVIDERS[provider_name]['base_url']
+ 
+-                generated_text = response.candidates[0].content.parts[0].text
+-                logger.debug(f"Raw response from Gemini API:\n--RESPONSE START--\n{generated_text}\n--RESPONSE END--")
+-                
++                response = await client.chat.completions.create(
++                    model=settings.CUSTOM_PROVIDERS[provider_name]['model'],
++                    messages=[{"role": "user", "content": prompt}],
++                    max_tokens=self.generation_config["max_tokens"] if "max_tokens" in self.generation_config else None,
++                    temperature=temperature,
++                    top_p=self.generation_config["top_p"]
++                )
++
++                generated_text = response.choices[0].message.content
++
++                logger.debug(f"Raw response from API:\n--RESPONSE START--\n{generated_text}\n--RESPONSE END--")
++                if generated_text is None:
++                    logger.error("Received None as generated text from API.")
++                    return ""
+                 if output_format == "code":
+                     cleaned_code = self._clean_llm_output(generated_text)
+                     logger.debug(f"Cleaned code:\n--CLEANED CODE START--\n{cleaned_code}\n--CLEANED CODE END--")
+@@ -87,19 +96,19 @@ async def generate_code(self, prompt: str, model_name: Optional[str] = None, tem
+                 else: # output_format == "diff"
+                     logger.debug(f"Returning raw diff text:\n--DIFF TEXT START--\n{generated_text}\n--DIFF TEXT END--")
+                     return generated_text # Return raw diff text
+-            except (InternalServerError, DeadlineExceeded, GoogleAPIError) as e:
+-                logger.warning(f"Gemini API error on attempt {attempt + 1}: {type(e).__name__} - {e}. Retrying in {delay}s...")
++            except (APIError, InternalServerError, TimeoutError, RateLimitError, APITimeoutError, AuthenticationError, BadRequestError) as e:
++                logger.warning(f"API error on attempt {attempt + 1}: {type(e).__name__} - {e}. Retrying in {delay}s...")
+                 if attempt < retries - 1:
+                     await asyncio.sleep(delay)
+                     delay *= 2 
+                 else:
+-                    logger.error(f"Gemini API call failed after {retries} retries for model {effective_model_name}.")
++                    logger.error(f"API call failed after {retries} retries for model {provider_name}.")
+                     raise
+             except Exception as e:
+-                logger.error(f"An unexpected error occurred during code generation with {effective_model_name}: {e}", exc_info=True)
++                logger.error(f"An unexpected error occurred during code generation with {provider_name}: {e}", exc_info=True)
+                 raise
+-        
+-        logger.error(f"Code generation failed for model {effective_model_name} after all retries.")
++
++        logger.error(f"Code generation failed for model {provider_name} after all retries.")
+         return ""
+ 
+     def _clean_llm_output(self, raw_code: str) -> str:
+@@ -172,8 +181,8 @@ async def execute(self, prompt: str, model_name: Optional[str] = None, temperatu
+         logger.debug(f"CodeGeneratorAgent.execute called. Output format: {output_format}")
+         
+         generated_output = await self.generate_code(
+-            prompt=prompt, 
+-            model_name=model_name, 
++            prompt=prompt,
++            provider_name=model_name,
+             temperature=temperature,
+             output_format=output_format
+         )
+diff --git a/config/settings.py b/config/settings.py
+index 7fdf78b..cf233e8 100644
+--- a/config/settings.py
++++ b/config/settings.py
+@@ -5,25 +5,39 @@
+ # Load environment variables from .env file
+ load_dotenv()
+ 
+-# Attempt to load the API key
+-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
++FLASH_KEY = "FLASH"
++PRO_KEY = "PRO"
++EVALUATION_KEY = "EVALUATION"
++
++CUSTOM_PROVIDERS = {
++    PRO_KEY: {
++        "base_url": os.getenv("PRO_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
++        "api_key": os.getenv("PRO_API_KEY"),
++        "model": os.getenv("PRO_MODEL", "models/gemini-2.0-flash")
++    },
++    FLASH_KEY: {
++        "base_url": os.getenv("FLASH_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
++        "api_key": os.getenv("FLASH_API_KEY"),
++        "model": os.getenv("FLASH_MODEL", "models/gemini-2.0-flash")
++    },
++    EVALUATION_KEY: {
++        "base_url": os.getenv("EVALUATION_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
++        "api_key": os.getenv("EVALUATION_API_KEY"),
++        "model": os.getenv("EVALUATION_MODEL", "models/gemini-2.0-flash")
++    }
++}
+ 
+ # Fallback for development if .env is not set or key is not found,
+ # but ensure this is handled securely in production.
+-if not GEMINI_API_KEY:
++# if not CUSTOM_PROVIDERS['GEMINI']['api_key']:
+     # --- IMPORTANT ---
+     # Directly embedding keys is a security risk.
+     # This is a placeholder for local development ONLY.
+     # In a real deployment, use environment variables, secrets management, or other secure methods.
+     # For local testing without a .env file, you can temporarily set it like:
+     # GEMINI_API_KEY = "YOUR_ACTUAL_API_KEY_HERE"
+-    print("Warning: GEMINI_API_KEY not found in .env or environment. Using a NON-FUNCTIONAL placeholder. Please create a .env file with your valid API key.")
+-    GEMINI_API_KEY = "YOUR_API_KEY_FROM_DOTENV_WAS_NOT_FOUND_PLEASE_SET_IT_UP" # Obvious placeholder
+-
+-# LLM Model Configuration
+-GEMINI_PRO_MODEL_NAME = "gemini-2.0-flash-lite" # Using a more capable model
+-GEMINI_FLASH_MODEL_NAME = "gemini-2.0-flash-lite" # Default model for speed
+-GEMINI_EVALUATION_MODEL = "gemini-2.0-flash-lite" # Model for evaluation tasks
++    # print("Warning: GEMINI_API_KEY not found in .env or environment. Using a NON-FUNCTIONAL placeholder. Please create a .env file with your valid API key.")
++    # CUSTOM_PROVIDERS['GEMINI']['api_key'] = "YOUR_API_KEY_FROM_DOTENV_WAS_NOT_FOUND_PLEASE_SET_IT_UP" # Obvious placeholder
+ 
+ # Evolutionary Parameters (examples)
+ POPULATION_SIZE = 50  # Number of individuals in each generation
+@@ -68,9 +82,9 @@ def get_setting(key, default=None):
+ # Example of how to get a model, perhaps with fallback logic (not strictly necessary with current direct assignments)
+ def get_llm_model(model_type="pro"):
+     if model_type == "pro":
+-        return GEMINI_PRO_MODEL_NAME
++        return PRO_KEY
+     elif model_type == "flash":
+-        return GEMINI_FLASH_MODEL_NAME
+-    return GEMINI_FLASH_MODEL_NAME # Default fallback
++        return FLASH_KEY
++    return FLASH_KEY # Default fallback
+ 
+ # Add other global settings here 
+diff --git a/core/interfaces.py b/core/interfaces.py
+index f67850e..159e22e 100644
+--- a/core/interfaces.py
++++ b/core/interfaces.py
+@@ -1,6 +1,6 @@
+ # Core components, interfaces, data models 
+ from abc import ABC, abstractmethod
+-from typing import List, Dict, Any, Optional, Union
++from typing import List, Dict, Any, Optional
+ from dataclasses import dataclass, field
+ 
+ @dataclass
+@@ -54,7 +54,7 @@ def design_bug_fix_prompt(self, task: TaskDefinition, program: Program, error_in
+ 
+ class CodeGeneratorInterface(BaseAgent):
+     @abstractmethod
+-    async def generate_code(self, prompt: str, model_name: Optional[str] = None, temperature: Optional[float] = 0.7, output_format: str = "code") -> str:
++    async def generate_code(self, prompt: str, provider_name: Optional[str] = None, temperature: Optional[float] = 0.7, output_format: str = "code") -> str:
+         pass
+ 
+ class EvaluatorAgentInterface(BaseAgent):
+diff --git a/evaluator_agent/agent.py b/evaluator_agent/agent.py
+index c701d15..2995cf4 100644
+--- a/evaluator_agent/agent.py
++++ b/evaluator_agent/agent.py
+@@ -20,7 +20,7 @@ class EvaluatorAgent(EvaluatorAgentInterface, BaseAgent):
+     def __init__(self, task_definition: Optional[TaskDefinition] = None):
+         super().__init__()
+         self.task_definition = task_definition
+-        self.evaluation_model_name = settings.GEMINI_EVALUATION_MODEL
++        self.evaluation_model_name = settings.EVALUATION_PROVIDER
+         self.evaluation_timeout_seconds = settings.EVALUATION_TIMEOUT_SECONDS
+         logger.info(f"EvaluatorAgent initialized with model: {self.evaluation_model_name}, timeout: {self.evaluation_timeout_seconds}s")
+         if self.task_definition:
+diff --git a/requirements.txt b/requirements.txt
+index 332c689..e7c9d6a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+ # Core Libraries
+-google-generativeai  # For Gemini LLMs
++openai  # For openai compatible LLMs
+ # langchain
+ # langchain-google-genai # Or similar for Gemini integration
+ python-dotenv # For managing environment variables

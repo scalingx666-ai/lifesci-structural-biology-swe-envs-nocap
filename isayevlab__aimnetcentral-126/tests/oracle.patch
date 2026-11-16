@@ -1,0 +1,118 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9b5753a..03603f4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Forbade the `ptfile` constructor kwarg anywhere in artifact `model_yaml`. `DispParam.__init__` runs `torch.load(ptfile, weights_only=True)` on a YAML-supplied path, and the import-path walker never inspected constructor kwargs, so a default-trusted artifact could carry an arbitrary-path read/probe/DoS primitive. The exporter always strips `ptfile` before an artifact is produced, so no legitimate artifact is affected; training-config loading is untouched.
+ - Cross-checked D3TS presence between `model_yaml` and the `has_embedded_d3ts` metadata flag during artifact validation. Previously the two were validated independently, so a mislabeled artifact could silently double-count or entirely lose dispersion depending on which direction it was mislabeled.
+ - Validated D3TS damping parameters (`a1`, `a2`, `s8`, `s6`) supplied via artifact `model_yaml`: they must be finite, non-negative real numbers. These are plain constructor floats outside the state dict, so nothing previously stopped a NaN/Inf value or `a1=a2=0` (an undamped `1/d**6` collapse) from loading silently.
++- Forbade positional constructor arguments (`args`) anywhere in artifact `model_yaml`. `build_module` forwards a sibling `args` list into `func(*args, **kwargs)`, but both constructor-argument guards match keyword names only, and the parameters they protect are not keyword-only: `ptfile` is `DispParam`'s third positional parameter and `D3TS` takes its damping parameters first. A positional respelling therefore evaded both under the default trust policy — `args: [null, null, <path>]` reopened the `torch.load` arbitrary-path read/probe/DoS primitive (including a filesystem existence oracle via differing exception types) and `args: [-1.0, .nan, .inf]` reopened the undamped `1/d**6` collapse. Artifact `model_yaml` is keyword-only in practice: no in-repo YAML and none of the shipped or registry-distributed artifacts use `args`, so first-party and registry artifacts are unaffected, and rejecting the spelling outright makes the keyword guards sound rather than advisory. A third-party artifact that was exported with positional `args` before this change must be re-exported. Training-time construction never routes through this validator, so training configs may still use `args`; `aimnet export` does route the model YAML through it, so a training YAML that spells a module positionally fails at export with this message rather than at load.
+ 
+ ### Added
+ 
+diff --git a/aimnet/models/artifact_validation.py b/aimnet/models/artifact_validation.py
+index c96ccf1..c570123 100644
+--- a/aimnet/models/artifact_validation.py
++++ b/aimnet/models/artifact_validation.py
+@@ -99,6 +99,27 @@
+ # through this walker (aimnet/config.py does not import this module).
+ _FORBIDDEN_CONSTRUCTOR_KEYS = frozenset({"ptfile"})
+ 
++# Positional constructor arguments are forbidden anywhere in artifact
++# model_yaml. `aimnet.config.build_module` forwards a sibling `args` list
++# straight into `func(*args, **kwargs)`, but every constructor-argument guard
++# here inspects keyword arguments only: `_FORBIDDEN_CONSTRUCTOR_KEYS` matches
++# mapping keys and `_validate_d3ts_damping_kwargs` reads `kwargs`. A positional
++# spelling slips both, because the parameters those guards protect are not
++# keyword-only -- `DispParam(ref_c6, ref_alpha, ptfile, ...)` takes `ptfile`
++# third and `D3TS(a1, a2, s8, s6, ...)` takes its damping parameters first. So
++# `args: [null, null, /some/path]` reopens the `torch.load` arbitrary-path
++# read primitive and `args: [-1.0, .nan, .inf]` reopens the undamped `1/d**6`
++# collapse, both under the default trust policy.
++#
++# Rejecting the positional spelling outright is what makes the keyword guards
++# sound rather than advisory, and it costs nothing: artifact model_yaml is
++# keyword-only in practice -- no in-repo YAML and none of the shipped or
++# registry-distributed artifacts use `args`. Training-time construction never
++# routes through this walker (aimnet/config.py does not import this module);
++# `aimnet export` does, so a training YAML that spells a module positionally
++# fails at export with this message rather than at load.
++_FORBIDDEN_POSITIONAL_KEYS = frozenset({"args"})
++
+ # Class paths recognized as the D3TS dispersion module for the purpose of
+ # validating its damping-parameter kwargs (see `_validate_d3ts_damping_kwargs`
+ # below). Both spellings that resolve to the same class must be matched here.
+@@ -266,6 +287,11 @@ def walk(value: object) -> None:
+             for key, child in value.items():
+                 if key in _FORBIDDEN_CONSTRUCTOR_KEYS:
+                     raise ValueError(f"Key {key!r} is forbidden in model artifacts.")
++                if key in _FORBIDDEN_POSITIONAL_KEYS:
++                    raise ValueError(
++                        f"Key {key!r} is forbidden in model artifacts: constructor arguments must be "
++                        "passed by keyword under 'kwargs' so they can be validated."
++                    )
+                 if key in _RECOGNIZED_IMPORT_KEYS:
+                     if key in _ALWAYS_FORBIDDEN_IMPORT_KEYS:
+                         raise ValueError(f"Import key {key!r} is forbidden in model artifacts.")
+diff --git a/tests/test_model_artifact_security.py b/tests/test_model_artifact_security.py
+index 2d17a24..d9df265 100644
+--- a/tests/test_model_artifact_security.py
++++ b/tests/test_model_artifact_security.py
+@@ -1455,6 +1455,57 @@ def test_ptfile_remains_forbidden_under_unsafe_import_mode() -> None:
+         )
+ 
+ 
++# --- Positional `args` bypass of the constructor-kwarg guards ----------------
++#
++# `build_module` forwards `args` into `func(*args, **kwargs)`, but the guards
++# above match keyword names only. `ptfile` is DispParam's third positional
++# parameter and D3TS takes its damping parameters positionally, so without a
++# blanket rejection of `args` both guards are evadable by respelling.
++
++
++def test_positional_args_are_forbidden_in_artifact_yaml() -> None:
++    with pytest.raises(ValueError, match="args"):
++        validate_model_yaml(
++            "class: aimnet.modules.lr.DispParam\nargs: [null, null, /etc/passwd]\n",
++        )
++
++
++def test_positional_args_are_forbidden_anywhere_in_the_tree() -> None:
++    """Rejected regardless of nesting depth, matching the ptfile guard."""
++    with pytest.raises(ValueError, match="args"):
++        validate_model_yaml(
++            """
++class: aimnet.models.AIMNet2
++kwargs:
++  outputs:
++    disp_param:
++      class: aimnet.modules.lr.DispParam
++      args: [null, null, /etc/passwd]
++"""
++        )
++
++
++def test_positional_args_cannot_smuggle_d3ts_damping_parameters() -> None:
++    """`a1=-1.0, a2=nan, s8=inf` positionally must fail like the kwarg spelling."""
++    with pytest.raises(ValueError, match="args"):
++        validate_model_yaml("class: aimnet.modules.D3TS\nargs: [-1.0, .nan, .inf]\n")
++
++
++def test_positional_args_remain_forbidden_under_unsafe_import_mode() -> None:
++    with pytest.raises(ValueError, match="args"):
++        validate_model_yaml(
++            "class: aimnet.modules.lr.DispParam\nargs: [null, null, /etc/passwd]\n",
++            model_import_mode="unsafe",
++        )
++
++
++def test_kwargs_key_is_not_confused_with_args() -> None:
++    """The guard must match the `args` key exactly, not the `kwargs` substring."""
++    validate_model_yaml(
++        "class: aimnet.modules.lr.DispParam\nkwargs:\n  key_in: disp_param\n  key_out: disp_param\n",
++    )
++
++
+ # --- Finding 2: YAML<->metadata D3TS consistency -----------------------------
+ 
+ _D3TS_MODEL_YAML = """

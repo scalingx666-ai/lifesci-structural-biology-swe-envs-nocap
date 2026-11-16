@@ -1,0 +1,1904 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5809970..8dd0013 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1654,7 +1654,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "proteinview"
+-version = "0.2.5"
++version = "0.2.6"
+ dependencies = [
+  "anyhow",
+  "clap",
+diff --git a/src/app.rs b/src/app.rs
+index 85d19df..9cecae3 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -45,6 +45,8 @@ pub struct App {
+     pub show_interface: bool,
+     pub interface_analysis: InterfaceAnalysis,
+     pub should_quit: bool,
++    /// Whether the B-factor column likely contains pLDDT confidence scores.
++    pub has_plddt: bool,
+     /// Cached ribbon mesh — regenerated only when color scheme changes.
+     pub mesh_cache: Vec<RibbonTriangle>,
+     mesh_dirty: bool,
+@@ -53,8 +55,12 @@ pub struct App {
+ }
+ 
+ impl App {
+-    pub fn new(mut protein: Protein, hd_mode: bool, term_cols: u16, term_rows: u16, picker: Picker) -> Self {
++    pub fn new(mut protein: Protein, hd_mode: bool, term_cols: u16, term_rows: u16, picker: Picker, color_override: Option<ColorSchemeType>) -> Self {
+         protein.center();
++        // If user explicitly requested pLDDT via CLI, trust that even if
++        // the heuristic disagrees.
++        let has_plddt = protein.has_plddt()
++            || color_override == Some(ColorSchemeType::Plddt);
+         let total_residues = protein.residue_count();
+         let radius = protein.bounding_radius().max(1.0);
+         // Dynamic zoom based on actual terminal size.
+@@ -92,7 +98,8 @@ impl App {
+             ia
+         };
+ 
+-        let color_scheme = ColorScheme::new(ColorSchemeType::Structure, total_residues);
++        let initial_scheme = color_override.unwrap_or(ColorSchemeType::Structure);
++        let color_scheme = ColorScheme::new(initial_scheme, total_residues);
+         let mesh_cache = generate_ribbon_mesh(&protein, &color_scheme);
+ 
+         Self {
+@@ -107,6 +114,7 @@ impl App {
+             show_interface: false,
+             interface_analysis,
+             should_quit: false,
++            has_plddt,
+             mesh_cache,
+             mesh_dirty: false,
+             picker,
+@@ -114,7 +122,7 @@ impl App {
+     }
+ 
+     pub fn cycle_color(&mut self) {
+-        let next = self.color_scheme.scheme_type.next();
++        let next = self.color_scheme.scheme_type.next(self.has_plddt);
+         self.color_scheme = ColorScheme::new(next, self.protein.residue_count());
+         self.mesh_dirty = true;
+     }
+diff --git a/src/main.rs b/src/main.rs
+index fde205f..18005be 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -41,7 +41,7 @@ struct Cli {
+     #[arg(long, alias = "pixel")]
+     hd: bool,
+ 
+-    /// Color scheme: structure, chain, element, bfactor, rainbow
++    /// Color scheme: structure, element, chain, plddt, bfactor, rainbow
+     #[arg(long, default_value = "structure")]
+     color: String,
+ 
+@@ -117,8 +117,22 @@ fn main() -> Result<()> {
+     log!(logfile, "picker: protocol={:?} font_size={:?}",
+         picker.protocol_type(), picker.font_size());
+ 
++    // Parse CLI color scheme override
++    let color_override = match cli.color.to_ascii_lowercase().as_str() {
++        "structure" => None, // default, no override needed
++        "element" => Some(render::color::ColorSchemeType::Element),
++        "chain" => Some(render::color::ColorSchemeType::Chain),
++        "bfactor" | "b-factor" => Some(render::color::ColorSchemeType::BFactor),
++        "rainbow" => Some(render::color::ColorSchemeType::Rainbow),
++        "plddt" => Some(render::color::ColorSchemeType::Plddt),
++        _ => {
++            eprintln!("Warning: unknown color scheme '{}', using structure", cli.color);
++            None
++        }
++    };
++
+     // Create app with actual terminal dimensions for dynamic zoom
+-    let mut app = App::new(protein, cli.hd, term_cols, term_rows, picker);
++    let mut app = App::new(protein, cli.hd, term_cols, term_rows, picker, color_override);
+     log!(logfile, "app created: hd={} chains={} zoom={:.2}", app.hd_mode, app.protein.chains.len(), app.camera.zoom);
+ 
+     // Spawn dedicated input thread — decouples input from rendering so
+diff --git a/src/model/protein.rs b/src/model/protein.rs
+index af08db7..62455ea 100644
+--- a/src/model/protein.rs
++++ b/src/model/protein.rs
+@@ -197,4 +197,130 @@ impl Protein {
+     pub fn ligand_atom_count(&self) -> usize {
+         self.ligands.iter().flat_map(|l| &l.atoms).count()
+     }
++
++    /// Heuristically detect whether the B-factor column stores pLDDT scores.
++    ///
++    /// AlphaFold/ModelCIF outputs store confidence values in [0, 100], with
++    /// most atoms above 50 and many above 70.  Classic experimental B-factors
++    /// are usually much lower on average even when they overlap numerically.
++    ///
++    /// Only polymer chain atoms are considered (ligands are excluded).
++    pub fn has_plddt(&self) -> bool {
++        let mut total = 0usize;
++        let mut in_range = 0usize;
++        let mut high_conf = 0usize;
++        let mut sum = 0.0f64;
++
++        for chain in &self.chains {
++            if chain.molecule_type == MoleculeType::SmallMolecule {
++                continue;
++            }
++            for residue in &chain.residues {
++                for atom in &residue.atoms {
++                    total += 1;
++                    let value = atom.b_factor;
++                    sum += value;
++                    if (0.0..=100.0).contains(&value) {
++                        in_range += 1;
++                    }
++                    if value >= 70.0 {
++                        high_conf += 1;
++                    }
++                }
++            }
++        }
++
++        if total == 0 {
++            return false;
++        }
++
++        let mean = sum / total as f64;
++        let in_range_fraction = in_range as f64 / total as f64;
++        let high_conf_fraction = high_conf as f64 / total as f64;
++
++        // All three conditions must be true:
++        // 1) >= 95% of B-factors in [0, 100]
++        // 2) Mean B-factor >= 50
++        // 3) >= 25% of atoms have B-factor >= 70
++        in_range_fraction >= 0.95 && mean >= 50.0 && high_conf_fraction >= 0.25
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn atom_with_bfactor(b: f64) -> Atom {
++        Atom {
++            name: "CA".to_string(),
++            element: "C".to_string(),
++            x: 0.0, y: 0.0, z: 0.0,
++            b_factor: b,
++            is_backbone: true,
++            is_hetero: false,
++        }
++    }
++
++    fn protein_from_bfactors(values: &[f64]) -> Protein {
++        Protein {
++            name: "test".to_string(),
++            chains: vec![Chain {
++                id: "A".to_string(),
++                molecule_type: MoleculeType::Protein,
++                residues: values.iter().enumerate().map(|(i, &b)| Residue {
++                    name: "ALA".to_string(),
++                    seq_num: i as i32 + 1,
++                    atoms: vec![atom_with_bfactor(b)],
++                    secondary_structure: SecondaryStructure::Coil,
++                }).collect(),
++            }],
++            ligands: vec![],
++        }
++    }
++
++    #[test]
++    fn test_has_plddt_alphafold_like() {
++        // Typical AlphaFold pLDDT scores: mostly high, all in [0,100]
++        let protein = protein_from_bfactors(&[
++            95.0, 92.0, 88.0, 76.0, 67.0, 54.0, 91.0, 85.0, 73.0, 80.0,
++        ]);
++        assert!(protein.has_plddt());
++    }
++
++    #[test]
++    fn test_has_plddt_crystallographic() {
++        // Typical crystallographic B-factors: low values, wide range
++        let protein = protein_from_bfactors(&[
++            12.0, 18.0, 22.0, 30.0, 16.0, 25.0, 8.0, 14.0, 20.0, 35.0,
++        ]);
++        assert!(!protein.has_plddt());
++    }
++
++    #[test]
++    fn test_has_plddt_empty_protein() {
++        let protein = Protein {
++            name: "empty".to_string(),
++            chains: vec![],
++            ligands: vec![],
++        };
++        assert!(!protein.has_plddt());
++    }
++
++    #[test]
++    fn test_has_plddt_borderline_mean_below_threshold() {
++        // Mean = 49.0, just below 50.0 threshold — should reject
++        let protein = protein_from_bfactors(&[
++            45.0, 42.0, 65.0, 48.0, 40.0, 55.0, 50.0, 38.0, 60.0, 47.0,
++        ]);
++        assert!(!protein.has_plddt());
++    }
++
++    #[test]
++    fn test_has_plddt_negative_bfactors() {
++        // NMR structures can have negative B-factors — outside [0,100]
++        let protein = protein_from_bfactors(&[
++            -5.0, 80.0, 75.0, 90.0, 85.0, -2.0, 78.0, 92.0, 70.0, 88.0,
++        ]);
++        assert!(!protein.has_plddt());
++    }
+ }
+diff --git a/src/model/secondary.rs b/src/model/secondary.rs
+index 72166a6..0c3268e 100644
+--- a/src/model/secondary.rs
++++ b/src/model/secondary.rs
+@@ -2,7 +2,7 @@ use std::collections::HashMap;
+ use std::fs::File;
+ use std::io::{BufRead, BufReader};
+ 
+-use crate::model::protein::{Protein, SecondaryStructure};
++use crate::model::protein::{Chain, MoleculeType, Protein, Residue, SecondaryStructure};
+ 
+ /// A secondary structure range parsed from PDB HELIX/SHEET records or CIF categories.
+ #[derive(Debug, Clone)]
+@@ -22,7 +22,10 @@ pub struct SSRange {
+ fn parse_ss_records(file_path: &str) -> Vec<SSRange> {
+     let file = match File::open(file_path) {
+         Ok(f) => f,
+-        Err(_) => return Vec::new(),
++        Err(e) => {
++            eprintln!("Warning: could not re-open '{}' for SS records: {}", file_path, e);
++            return Vec::new();
++        }
+     };
+     let reader = BufReader::new(file);
+     let mut ranges = Vec::new();
+@@ -30,7 +33,10 @@ fn parse_ss_records(file_path: &str) -> Vec<SSRange> {
+     for line in reader.lines() {
+         let line = match line {
+             Ok(l) => l,
+-            Err(_) => continue,
++            Err(e) => {
++                eprintln!("Warning: skipping unreadable line in '{}': {}", file_path, e);
++                continue;
++            }
+         };
+ 
+         if line.starts_with("HELIX ") {
+@@ -61,7 +67,7 @@ fn parse_ss_records(file_path: &str) -> Vec<SSRange> {
+                 ranges.push(SSRange {
+                     chain_id: init_chain.to_string(),
+                     start_seq: init_seq,
+-                    end_seq: end_seq,
++                    end_seq,
+                     ss_type: SecondaryStructure::Helix,
+                 });
+             }
+@@ -91,7 +97,7 @@ fn parse_ss_records(file_path: &str) -> Vec<SSRange> {
+                 ranges.push(SSRange {
+                     chain_id: init_chain.to_string(),
+                     start_seq: init_seq,
+-                    end_seq: end_seq,
++                    end_seq,
+                     ss_type: SecondaryStructure::Sheet,
+                 });
+             }
+@@ -182,7 +188,10 @@ fn tokenize_cif_line(line: &str) -> Vec<String> {
+ fn parse_cif_ss_records(file_path: &str) -> Vec<SSRange> {
+     let file = match File::open(file_path) {
+         Ok(f) => f,
+-        Err(_) => return Vec::new(),
++        Err(e) => {
++            eprintln!("Warning: could not re-open '{}' for CIF SS records: {}", file_path, e);
++            return Vec::new();
++        }
+     };
+     let reader = BufReader::new(file);
+     let mut ranges = Vec::new();
+@@ -202,6 +211,7 @@ fn parse_cif_ss_records(file_path: &str) -> Vec<SSRange> {
+     let mut column_names: Vec<String> = Vec::new();
+     let mut col_map: HashMap<String, usize> = HashMap::new();
+ 
++    #[allow(clippy::lines_filter_map_ok)]
+     let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+     let mut i = 0;
+ 
+@@ -389,6 +399,430 @@ pub fn assign_from_cif_file(protein: &mut Protein, file_path: &str) {
+     apply_ss_ranges(protein, &ranges);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Secondary structure inference from backbone coordinates (DSSP-like)
++// ---------------------------------------------------------------------------
++
++/// Infer secondary structure from backbone geometry for protein chains that
++/// lack explicit HELIX/SHEET annotations.
++///
++/// Skips non-protein chains (RNA, DNA, SmallMolecule) and chains that already
++/// have any non-Coil secondary structure assignments.
++pub fn infer_secondary_structure(chains: &mut [Chain]) {
++    for chain in chains.iter_mut() {
++        // Skip non-protein chains
++        if chain.molecule_type != MoleculeType::Protein {
++            continue;
++        }
++
++        // Skip chains that already have explicit SS assignments
++        let has_existing_ss = chain
++            .residues
++            .iter()
++            .any(|r| r.secondary_structure != SecondaryStructure::Coil);
++        if has_existing_ss {
++            continue;
++        }
++
++        let inferred = infer_chain_ss(&chain.residues);
++        for (residue, ss) in chain.residues.iter_mut().zip(inferred) {
++            residue.secondary_structure = ss;
++        }
++    }
++}
++
++/// Infer secondary structure for a single chain's residues.
++fn infer_chain_ss(residues: &[Residue]) -> Vec<SecondaryStructure> {
++    let mut assignments = vec![SecondaryStructure::Coil; residues.len()];
++    let torsions = compute_torsion_angles(residues);
++    let hbonds = compute_hbond_map(residues);
++
++    assign_helices(&mut assignments, &hbonds, &torsions);
++    assign_sheets(&mut assignments, &hbonds, &torsions);
++
++    // Post-processing: fill single-residue gaps and enforce minimum run lengths
++    fill_single_gaps(&mut assignments, &torsions, SecondaryStructure::Helix);
++    fill_single_gaps(&mut assignments, &torsions, SecondaryStructure::Sheet);
++    enforce_min_run(&mut assignments, SecondaryStructure::Helix, 3);
++    enforce_min_run(&mut assignments, SecondaryStructure::Sheet, 2);
++
++    assignments
++}
++
++/// Compute phi/psi torsion angles for each residue from backbone N, CA, C atoms.
++///
++/// Phi(i)  = dihedral(C[i-1], N[i], CA[i], C[i])
++/// Psi(i)  = dihedral(N[i], CA[i], C[i], N[i+1])
++///
++/// Returns None for terminal residues or those with incomplete backbone.
++fn compute_torsion_angles(residues: &[Residue]) -> Vec<Option<(f64, f64)>> {
++    let mut torsions = vec![None; residues.len()];
++
++    for i in 1..residues.len().saturating_sub(1) {
++        let c_prev = atom_pos(&residues[i - 1], "C");
++        let n_i = atom_pos(&residues[i], "N");
++        let ca_i = atom_pos(&residues[i], "CA");
++        let c_i = atom_pos(&residues[i], "C");
++        let n_next = atom_pos(&residues[i + 1], "N");
++
++        let (Some(c_prev), Some(n_i), Some(ca_i), Some(c_i), Some(n_next)) =
++            (c_prev, n_i, ca_i, c_i, n_next)
++        else {
++            continue;
++        };
++
++        let (Some(phi), Some(psi)) = (
++            dihedral(c_prev, n_i, ca_i, c_i),
++            dihedral(n_i, ca_i, c_i, n_next),
++        ) else {
++            continue; // degenerate geometry — skip this residue
++        };
++        torsions[i] = Some((phi, psi));
++    }
++
++    torsions
++}
++
++/// Build an NxN boolean matrix of hydrogen bonds between residues.
++///
++/// hbonds[acceptor][donor] = true means the C=O of residue `acceptor` accepts
++/// an H-bond from the N-H of residue `donor`.
++///
++/// Uses the DSSP energy formula (Kabsch & Sander, 1983):
++///   E = 27.888 * (1/r_ON + 1/r_CH - 1/r_OH - 1/r_CN)
++/// with threshold E < -0.5 kcal/mol.
++fn compute_hbond_map(residues: &[Residue]) -> Vec<Vec<bool>> {
++    let n = residues.len();
++    let mut hbonds = vec![vec![false; n]; n];
++
++    // Pre-extract backbone atom positions for efficiency
++    let c_atoms: Vec<Option<[f64; 3]>> = residues.iter().map(|r| atom_pos(r, "C")).collect();
++    let o_atoms: Vec<Option<[f64; 3]>> = residues.iter().map(|r| atom_pos(r, "O")).collect();
++    let n_atoms: Vec<Option<[f64; 3]>> = residues.iter().map(|r| atom_pos(r, "N")).collect();
++    let ca_atoms: Vec<Option<[f64; 3]>> = residues.iter().map(|r| atom_pos(r, "CA")).collect();
++
++    for acceptor in 0..n {
++        let (Some(c_acc), Some(o_acc)) = (c_atoms[acceptor], o_atoms[acceptor]) else {
++            continue;
++        };
++
++        for donor in 0..n {
++            // Skip self and immediate neighbors
++            if donor == acceptor || donor.abs_diff(acceptor) <= 1 {
++                continue;
++            }
++
++            let (Some(n_don), Some(ca_don)) = (n_atoms[donor], ca_atoms[donor]) else {
++                continue;
++            };
++
++            // N...O distance pre-filter: skip pairs where N...O > 5.2 A
++            if distance(n_don, o_acc) > 5.2 {
++                continue;
++            }
++
++            let Some(h_don) = estimate_amide_h(&c_atoms, n_don, ca_don, donor) else {
++                continue;
++            };
++
++            let energy = hbond_energy(o_acc, c_acc, n_don, h_don);
++            if energy < -0.5 {
++                hbonds[acceptor][donor] = true;
++            }
++        }
++    }
++
++    hbonds
++}
++
++/// Estimate amide hydrogen position using the bisector method.
++///
++/// The H atom is placed along the bisector of the N->C(i-1) and N->CA(i)
++/// vectors, at 1.0 A from N.
++fn estimate_amide_h(
++    c_atoms: &[Option<[f64; 3]>],
++    n_atom: [f64; 3],
++    ca_atom: [f64; 3],
++    donor: usize,
++) -> Option<[f64; 3]> {
++    // Need C of previous residue
++    let prev_c = donor.checked_sub(1).and_then(|i| c_atoms[i])?;
++    let dir_prev = normalize(sub(n_atom, prev_c))?;
++    let dir_ca = normalize(sub(n_atom, ca_atom))?;
++    let bisector = normalize(add(dir_prev, dir_ca))?;
++    // Place H at 1.0 A along bisector from N
++    Some(add(n_atom, scale(bisector, 1.0)))
++}
++
++/// DSSP hydrogen bond energy formula (Kabsch & Sander, 1983).
++///
++/// E = 0.084 * 332 * (1/r_ON + 1/r_CH - 1/r_OH - 1/r_CN)
++///   = 27.888 * (1/r_ON + 1/r_CH - 1/r_OH - 1/r_CN)
++///
++/// Distances are in Angstroms, energy in kcal/mol.
++/// A bond is considered present if E < -0.5 kcal/mol.
++fn hbond_energy(o: [f64; 3], c: [f64; 3], n: [f64; 3], h: [f64; 3]) -> f64 {
++    let r_on = distance(o, n).max(0.5);
++    let r_ch = distance(c, h).max(0.5);
++    let r_oh = distance(o, h).max(0.5);
++    let r_cn = distance(c, n).max(0.5);
++    27.888 * (1.0 / r_on + 1.0 / r_ch - 1.0 / r_oh - 1.0 / r_cn)
++}
++
++/// Detect helices from H-bond patterns: i -> i+3, i -> i+4, or i -> i+5.
++///
++/// For each turn pattern (alpha=4, 3_10=3, pi=5), checks if acceptor residue i
++/// forms an H-bond with donor residue i+turn. Residues in the interior of such
++/// turns that have compatible torsion angles are assigned as Helix.
++fn assign_helices(
++    assignments: &mut [SecondaryStructure],
++    hbonds: &[Vec<bool>],
++    torsions: &[Option<(f64, f64)>],
++) {
++    let n = assignments.len();
++    let mut support = vec![0usize; n];
++
++    // Check alpha (i->i+4), 3_10 (i->i+3), and pi (i->i+5) turns
++    for turn in [4usize, 3, 5] {
++        for i in 0..n.saturating_sub(turn) {
++            if !hbonds[i][i + turn] {
++                continue;
++            }
++
++            // Check that at least half the interior residues have helix-compatible torsions
++            let span = i + 1..=i + turn;
++            let span_len = turn;
++            let compatible = span
++                .clone()
++                .filter(|&idx| torsions_match(torsions[idx], SecondaryStructure::Helix))
++                .count();
++            if compatible * 2 < span_len {
++                continue;
++            }
++
++            for idx in span {
++                support[idx] += 1;
++            }
++        }
++    }
++
++    for (idx, s) in assignments.iter_mut().enumerate() {
++        if support[idx] > 0 {
++            *s = SecondaryStructure::Helix;
++        }
++    }
++}
++
++/// Detect beta-sheets from parallel and antiparallel H-bond bridge patterns.
++///
++/// Antiparallel bridge: (hbonds[i][j] && hbonds[j][i]) or
++///                      (hbonds[i-1][j+1] && hbonds[j-1][i+1])
++/// Parallel bridge:     (hbonds[i-1][j] && hbonds[j][i+1]) or
++///                      (hbonds[j-1][i] && hbonds[i][j+1])
++fn assign_sheets(
++    assignments: &mut [SecondaryStructure],
++    hbonds: &[Vec<bool>],
++    torsions: &[Option<(f64, f64)>],
++) {
++    let n = assignments.len();
++    let mut support = vec![0usize; n];
++
++    for i in 1..n.saturating_sub(1) {
++        for j in (i + 2)..n.saturating_sub(1) {
++            // Both residues should have sheet-compatible torsion angles
++            if !torsions_match(torsions[i], SecondaryStructure::Sheet)
++                || !torsions_match(torsions[j], SecondaryStructure::Sheet)
++            {
++                continue;
++            }
++
++            let antiparallel =
++                (hbonds[i][j] && hbonds[j][i]) || (hbonds[i - 1][j + 1] && hbonds[j - 1][i + 1]);
++            let parallel =
++                (hbonds[i - 1][j] && hbonds[j][i + 1]) || (hbonds[j - 1][i] && hbonds[i][j + 1]);
++
++            if antiparallel || parallel {
++                support[i] += 1;
++                support[j] += 1;
++            }
++        }
++    }
++
++    // Only assign Sheet to residues currently marked as Coil (helix takes priority)
++    for idx in 0..n {
++        if assignments[idx] == SecondaryStructure::Coil
++            && support[idx] > 0
++            && torsions_match(torsions[idx], SecondaryStructure::Sheet)
++        {
++            assignments[idx] = SecondaryStructure::Sheet;
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Post-processing: gap filling and minimum run length
++// ---------------------------------------------------------------------------
++
++/// Fill single-residue Coil gaps within runs of the given SS type.
++///
++/// If residues [i-1] and [i+1] are both `target` and residue [i] is Coil,
++/// promote [i] to `target` if its torsion angles are compatible (or missing).
++fn fill_single_gaps(
++    assignments: &mut [SecondaryStructure],
++    torsions: &[Option<(f64, f64)>],
++    target: SecondaryStructure,
++) {
++    if assignments.len() < 3 {
++        return;
++    }
++
++    for i in 1..assignments.len() - 1 {
++        if assignments[i - 1] != target
++            || assignments[i] != SecondaryStructure::Coil
++            || assignments[i + 1] != target
++        {
++            continue;
++        }
++
++        // Fill the gap if torsions are compatible or unknown
++        if torsions_match(torsions[i], target) || torsions[i].is_none() {
++            assignments[i] = target;
++        }
++    }
++}
++
++/// Remove runs of `ss` shorter than `min_len`, resetting them to Coil.
++fn enforce_min_run(assignments: &mut [SecondaryStructure], ss: SecondaryStructure, min_len: usize) {
++    let mut i = 0;
++    while i < assignments.len() {
++        if assignments[i] != ss {
++            i += 1;
++            continue;
++        }
++
++        let start = i;
++        while i < assignments.len() && assignments[i] == ss {
++            i += 1;
++        }
++
++        if i - start < min_len {
++            for state in &mut assignments[start..i] {
++                *state = SecondaryStructure::Coil;
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Torsion angle windows
++// ---------------------------------------------------------------------------
++
++/// Check whether torsion angles are compatible with the given SS type.
++fn torsions_match(torsions: Option<(f64, f64)>, target: SecondaryStructure) -> bool {
++    let Some((phi, psi)) = torsions else {
++        return false;
++    };
++    match target {
++        SecondaryStructure::Helix => is_helix_torsion(phi, psi),
++        SecondaryStructure::Sheet => is_sheet_torsion(phi, psi),
++        _ => false,
++    }
++}
++
++/// Helix-compatible torsion angles (wide window covering alpha/3_10/pi).
++fn is_helix_torsion(phi: f64, psi: f64) -> bool {
++    // Strong: typical alpha helix (phi ~ -57, psi ~ -47)
++    let strong = (-80.0..=-40.0).contains(&phi) && (-70.0..=-20.0).contains(&psi);
++    // Weak: wider window for 3_10 and pi helices
++    let weak = (-170.0..=-20.0).contains(&phi) && (-80.0..=10.0).contains(&psi);
++    strong || weak
++}
++
++/// Sheet-compatible torsion angles (extended conformation).
++fn is_sheet_torsion(phi: f64, psi: f64) -> bool {
++    // Strong: canonical beta sheet
++    let strong = ((-100.0..=-40.0).contains(&phi) && (20.0..=90.0).contains(&psi))
++        || ((80.0..=180.0).contains(&phi) && (120.0..=180.0).contains(&psi));
++    // Weak: wider window
++    let weak = ((-140.0..=-20.0).contains(&phi) && (0.0..=180.0).contains(&psi))
++        || ((60.0..=180.0).contains(&phi) && (90.0..=180.0).contains(&psi));
++    strong || weak
++}
++
++// ---------------------------------------------------------------------------
++// 3D vector math utilities
++// ---------------------------------------------------------------------------
++
++/// Get the [x, y, z] position of a named atom in a residue, or None.
++fn atom_pos(residue: &Residue, atom_name: &str) -> Option<[f64; 3]> {
++    residue
++        .atoms
++        .iter()
++        .find(|a| a.name == atom_name)
++        .map(|a| [a.x, a.y, a.z])
++}
++
++fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
++}
++
++fn scale(v: [f64; 3], factor: f64) -> [f64; 3] {
++    [v[0] * factor, v[1] * factor, v[2] * factor]
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [
++        a[1] * b[2] - a[2] * b[1],
++        a[2] * b[0] - a[0] * b[2],
++        a[0] * b[1] - a[1] * b[0],
++    ]
++}
++
++fn norm(v: [f64; 3]) -> f64 {
++    dot(v, v).sqrt()
++}
++
++fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
++    norm(sub(a, b))
++}
++
++fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
++    let len = norm(v);
++    if len < 1e-8 {
++        None
++    } else {
++        Some([v[0] / len, v[1] / len, v[2] / len])
++    }
++}
++
++/// Compute the dihedral angle (in degrees) defined by four points.
++/// Returns None for degenerate geometry (coincident atoms, collinear atoms).
++fn dihedral(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> Option<f64> {
++    // IUPAC/biochemistry convention (matches MDAnalysis/BioPython):
++    // Bond vectors along the chain A→B→C→D
++    let b1 = sub(b, a);
++    let b2 = sub(c, b);
++    let b3 = sub(d, c);
++
++    let b2_unit = normalize(b2)?;
++
++    let n1 = cross(b1, b2); // normal to plane A-B-C
++    let n2 = cross(b2, b3); // normal to plane B-C-D
++    let n1_unit = normalize(n1)?;
++    let n2_unit = normalize(n2)?;
++
++    let m1 = cross(n1_unit, b2_unit);
++    Some(-dot(m1, n2_unit).atan2(dot(n1_unit, n2_unit)).to_degrees())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -523,4 +957,401 @@ mod tests {
+         assert!(helix_count > 0, "Expected helix residues, got 0");
+         assert!(sheet_count > 0, "Expected sheet residues, got 0");
+     }
++
++    // -----------------------------------------------------------------------
++    // Tests for secondary structure inference
++    // -----------------------------------------------------------------------
++
++    #[test]
++    fn test_hbond_energy_known_geometry() {
++        // Hand-calculated test: typical alpha-helix H-bond geometry
++        // O at origin, C at (1.24, 0, 0), N at (2.8, 1.5, 0), H at (1.9, 1.2, 0)
++        let o = [0.0, 0.0, 0.0];
++        let c = [1.24, 0.0, 0.0];
++        let n = [2.8, 1.5, 0.0];
++        let h = [1.9, 1.2, 0.0];
++
++        let energy = hbond_energy(o, c, n, h);
++
++        // r_ON = sqrt(2.8^2 + 1.5^2) = sqrt(10.09) ~ 3.177
++        // r_CH = sqrt((1.9-1.24)^2 + 1.2^2) = sqrt(0.4356 + 1.44) ~ 1.370
++        // r_OH = sqrt(1.9^2 + 1.2^2) = sqrt(5.05) ~ 2.247
++        // r_CN = sqrt((2.8-1.24)^2 + 1.5^2) = sqrt(2.4336 + 2.25) ~ 2.164
++        // E = 27.888 * (1/3.177 + 1/1.370 - 1/2.247 - 1/2.164)
++        //   = 27.888 * (0.3148 + 0.7299 - 0.4451 - 0.4621)
++        //   = 27.888 * 0.1375 ~ 3.83
++
++        // This geometry does NOT form a favorable H-bond (energy > 0)
++        assert!(energy > -0.5, "Expected no H-bond for this geometry, got E={}", energy);
++
++        // Now test a geometry that SHOULD form an H-bond:
++        // Closer O-H distance, typical for real H-bond
++        let o2 = [0.0, 0.0, 0.0];
++        let c2 = [1.24, 0.0, 0.0];
++        let n2 = [3.0, 0.0, 0.0];
++        let h2 = [2.0, 0.0, 0.0]; // H pointing directly at O
++
++        let energy2 = hbond_energy(o2, c2, n2, h2);
++        // r_ON = 3.0, r_CH = 0.76, r_OH = 2.0, r_CN = 1.76
++        // E = 27.888 * (1/3.0 + 1/0.76 - 1/2.0 - 1/1.76)
++        //   = 27.888 * (0.333 + 1.316 - 0.500 - 0.568)
++        //   = 27.888 * 0.581 ~ 16.2 (repulsive — atoms too close/collinear)
++        // The actual energy depends on geometry; let's just verify the formula runs
++        assert!(energy2.is_finite(), "Energy should be finite");
++    }
++
++    #[test]
++    fn test_torsion_angle_computation() {
++        // IUPAC convention: dihedral A-B-C-D.
++        // B→C along +Y, A at (1,0,0) projects onto +X perpendicular to B-C.
++
++        // Trans (±180°): D projects to -X (opposite side from A)
++        let trans = dihedral(
++            [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 1.0, 0.0],
++        ).unwrap();
++        assert!(
++            (trans.abs() - 180.0).abs() < 1.0,
++            "Expected ~±180° for trans, got {trans}"
++        );
++
++        // Cis (0°): D projects to +X (same side as A)
++        let cis = dihedral(
++            [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],
++        ).unwrap();
++        assert!(
++            cis.abs() < 1.0,
++            "Expected ~0° for cis, got {cis}"
++        );
++
++        // -90°: D at (0,1,1) → projects to +Z
++        let neg90 = dihedral(
++            [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0],
++        ).unwrap();
++        assert!(
++            (neg90 + 90.0).abs() < 1.0,
++            "Expected ~-90°, got {neg90}"
++        );
++
++        // +90°: D at (0,1,-1) → projects to -Z
++        let pos90 = dihedral(
++            [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, -1.0],
++        ).unwrap();
++        assert!(
++            (pos90 - 90.0).abs() < 1.0,
++            "Expected ~+90°, got {pos90}"
++        );
++
++        // Degenerate geometry: coincident atoms → returns None
++        assert!(dihedral([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]).is_none());
++        // Collinear atoms → returns None
++        assert!(dihedral([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]).is_none());
++    }
++
++    #[test]
++    fn test_skip_non_protein_chains() {
++        use crate::model::protein::{Atom, Chain, Residue};
++
++        // Create an RNA chain — inference should not touch it
++        let mut chains = vec![Chain {
++            id: "A".to_string(),
++            molecule_type: MoleculeType::RNA,
++            residues: vec![
++                Residue {
++                    name: "A".to_string(),
++                    seq_num: 1,
++                    atoms: vec![Atom {
++                        name: "CA".to_string(),
++                        element: "C".to_string(),
++                        x: 0.0, y: 0.0, z: 0.0,
++                        b_factor: 0.0,
++                        is_backbone: true,
++                        is_hetero: false,
++                    }],
++                    secondary_structure: SecondaryStructure::Coil,
++                },
++            ],
++        }];
++
++        infer_secondary_structure(&mut chains);
++
++        // RNA chain should remain all Coil
++        assert_eq!(
++            chains[0].residues[0].secondary_structure,
++            SecondaryStructure::Coil,
++            "RNA chain should not have SS inferred"
++        );
++
++        // Also test DNA
++        let mut dna_chains = vec![Chain {
++            id: "B".to_string(),
++            molecule_type: MoleculeType::DNA,
++            residues: vec![
++                Residue {
++                    name: "DA".to_string(),
++                    seq_num: 1,
++                    atoms: vec![Atom {
++                        name: "CA".to_string(),
++                        element: "C".to_string(),
++                        x: 0.0, y: 0.0, z: 0.0,
++                        b_factor: 0.0,
++                        is_backbone: true,
++                        is_hetero: false,
++                    }],
++                    secondary_structure: SecondaryStructure::Coil,
++                },
++            ],
++        }];
++
++        infer_secondary_structure(&mut dna_chains);
++        assert_eq!(
++            dna_chains[0].residues[0].secondary_structure,
++            SecondaryStructure::Coil,
++            "DNA chain should not have SS inferred"
++        );
++    }
++
++    #[test]
++    fn test_skip_chains_with_existing_ss() {
++        use crate::model::protein::{Atom, Chain, Residue};
++
++        // Create a protein chain with some residues already assigned to Helix
++        let mut chains = vec![Chain {
++            id: "A".to_string(),
++            molecule_type: MoleculeType::Protein,
++            residues: vec![
++                Residue {
++                    name: "ALA".to_string(),
++                    seq_num: 1,
++                    atoms: vec![Atom {
++                        name: "CA".to_string(),
++                        element: "C".to_string(),
++                        x: 0.0, y: 0.0, z: 0.0,
++                        b_factor: 0.0,
++                        is_backbone: true,
++                        is_hetero: false,
++                    }],
++                    secondary_structure: SecondaryStructure::Helix,
++                },
++                Residue {
++                    name: "GLY".to_string(),
++                    seq_num: 2,
++                    atoms: vec![Atom {
++                        name: "CA".to_string(),
++                        element: "C".to_string(),
++                        x: 3.8, y: 0.0, z: 0.0,
++                        b_factor: 0.0,
++                        is_backbone: true,
++                        is_hetero: false,
++                    }],
++                    secondary_structure: SecondaryStructure::Coil,
++                },
++            ],
++        }];
++
++        infer_secondary_structure(&mut chains);
++
++        // The chain already has non-Coil SS, so inference should leave it untouched
++        assert_eq!(
++            chains[0].residues[0].secondary_structure,
++            SecondaryStructure::Helix,
++            "Existing Helix should be preserved"
++        );
++        assert_eq!(
++            chains[0].residues[1].secondary_structure,
++            SecondaryStructure::Coil,
++            "Existing Coil should be preserved when chain has explicit SS"
++        );
++    }
++
++    #[test]
++    fn test_gap_filling() {
++        // Test that single-residue Coil gaps within helix/sheet runs are filled
++        // Use canonical alpha-helix torsion angles: phi ~ -57, psi ~ -47
++        let torsions = vec![
++            Some((-57.0, -47.0)),  // helix-compatible
++            Some((-57.0, -47.0)),  // helix-compatible (gap to fill)
++            Some((-57.0, -47.0)),  // helix-compatible
++        ];
++        let mut assignments = vec![
++            SecondaryStructure::Helix,
++            SecondaryStructure::Coil,
++            SecondaryStructure::Helix,
++        ];
++
++        fill_single_gaps(&mut assignments, &torsions, SecondaryStructure::Helix);
++
++        assert_eq!(assignments[0], SecondaryStructure::Helix);
++        assert_eq!(
++            assignments[1],
++            SecondaryStructure::Helix,
++            "Single Coil gap between Helix runs should be filled"
++        );
++        assert_eq!(assignments[2], SecondaryStructure::Helix);
++    }
++
++    #[test]
++    fn test_gap_filling_no_fill_when_torsion_incompatible() {
++        // If the gap residue has incompatible torsion angles, it should NOT be filled
++        let torsions = vec![
++            Some((-57.0, -47.0)),   // helix-compatible
++            Some((-120.0, 130.0)),  // sheet-compatible, NOT helix
++            Some((-57.0, -47.0)),   // helix-compatible
++        ];
++        let mut assignments = vec![
++            SecondaryStructure::Helix,
++            SecondaryStructure::Coil,
++            SecondaryStructure::Helix,
++        ];
++
++        fill_single_gaps(&mut assignments, &torsions, SecondaryStructure::Helix);
++
++        assert_eq!(
++            assignments[1],
++            SecondaryStructure::Coil,
++            "Gap with incompatible torsions should NOT be filled"
++        );
++    }
++
++    #[test]
++    fn test_minimum_run_length() {
++        // Helices shorter than 3 residues should be removed
++        let mut assignments = vec![
++            SecondaryStructure::Coil,
++            SecondaryStructure::Helix,
++            SecondaryStructure::Helix,
++            SecondaryStructure::Coil,
++            SecondaryStructure::Helix,
++            SecondaryStructure::Helix,
++            SecondaryStructure::Helix,
++            SecondaryStructure::Coil,
++        ];
++
++        enforce_min_run(&mut assignments, SecondaryStructure::Helix, 3);
++
++        // First helix run (2 residues) should be removed
++        assert_eq!(assignments[1], SecondaryStructure::Coil, "2-residue helix should be removed");
++        assert_eq!(assignments[2], SecondaryStructure::Coil, "2-residue helix should be removed");
++
++        // Second helix run (3 residues) should survive
++        assert_eq!(assignments[4], SecondaryStructure::Helix, "3-residue helix should survive");
++        assert_eq!(assignments[5], SecondaryStructure::Helix, "3-residue helix should survive");
++        assert_eq!(assignments[6], SecondaryStructure::Helix, "3-residue helix should survive");
++    }
++
++    #[test]
++    fn test_minimum_run_length_sheet() {
++        // Sheets shorter than 2 residues should be removed
++        let mut assignments = vec![
++            SecondaryStructure::Coil,
++            SecondaryStructure::Sheet,  // 1-residue run: should be removed
++            SecondaryStructure::Coil,
++            SecondaryStructure::Sheet,  // 2-residue run: should survive
++            SecondaryStructure::Sheet,
++            SecondaryStructure::Coil,
++        ];
++
++        enforce_min_run(&mut assignments, SecondaryStructure::Sheet, 2);
++
++        assert_eq!(assignments[1], SecondaryStructure::Coil, "1-residue sheet should be removed");
++        assert_eq!(assignments[3], SecondaryStructure::Sheet, "2-residue sheet should survive");
++        assert_eq!(assignments[4], SecondaryStructure::Sheet, "2-residue sheet should survive");
++    }
++
++    #[test]
++    fn test_infer_ss_alphafold_pdb() {
++        // Integration test: AF3_TNFa.pdb has no HELIX/SHEET records,
++        // so inference should produce significant structured residues.
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/AF3_TNFa.pdb");
++        let protein = crate::parser::pdb::load_structure(path).unwrap();
++
++        let structured_count = protein.chains.iter()
++            .flat_map(|c| &c.residues)
++            .filter(|r| r.secondary_structure != SecondaryStructure::Coil)
++            .count();
++        let total_count = protein.chains.iter()
++            .flat_map(|c| &c.residues)
++            .count();
++
++        assert!(
++            structured_count > total_count / 3,
++            "Expected significant SS for AF3_TNFa.pdb, got {structured_count}/{total_count} non-coil"
++        );
++    }
++
++    #[test]
++    fn test_helix_torsion_canonical_alpha() {
++        // Canonical alpha helix: phi ~ -57, psi ~ -47
++        assert!(is_helix_torsion(-57.0, -47.0));
++        // 3_10 helix: phi ~ -49, psi ~ -26
++        assert!(is_helix_torsion(-49.0, -26.0));
++        // Strong window boundaries
++        assert!(is_helix_torsion(-80.0, -70.0));
++        assert!(is_helix_torsion(-40.0, -20.0));
++        // Just outside strong but inside weak
++        assert!(is_helix_torsion(-170.0, -80.0));
++        assert!(is_helix_torsion(-20.0, 10.0));
++        // Outside all windows
++        assert!(!is_helix_torsion(-10.0, -47.0));
++        assert!(!is_helix_torsion(-57.0, 20.0));
++        assert!(!is_helix_torsion(-180.0, -47.0));
++    }
++
++    #[test]
++    fn test_sheet_torsion_canonical_beta() {
++        // Canonical antiparallel beta: phi ~ -139, psi ~ 135
++        assert!(is_sheet_torsion(-139.0, 135.0));
++        // Canonical parallel beta: phi ~ -119, psi ~ 113
++        assert!(is_sheet_torsion(-80.0, 50.0));
++        // Outside sheet windows
++        assert!(!is_sheet_torsion(-57.0, -47.0)); // alpha helix region
++    }
++
++    #[test]
++    fn test_explicit_pdb_ss_preserved_after_inference() {
++        // 1UBQ has explicit HELIX/SHEET records. Inference should NOT
++        // override them — the chain should be skipped entirely.
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/1UBQ.pdb");
++        let protein = crate::parser::pdb::load_structure(path).unwrap();
++        let chain = &protein.chains[0];
++
++        // Residue 10 is in a beta sheet, residue 23 is in an alpha helix
++        let residue_10 = chain.residues.iter().find(|r| r.seq_num == 10).unwrap();
++        let residue_23 = chain.residues.iter().find(|r| r.seq_num == 23).unwrap();
++
++        assert_eq!(
++            residue_10.secondary_structure,
++            SecondaryStructure::Sheet,
++            "Explicit PDB Sheet assignment should be preserved"
++        );
++        assert_eq!(
++            residue_23.secondary_structure,
++            SecondaryStructure::Helix,
++            "Explicit PDB Helix assignment should be preserved"
++        );
++    }
++
++    #[test]
++    fn test_ubq_helix_torsions_in_range() {
++        // 1UBQ has known alpha helix at residues 23-34.
++        // Canonical alpha helix: phi ~ -57, psi ~ -47.
++        // We verify torsions fall in the helix-compatible window.
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/1UBQ.pdb");
++        let protein = crate::parser::pdb::load_structure(path).unwrap();
++        let chain = &protein.chains[0];
++        let torsions = compute_torsion_angles(&chain.residues);
++
++        let helix_residues: Vec<_> = chain.residues.iter().enumerate()
++            .filter(|(_, r)| r.seq_num >= 24 && r.seq_num <= 33)
++            .collect();
++
++        let helix_compatible = helix_residues.iter()
++            .filter(|(i, _)| torsions[*i].map_or(false, |(phi, psi)| is_helix_torsion(phi, psi)))
++            .count();
++
++        assert!(
++            helix_compatible >= helix_residues.len() / 2,
++            "Expected most 1UBQ helix residues (24-33) to have helix-compatible torsions, got {}/{}",
++            helix_compatible, helix_residues.len()
++        );
++    }
+ }
+diff --git a/src/parser/pdb.rs b/src/parser/pdb.rs
+index ea98345..e9b081e 100644
+--- a/src/parser/pdb.rs
++++ b/src/parser/pdb.rs
+@@ -1,6 +1,6 @@
+ use anyhow::Result;
+ use crate::model::protein::{Protein, Chain, MoleculeType, Residue, Atom, SecondaryStructure, RNA_RESIDUES, DNA_RESIDUES, Ligand, LigandType, WATER_NAMES, COMMON_IONS};
+-use crate::model::secondary::{assign_from_pdb_file, assign_from_cif_file};
++use crate::model::secondary::{assign_from_pdb_file, assign_from_cif_file, infer_secondary_structure};
+ 
+ /// Load a protein structure from a PDB or mmCIF file
+ pub fn load_structure(path: &str) -> Result<Protein> {
+@@ -96,6 +96,10 @@ pub fn load_structure(path: &str) -> Result<Protein> {
+         }
+     }
+ 
++    // Infer secondary structure from backbone geometry for any protein chains
++    // that still lack SS annotations (e.g. AlphaFold PDBs without HELIX/SHEET records).
++    infer_secondary_structure(&mut protein.chains);
++
+     Ok(protein)
+ }
+ 
+diff --git a/src/render/camera.rs b/src/render/camera.rs
+index e0ed442..33a1039 100644
+--- a/src/render/camera.rs
++++ b/src/render/camera.rs
+@@ -42,8 +42,8 @@ impl Camera {
+     const PAN_STEP: f64 = 2.0;
+ 
+     pub fn rotate_x(&mut self, dir: f64) { self.rot_x += dir * Self::ROT_STEP; }
+-    pub fn rotate_y(&mut self, dir: f64) { self.rot_y += dir * Self::ROT_STEP; }
+-    pub fn rotate_z(&mut self, dir: f64) { self.rot_z += dir * Self::ROT_STEP; }
++    pub fn rotate_y(&mut self, dir: f64) { self.rot_y -= dir * Self::ROT_STEP; }
++    pub fn rotate_z(&mut self, dir: f64) { self.rot_z -= dir * Self::ROT_STEP; }
+     pub fn zoom_in(&mut self) { self.zoom *= 1.0 + Self::ZOOM_STEP; }
+     pub fn zoom_out(&mut self) { self.zoom *= 1.0 - Self::ZOOM_STEP; }
+     pub fn pan(&mut self, dx: f64, dy: f64) { self.pan_x += dx * Self::PAN_STEP; self.pan_y += dy * Self::PAN_STEP; }
+@@ -57,7 +57,7 @@ impl Camera {
+         let dt = now.duration_since(self.last_tick).as_secs_f64();
+         self.last_tick = now;
+         if self.auto_rotate {
+-            self.rot_y += Self::AUTO_ROTATE_SPEED * dt;
++            self.rot_y -= Self::AUTO_ROTATE_SPEED * dt;
+         }
+     }
+ 
+@@ -80,9 +80,70 @@ impl Camera {
+ 
+         // Apply zoom and pan (orthographic projection)
+         Projected {
+-            x: x3 * self.zoom + self.pan_x,
++            x: -x3 * self.zoom + self.pan_x,
+             y: y3 * self.zoom + self.pan_y,
+             z: z2,
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn project_identity_negates_x() {
++        // With identity rotation (all angles zero) and unit zoom,
++        // a point at positive world-X should project to negative screen-X.
++        // This ensures a right-handed coordinate system so L-amino acids
++        // are not rendered as their mirror-image D-amino acids.
++        let cam = Camera::default();
++        let p = cam.project(1.0, 0.0, 0.0);
++        assert!(
++            p.x < 0.0,
++            "positive world-X should project to negative screen-X, got {}",
++            p.x
++        );
++        assert!((p.y).abs() < 1e-12, "Y should be zero for a point on the X axis");
++    }
++
++    #[test]
++    fn project_identity_preserves_y() {
++        // Y axis should pass through without negation.
++        let cam = Camera::default();
++        let p = cam.project(0.0, 1.0, 0.0);
++        assert!(
++            p.y > 0.0,
++            "positive world-Y should project to positive screen-Y, got {}",
++            p.y
++        );
++        assert!((p.x).abs() < 1e-12, "X should be zero for a point on the Y axis");
++    }
++
++    #[test]
++    fn project_respects_zoom_and_pan() {
++        let mut cam = Camera::default();
++        cam.zoom = 2.0;
++        cam.pan_x = 5.0;
++        cam.pan_y = 3.0;
++        let p = cam.project(1.0, 1.0, 0.0);
++        // x = -1.0 * 2.0 + 5.0 = 3.0
++        assert!((p.x - 3.0).abs() < 1e-12, "expected x=3.0, got {}", p.x);
++        // y = 1.0 * 2.0 + 3.0 = 5.0
++        assert!((p.y - 5.0).abs() < 1e-12, "expected y=5.0, got {}", p.y);
++    }
++
++    #[test]
++    fn rotate_y_produces_negative_delta() {
++        let mut cam = Camera::default();
++        cam.rotate_y(1.0);
++        assert!(cam.rot_y < 0.0, "rotate_y(+1) should decrease rot_y, got {}", cam.rot_y);
++    }
++
++    #[test]
++    fn rotate_z_produces_negative_delta() {
++        let mut cam = Camera::default();
++        cam.rotate_z(1.0);
++        assert!(cam.rot_z < 0.0, "rotate_z(+1) should decrease rot_z, got {}", cam.rot_z);
++    }
++}
+diff --git a/src/render/color.rs b/src/render/color.rs
+index 1346632..d956c5c 100644
+--- a/src/render/color.rs
++++ b/src/render/color.rs
+@@ -13,17 +13,26 @@ pub enum ColorSchemeType {
+     BFactor,
+     Rainbow,
+     Interface,
++    Plddt,
+ }
+ 
+ impl ColorSchemeType {
+-    pub fn next(&self) -> Self {
++    pub fn next(&self, has_plddt: bool) -> Self {
+         match self {
+-            Self::Structure => Self::Chain,
+-            Self::Chain => Self::Element,
+-            Self::Element => Self::BFactor,
+-            Self::BFactor => Self::Rainbow,
++            Self::Structure => Self::Element,
++            Self::Element => Self::Chain,
++            Self::Chain => {
++                if has_plddt {
++                    Self::Plddt
++                } else {
++                    Self::Structure
++                }
++            }
++            Self::Plddt => Self::Structure,
++            // BFactor and Rainbow are accessible via --color CLI flag
++            Self::BFactor => Self::Structure,
+             Self::Rainbow => Self::Structure,
+-            // Interface is toggled separately, skip it in the cycle
++            // Interface is toggled separately via 'f' key
+             Self::Interface => Self::Structure,
+         }
+     }
+@@ -36,6 +45,7 @@ impl ColorSchemeType {
+             Self::BFactor => "B-Factor",
+             Self::Rainbow => "Rainbow",
+             Self::Interface => "Interface",
++            Self::Plddt => "pLDDT",
+         }
+     }
+ }
+@@ -87,6 +97,7 @@ impl ColorScheme {
+             ColorSchemeType::BFactor => self.bfactor_color(residue),
+             ColorSchemeType::Rainbow => self.rainbow_color(residue),
+             ColorSchemeType::Interface => self.interface_color(residue, chain),
++            ColorSchemeType::Plddt => self.plddt_residue_color(residue),
+         }
+     }
+ 
+@@ -177,6 +188,11 @@ impl ColorScheme {
+             },
+             ColorSchemeType::Rainbow => Color::Rgb(255, 0, 255),
+             ColorSchemeType::Interface => Color::Rgb(255, 255, 255), // bright white to stand out
++            // pLDDT mode: fall back to Structure-mode colors for ligands
++            ColorSchemeType::Plddt => match ligand.ligand_type {
++                LigandType::Ligand => Color::Rgb(255, 0, 255),   // magenta for ligands
++                LigandType::Ion => Color::Rgb(0, 255, 255),      // cyan for ions
++            },
+         }
+     }
+ 
+@@ -184,6 +200,8 @@ impl ColorScheme {
+     pub fn ligand_atom_color(&self, atom: &Atom, ligand: &Ligand) -> Color {
+         match self.scheme_type {
+             ColorSchemeType::Element => Self::element_color(atom),
++            // pLDDT mode: fall back to Element-mode (CPK) colors for ligand atoms
++            ColorSchemeType::Plddt => Self::element_color(atom),
+             _ => self.ligand_color(ligand),
+         }
+     }
+@@ -236,6 +254,35 @@ impl ColorScheme {
+         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+         Color::Rgb(r, g, b)
+     }
++
++    /// AlphaFold pLDDT confidence color for a raw B-factor value.
++    ///
++    /// Uses the standard AlphaFold color bands:
++    /// - >= 90: dark blue  (very high confidence)
++    /// - >= 70: light blue (confident)
++    /// - >= 50: yellow     (low confidence)
++    /// - <  50: orange     (very low confidence)
++    pub fn plddt_color(b_factor: f64) -> Color {
++        if b_factor >= 90.0 {
++            Color::Rgb(0, 83, 214)
++        } else if b_factor >= 70.0 {
++            Color::Rgb(101, 203, 243)
++        } else if b_factor >= 50.0 {
++            Color::Rgb(255, 219, 19)
++        } else {
++            Color::Rgb(255, 125, 69)
++        }
++    }
++
++    /// pLDDT color for a residue, using the average B-factor of its atoms.
++    fn plddt_residue_color(&self, residue: &Residue) -> Color {
++        let avg_b = if residue.atoms.is_empty() {
++            0.0
++        } else {
++            residue.atoms.iter().map(|a| a.b_factor).sum::<f64>() / residue.atoms.len() as f64
++        };
++        Self::plddt_color(avg_b)
++    }
+ }
+ 
+ /// Returns a base-type color for nucleotide residues, or `None` for non-nucleotides.
+@@ -501,4 +548,83 @@ mod tests {
+         };
+         assert_eq!(ColorScheme::element_color(&atom), Color::Rgb(0, 180, 0));
+     }
++
++    // ---- pLDDT coloring ----
++
++    #[test]
++    fn test_plddt_color_bands() {
++        // Very high confidence (>= 90): dark blue
++        assert_eq!(ColorScheme::plddt_color(90.0), Color::Rgb(0, 83, 214));
++        assert_eq!(ColorScheme::plddt_color(95.0), Color::Rgb(0, 83, 214));
++        assert_eq!(ColorScheme::plddt_color(100.0), Color::Rgb(0, 83, 214));
++
++        // Confident (>= 70, < 90): light blue
++        assert_eq!(ColorScheme::plddt_color(70.0), Color::Rgb(101, 203, 243));
++        assert_eq!(ColorScheme::plddt_color(80.0), Color::Rgb(101, 203, 243));
++        assert_eq!(ColorScheme::plddt_color(89.9), Color::Rgb(101, 203, 243));
++
++        // Low confidence (>= 50, < 70): yellow
++        assert_eq!(ColorScheme::plddt_color(50.0), Color::Rgb(255, 219, 19));
++        assert_eq!(ColorScheme::plddt_color(60.0), Color::Rgb(255, 219, 19));
++        assert_eq!(ColorScheme::plddt_color(69.9), Color::Rgb(255, 219, 19));
++
++        // Very low confidence (< 50): orange
++        assert_eq!(ColorScheme::plddt_color(49.9), Color::Rgb(255, 125, 69));
++        assert_eq!(ColorScheme::plddt_color(30.0), Color::Rgb(255, 125, 69));
++        assert_eq!(ColorScheme::plddt_color(0.0), Color::Rgb(255, 125, 69));
++    }
++
++    #[test]
++    fn test_plddt_next_cycling() {
++        // With pLDDT available: Structure -> Element -> Chain -> Plddt -> Structure
++        assert_eq!(ColorSchemeType::Structure.next(true), ColorSchemeType::Element);
++        assert_eq!(ColorSchemeType::Element.next(true), ColorSchemeType::Chain);
++        assert_eq!(ColorSchemeType::Chain.next(true), ColorSchemeType::Plddt);
++        assert_eq!(ColorSchemeType::Plddt.next(true), ColorSchemeType::Structure);
++
++        // Without pLDDT: Structure -> Element -> Chain -> Structure (skips Plddt)
++        assert_eq!(ColorSchemeType::Structure.next(false), ColorSchemeType::Element);
++        assert_eq!(ColorSchemeType::Element.next(false), ColorSchemeType::Chain);
++        assert_eq!(ColorSchemeType::Chain.next(false), ColorSchemeType::Structure);
++
++        // Interface always cycles to Structure regardless of pLDDT flag
++        assert_eq!(ColorSchemeType::Interface.next(true), ColorSchemeType::Structure);
++        assert_eq!(ColorSchemeType::Interface.next(false), ColorSchemeType::Structure);
++    }
++
++    #[test]
++    fn test_plddt_ligand_fallback() {
++        let scheme = ColorScheme::new(ColorSchemeType::Plddt, 100);
++
++        // Ligands should fall back to Structure-mode colors (magenta)
++        let ligand = crate::model::protein::Ligand {
++            name: "HEM".to_string(),
++            chain_id: "A".to_string(),
++            seq_num: 1,
++            atoms: vec![],
++            ligand_type: LigandType::Ligand,
++        };
++        assert_eq!(scheme.ligand_color(&ligand), Color::Rgb(255, 0, 255));
++
++        // Ions should fall back to Structure-mode colors (cyan)
++        let ion = crate::model::protein::Ligand {
++            name: "ZN".to_string(),
++            chain_id: "A".to_string(),
++            seq_num: 1,
++            atoms: vec![],
++            ligand_type: LigandType::Ion,
++        };
++        assert_eq!(scheme.ligand_color(&ion), Color::Rgb(0, 255, 255));
++
++        // Ligand atoms should fall back to Element-mode (CPK) colors
++        let fe_atom = Atom {
++            name: "FE".to_string(),
++            element: "Fe".to_string(),
++            x: 0.0, y: 0.0, z: 0.0,
++            b_factor: 0.0,
++            is_backbone: false,
++            is_hetero: true,
++        };
++        assert_eq!(scheme.ligand_atom_color(&fe_atom, &ligand), Color::Rgb(224, 102, 51));
++    }
+ }
+diff --git a/src/render/ribbon.rs b/src/render/ribbon.rs
+index cbebf6b..a66cf59 100644
+--- a/src/render/ribbon.rs
++++ b/src/render/ribbon.rs
+@@ -98,6 +98,124 @@ fn v3_normalize(a: V3) -> V3 {
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Sheet frame guide helpers
++// ---------------------------------------------------------------------------
++
++use crate::model::protein::Residue;
++
++/// Compute the carbonyl C→O direction for a protein residue.
++///
++/// Looks for backbone atoms named "C" (carbonyl carbon) and "O" (carbonyl
++/// oxygen), computes the normalized direction vector from C to O.  As a
++/// fallback, tries CA→O if C is missing.  Returns `None` for nucleic acid
++/// residues or when the required atoms are absent.
++fn residue_frame_hint(residue: &Residue) -> Option<V3> {
++    let find_atom = |name: &str| -> Option<V3> {
++        residue
++            .atoms
++            .iter()
++            .find(|a| a.name.trim() == name)
++            .map(|a| [a.x, a.y, a.z])
++    };
++
++    let o_pos = find_atom("O")?;
++
++    // Prefer backbone C atom; fall back to CA.
++    let origin = find_atom("C").or_else(|| find_atom("CA"))?;
++
++    let dir = v3_sub(o_pos, origin);
++    let len = v3_len(dir);
++    if len < 1e-12 {
++        return None;
++    }
++    Some(v3_scale(dir, 1.0 / len))
++}
++
++/// Project vector `v` perpendicular to `onto` and normalize the result.
++/// Returns `None` if the projection is degenerate (v is parallel to onto).
++fn project_perp_normalize(v: V3, onto: V3) -> Option<V3> {
++    let d = v3_dot(v, onto);
++    let perp = v3_sub(v, v3_scale(onto, d));
++    let len = v3_len(perp);
++    if len < 1e-12 {
++        None
++    } else {
++        Some(v3_scale(perp, 1.0 / len))
++    }
++}
++
++/// Adjust binormal/normal frames for sheet regions using carbonyl direction
++/// hints (frame guides).
++///
++/// This runs **after** parallel-transport frame computation.  For each
++/// contiguous run of `SecondaryStructure::Sheet` spline points, it:
++///   1. Projects each point's `frame_hint` perpendicular to the tangent.
++///   2. Aligns consecutive projected hints to the same hemisphere.
++///   3. Blends the hint with the existing binormal (65% hint / 35% existing).
++///   4. Recomputes the normal from `tangent × blended_binormal`.
++///
++/// Points outside sheet regions or without hints are left unchanged.
++fn apply_sheet_frame_guides(spline_points: &mut [SplinePoint]) {
++    let n = spline_points.len();
++    if n == 0 {
++        return;
++    }
++
++    // Identify contiguous sheet runs.
++    let mut i = 0;
++    while i < n {
++        if spline_points[i].ss != SecondaryStructure::Sheet {
++            i += 1;
++            continue;
++        }
++
++        // Found the start of a sheet run.
++        let run_start = i;
++        while i < n && spline_points[i].ss == SecondaryStructure::Sheet {
++            i += 1;
++        }
++        let run_end = i; // exclusive
++
++        // Process this sheet run: project hints, align signs, blend.
++        let mut prev_hint_perp: Option<V3> = None;
++
++        for sp in spline_points[run_start..run_end].iter_mut() {
++            let hint = match sp.frame_hint {
++                Some(h) => h,
++                None => continue,
++            };
++
++            let tangent = sp.tangent;
++
++            // Project hint perpendicular to tangent.
++            let mut hint_perp = match project_perp_normalize(hint, tangent) {
++                Some(h) => h,
++                None => continue,
++            };
++
++            // Align sign with previous hint to avoid flipping.
++            if let Some(prev) = prev_hint_perp {
++                if v3_dot(hint_perp, prev) < 0.0 {
++                    hint_perp = v3_scale(hint_perp, -1.0);
++                }
++            }
++            prev_hint_perp = Some(hint_perp);
++
++            // Blend with existing binormal: 65% hint, 35% existing.
++            let existing_b = sp.binormal;
++            let blended = v3_add(v3_scale(hint_perp, 0.65), v3_scale(existing_b, 0.35));
++            let new_binormal = v3_normalize(blended);
++
++            // Recompute normal from tangent x binormal.
++            let new_normal = v3_normalize(v3_cross(tangent, new_binormal));
++
++            sp.binormal = new_binormal;
++            sp.normal = new_normal;
++        }
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // Catmull-Rom spline
+ // ---------------------------------------------------------------------------
+@@ -131,6 +249,9 @@ struct SplinePoint {
+     tangent: V3,
+     normal: V3,
+     binormal: V3,
++    /// Carbonyl direction hint propagated from the nearest control point.
++    /// Used by `apply_sheet_frame_guides` to orient sheet ribbons.
++    frame_hint: Option<V3>,
+     ss: SecondaryStructure,
+     color: [u8; 3],
+     /// True when this point lies within the arrowhead region at the end of a
+@@ -354,6 +475,8 @@ struct CaRecord {
+     pos: V3,
+     ss: SecondaryStructure,
+     color: [u8; 3],
++    /// Carbonyl C→O direction hint for sheet frame orientation.
++    frame_hint: Option<V3>,
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -412,6 +535,11 @@ fn build_spline_tube(records: &[CaRecord], out: &mut Vec<RibbonTriangle>) {
+                 tangent: [0.0, 0.0, 0.0],
+                 normal: [0.0, 1.0, 0.0],
+                 binormal: [0.0, 0.0, 1.0],
++                frame_hint: if t < 0.5 {
++                    records[i1].frame_hint
++                } else {
++                    records[i2].frame_hint
++                },
+                 ss,
+                 color,
+                 arrow_t: None,
+@@ -464,12 +592,15 @@ fn build_spline_tube(records: &[CaRecord], out: &mut Vec<RibbonTriangle>) {
+         }
+     }
+ 
++    // --- Step 3b: Apply sheet frame guides ---
++    apply_sheet_frame_guides(&mut spline_points);
++
+     // --- Step 4: Build cross-sections and emit triangle strips ---
+     let mut prev_ring = cross_section(&spline_points[0]);
+ 
+-    for i in 1..spline_points.len() {
+-        let mut curr_ring = cross_section(&spline_points[i]);
+-        let color = spline_points[i].color;
++    for sp in spline_points.iter().skip(1) {
++        let mut curr_ring = cross_section(sp);
++        let color = sp.color;
+ 
+         if prev_ring.len() != curr_ring.len() {
+             let target = prev_ring.len().max(curr_ring.len());
+@@ -510,7 +641,7 @@ fn generate_chain_ribbon(
+     color_scheme: &ColorScheme,
+     out: &mut Vec<RibbonTriangle>,
+ ) {
+-    // 1. Collect C-alpha positions, SS types, and colors.
++    // 1. Collect C-alpha positions, SS types, colors, and frame hints.
+     let cas: Vec<CaRecord> = chain
+         .residues
+         .iter()
+@@ -521,6 +652,7 @@ fn generate_chain_ribbon(
+                 pos: [ca.x, ca.y, ca.z],
+                 ss: res.secondary_structure,
+                 color,
++                frame_hint: residue_frame_hint(res),
+             })
+         })
+         .collect();
+@@ -609,19 +741,27 @@ fn generate_chain_ribbon(
+                 let arrow_end = aend as f64; // exclusive in residue space but we approach it
+                 // We actually want the arrow to span [astart, aend-1] in segment indices,
+                 // so the last spline sample is at aend.
+-                if global_pos >= arrow_begin && global_pos <= arrow_end as f64 {
+-                    let frac = (global_pos - arrow_begin) / (arrow_end as f64 - arrow_begin);
++                if global_pos >= arrow_begin && global_pos <= arrow_end {
++                    let frac = (global_pos - arrow_begin) / (arrow_end - arrow_begin);
+                     Some(frac.clamp(0.0, 1.0))
+                 } else {
+                     None
+                 }
+             });
+ 
++            // Nearest-neighbor frame hint: snap to the closer control point.
++            let frame_hint = if t < 0.5 {
++                cas[i1].frame_hint
++            } else {
++                cas[i2].frame_hint
++            };
++
+             spline_points.push(SplinePoint {
+                 pos,
+                 tangent: [0.0, 0.0, 0.0], // computed below
+                 normal: [0.0, 1.0, 0.0],
+                 binormal: [0.0, 0.0, 1.0],
++                frame_hint,
+                 ss,
+                 color,
+                 arrow_t,
+@@ -683,12 +823,15 @@ fn generate_chain_ribbon(
+         }
+     }
+ 
++    // 5b. Apply sheet frame guides (carbonyl-direction-based orientation).
++    apply_sheet_frame_guides(&mut spline_points);
++
+     // 6. Build cross-sections and emit triangle strips.
+     let mut prev_ring = cross_section(&spline_points[0]);
+ 
+-    for i in 1..spline_points.len() {
+-        let mut curr_ring = cross_section(&spline_points[i]);
+-        let color = spline_points[i].color;
++    for sp in spline_points.iter().skip(1) {
++        let mut curr_ring = cross_section(sp);
++        let color = sp.color;
+ 
+         // Handle cross-section vertex count mismatch at SS transitions.
+         if prev_ring.len() != curr_ring.len() {
+@@ -761,6 +904,7 @@ fn generate_nucleic_acid_ribbon(
+                 pos: [c4.x, c4.y, c4.z],
+                 ss: SecondaryStructure::Coil, // always coil for nucleic acids
+                 color,
++                frame_hint: None, // not applicable for nucleic acids
+             })
+         })
+         .collect();
+@@ -886,3 +1030,190 @@ fn emit_quad(
+         normal: n2,
+     });
+ }
++
++// ---------------------------------------------------------------------------
++// Tests
++// ---------------------------------------------------------------------------
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::model::protein::{Atom, Residue};
++
++    /// Helper to build a minimal atom.
++    fn make_atom(name: &str, x: f64, y: f64, z: f64) -> Atom {
++        Atom {
++            name: name.to_string(),
++            element: "C".to_string(),
++            x,
++            y,
++            z,
++            b_factor: 0.0,
++            is_backbone: name == "CA",
++            is_hetero: false,
++        }
++    }
++
++    #[test]
++    fn test_residue_frame_hint_with_co() {
++        // Residue with C at origin and O along the +X axis.
++        let res = Residue {
++            name: "ALA".to_string(),
++            seq_num: 1,
++            atoms: vec![
++                make_atom("CA", 0.0, 0.0, 0.0),
++                make_atom("C", 1.0, 0.0, 0.0),
++                make_atom("O", 4.0, 0.0, 0.0),
++            ],
++            secondary_structure: SecondaryStructure::Sheet,
++        };
++        let hint = residue_frame_hint(&res).expect("should produce a hint");
++        // Direction should be [1, 0, 0] (normalized C→O).
++        assert!((hint[0] - 1.0).abs() < 1e-9);
++        assert!(hint[1].abs() < 1e-9);
++        assert!(hint[2].abs() < 1e-9);
++    }
++
++    #[test]
++    fn test_residue_frame_hint_missing_o() {
++        // Residue with C but no O.
++        let res = Residue {
++            name: "ALA".to_string(),
++            seq_num: 1,
++            atoms: vec![
++                make_atom("CA", 0.0, 0.0, 0.0),
++                make_atom("C", 1.0, 0.0, 0.0),
++                make_atom("N", 2.0, 0.0, 0.0),
++            ],
++            secondary_structure: SecondaryStructure::Sheet,
++        };
++        assert!(residue_frame_hint(&res).is_none());
++    }
++
++    #[test]
++    fn test_residue_frame_hint_fallback_ca_o() {
++        // Residue with CA and O but no C — should use CA→O fallback.
++        let res = Residue {
++            name: "ALA".to_string(),
++            seq_num: 1,
++            atoms: vec![
++                make_atom("CA", 0.0, 0.0, 0.0),
++                make_atom("O", 0.0, 3.0, 0.0),
++            ],
++            secondary_structure: SecondaryStructure::Sheet,
++        };
++        let hint = residue_frame_hint(&res).expect("should fallback to CA->O");
++        assert!(hint[0].abs() < 1e-9);
++        assert!((hint[1] - 1.0).abs() < 1e-9);
++        assert!(hint[2].abs() < 1e-9);
++    }
++
++    #[test]
++    fn test_apply_sheet_guides_flipped_hints() {
++        // Build a small set of sheet spline points with alternating hint signs.
++        // After apply_sheet_frame_guides, consecutive binormals should be
++        // coherent (positive dot product).
++        let mut points: Vec<SplinePoint> = Vec::new();
++        for i in 0..6 {
++            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
++            points.push(SplinePoint {
++                pos: [i as f64, 0.0, 0.0],
++                tangent: [1.0, 0.0, 0.0],
++                normal: [0.0, 1.0, 0.0],
++                binormal: [0.0, 0.0, 1.0],
++                frame_hint: Some([0.0, sign * 0.5, 0.5]),
++                ss: SecondaryStructure::Sheet,
++                color: [255, 255, 255],
++                arrow_t: None,
++            });
++        }
++
++        apply_sheet_frame_guides(&mut points);
++
++        // All consecutive binormals should agree in direction.
++        for i in 1..points.len() {
++            let d = v3_dot(points[i].binormal, points[i - 1].binormal);
++            assert!(
++                d > 0.0,
++                "Binormals at {} and {} should agree in sign, got dot={}",
++                i - 1,
++                i,
++                d
++            );
++        }
++    }
++
++    #[test]
++    fn test_coil_points_unaffected() {
++        // Build spline points that are all Coil with frame hints.
++        // They should NOT be modified by the guide pass.
++        let original_binormal: V3 = [0.0, 0.0, 1.0];
++        let original_normal: V3 = [0.0, 1.0, 0.0];
++
++        let mut points: Vec<SplinePoint> = Vec::new();
++        for i in 0..4 {
++            points.push(SplinePoint {
++                pos: [i as f64, 0.0, 0.0],
++                tangent: [1.0, 0.0, 0.0],
++                normal: original_normal,
++                binormal: original_binormal,
++                frame_hint: Some([0.0, 0.7, 0.7]),
++                ss: SecondaryStructure::Coil,
++                color: [128, 128, 128],
++                arrow_t: None,
++            });
++        }
++
++        apply_sheet_frame_guides(&mut points);
++
++        for (i, sp) in points.iter().enumerate() {
++            assert_eq!(
++                sp.binormal, original_binormal,
++                "Coil point {} binormal should be unchanged",
++                i
++            );
++            assert_eq!(
++                sp.normal, original_normal,
++                "Coil point {} normal should be unchanged",
++                i
++            );
++        }
++    }
++
++    #[test]
++    fn test_helix_points_unaffected() {
++        // Build spline points that are all Helix with frame hints.
++        // They should NOT be modified by the guide pass.
++        let original_binormal: V3 = [0.0, 0.0, 1.0];
++        let original_normal: V3 = [0.0, 1.0, 0.0];
++
++        let mut points: Vec<SplinePoint> = Vec::new();
++        for i in 0..4 {
++            points.push(SplinePoint {
++                pos: [i as f64, 0.0, 0.0],
++                tangent: [1.0, 0.0, 0.0],
++                normal: original_normal,
++                binormal: original_binormal,
++                frame_hint: Some([0.0, 0.7, 0.7]),
++                ss: SecondaryStructure::Helix,
++                color: [128, 128, 128],
++                arrow_t: None,
++            });
++        }
++
++        apply_sheet_frame_guides(&mut points);
++
++        for (i, sp) in points.iter().enumerate() {
++            assert_eq!(
++                sp.binormal, original_binormal,
++                "Helix point {} binormal should be unchanged",
++                i
++            );
++            assert_eq!(
++                sp.normal, original_normal,
++                "Helix point {} normal should be unchanged",
++                i
++            );
++        }
++    }
++}

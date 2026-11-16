@@ -1,0 +1,307 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6eba97c158..84be7e6180 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,6 @@
+ # Changelog
+ 
++- 2026-07-31: Fixed topocg issue removing ligands - Issue #1638
+ - 2026-07-27: Added `rnascan` module for mutagenesis scanning of RNA bases (mutating interface nucleotides to A, C, G, U) - Issue #1631
+ - 2026-07-22: Added protein-DNA docking Jupyter notebook
+ - 2026-07-21: Fixed `gen_archive=true` crash (`Directory not empty`) on non-local filesystems (NFS, gcsfuse/s3fs, overlayfs) - Issue #1626
+diff --git a/src/haddock/modules/topology/topocg/__init__.py b/src/haddock/modules/topology/topocg/__init__.py
+index d8fc58dfd7..38dd6e7040 100644
+--- a/src/haddock/modules/topology/topocg/__init__.py
++++ b/src/haddock/modules/topology/topocg/__init__.py
+@@ -5,7 +5,7 @@
+ 
+ It will:
+ - Convert an all atom model to a Martini coarse-grained model
+-- Detect missing atoms 
++- Detect missing atoms
+ - Re-build them when missing
+ - Build and write out topologies (``.psf``) and coordinates (``.pdb``) files
+ - Write out a restrain file to convert back the CG model to all atoms
+@@ -30,14 +30,13 @@
+     load_workflow_params,
+     prepare_output,
+     prepare_single_input,
+-    )
++)
+ from haddock.libs.libaa2cg import (
+     martinize,
+     gen_cg_filename,
+     gen_cg_tbl_backmapping_fname,
+-    )
++)
+ from haddock.libs.libontology import Format, PDBFile, TopologyFile
+-from haddock.libs.libstructure import make_molecules
+ from haddock.libs.libsubprocess import CNSJob
+ from haddock.modules import get_engine
+ from haddock.modules.base_cns_module import BaseCNSModule
+@@ -169,7 +168,7 @@ def get_ensemble_origin(ensemble_f: FilePath) -> dict[int, str]:
+         lines = text.split(os.linesep)
+         REMARK_lines = (line for line in lines if line.startswith("REMARK"))
+         re_origin = re.compile(
+-            "REMARK\s+MODEL\s+(\d+)\s+(FROM|from|From)\s+(([\w_-]+\.?)+)"
++            r"REMARK\s+MODEL\s+(\d+)\s+(FROM|from|From)\s+(([\w_-]+\.?)+)"
+         )  # noqa : E501
+         for line in REMARK_lines:
+             if match := re_origin.search(line):
+@@ -183,10 +182,13 @@ def _run(self) -> None:
+         """Execute module."""
+ 
+         try:
+-            _molecules = self.previous_io.output
+-            molecules = []
+-            for mol in _molecules:
+-                molecules.append(make_molecules([mol[key].rel_path for key in mol]))
++            # Models already come split into individual structures from the
++            # previous (topoaa) step, so we can use them directly. Each entry
++            # of `molecules` is the list of model paths for one input molecule.
++            molecules = [
++                [pdbfile.rel_path for pdbfile in mol.values()]
++                for mol in self.previous_io.output
++            ]
+         except Exception as e:
+             self.finish_with_error(e)
+ 
+@@ -221,57 +223,33 @@ def _run(self) -> None:
+ 
+         force_field = self.params["cgffversion"]
+ 
+-        for i, molecule in enumerate(molecules, start=1):
+-            #self.log(f"Molecule {i}: {molecule.with_parent}")
++        for i, models in enumerate(molecules, start=1):
+             shape_dic[i] = False
+-            # Copy the molecule to the step folder
+             models_dic[i] = []
+ 
+-            # Split models
+-            # these come already sorted
+-            splited_models = [
+-                libpdb.split_ensemble(Path(mol.file_name), dest=Path.cwd(),)[0]
+-                for mol in molecule
+-            ]
+-
+             # check for shape
+-            if libpdb.check_mol_shape(splited_models[0]):
++            if libpdb.check_mol_shape(models[0]):
+                 shape_dic[i] = True
+ 
+             # Get psf files for aa topology
+             psf_files[i] = [
+-                Path(mol.parent, f"{mol.stem}.{Format.TOPOLOGY}")
+-                for mol in splited_models
+-                ]
++                Path(model.parent, f"{model.stem}.{Format.TOPOLOGY}")
++                for model in models
++            ]
+ 
+             # get the MD5 hash of each model
+-            ens_dic[i] = [
+-                self.get_md5(mol.file_name)
+-                for mol in molecule
+-                ]
+-            origi_ens_dic[i] = [
+-                self.get_ensemble_origin(mol.file_name)
+-                for mol in molecule
+-            ]
+-            # nice variable name, isn't it? :-)
++            ens_dic[i] = [self.get_md5(model) for model in models]
++            origi_ens_dic[i] = [self.get_ensemble_origin(model) for model in models]
+             # molecule parameters are shared among models of the same molecule
+             parameters_for_this_molecule = mol_params[mol_params_get()]
+ 
+-            for task_id, model in enumerate(splited_models):
++            for task_id, model in enumerate(models):
+                 self.log(f"Sanitizing molecule {model.name}")
+                 models_dic[i].append(model)
+ 
+                 if self.params["ligand_top_fname"]:
+                     custom_top = self.params["ligand_top_fname"]
+                     self.log(f"Using custom topology {custom_top}")
+-                    libpdb.sanitize(
+-                        model,
+-                        overwrite=True,
+-                        custom_topology=custom_top,
+-                    )
+-
+-                else:
+-                    libpdb.sanitize(model, overwrite=True)
+ 
+                 # Prepare generation of topologies jobs
+                 topocg_input = generate_topology(
+@@ -283,7 +261,7 @@ def _run(self) -> None:
+                     default_params_path=self.toppar_path,
+                     write_to_disk=self.params["debug"],
+                     force_field=force_field,
+-                    shape=shape_dic[i]
++                    shape=shape_dic[i],
+                 )
+                 self.log("Topology CNS input created")
+ 
+@@ -334,17 +312,17 @@ def _run(self) -> None:
+                         self.path.resolve().parent,
+                         origin_name_model,
+                         force_field=force_field,
+-                        )
++                    )
+                     processed_topology = gen_cg_filename(
+                         self.path.resolve().parent,
+                         origin_name_model,
+                         force_field=force_field,
+                         ext=Format.TOPOLOGY,
+-                        )
++                    )
+                     processed_cgtoaa_tbl = gen_cg_tbl_backmapping_fname(
+                         self.path.resolve().parent,
+                         origin_name_model,
+-                        ).resolve()
++                    ).resolve()
+                 else:
+                     processed_pdb = Path(f"{origin_name_model}.{Format.PDB}")
+                     processed_topology = Path(f"{origin_name_model}.{Format.TOPOLOGY}")
+@@ -368,7 +346,9 @@ def _run(self) -> None:
+ 
+         # Remove temporary `*_cg.pdb` files if not in debug mode
+         if not self.params["debug"]:
+-            for tmp_cg in Path(self.path.resolve().parent).glob(f"{gen_cg_filename('', '*')}"):
++            for tmp_cg in Path(self.path.resolve().parent).glob(
++                f"{gen_cg_filename('', '*')}"
++            ):
+                 os.remove(tmp_cg)
+ 
+         # Save module information
+diff --git a/tests/test_module_topocg.py b/tests/test_module_topocg.py
+index 061c7bedfc..c28901a0be 100644
+--- a/tests/test_module_topocg.py
++++ b/tests/test_module_topocg.py
+@@ -1,5 +1,6 @@
+ """Specific tests for topocg."""
+ 
++import shutil
+ import tempfile
+ from math import isnan
+ from pathlib import Path
+@@ -8,8 +9,10 @@
+ 
+ import pytest
+ 
++import haddock.modules.topology.topocg as topocg_mod
+ from haddock.gear.yaml2cfg import read_from_yaml_config
+-from haddock.libs.libontology import Format
++from haddock.libs import libpdb
++from haddock.libs.libontology import Format, PDBFile
+ from haddock.modules.topology.topocg import DEFAULT_CONFIG as topocg_params
+ from haddock.modules.topology.topocg import HaddockModule as Topocg
+ from haddock.modules.topology.topocg import generate_topology
+@@ -59,7 +62,7 @@ def test_generate_topology(topocg, protein):
+     """Test generate_topology function."""
+     with warnings.catch_warnings():
+         warnings.simplefilter("ignore", PDBConstructionWarning)
+-        force_field=topocg.params["cgffversion"]
++        force_field = topocg.params["cgffversion"]
+         observed_inp_out = generate_topology(
+             input_pdb=protein,
+             output_path=topocg.path,
+@@ -71,10 +74,12 @@ def test_generate_topology(topocg, protein):
+         )
+ 
+     assert observed_inp_out == Path(protein.name).with_suffix(f".{Format.CNS_INPUT}")
+-    
++
+     # Confirm the expected output file exists
+     expected_filename = topocg.path.resolve() / f"{protein.stem}_cg.pdb"
+-    assert expected_filename.exists(), f"Expected CG PDB file not found: {expected_filename}"
++    assert expected_filename.exists(), (
++        f"Expected CG PDB file not found: {expected_filename}"
++    )
+ 
+     # Check that backmapping tbl file has been created
+     tbl_backmapping_fpath = topocg.path.resolve() / f"{protein.stem}_cg_to_aa.tbl"
+@@ -90,6 +95,84 @@ def test_generate_topology(topocg, protein):
+     assert "BB" in contents, "CG markers not found in output PDB."
+ 
+ 
++def test_run_uses_presplit_models_without_splitting(monkeypatch, protein):
++    """Models from the previous (topoaa) step are already split.
++
++    ``_run`` must consume them directly and must not re-split the ensemble
++    (the redundant ``libpdb.split_ensemble`` call that was removed).
++    """
++    with tempfile.TemporaryDirectory() as tempdir:
++        root = Path(tempdir)
++        prev_dir = root / "1_topoaa"
++        cwd = root / "2_topocg"
++        prev_dir.mkdir()
++        cwd.mkdir()
++
++        # Two individual (already-split) models with their aa topologies,
++        # mimicking the output of the previous topoaa step.
++        prev_output = {}
++        expected_inputs = []
++        for idx in range(2):
++            pdb_name = f"mol_{idx + 1}.pdb"
++            shutil.copy(protein, prev_dir / pdb_name)
++            (prev_dir / f"mol_{idx + 1}.{Format.TOPOLOGY}").write_text("")
++            pdbfile = PDBFile(file_name=pdb_name, path=str(prev_dir))
++            prev_output[idx] = pdbfile
++            expected_inputs.append(pdbfile.rel_path)
++
++        monkeypatch.chdir(cwd)
++        module = Topocg(order=1, path=Path("."), initial_params=topocg_params)
++        module.envvars = {}
++
++        class _FakePreviousIO:
++            output = [prev_output]
++
++        module.previous_io = _FakePreviousIO()
++
++        # Guard against regressions: splitting must never happen here.
++        def _no_split(*args, **kwargs):
++            raise AssertionError("topocg should not call split_ensemble")
++
++        monkeypatch.setattr(libpdb, "split_ensemble", _no_split)
++
++        # Capture the model paths handed to topology generation instead of
++        # running CNS, and avoid the DSSP/martinize machinery.
++        captured_inputs = []
++
++        def _fake_generate_topology(input_pdb, *args, **kwargs):
++            captured_inputs.append(Path(input_pdb))
++            return Path(f"{Path(input_pdb).stem}.{Format.CNS_INPUT}")
++
++        monkeypatch.setattr(topocg_mod, "generate_topology", _fake_generate_topology)
++
++        # Neutralise the CNS engine.
++        class _FakeEngine:
++            def __init__(self, jobs):
++                self.jobs = jobs
++
++            def run(self):
++                return None
++
++        monkeypatch.setattr(topocg_mod, "get_engine", lambda *a, **k: _FakeEngine)
++
++        # Skip the disk-dependent export step, just capture its input.
++        exported = {}
++
++        def _fake_export(self, faulty_tolerance=0.0):
++            exported["models"] = self.output_models
++
++        monkeypatch.setattr(Topocg, "export_io_models", _fake_export)
++
++        module._run()
++
++    # The presplit model paths were used verbatim (no split, no renaming).
++    assert captured_inputs == expected_inputs
++    # One CNS job per input model was created.
++    assert len(module.output_models) == 1
++    assert len(module.output_models[0]) == 2
++    assert exported["models"] is module.output_models
++
++
+ def test_get_md5(topocg, ensemble_header_w_md5, protein):
+     """Test get_md5 method."""
+     observed_md5_dic = topocg.get_md5(ensemble_header_w_md5)

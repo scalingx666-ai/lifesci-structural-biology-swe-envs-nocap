@@ -1,0 +1,488 @@
+diff --git a/Project.toml b/Project.toml
+index f1480b5ca..dfcf3e5ed 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -24,6 +24,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+ Roots = "f2b01f46-fcfa-551c-844a-d8ac1e96c665"
+ SciMLPublic = "431bcebd-1456-4ced-9d72-93c2757fff0b"
+ Scratch = "6c6a2e73-6563-6170-7368-637461726353"
++Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+ StableTasks = "91464d47-22a1-43fe-8b7f-2d57ee82463f"
+@@ -84,6 +85,7 @@ Random = "1"
+ Roots = "2.1, 3"
+ SciMLPublic = "1"
+ Scratch = "^1.1"
++Serialization = "1.10"
+ SparseArrays = "1"
+ SpecialFunctions = "2"
+ StableTasks = "0.1"
+diff --git a/docs/src/eos/misc.md b/docs/src/eos/misc.md
+index a2a97f7ca..e4b63eee2 100755
+--- a/docs/src/eos/misc.md
++++ b/docs/src/eos/misc.md
+@@ -34,6 +34,7 @@ Clapeyron.SLk0k1lMixingRule
+ ```@docs
+ Clapeyron.PeTS
+ Clapeyron.KolafaNezbeda
++Clapeyron.FeANNMie
+ ```
+ 
+ # Composite and Utility Models
+diff --git a/src/Clapeyron.jl b/src/Clapeyron.jl
+index f022f6761..69972f634 100755
+--- a/src/Clapeyron.jl
++++ b/src/Clapeyron.jl
+@@ -13,7 +13,7 @@ import LogExpFunctions
+ using FillArrays: FillArrays
+ import SpecialFunctions
+ using StaticArrays
+-
++using Serialization #FeANNMie
+ using DiffResults, ForwardDiff
+ using IFTDuals
+ using Downloads #for bibtex
+@@ -285,6 +285,7 @@ include("models/Virial/Virial.jl")
+ include("models/ECS/ECS.jl")
+ include("models/ECS/variants/SPUNG.jl")
+ include("models/Potentials/PeTS/PeTS.jl")
++include("models/Potentials/FeANNMie/FeANNMie.jl")
+ include("models/Potentials/KolafaNezbeda/KolafaNezbeda.jl")
+ 
+ #electrolytes
+diff --git a/src/methods/differentials.jl b/src/methods/differentials.jl
+index fb9ec23d2..1e85c066e 100755
+--- a/src/methods/differentials.jl
++++ b/src/methods/differentials.jl
+@@ -107,6 +107,17 @@ function p∂p∂V(model,V,T,z::AbstractVector=SA[1.0])
+     return SVector(p,∂p∂V)
+ end
+ 
++function ∂p(model,V,T,z)
++    f = @deferred_VT(pressure,∂₁p)
++    _f,_df = Solvers.fgradf2(f,V,T)
++    return _df,_f
++end
++
++function ∂p_vec(model,V,T,z)
++    _∂f,_f = ∂p(model,V,T,z)
++    return SVector(_f,_∂f[1],_∂f[2])
++end
++
+ function p∂p∂rho(model, rho, T, z=SA[1.0])
+     n   = sum(z)
+     V   = n / rho
+diff --git a/src/methods/property_solvers/volume.jl b/src/methods/property_solvers/volume.jl
+index 7148e6d79..6a2c34fc4 100755
+--- a/src/methods/property_solvers/volume.jl
++++ b/src/methods/property_solvers/volume.jl
+@@ -288,10 +288,9 @@ function volume_chill(model::EoSModel,p,T,z,v0,T0,Ttol = 0.01,max_iters=100)
+     count_invalid_iters = 0
+     scale = _1
+     for i in 1:max_iters
+-        d²A,dA,_ = ∂2f(model,vᵢ,Tᵢ,z)
+-        ∂²A∂V∂T = d²A[1,2]
+-        ∂²A∂V² = d²A[1,1]
+-        pᵢ = -dA[1]
++        pᵢ,∂pᵢ∂V,∂pᵢ∂T = ∂p_vec(model,vᵢ,Tᵢ,z)
++        ∂²A∂V²  = -∂pᵢ∂V
++        ∂²A∂V∂T = -∂pᵢ∂T
+         #mechanical stability check (same criterion as volume_compress: ∂p/∂V = -∂²A/∂V² must be < 0)
+         ∂²A∂V² <= 0 && return nan
+         dvdt = -∂²A∂V∂T/∂²A∂V²
+diff --git a/src/models/Potentials/FeANNMie/FeANNMie.jl b/src/models/Potentials/FeANNMie/FeANNMie.jl
+new file mode 100644
+index 000000000..4831a833b
+--- /dev/null
++++ b/src/models/Potentials/FeANNMie/FeANNMie.jl
+@@ -0,0 +1,247 @@
++#=most of this implementation is taken from https://github.com/gustavochm/Square-Peg-Mie
++
++Weights were read by MsgPack:
++
++data_dict =open("Clapeyron/src/models/Potentials/FeANNMie/checkpoint","r") do io
++          data = MsgPack.unpack(io)
++       end
++
++params = data_dict["params]
++
++function unpack_flax_tensor(ext::MsgPack.Extension)
++    @assert ext.type == 1 "unexpected extension type code"
++    io = IOBuffer(ext.data)
++    shape, dtype, raw = MsgPack.unpack(io)
++    T = dtype == "float32" ? Float32 :
++        dtype == "float64" ? Float64 :
++        error("unsupported dtype $dtype")
++    A = reinterpret(T, raw)
++    return reshape(collect(A), Tuple(shape)...)
++end
++
++function save_compatible(path::AbstractString, data; target_version=UInt8(24))
++    buf = IOBuffer()
++    serialize(buf, data)
++    bytes = take!(buf)
++    bytes[4] = target_version   # 1-based index 4 == header offset 3
++    write(path, bytes)
++end
++
++b0 = unpack_flax_tensor(params["hidden_layers_0"]["bias"])
++b1 = unpack_flax_tensor(params["hidden_layers_1"]["bias"])
++b2 = unpack_flax_tensor(params["hidden_layers_2"]["bias"])
++W0 = unpack_flax_tensor(params["hidden_layers_0"]["kernel"])
++W1 = unpack_flax_tensor(params["hidden_layers_1"]["kernel"])
++W2 = unpack_flax_tensor(params["hidden_layers_2"]["kernel"])
++Wh = unpack_flax_tensor(params["helmholtz_layer"]["kernel"])
++
++nt_data = (;W0,b0,W1,b1,W2,b2,Wh)
++save_compatible("Clapeyron/src/models/Potentials/FeANNMie/params_anns.jls",nt_data)
++=#
++using Serialization
++
++function load_fe_ann_mie_consts(solid::Bool)
++    if solid
++        p = open(deserialize, joinpath(@__DIR__, "params_anns.jls"))
++    else
++        p = open(deserialize, joinpath(@__DIR__, "params_ann.jls"))
++    end
++    #files extracted from https://github.com/gustavochm/Square-Peg-Mie/tree/main/ann_models/feann_eos
++    #we do additional reshaping here to make it work with julia conventions.
++    return (
++        solid = solid,
++        W0t = reshape(p.W0, 30,  3),
++        b0  = p.b0,
++        W1t = reshape(p.W1, 30, 30),
++        b1  = p.b1,
++        W2t = reshape(p.W2, 30, 30),
++        b2  = p.b2,
++        Wh  = vec(p.Wh),
++    )
++end
++
++struct FeANNMie{T,S} <: EoSModel
++    lambda_r::T
++    lambda_a::T
++    weights::S
++end
++
++is_splittable(::FeANNMie) = false
++
++"""
++
++    FeANNMie(λr, λa; solid = false)
++
++
++## Input arguments
++
++- `λa`: Real - Atractive range parameter (no units)
++- `λr`: Real - Repulsive range parameter (no units)
++
++## Keyword arguments
++- `solid`: if set to `true`, it will load the weights for the `Fe-ANN(s)-Mie` model instead of the weights for the `Fe-ANN-Mie`.
++
++## Description
++
++Free Energy Artificial Neural Network equation of state for the Mie fluid.
++There are two available models, that can be selected with the `solid` keyword argument:
++- Fe-ANN-Mie: model trained on VLE data of the Mie fluid
++- Fe-ANN(S)-Mie: Trained model using fluid and crystal Mie data
++
++## References
++
++1. Chaparro, G., & Müller, E. A. (2023). Development of thermodynamically consistent machine-learning equations of state: Application to the Mie fluid. The Journal of Chemical Physics, 158(18), 184505. [doi:10.1063/5.0146634](https://doi.org/10.1063/5.0146634)
++1. Chaparro, G., & Müller, E. A. (2024). Development of a Helmholtz free energy equation of state for fluid and solid phases via artificial neural networks. Communications Physics, 7(1). [doi:10.1038/s42005-024-01892-3]https://doi.org/10.1038/s42005-024-01892-3)
++1. Chaparro, G., & Müller, E. A. (2025). Fitting a square peg in a round hole: parameterisation of quasi-spherical molecules employing the Mie potential. Molecular Systems Design & Engineering, 10(8), 620–634. [doi:10.1039/d5me00048c](https://doi.org/10.1039/d5me00048c)
++"""
++function FeANNMie(λr, λa; solid::Bool = false)
++    λr, λa = promote(λr, λa)
++    weights = load_fe_ann_mie_consts(solid)
++    return FeANNMie(λr, λa, weights)
++end
++
++function Base.show(io::IO,model::FeANNMie)
++    print(io,"FeANNMie(λr = $(model.lambda_r), λa = $(model.lambda_a)")
++    model.weights.feanns && print(io,", solid = true")
++    print(io,")")
++end
++
++function Base.show(io::IO,::MIME"text/plain",model::FeANNMie)
++    print(io,"FeANNMie(λr = $(model.lambda_r), λa = $(model.lambda_a)")
++    model.weights.solid && print(io,", solid = true")
++    print(io,")")
++end
++
++function mie_α_const(λa, λr)
++    C = Cλ_mie(λa, λr)
++    α = C*(1/(λa - 3) - 1/(λr - 3))
++    return α
++end
++
++mie_α_const(model::FeANNMie) = mie_α_const(model.lambda_a,model.lambda_r)
++function a_res(model::FeANNMie,V,T,z)
++    ρ⃰ = sum(z)/V
++    T⃰ = T
++    λa, λr = model.lambda_a,model.lambda_r
++    α = mie_α_const(λa, λr)
++    x1 = zeros(Base.promote_eltype(model,V,T,z),30)
++    x2 = similar(x1)
++    cache = (x1,x2)
++    weights = model.weights
++    a = a_fe_ann(weights, α, T⃰, ρ⃰,cache)
++    a0 = a_fe_ann(weights, α, T⃰, zero(ρ⃰), cache)
++    return a - a0
++end
++
++function a_fe_ann(weights, α, T⃰, ρ⃰)
++    x1 = zeros(Base.promote_eltype(α, T⃰, ρ⃰),30)
++    x2 = similar(x1)
++    return a_fe_ann(weights, α, T⃰, ρ⃰,(x1,x2))
++end
++
++function a_fe_ann(weights, α, T⃰, ρ⃰, cache)
++    mul_cache, z = cache
++    x = SVector(promote(α, ρ⃰, 1.0 / T⃰))
++
++    mul!(mul_cache, weights.W0t, x)
++    z .= tanh.(mul_cache .+ weights.b0)
++
++    mul!(mul_cache, weights.W1t, z)
++    z .= tanh.(mul_cache .+ weights.b1)
++
++    mul!(mul_cache, weights.W2t, z)
++    z .= tanh.(mul_cache .+ weights.b2)
++
++    return dot(z, weights.Wh) / T⃰
++end
++
++"""
++    galliero_tc(ms, α)
++
++Calculate the critical temperature using the Galliero's CS correlation.
++Requires `ms` (chain length) and `α` (van der Waals constant for the mie fluid) 
++
++## References
++1. Hoang, H., Delage-Santacreu, S., & Galliero, G. (2017). Simultaneous description of equilibrium, interfacial, and transport properties of fluids using a Mie chain coarse-grained force field. Industrial & Engineering Chemistry Research, 56(32), 9213–9226. doi:10.1021/acs.iecr.7b01397
++"""
++function galliero_tc(ms, α)
++
++    # Table 1
++    A0, A1, A2, A3, A4, A5, A6, A7, A8 = -4.0219, -0.6969, 3.1689, -0.5822,  -0.3909, 1.4849, 0.7195, -3.1836, 0.2520
++
++    # Eq. 10 
++    sqrt_ms = sqrt(ms)
++    Tc = (A0 * exp(A1 * sqrt_ms) + A2) * α^(A3 * exp(A4 * ms) + A5)
++    Tc += (A6 * exp(A7 / sqrt_ms) + A8)
++    return Tc
++end
++
++"""
++    galliero_rholsat(ms, α)
++
++Calculate the an estimate of the saturated liquid density at Tr = 0.7 using the Galliero's CS correlation.
++Requires `ms` (chain length) and `α` (van der Waals constant for the mie fluid)
++
++## References
++1. Hoang, H., Delage-Santacreu, S., & Galliero, G. (2017). Simultaneous description of equilibrium, interfacial, and transport properties of fluids using a Mie chain coarse-grained force field. Industrial & Engineering Chemistry Research, 56(32), 9213–9226. doi:10.1021/acs.iecr.7b01397
++"""
++function galliero_rholsat(ms, α)
++
++    # Table 1
++    B0, B1, B2, B3, B4, B5, B6, B7, B8 = 0.3198, -0.6815, 0.2532, -1.9621, -0.4389, -2.5033, 0.1568, -0.1756, 0.5972
++
++    # Eq. 11
++    rholsat = (B0 * exp(B1 * ms) + B2) * exp((B3 * exp(B4 * ms) + B5) * α^1.75) 
++    rholsat += (B6 * exp(B7 * ms) + B8)
++    rholsat /= ms
++    return rholsat
++end
++
++"""
++    galliero_acentric_factor(ms, α)
++
++Calculate the an estimate of acentric factor using the Galliero's CS correlation.
++Requires `ms` (chain length) and `α` (van der Waals constant for the mie fluid) 
++
++## References
++1. Hoang, H., Delage-Santacreu, S., & Galliero, G. (2017). Simultaneous description of equilibrium, interfacial, and transport properties of fluids using a Mie chain coarse-grained force field. Industrial & Engineering Chemistry Research, 56(32), 9213–9226. doi:10.1021/acs.iecr.7b01397
++"""
++function galliero_acentric_factor(ms, α)
++
++    # Table 1
++    C0, C1, C2, C3 = -0.1574, -0.0008, 0.3158, -0.4292
++
++    # Eq. 12
++    α∞ = 1/3
++    sqrt_ms = sqrt(ms)
++    ω = (C0 * sqrt_ms + C1) * log(α - α∞)
++    ω += (C2 * sqrt_ms + C3)
++    return ω
++end
++
++T_scale(::FeANNMie,z) = 1.0
++Base.length(::FeANNMie) = 1
++paramtype(::FeANNMie{T}) where T = T
++paramtype(::Type{FeANNMie{T}}) where T = T
++component_list(model::FeANNMie) = ["Mie ($(model.lambda_r)-$(model.lambda_a)) fluid"]
++lb_volume(::FeANNMie,T,z) = 1/1.25
++Rgas(::FeANNMie) = 1.0
++idealmodel(::FeANNMie) = BasicIdeal()
++
++function x0_volume_liquid(model::FeANNMie,p,T,z)
++    α = mie_α_const(model)
++    tc = galliero_tc(1.0, α)
++    _1 = one(Base.promote_eltype(p,T,z))
++    rhol = galliero_rholsat(1.0, α)*_1
++    v0 = sum(z)/rhol
++    T > 0.7*tc && return v0
++    return volume_chill(model,p,T,z,v0,0.7tc)
++end
++
++function x0_crit_pure(model::FeANNMie,z)
++    α = mie_α_const(model)
++    Tr = galliero_tc(1.0, α) #T_scale is already one
++    return Tr, log10(1/galliero_rholsat(1.0, α))
++end
++
++export FeANNMie
+\ No newline at end of file
+diff --git a/src/models/Potentials/FeANNMie/params_ann.jls b/src/models/Potentials/FeANNMie/params_ann.jls
+new file mode 100644
+index 000000000..5415a6ce9
+Binary files /dev/null and b/src/models/Potentials/FeANNMie/params_ann.jls differ
+diff --git a/src/models/Potentials/FeANNMie/params_anns.jls b/src/models/Potentials/FeANNMie/params_anns.jls
+new file mode 100644
+index 000000000..f136c55ed
+Binary files /dev/null and b/src/models/Potentials/FeANNMie/params_anns.jls differ
+diff --git a/test/methods/eos.jl b/test/methods/eos.jl
+index 54a450609..e90f4261f 100644
+--- a/test/methods/eos.jl
++++ b/test/methods/eos.jl
+@@ -703,56 +703,76 @@ GC.gc()
+ 
+ end
+ 
+-@testset "PeTS" begin
+-    system = PeTS(["methane"])
+-    system.params.sigma.values[1] = 1e-10
+-    system.params.epsilon.values[1] = 1
+-    system.params.epsilon.values[1] = 1
+-
+-    #Values from FeOs notebook example:
+-    #We can reproduce FeOs values here
+-    crit = crit_pure(system)
+-    Tc,Pc,Vc  = crit
+-    @test Tc ≈ 1.08905 rtol = 1e-5
+-    @test Vc ≈ 1/513383.86 rtol = 1e-5
+-
+-    #first value from saturation pressure(T = 0.64):
+-    psat,vl,vv = saturation_pressure(system,0.64)
+-    @test psat ≈ 3.027452e+04 rtol = 1e-6
+-    @test vl  ≈ 1/1.359958e+06 rtol = 1e-6
+-    @test vv  ≈ 1/5892.917088 rtol = 1e-6
+-
+-    #uses the default x0_saturation_temperature initial guess
+-    @test saturation_temperature(system,psat)[1] ≈ 0.64  rtol = 1e-6
+-
+-    #uses the default x0_psat initial guess
+-    @test saturation_pressure(system,0.64,IsoFugacitySaturation(;crit))[1] ≈ 3.027452e+04 rtol = 1e-6
+-
+-    T_nearc = 1.084513 #The last value of their critical point is actually above ours.
+-    psat_nearc = 1.374330e+06
+-    @test saturation_pressure(system,T_nearc)[1] ≈ psat_nearc rtol = 1e-6
+-    @test saturation_pressure(system,T_nearc,IsoFugacitySaturation(;crit))[1] ≈ psat_nearc rtol = 1e-6
+-end
+-
+-@testset "KolafaNezbeda" begin
+-    system = KolafaNezbeda(["argon"])   # σ = 3.3952 Å, ϵ = 116.79 K
+-    σ, ε = system.params.sigma[1], system.params.epsilon[1]
+-
+-    # Tc* = 1.3396478, ρc* = 0.3108039, pc* = 0.1405304 (10.1016/j.fluid.2020.112772)
+-    Tc,pc,vc = crit_pure(system)
+-    @test Tc/ε ≈ 1.339647826460148 rtol = 1e-8
+-    @test pc*σ^3/(ε*Clapeyron.k_B) ≈ 0.1405303764858344 rtol = 1e-8
+-    @test σ^3*Clapeyron.N_A/vc ≈ 0.31080390096265526 rtol = 1e-8
+-
+-    # T* = 0.8: p* = 0.0046281073, ρl* = 0.80012251, ρv* = 0.0060751965
+-    psat,vl,vv = saturation_pressure(system,0.8*ε)
+-    @test psat ≈ 1.9067610763345455e5 rtol = 1e-6
+-    @test vl ≈ 2.9457134788241128e-5 rtol = 1e-6
+-    @test vv ≈ 3.8795974207135437e-3 rtol = 1e-6
+-
+-    # mixtures
+-    mix = KolafaNezbeda(["argon","methane"])
+-    @test Clapeyron.a_res(mix,5e-5,150.0,[0.4,0.6]) ≈ -1.8669348933846823 rtol = 1e-10
+-    set_k!(mix, [0.0 0.05; 0.05 0.0])
+-    @test Clapeyron.a_res(mix,5e-5,150.0,[0.4,0.6]) ≈ -1.7870541770130663 rtol = 1e-10
++@testset verbose = true "model potentials" begin
++    @testset "PeTS" begin
++        system = PeTS(["methane"])
++        system.params.sigma.values[1] = 1e-10
++        system.params.epsilon.values[1] = 1
++        system.params.epsilon.values[1] = 1
++
++        #Values from FeOs notebook example:
++        #We can reproduce FeOs values here
++        crit = crit_pure(system)
++        Tc,Pc,Vc  = crit
++        @test Tc ≈ 1.08905 rtol = 1e-5
++        @test Vc ≈ 1/513383.86 rtol = 1e-5
++
++        #first value from saturation pressure(T = 0.64):
++        psat,vl,vv = saturation_pressure(system,0.64)
++        @test psat ≈ 3.027452e+04 rtol = 1e-6
++        @test vl  ≈ 1/1.359958e+06 rtol = 1e-6
++        @test vv  ≈ 1/5892.917088 rtol = 1e-6
++
++        #uses the default x0_saturation_temperature initial guess
++        @test saturation_temperature(system,psat)[1] ≈ 0.64  rtol = 1e-6
++
++        #uses the default x0_psat initial guess
++        @test saturation_pressure(system,0.64,IsoFugacitySaturation(;crit))[1] ≈ 3.027452e+04 rtol = 1e-6
++
++        T_nearc = 1.084513 #The last value of their critical point is actually above ours.
++        psat_nearc = 1.374330e+06
++        @test saturation_pressure(system,T_nearc)[1] ≈ psat_nearc rtol = 1e-6
++        @test saturation_pressure(system,T_nearc,IsoFugacitySaturation(;crit))[1] ≈ psat_nearc rtol = 1e-6
++    end
++
++    @testset "KolafaNezbeda" begin
++        system = KolafaNezbeda(["argon"])   # σ = 3.3952 Å, ϵ = 116.79 K
++        σ, ε = system.params.sigma[1], system.params.epsilon[1]
++
++        # Tc* = 1.3396478, ρc* = 0.3108039, pc* = 0.1405304 (10.1016/j.fluid.2020.112772)
++        Tc,pc,vc = crit_pure(system)
++        @test Tc/ε ≈ 1.339647826460148 rtol = 1e-8
++        @test pc*σ^3/(ε*Clapeyron.k_B) ≈ 0.1405303764858344 rtol = 1e-8
++        @test σ^3*Clapeyron.N_A/vc ≈ 0.31080390096265526 rtol = 1e-8
++
++        # T* = 0.8: p* = 0.0046281073, ρl* = 0.80012251, ρv* = 0.0060751965
++        psat,vl,vv = saturation_pressure(system,0.8*ε)
++        @test psat ≈ 1.9067610763345455e5 rtol = 1e-6
++        @test vl ≈ 2.9457134788241128e-5 rtol = 1e-6
++        @test vv ≈ 3.8795974207135437e-3 rtol = 1e-6
++
++        # mixtures
++        mix = KolafaNezbeda(["argon","methane"])
++        @test Clapeyron.a_res(mix,5e-5,150.0,[0.4,0.6]) ≈ -1.8669348933846823 rtol = 1e-10
++        set_k!(mix, [0.0 0.05; 0.05 0.0])
++        @test Clapeyron.a_res(mix,5e-5,150.0,[0.4,0.6]) ≈ -1.7870541770130663 rtol = 1e-10
++    end
++
++    @testset "Fe-ANN-Mie" begin
++        fe_ann_mie = FeANNMie(12,6)
++        fe_anns_mie =FeANNMie(12,6,solid = true)
++        rho = (1:5) .* 0.1
++        V = 1 ./ rho
++        T = fill(2.0,5)
++        p1 = pressure.(fe_ann_mie,V,T)
++        p2 = pressure.(fe_anns_mie,V,T)
++        p10 = [0.17840788 0.33422359 0.49710743 0.72013464 1.10269866]
++        p20 = [0.17777895 0.33012058 0.49323471 0.7207129  1.10336088]
++        for i in 1:5
++            @test p1[i] ≈ p10[i] rtol = 1e-6
++            @test p2[i] ≈ p20[i] rtol = 1e-6
++        end
++
++    end
++
+ end

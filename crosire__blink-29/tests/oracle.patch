@@ -1,0 +1,189 @@
+diff --git a/source/main.cpp b/source/main.cpp
+index f32182f..26077e7 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -8,6 +8,7 @@
+ #include <iostream>
+ #include <Windows.h>
+ #include <Psapi.h>
++#include <TlHelp32.h> // GetProcessByName
+ 
+ #pragma region CRT sections
+ // This exists to imitate the behavior of the CRT initialization code
+@@ -32,6 +33,37 @@ void print(const char *message, size_t length)
+ 	WriteFile(console, message, size, &size, nullptr);
+ }
+ 
++DWORD GetProcessByName(PCSTR name)
++{
++	DWORD pid = 0;
++
++	WCHAR exe[MAX_PATH] = {};
++	mbstowcs_s(NULL, exe, name, MAX_PATH);
++
++	// Create toolhelp snapshot.
++	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++	PROCESSENTRY32 process;
++	ZeroMemory(&process, sizeof(process));
++	process.dwSize = sizeof(process);
++
++	// Walkthrough all processes.
++	if (Process32First(snapshot, &process))
++	{
++		do
++		{
++			if (wcscmp(process.szExeFile, exe) == 0)
++			{
++				pid = process.th32ProcessID;
++				break;
++			}
++		} while (Process32Next(snapshot, &process));
++	}
++
++	CloseHandle(snapshot);
++
++	return pid;
++}
++
+ DWORD CALLBACK remote_main(BYTE *image_base)
+ {
+ 	#pragma region Initialize module image
+@@ -124,27 +156,46 @@ int main(int argc, char *argv[])
+ 
+ 	if (argc > 1)
+ 	{
+-		pid = strtoul(argv[1], nullptr, 0);
+-
+-		if (pid == 0)
++		if (argc > 2)
+ 		{
+-			STARTUPINFOA startup_info = { sizeof(startup_info) };
+-			PROCESS_INFORMATION process_info = {};
++			if (strcmp(argv[1],"-a") == 0) // Attach to running process
++			{
++				// Is numerical PID
++				pid = strtoul(argv[2], nullptr, 0);
+ 
+-			std::string command_line;
+-			for (int i = 1; i < argc; ++i, command_line += ' ')
+-				command_line += argv[i];
++				if (pid == 0)
++				{
++					// Try to look up PID of running process by name
++					pid = GetProcessByName(argv[2]);
++				}
++			}
++		}
++		else
++		{
++			// Attach to running process by PID
++			pid = strtoul(argv[1], nullptr, 0);
+ 
+-			if (!CreateProcessA(nullptr, command_line.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &startup_info, &process_info))
++			// Launch target application and determine PID
++			if (pid == 0)
+ 			{
+-				std::cout << "Failed to start target application process!" << std::endl;
+-				return GetLastError();
+-			}
++				STARTUPINFOA startup_info = { sizeof(startup_info) };
++				PROCESS_INFORMATION process_info = {};
++
++				std::string command_line;
++				for (int i = 1; i < argc; ++i, command_line += ' ')
++					command_line += argv[i];
++
++				if (!CreateProcessA(nullptr, command_line.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &startup_info, &process_info))
++				{
++					std::cout << "Failed to start target application process!" << std::endl;
++					return GetLastError();
++				}
+ 
+-			pid = process_info.dwProcessId;
++				pid = process_info.dwProcessId;
+ 
+-			CloseHandle(process_info.hThread);
+-			CloseHandle(process_info.hProcess);
++				CloseHandle(process_info.hThread);
++				CloseHandle(process_info.hProcess);			
++			}
+ 		}
+ 	}
+ 
+diff --git a/source/pdb_reader.cpp b/source/pdb_reader.cpp
+index a20b542..f2082aa 100644
+--- a/source/pdb_reader.cpp
++++ b/source/pdb_reader.cpp
+@@ -226,12 +226,47 @@ void blink::pdb_reader::read_object_files(std::vector<std::filesystem::path> &ob
+ 	// Read module information stream (https://llvm.org/docs/PDB/DbiStream.html#dbi-mod-info-substream)
+ 	while (stream.tell() < sizeof(pdb_dbi_header) + header.module_info_size)
+ 	{
+-		stream.skip(sizeof(pdb_dbi_module_info));
++		const pdb_dbi_module_info &info = stream.read<pdb_dbi_module_info>();
+ 
+ 		const auto module_name = stream.read_string();
+ 		const auto obj_file_name = stream.read_string(); // Contains the name of the ".lib" if this object file is part of a library
+ 
+-		object_files.push_back(module_name);
++		std::filesystem::path path(module_name);
++
++		// Find absolute path to if necessary
++		if (path.is_relative())
++		{
++			if (info.symbol_stream != 65535 /*-1*/)
++			{
++				std::filesystem::path cwd;
++
++				// Look up current working directory in symbol stream https://llvm.org/docs/PDB/ModiStream.html
++				stream_reader stream(msf_reader::stream(info.symbol_stream));
++				stream.skip(4); // Skip 32-bit signature
++				
++				parse_code_view_records(stream, [&](uint16_t tag) {
++					if (tag == 0x113d) // S_ENVBLOCK
++					{
++						stream.skip(1);
++						while (stream.tell() < stream.size() && *stream.data() != '\0')
++						{
++							const auto key = stream.read_string();
++							const std::string value(stream.read_string());
++
++							if (key == "cwd")
++							{
++								cwd = value;
++								return;
++							}
++						}
++					}
++				});
++			
++				path = cwd / path;
++			}
++		}
++
++		object_files.push_back( path.string() );
+ 
+ 		stream.align(4);
+ 	}
+@@ -263,14 +298,19 @@ void blink::pdb_reader::read_source_files(std::vector<std::vector<std::filesyste
+ 	stream.skip(num_modules * sizeof(uint16_t) * 2 + num_source_files * sizeof(uint32_t));
+ 	const auto offset = stream.tell();
+ 
+-	source_files.resize(num_modules);
++	// Append source files to array
++	size_t n = source_files.size();
++	source_files.resize(n + num_modules);
+ 
+ 	for (uint32_t k = 0; k < num_modules; ++k)
+ 	{
+-		for (uint32_t i = 0; i < module_num_source_files[k]; ++i)
++		uint16_t num_files = module_num_source_files[k];
++		source_files[n + k].resize(num_files);
++
++		for (uint32_t i = 0; i < num_files; ++i)
+ 		{
+ 			stream.seek(offset + file_name_offsets[module_file_offsets[k] + i]);
+-			source_files[k].push_back(stream.read_string());
++			source_files[n + k][i] = stream.read_string();
+ 		}
+ 	}
+ }

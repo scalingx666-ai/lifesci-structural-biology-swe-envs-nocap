@@ -1,0 +1,388 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2a94c1337..3c3f6768a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@
+ * [Logging] - [#242](https://github.com/a-r-j/graphein/pull/242) Adds control of protein graph construction logging. Resolves [#238](https://github.com/a-r-j/graphein/issues/238)
+ 
+ #### Protein
++* [Feature] = [#263](https://github.com/a-r-j/graphein/pull/263) Adds control of Alt Loc selection strategy. N.b. Default `ProteinGraphConfig` changed to include insertions by default (`insertions=True`) and `alt_locs="max_occupancy"`.
+ * [Feature] - [#264](https://github.com/a-r-j/graphein/pull/264) Adds entrypoint to `graphein.protein.graphs.construct_graph` for passing in a BioPandas dataframe directly.
+ * [Feature] - [#229](https://github.com/a-r-j/graphein/pull/220) Adds support for filtering KNN edges based on self-loops and chain membership. Contribution by @anton-bushuiev.
+ * [Feature] - [#234](https://github.com/a-r-j/graphein/pull/234) Adds support for aggregating node features over residues (`graphein.protein.features.sequence.utils.aggregate_feature_over_residues`).
+diff --git a/graphein/protein/config.py b/graphein/protein/config.py
+index 90bba527c..23925db02 100644
+--- a/graphein/protein/config.py
++++ b/graphein/protein/config.py
+@@ -12,7 +12,7 @@
+ from typing import Any, Callable, List, Optional, Union
+ 
+ from deepdiff import DeepDiff
+-from pydantic import BaseModel
++from pydantic import BaseModel, validator
+ from typing_extensions import Literal
+ 
+ from graphein.protein.edges.distance import add_peptide_bonds
+@@ -97,6 +97,14 @@ class GetContactsConfig(BaseModel):
+ GranularityOpts = Literal["atom", "centroids"]
+ """Allowable granularity options for nodes in the graph."""
+ 
++AltLocsOpts = Union[
++    bool,
++    Literal[
++        "max_occupancy", "min_occupancy", "first", "last", "exclude", "include"
++    ],
++]
++"""Allowable altlocs options for alternative locations handling."""
++
+ 
+ class ProteinGraphConfig(BaseModel):
+     """
+@@ -118,6 +126,12 @@ class ProteinGraphConfig(BaseModel):
+     :type keep_hets: List[str]
+     :param insertions: Controls whether or not insertions are allowed.
+     :type insertions: bool
++    :param alt_locs: Controls whether or not alternative locations are allowed. The supported values are
++        ``"max_occupancy"``, ``"min_occupancy"``, ``"first"``, ``"last"``, ``"exclude"``. First two will leave altlocs
++        with the highest/lowest occupancies, next two will leave first/last in the PDB file ordering. The ``"exclude"``
++        value will drop them entirely and ``"include"`` leave all of them. Additionally, boolean values are the aliases
++        for the latest options. Default is ``"max_occupancy"``.
++    :type alt_locs: AltLocsOpts
+     :param pdb_dir: Specifies path to download protein structures into.
+     :type pdb_dir: pathlib.Path. Optional.
+     :param verbose: Specifies verbosity of graph creation process.
+@@ -151,7 +165,8 @@ class ProteinGraphConfig(BaseModel):
+ 
+     granularity: Union[GraphAtoms, GranularityOpts] = "CA"
+     keep_hets: List[str] = []
+-    insertions: bool = False
++    insertions: bool = True
++    alt_locs: AltLocsOpts = "max_occupancy"
+     pdb_dir: Optional[Path] = None
+     verbose: bool = False
+     exclude_waters: bool = True
+@@ -172,6 +187,15 @@ class ProteinGraphConfig(BaseModel):
+     get_contacts_config: Optional[GetContactsConfig] = None
+     dssp_config: Optional[DSSPConfig] = None
+ 
++    @validator("alt_locs")
++    def convert_alt_locs_aliases(cls, v):
++        if v is True:
++            return "include"
++        elif v is False:
++            return "exclude"
++        else:
++            return v
++
+     def __eq__(self, other: Any) -> bool:
+         """Overwrites the BaseModel __eq__ function in order to check more specific cases (like partial functions)."""
+         if isinstance(other, ProteinGraphConfig):
+diff --git a/graphein/protein/features/nodes/amino_acid.py b/graphein/protein/features/nodes/amino_acid.py
+index 8a3a8018f..0c0eaca65 100644
+--- a/graphein/protein/features/nodes/amino_acid.py
++++ b/graphein/protein/features/nodes/amino_acid.py
+@@ -200,20 +200,22 @@ def hydrogen_bond_donor(
+         returns a ``pd.Series``. Default is ``True``.
+     :type return_array: bool
+     """
+-    node_id = n.split(":")
+-    res = node_id[1]
++    res = d["residue_name"]
+ 
+-    if len(node_id) == 4:  # Atomic graph
+-        atom = node_id[-1]
++    # Hack to determine graph type
++    # If last ID component is atom type, assume graph is atomic
++    if n.split(":")[-1] == d["atom_type"]:
++        granularity = "atom"
++    else:
++        granularity = "residue"
++
++    if granularity == "atom":  # Atomic graph
++        atom = d["atom_type"]
+         try:
+             features = HYDROGEN_BOND_DONORS[res][atom]
+         except KeyError:
+-            try:  # Handle insertions
+-                atom = node_id[-2]
+-                features = HYDROGEN_BOND_DONORS[res][atom]
+-            except KeyError:
+-                features = 0
+-    elif len(node_id) == 3:  # Residue graph
++            features = 0
++    else:  # Residue graph
+         if res not in HYDROGEN_BOND_DONORS.keys():
+             features = 0
+         else:
+@@ -247,19 +249,21 @@ def hydrogen_bond_acceptor(
+         returns a ``pd.Series``. Default is ``True``.
+     :type return_array: bool
+     """
+-    node_id = n.split(":")
+-    res = node_id[1]
+-    if len(node_id) == 4:  # Atomic graph
+-        atom = node_id[-1]
++    res = d["residue_name"]
++    # Hack to determine graph type
++    # If last ID component is atom type, assume graph is atomic
++    if n.split(":")[-1] == d["atom_type"]:
++        granularity = "atom"
++    else:
++        granularity = "residue"
++
++    if granularity == "atom":  # Atomic graph
++        atom = d["atom_type"]
+         try:
+             features = HYDROGEN_BOND_ACCEPTORS[res][atom]
+         except KeyError:
+-            try:  # Handle insertions
+-                atom = node_id[-2]
+-                features = HYDROGEN_BOND_ACCEPTORS[res][atom]
+-            except KeyError:
+-                features = 0
+-    elif len(node_id) == 3:  # Residue graph
++            features = 0
++    else:  # Residue graph
+         if res not in HYDROGEN_BOND_ACCEPTORS.keys():
+             features = 0
+         else:
+diff --git a/graphein/protein/graphs.py b/graphein/protein/graphs.py
+index c74d4a43d..4a3499b5d 100644
+--- a/graphein/protein/graphs.py
++++ b/graphein/protein/graphs.py
+@@ -20,6 +20,7 @@
+ from loguru import logger as log
+ from rich.progress import Progress
+ from tqdm.contrib.concurrent import process_map
++from typing_extensions import Literal
+ 
+ from graphein.protein.config import (
+     DSSPConfig,
+@@ -151,6 +152,11 @@ def label_node_id(
+ 
+     if insertions:
+         df["node_id"] = df["node_id"] + ":" + df["insertion"].apply(str)
++        # Replace trailing : for non insertions
++        df["node_id"] = df["node_id"].str.replace(":$", "")
++    # Add Alt Loc identifiers
++    df["node_id"] = df["node_id"] + ":" + df["alt_loc"].apply(str)
++    df["node_id"] = df["node_id"].str.replace(":$", "")
+     df["residue_id"] = df["node_id"]
+     if granularity == "atom":
+         df["node_id"] = df["node_id"] + ":" + df["atom_name"]
+@@ -222,7 +228,49 @@ def subset_structure_to_atom_type(
+     )
+ 
+ 
+-def remove_insertions(df: pd.DataFrame, keep: str = "first") -> pd.DataFrame:
++def remove_alt_locs(
++    df: pd.DataFrame, keep: str = "max_occupancy"
++) -> pd.DataFrame:
++    """
++    This function removes alternatively located atoms from PDB DataFrames
++    (see https://proteopedia.org/wiki/index.php/Alternate_locations). Among the
++    alternative locations the ones with the highest occupancies are left.
++
++    :param df: Protein Structure dataframe to remove alternative located atoms
++        from.
++    :type df: pd.DataFrame
++    :param keep: Controls how to remove altlocs. Default is ``"max_occupancy"``.
++    :type keep: Literal["max_occupancy", "min_occupancy", "first", "last"]
++    :return: Protein structure dataframe with alternative located atoms removed
++    :rtype: pd.DataFrame
++    """
++    # Sort accordingly
++    if keep == "max_occupancy":
++        df = df.sort_values("occupancy")
++        keep = "last"
++    elif keep == "min_occupancy":
++        df = df.sort_values("occupancy")
++        keep = "first"
++    elif keep == "exclude":
++        keep = False
++
++    # Filter
++    duplicates = df.duplicated(
++        subset=["chain_id", "residue_number", "atom_name", "insertion"],
++        keep=keep,
++    )
++    df = df[~duplicates]
++
++    # Unsort
++    if keep in ["max_occupancy", "min_occupancy"]:
++        df = df.sort_index()
++
++    return df
++
++
++def remove_insertions(
++    df: pd.DataFrame, keep: Literal["first", "last"] = "first"
++) -> pd.DataFrame:
+     """
+     This function removes insertions from PDB DataFrames.
+ 
+@@ -231,13 +279,14 @@ def remove_insertions(df: pd.DataFrame, keep: str = "first") -> pd.DataFrame:
+     :param keep: Specifies which insertion to keep. Options are ``"first"`` or
+         ``"last"``.
+         Default is ``"first"``
+-    :type keep: str
++    :type keep: Literal["first", "last"]
+     :return: Protein structure dataframe with insertions removed
+     :rtype: pd.DataFrame
+     """
+     # Catches unnamed insertions
+     duplicates = df.duplicated(
+-        subset=["chain_id", "residue_number", "atom_name"], keep=keep
++        subset=["chain_id", "residue_number", "atom_name", "alt_loc"],
++        keep=keep,
+     )
+     df = df[~duplicates]
+ 
+@@ -246,11 +295,6 @@ def remove_insertions(df: pd.DataFrame, keep: str = "first") -> pd.DataFrame:
+         df, by_column="insertion", list_of_values=[""], boolean=True
+     )
+ 
+-    # Remove alt_locs
+-    df = filter_dataframe(
+-        df, by_column="alt_loc", list_of_values=["", "A"], boolean=True
+-    )
+-
+     return df
+ 
+ 
+@@ -275,6 +319,7 @@ def process_dataframe(
+     granularity: str = "centroids",
+     chain_selection: str = "all",
+     insertions: bool = False,
++    alt_locs: bool = False,
+     deprotonate: bool = True,
+     keep_hets: List[str] = [],
+     verbose: bool = False,
+@@ -303,6 +348,8 @@ def process_dataframe(
+     :type granularity: str
+     :param insertions: Whether or not to keep insertions.
+     :param insertions: bool
++    :param alt_locs: Whether or not to keep alternatively located atoms.
++    :param alt_locs: bool
+     :param deprotonate: Whether or not to remove hydrogen atoms (i.e.
+         deprotonation).
+     :type deprotonate: bool
+@@ -372,6 +419,10 @@ def process_dataframe(
+     protein_df = atoms
+ 
+     # Remove alt_loc residues
++    if alt_locs != "include":
++        protein_df = remove_alt_locs(protein_df, keep=alt_locs)
++
++    # Remove inserted residues
+     if not insertions:
+         protein_df = remove_insertions(protein_df)
+ 
+@@ -763,6 +814,7 @@ def construct_graph(
+             chain_selection=chain_selection,
+             granularity=config.granularity,
+             insertions=config.insertions,
++            alt_locs=config.alt_locs,
+             keep_hets=config.keep_hets,
+         )
+ 
+diff --git a/tests/protein/test_graphs.py b/tests/protein/test_graphs.py
+index 062de4d63..b9d8e4645 100644
+--- a/tests/protein/test_graphs.py
++++ b/tests/protein/test_graphs.py
+@@ -4,6 +4,7 @@
+ from pathlib import Path
+ 
+ import networkx as nx
++import numpy as np
+ import pytest
+ 
+ from graphein.protein.config import DSSPConfig, ProteinGraphConfig
+@@ -356,11 +357,12 @@ def test_graph_sequence_feature():
+         assert g_atom.graph[f"sequence_{c}"] == g_res.graph[f"sequence_{c}"]
+ 
+ 
+-def test_insertion_handling():
++def test_insertion_and_alt_loc_handling():
+     configs = {
+         "granularity": "CA",
+         "keep_hets": [],
+         "insertions": False,
++        "alt_locs": "max_occupancy",
+         "verbose": False,
+         "node_metadata_functions": [meiler_embedding, expasy_protein_scale],
+         "edge_construction_functions": [
+@@ -384,6 +386,73 @@ def test_insertion_handling():
+     assert g.graph["coords"].shape[0] == len(g)
+ 
+ 
++def test_alt_loc_exclusion():
++    configs = {
++        "granularity": "CA",
++        "keep_hets": [],
++        "insertions": True,
++        "alt_locs": "max_occupancy",
++        "verbose": False,
++        "node_metadata_functions": [meiler_embedding, expasy_protein_scale],
++        "edge_construction_functions": [
++            add_peptide_bonds,
++            add_hydrogen_bond_interactions,
++            add_ionic_interactions,
++            add_aromatic_sulphur_interactions,
++            add_hydrophobic_interactions,
++            add_cation_pi_interactions,
++        ],
++    }
++
++    config = ProteinGraphConfig(**configs)
++
++    # This is a PDB with three altlocs
++    g = construct_graph(config=config, pdb_code="2VVI")
++
++    # Test altlocs are dropped
++    assert len(set(g.nodes())) == len(g.nodes())
++
++    # Test the correct one is left
++    for opt, expected_coords, node_id in (
++        ("max_occupancy", [5.850, -9.326, -42.884], "A:CYS:195:A"),
++        ("min_occupancy", [5.864, -9.355, -42.943], "A:CYS:195:B"),
++        ("first", [5.850, -9.326, -42.884], "A:CYS:195:A"),
++        ("last", [5.864, -9.355, -42.943], "A:CYS:195:B"),
++    ):
++        config.alt_locs = opt
++        g = construct_graph(config=config, pdb_code="2VVI")
++        assert np.array_equal(g.nodes[node_id]["coords"], expected_coords)
++
++
++def test_alt_loc_inclusion():
++    configs = {
++        "granularity": "CA",
++        "keep_hets": [],
++        "insertions": False,
++        "alt_locs": True,
++        "verbose": False,
++        "node_metadata_functions": [meiler_embedding, expasy_protein_scale],
++        "edge_construction_functions": [
++            add_peptide_bonds,
++            add_hydrogen_bond_interactions,
++            add_ionic_interactions,
++            add_aromatic_sulphur_interactions,
++            add_hydrophobic_interactions,
++            add_cation_pi_interactions,
++        ],
++    }
++
++    config = ProteinGraphConfig(**configs)
++
++    # This is a PDB with an altloc leading to different residues
++    g = construct_graph(config=config, pdb_code="1ALX")
++
++    # Test both are present
++    assert "A:TYR:11:A" in g.nodes() and "A:TRP:11:B" in g.nodes()
++
++    # TODO Test on other PDBs where altlocs are of the same residues
++
++
+ def test_edges_do_not_add_nodes_for_chain_subset():
+     new_funcs = {
+         "edge_construction_functions": [

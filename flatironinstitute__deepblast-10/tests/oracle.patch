@@ -1,0 +1,658 @@
+diff --git a/deepblast/dataset/__init__.py b/deepblast/dataset/__init__.py
+new file mode 100644
+index 0000000..f0d19e3
+--- /dev/null
++++ b/deepblast/dataset/__init__.py
+@@ -0,0 +1 @@
++from deepblast.dataset.dataset import AlignmentDataset, collate
+diff --git a/deepblast/dataset/alphabet.py b/deepblast/dataset/alphabet.py
+new file mode 100644
+index 0000000..cc63bab
+--- /dev/null
++++ b/deepblast/dataset/alphabet.py
+@@ -0,0 +1,77 @@
++# Author : Tristian Bepler
++
++import numpy as np
++
++
++class Alphabet:
++    def __init__(self, chars, encoding=None, mask=False, missing=255):
++        self.chars = np.frombuffer(chars, dtype=np.uint8)
++        self.encoding = np.zeros(256, dtype=np.uint8) + missing
++        if encoding is None:
++            self.encoding[self.chars] = np.arange(len(self.chars))
++            self.size = len(self.chars)
++        else:
++            self.encoding[self.chars] = encoding
++            self.size = encoding.max() + 1
++        self.mask = mask
++        if mask:
++            self.size -= 1
++
++    def __len__(self):
++        return self.size
++
++    def __getitem__(self, i):
++        return chr(self.chars[i])
++
++    def encode(self, x):
++        """ encode a byte string into alphabet indices """
++        x = np.frombuffer(x, dtype=np.uint8)
++        z = self.encoding[x]
++        return z
++
++    def decode(self, x):
++        """ decode index array, x, to byte string of this alphabet """
++        string = self.chars[x]
++        return string.tobytes()
++
++    def unpack(self, h, k):
++        """ unpack integer h into array of this alphabet with length k """
++        n = self.size
++        kmer = np.zeros(k, dtype=np.uint8)
++        for i in reversed(range(k)):
++            c = h % n
++            kmer[i] = c
++            h = h // n
++        return kmer
++
++    def get_kmer(self, h, k):
++        """ retrieve byte string of length k decoded from integer h """
++        kmer = self.unpack(h, k)
++        return self.decode(kmer)
++
++
++DNA = Alphabet(b'ACGT')
++
++
++class Uniprot21(Alphabet):
++    def __init__(self, mask=False):
++        chars = b'ARNDCQEGHILKMFPSTWYVXOUBZ'
++        encoding = alphabet = np.arange(len(chars))
++        encoding[21:] = [11,4,20,20] # encode 'OUBZ' as synonyms
++        super(Uniprot21, self).__init__(chars, encoding=encoding, mask=mask, missing=20)
++
++
++class UniprotTokenizer:
++
++    def __init__(self):
++        self.alphabet = Uniprot21()
++
++    def __call__(self, x):
++        # encode sequence
++        s = np.array(x.upper())
++        x = self.alphabet.encode(s)
++        # pad with start/stop token
++        z = np.zeros(len(x) + 2, dtype=x.dtype)
++        z[1:-1] = x + 1
++        return z
++
+diff --git a/deepblast/dataset/dataset.py b/deepblast/dataset/dataset.py
+new file mode 100644
+index 0000000..fe79c08
+--- /dev/null
++++ b/deepblast/dataset/dataset.py
+@@ -0,0 +1,122 @@
++import numpy as np
++
++import torch
++from torch.utils.data import Dataset
++from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
++from scipy.sparse import coo_matrix
++from deepblast.dataset.alphabet import UniprotTokenizer
++
++
++def state_f(z):
++    x, m, y = 0, 1, 2 # state numberings
++    if z[0] == '-':
++        return x
++    if z[1] == '-':
++        return y
++    else:
++        return m
++
++def states2matrix(states, N, M):
++    """ Converts state string to alignment matrix. """
++    x, m, y = 0, 1, 2 # state numberings
++    # Encode as sparse matrix
++    i, j = 0, 0
++    coords = [(i, j)]
++    for st in states:
++        if st == x:
++            j += 1
++        elif st == y:
++            i += 1
++        else:
++            i += 1
++            j += 1
++        coords.append((i, j))
++    data = np.ones(len(coords))
++    row, col = list(zip(*coords))
++    row, col = np.array(row), np.array(col)
++    mat = coo_matrix((data, (row, col)), shape=(N, M)).toarray()
++    return mat
++
++
++def collate(xs):
++    B = len(xs)
++    N = max(len(x) for x in xs)
++    lengths = np.array([len(x) for x in xs], dtype=int)
++
++    order = np.argsort(lengths)[::-1]
++    lengths = lengths[order]
++
++    X = torch.LongTensor(B, N).zero_() + mask_idx
++    for i in range(B):
++        x = xs[order[i]]
++        n = len(x)
++        X[i,:n] = torch.from_numpy(x)
++    return X, lengths
++
++
++class AlignmentDataset(Dataset):
++    """ Dataset for training and testing. """
++    def __init__(self, pairs, tokenizer=UniprotTokenizer()):
++        """ Read in pairs of proteins
++
++        Parameters
++        ----------
++        pairs: np.array of str
++            Pairs of proteins that are aligned.  This includes gaps
++            and require that the proteins have the same length
++        """
++        self.pairs = pairs
++        self.tokenizer = tokenizer
++
++    def __len__(self):
++        return self.pairs.shape[0]
++
++    def __getitem__(self, i):
++        """ Gets alignment pair.
++
++        Parameters
++        ----------
++        i : int
++           Index of item
++
++        Returns
++        -------
++        gene : torch.Tensor
++           Encoded representation of protein of interest
++        pos : torch.Tensor
++           Encoded representation of protein that aligns with `gene`.
++        states : torch.Tensor
++           Alignment string
++        alignment_matrix : torch.Tensor
++           Ground truth alignment matrix
++        """
++        gene = self.pairs.loc[i, 0]
++        pos = self.pairs.loc[i, 1]
++        assert len(gene) == len(pos)
++        alnstr = list(zip(list(gene), list(pos)))
++        states = torch.Tensor(list(map(state_f, alnstr)))
++        gene = self.tokenizer(str.encode(gene.replace('-', '')))
++        pos = self.tokenizer(str.encode(pos.replace('-', '')))
++        N, M = len(gene), len(pos)
++        alignment_matrix = torch.from_numpy(states2matrix(states, N, M))
++        return gene, pos, states, alignment_matrix
++
++    def __iter__(self):
++        worker_info = torch.utils.data.get_worker_info()
++        start = 0
++        end = len(self.pairs)
++
++        if worker_info is None:  # single-process data loading
++            for i in range(end):
++                yield self.__getitem__(i)
++        else:
++            worker_id = worker_info.id
++            w = float(worker_info.num_workers)
++            t = (end - start)
++            w = float(worker_info.num_workers)
++            per_worker = int(math.ceil(t / w))
++            worker_id = worker_info.id
++            iter_start = start + worker_id * per_worker
++            iter_end = min(iter_start + per_worker, end)
++            for i in range(iter_start, iter_end):
++                yield self.__getitem__(i)
+diff --git a/deepblast/dataset/tests/test_alphabet.py b/deepblast/dataset/tests/test_alphabet.py
+new file mode 100644
+index 0000000..a602f7d
+--- /dev/null
++++ b/deepblast/dataset/tests/test_alphabet.py
+@@ -0,0 +1,26 @@
++import numpy as np
++import torch
++import unittest
++from deepblast.dataset.alphabet import UniprotTokenizer
++import numpy.testing as npt
++
++
++class TestAlphabet(unittest.TestCase):
++
++    def test_tokenizer(self):
++        tokenizer = UniprotTokenizer()
++        res = tokenizer(b'ARNDCQEGHILKMFPSTWYVXOUBZ')
++        # Need to account for padding and offset
++        exp = np.array([0] + list(range(1, 22)) + [12,5,21,21] + [0])
++        npt.assert_allclose(res, exp)
++
++    def test_tokenizer_encode(self):
++        tokenizer = UniprotTokenizer()
++        x = 'ARNDCQEGHILKMFPSTWYVXOUBZ'
++        x = str.encode(x)
++        res = tokenizer(x)
++        self.assertEqual(len(x) + 2, len(res))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/deepblast/dataset/tests/test_dataset.py b/deepblast/dataset/tests/test_dataset.py
+new file mode 100644
+index 0000000..aaff796
+--- /dev/null
++++ b/deepblast/dataset/tests/test_dataset.py
+@@ -0,0 +1,34 @@
++import numpy as np
++import torch
++import unittest
++from deepblast.utils import get_data_path
++from deepblast.dataset import AlignmentDataset
++import pandas as pd
++
++
++class TestDataset(unittest.TestCase):
++
++    def setUp(self):
++        self.data_path = get_data_path('example.txt')
++        self.pairs = pd.read_table(self.data_path, header=None)
++
++    def test_constructor(self):
++        x = AlignmentDataset(self.pairs)
++        self.assertEqual(len(x), 3)
++
++    def test_getitem(self):
++        x = AlignmentDataset(self.pairs)
++        res = x[0]
++        self.assertEqual(len(res), 4)
++        gene, pos, states, alignment_matrix = res
++        self.assertFalse('-' in gene)
++        self.assertFalse('-' in pos)
++        # test the lengths
++        self.assertEqual(len(gene) - 2, 81)
++        self.assertEqual(len(pos) - 2, 81)
++        self.assertEqual(len(states), 100)
++        self.assertEqual(alignment_matrix.shape, (83, 83))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/deepblast/language_model.py b/deepblast/language_model.py
+new file mode 100644
+index 0000000..009c524
+--- /dev/null
++++ b/deepblast/language_model.py
+@@ -0,0 +1,250 @@
++import os
++import torch
++import torch.nn as nn
++from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
++import torch.nn.functional as F
++
++_ROOT = os.path.abspath(os.path.dirname(__file__))
++
++
++def get_model(path):
++    return os.path.join(_ROOT, 'pretrained_models', path)
++
++
++pretrained_language_models = {
++    'bilstm' : get_model('lstm2x.pt')
++}
++
++
++class BiLM(nn.Module):
++    """ Two layer LSTM implemented in Bepler et al 2019"""
++    def __init__(self, nin=22, nout=21, embedding_dim=21, hidden_dim=1024,
++                 num_layers=2, tied=True, mask_idx=None, dropout=0):
++        super(BiLM, self).__init__()
++
++        if mask_idx is None:
++            mask_idx = nin-1
++        self.mask_idx = mask_idx
++        self.embed = nn.Embedding(nin, embedding_dim, padding_idx=mask_idx)
++        self.dropout = nn.Dropout(p=dropout)
++
++        self.tied = tied
++        if tied:
++            layers = []
++            nin = embedding_dim
++            for _ in range(num_layers):
++                layers.append(nn.LSTM(nin, hidden_dim, 1, batch_first=True))
++                nin = hidden_dim
++            self.rnn = nn.ModuleList(layers)
++        else:
++            layers = []
++            nin = embedding_dim
++            for _ in range(num_layers):
++                layers.append(nn.LSTM(nin, hidden_dim, 1, batch_first=True))
++                nin = hidden_dim
++            self.lrnn = nn.ModuleList(layers)
++
++            layers = []
++            nin = embedding_dim
++            for _ in range(num_layers):
++                layers.append(nn.LSTM(nin, hidden_dim, 1, batch_first=True))
++                nin = hidden_dim
++            self.rrnn = nn.ModuleList(layers)
++
++        self.linear = nn.Linear(hidden_dim, nout)
++
++    def hidden_size(self):
++        h = 0
++        if self.tied:
++            for layer in self.rnn:
++                h += 2*layer.hidden_size
++        else:
++            for layer in self.lrnn:
++                h += layer.hidden_size
++            for layer in self.rrnn:
++                h += layer.hidden_size
++        return h
++
++
++    def reverse(self, h):
++        packed = type(h) is PackedSequence
++        if packed:
++            h,batch_sizes = pad_packed_sequence(h, batch_first=True)
++            h_rvs = h.clone().zero_()
++            for i in range(h.size(0)):
++                n = batch_sizes[i]
++                idx = [j for j in range(n-1, -1, -1)]
++                idx = torch.LongTensor(idx).to(h.device)
++                h_rvs[i,:n] = h[i].index_select(0, idx)
++            # repack h_rvs
++            h_rvs = pack_padded_sequence(h_rvs, batch_sizes, batch_first=True)
++        else:
++            idx = [i for i in range(h.size(1)-1, -1, -1)]
++            idx = torch.LongTensor(idx).to(h.device)
++            h_rvs = h.index_select(1, idx)
++        return h_rvs
++
++
++    def transform(self, z_fwd, z_rvs, last_only=False):
++        # sequences are flanked by the start/stop token as:
++        # [stop, x, stop]
++
++        # z_fwd should be [stop,x]
++        # z_rvs should be [x,stop] reversed
++
++        # first, do the forward direction
++        if self.tied:
++            layers = self.rnn
++        else:
++            layers = self.lrnn
++
++        h_fwd = []
++        h = z_fwd
++        for rnn in layers:
++            h,_ = rnn(h)
++            if type(h) is PackedSequence:
++                h = PackedSequence(self.dropout(h.data), h.batch_sizes)
++            else:
++                h = self.dropout(h)
++            if not last_only:
++                h_fwd.append(h)
++        if last_only:
++            h_fwd = h
++
++        # now, do the reverse direction
++        if self.tied:
++            layers = self.rnn
++        else:
++            layers = self.rrnn
++
++        # we'll need to reverse the direction of these
++        # hidden states back to match forward direction
++
++        h_rvs = []
++        h = z_rvs
++        for rnn in layers:
++            h,_ = rnn(h)
++            if type(h) is PackedSequence:
++                h = PackedSequence(self.dropout(h.data), h.batch_sizes)
++            else:
++                h = self.dropout(h)
++            if not last_only:
++                h_rvs.append(self.reverse(h))
++        if last_only:
++            h_rvs = self.reverse(h)
++
++        return h_fwd,h_rvs
++
++
++    def embed_and_split(self, x, pad=False):
++
++        packed = type(x) is PackedSequence
++        if packed:
++            x,batch_sizes = pad_packed_sequence(x, batch_first=True)
++
++        if pad:
++            # pad x with the start/stop token
++            x = x + 1
++            ## append start/stop tokens to x
++            x_ = x.data.new(x.size(0), x.size(1)+2).zero_()
++            if packed:
++                for i in range(len(batch_sizes)):
++                    n = batch_sizes[i]
++                    x_[i,1:n+1] = x[i,:n]
++                batch_sizes = [s+2 for s in batch_sizes]
++            else:
++                x_[:,1:-1] = x
++            x = x_
++
++        # sequences x are flanked by the start/stop token as:
++        # [stop, x, stop]
++
++        # now, encode x as distributed vectors
++        z = self.embed(x)
++
++        # to pass to transform, we discard the last element for z_fwd and the first element for z_rvs
++        z_fwd = z[:,:-1]
++        z_rvs = z[:,1:]
++        if packed:
++            lengths = [s-1 for s in batch_sizes]
++            z_fwd = pack_padded_sequence(z_fwd, lengths, batch_first=True)
++            z_rvs = pack_padded_sequence(z_rvs, lengths, batch_first=True)
++        # reverse z_rvs
++        z_rvs = self.reverse(z_rvs)
++
++        return z_fwd, z_rvs
++
++
++    def encode(self, x):
++        z_fwd,z_rvs = self.embed_and_split(x, pad=True)
++        h_fwd_layers,h_rvs_layers = self.transform(z_fwd, z_rvs)
++
++        # concatenate hidden layers together
++        packed = type(z_fwd) is PackedSequence
++        concat = []
++        for h_fwd,h_rvs in zip(h_fwd_layers,h_rvs_layers):
++            if packed:
++                h_fwd,batch_sizes = pad_packed_sequence(h_fwd, batch_first=True)
++                h_rvs,batch_sizes = pad_packed_sequence(h_rvs, batch_first=True)
++            # discard last element of h_fwd and first element of h_rvs
++            h_fwd = h_fwd[:,:-1]
++            h_rvs = h_rvs[:,1:]
++
++            # accumulate for concatenation
++            concat.append(h_fwd)
++            concat.append(h_rvs)
++
++        h = torch.cat(concat, 2)
++        if packed:
++            batch_sizes = [s-1 for s in batch_sizes]
++            h = pack_padded_sequence(h, batch_sizes, batch_first=True)
++
++        return h
++
++
++    def forward(self, x):
++        # x's are already flanked by the star/stop token as:
++        # [stop, x, stop]
++        z_fwd,z_rvs = self.embed_and_split(x, pad=False)
++
++        h_fwd,h_rvs = self.transform(z_fwd, z_rvs, last_only=True)
++
++        packed = type(z_fwd) is PackedSequence
++        if packed:
++            h_flat = h_fwd.data
++            logp_fwd = self.linear(h_flat)
++            logp_fwd = PackedSequence(logp_fwd, h_fwd.batch_sizes)
++
++            h_flat = h_rvs.data
++            logp_rvs = self.linear(h_flat)
++            logp_rvs = PackedSequence(logp_rvs, h_rvs.batch_sizes)
++
++            logp_fwd,batch_sizes = pad_packed_sequence(logp_fwd, batch_first=True)
++            logp_rvs,batch_sizes = pad_packed_sequence(logp_rvs, batch_first=True)
++
++        else:
++            b = h_fwd.size(0)
++            n = h_fwd.size(1)
++            h_flat = h_fwd.contiguous().view(-1, h_fwd.size(2))
++            logp_fwd = self.linear(h_flat)
++            logp_fwd = logp_fwd.view(b, n, -1)
++
++            h_flat = h_rvs.contiguous().view(-1, h_rvs.size(2))
++            logp_rvs = self.linear(h_flat)
++            logp_rvs = logp_rvs.view(b, n, -1)
++
++        # prepend forward logp with zero
++        # postpend reverse logp with zero
++
++        b = h_fwd.size(0)
++        zero = h_fwd.data.new(b,1,logp_fwd.size(2)).zero_()
++        logp_fwd = torch.cat([zero, logp_fwd], 1)
++        logp_rvs = torch.cat([logp_rvs, zero], 1)
++
++        logp = F.log_softmax(logp_fwd + logp_rvs, dim=2)
++
++        if packed:
++            batch_sizes = [s+1 for s in batch_sizes]
++            logp = pack_padded_sequence(logp, batch_sizes, batch_first=True)
++
++        return logp
+diff --git a/deepblast/tests/test_language_model.py b/deepblast/tests/test_language_model.py
+new file mode 100644
+index 0000000..bbb6f66
+--- /dev/null
++++ b/deepblast/tests/test_language_model.py
+@@ -0,0 +1,22 @@
++import torch
++from deepblast.language_model import BiLM, pretrained_language_models
++from deepblast.dataset.alphabet import UniprotTokenizer
++import unittest
++
++
++class TestBiLM(unittest.TestCase):
++
++    def test_bilm(self):
++        path = pretrained_language_models['bilstm']
++        embedding = BiLM()
++        embedding.load_state_dict(torch.load(path))
++        embedding.eval()
++
++        tokenizer = UniprotTokenizer()
++        toks = torch.Tensor(tokenizer(b'ABC')).long().unsqueeze(0)
++        res = embedding(toks)
++        self.assertEqual(res.shape, (1, 5, 21))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/deepblast/tests/test_viterbi.py b/deepblast/tests/test_viterbi.py
+index a750603..20add76 100644
+--- a/deepblast/tests/test_viterbi.py
++++ b/deepblast/tests/test_viterbi.py
+@@ -15,7 +15,7 @@
+ 
+ 
+ class TestViterbiUtils(unittest.TestCase):
+-
++    # Careful, we know that these tests are broken
+     def setUp(self):
+         # smoke tests
+         torch.manual_seed(0)
+@@ -86,6 +86,7 @@ def test_adjoint_backward_pass(self):
+ 
+ 
+ class TestViterbiDecoder(unittest.TestCase):
++    # Careful, we know that these tests are broken
+     def setUp(self):
+         # smoke tests
+         torch.manual_seed(0)
+diff --git a/deepblast/utils.py b/deepblast/utils.py
+index 4b1d52c..ea7fd29 100644
+--- a/deepblast/utils.py
++++ b/deepblast/utils.py
+@@ -1,5 +1,7 @@
++import os
+ import numpy as np
+ from scipy.stats import multivariate_normal
++import inspect
+ 
+ 
+ def sample(transition_matrix,
+@@ -66,3 +68,35 @@ def make_alignment_data():
+     X = rng.randn(m, 3)
+     Y = rng.randn(n, 3)
+     return pairwise_distances(X, Y) / 10
++
++
++def get_data_path(fn, subfolder='data'):
++    """Return path to filename ``fn`` in the data folder.
++    During testing it is often necessary to load data files. This
++    function returns the full path to files in the ``data`` subfolder
++    by default.
++    Parameters
++    ----------
++    fn : str
++        File name.
++    subfolder : str, defaults to ``data``
++        Name of the subfolder that contains the data.
++    Returns
++    -------
++    str
++        Inferred absolute path to the test data for the module where
++        ``get_data_path(fn)`` is called.
++    Notes
++    -----
++    The requested path may not point to an existing file, as its
++    existence is not checked.
++    This is from skbio's code base
++    https://github.com/biocore/scikit-bio/blob/master/skbio/util/_testing.py#L50
++    """
++    # getouterframes returns a list of tuples: the second tuple
++    # contains info about the caller, and the second element is its
++    # filename
++    callers_filename = inspect.getouterframes(inspect.currentframe())[1][1]
++    path = os.path.dirname(os.path.abspath(callers_filename))
++    data_path = os.path.join(path, subfolder, fn)
++    return data_path
+diff --git a/deepblast/viterbi.py b/deepblast/viterbi.py
+index 8d11751..7aa3e8e 100644
+--- a/deepblast/viterbi.py
++++ b/deepblast/viterbi.py
+@@ -131,8 +131,8 @@ def _adjoint_forward_pass(Qt, Q, Ztheta, ZA, operator='softmax'):
+             # nullify illegal actions (TODO make unittest for this)
+             # vx[y] = 0 vy[x] = 0
+             Vd[i, j, m] = Ztheta[i - 1, j - 1, m] + Q[i, j, m] @ vm
+-            Vd[i, j, x] = Ztheta[i - 1, j - 1, x] + Q[i, j, x] @ vx
+-            Vd[i, j, y] = Ztheta[i - 1, j - 1, y] + Q[i, j, y] @ vy
++            Vd[i, j, x] = Ztheta[i - 1, j, x] + Q[i, j, x] @ vx
++            Vd[i, j, y] = Ztheta[i, j - 1, y] + Q[i, j, y] @ vy
+             Qd[i, j, m] = operator.hessian_product(Q[i, j, m], vm)
+             Qd[i, j, x] = operator.hessian_product(Q[i, j, x], vx)
+             Qd[i, j, y] = operator.hessian_product(Q[i, j, y], vy)

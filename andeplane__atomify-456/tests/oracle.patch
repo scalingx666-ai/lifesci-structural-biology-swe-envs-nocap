@@ -1,0 +1,1151 @@
+diff --git a/package-lock.json b/package-lock.json
+index eaa34cdb..1f45098e 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -48,6 +48,7 @@
+         "@vitest/ui": "^4.1.10",
+         "eslint": "^9.39.5",
+         "eslint-plugin-react-hooks": "^7.1.1",
++        "fake-indexeddb": "^6.2.5",
+         "globals": "^17.13.0",
+         "jsdom": "^29.0.1",
+         "prettier": "3.9.6",
+@@ -3474,6 +3475,16 @@
+         "node": ">=12.0.0"
+       }
+     },
++    "node_modules/fake-indexeddb": {
++      "version": "6.2.5",
++      "resolved": "https://registry.npmjs.org/fake-indexeddb/-/fake-indexeddb-6.2.5.tgz",
++      "integrity": "sha512-CGnyrvbhPlWYMngksqrSSUT1BAVP49dZocrHuK0SvtR0D5TMs5wP0o3j7jexDJW01KSadjBp1M/71o/KR3nD1w==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/fast-deep-equal": {
+       "version": "3.1.3",
+       "resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
+diff --git a/package.json b/package.json
+index bb258f0b..a19fcc44 100644
+--- a/package.json
++++ b/package.json
+@@ -69,6 +69,7 @@
+     "@vitest/ui": "^4.1.10",
+     "eslint": "^9.39.5",
+     "eslint-plugin-react-hooks": "^7.1.1",
++    "fake-indexeddb": "^6.2.5",
+     "globals": "^17.13.0",
+     "jsdom": "^29.0.1",
+     "prettier": "3.9.6",
+diff --git a/src/storage/contentsProjectStorage.test.ts b/src/storage/contentsProjectStorage.test.ts
+index 48f90741..b1470f56 100644
+--- a/src/storage/contentsProjectStorage.test.ts
++++ b/src/storage/contentsProjectStorage.test.ts
+@@ -1,7 +1,7 @@
+-import { describe, expect, it, beforeEach } from "vitest";
++import { describe, expect, it, beforeEach, vi } from "vitest";
+ import { ContentsProjectStorage } from "./contentsProjectStorage";
+ import type { ContentsRecord } from "./contentsSchema";
+-import { MemoryStore } from "./kv";
++import { MemoryStore, type KeyValueStore } from "./kv";
+ import type { ProjectMeta, ProjectStorage } from "./types";
+ 
+ describe("ContentsProjectStorage", () => {
+@@ -209,6 +209,119 @@ describe("ContentsProjectStorage", () => {
+       ).toBeNull();
+     });
+ 
++    it("scopes key scans to the directory instead of listing the whole store", async () => {
++      await storage.write(dirName, "data/one.txt", "1");
++      // A sibling whose name shares the prefix must not leak in.
++      const other = await storage.createProject({ displayName: "Proj 2" });
++      await storage.write(other.dirName, "data/one.txt", "x");
++      const keys = vi.spyOn(files, "keys");
++
++      expect((await storage.list(dirName, "data")).map((s) => s.path)).toEqual([
++        "data/one.txt",
++      ]);
++      await storage.rename(dirName, "data", "inputs");
++      await storage.remove(dirName, "inputs");
++      await storage.listProjects();
++      await storage.deleteProject(dirName);
++
++      expect(keys).not.toHaveBeenCalled();
++      expect(await storage.read(other.dirName, "data/one.txt")).toBe("x");
++    });
++
++    it("falls back to filtering keys() for stores without prefix queries", async () => {
++      const plain: KeyValueStore = {
++        getItem: (key) => files.getItem(key),
++        setItem: (key, value) => files.setItem(key, value),
++        removeItem: (key) => files.removeItem(key),
++        keys: () => files.keys(),
++      };
++      const fallback = new ContentsProjectStorage(plain, checkpoints);
++      await fallback.write(dirName, "data/one.txt", "1");
++
++      await fallback.rename(dirName, "data", "inputs");
++
++      expect((await fallback.list(dirName)).map((s) => s.path)).toContain(
++        "inputs",
++      );
++      expect((await fallback.listProjects()).map((p) => p.dirName)).toEqual([
++        dirName,
++      ]);
++    });
++
++    it("renames crash-safely: every new key is written before any old key is removed", async () => {
++      await storage.write(dirName, "data/one.txt", "1");
++      await storage.write(dirName, "data/deep/two.txt", "2");
++      await checkpoints.setItem(`${dirName}/data/one.txt`, [{ id: "0" }]);
++      const ops: string[] = [];
++      for (const [name, store] of [
++        ["files", files],
++        ["checkpoints", checkpoints],
++      ] as const) {
++        const set = store.setItem.bind(store);
++        const remove = store.removeItem.bind(store);
++        vi.spyOn(store, "setItem").mockImplementation((key, value) => {
++          ops.push(`${name} set ${key}`);
++          return set(key, value);
++        });
++        vi.spyOn(store, "removeItem").mockImplementation((key) => {
++          ops.push(`${name} remove ${key}`);
++          return remove(key);
++        });
++      }
++
++      await storage.rename(dirName, "data", "inputs");
++
++      const lastSet = ops.findLastIndex((op) => op.includes(" set "));
++      const firstRemove = ops.findIndex((op) => op.includes(" remove "));
++      expect(lastSet).toBeLessThan(firstRemove);
++      expect(ops).toContain(`checkpoints set ${dirName}/inputs/one.txt`);
++      // The old directory record goes last.
++      expect(ops.at(-1)).toMatch(new RegExp(` remove ${dirName}/data$`));
++    });
++
++    it("leaves a duplicate, never a hole, when a rename is interrupted", async () => {
++      await storage.write(dirName, "data/one.txt", "1");
++      await storage.write(dirName, "data/two.txt", "2");
++      vi.spyOn(files, "removeItem").mockRejectedValue(new Error("tab closed"));
++
++      await expect(storage.rename(dirName, "data", "inputs")).rejects.toThrow();
++
++      for (const dir of ["data", "inputs"]) {
++        expect(await storage.read(dirName, `${dir}/one.txt`)).toBe("1");
++        expect(await storage.read(dirName, `${dir}/two.txt`)).toBe("2");
++      }
++    });
++
++    it("treats a rename onto itself as a no-op and refuses moving into itself", async () => {
++      await storage.write(dirName, "data/one.txt", "1");
++
++      await storage.rename(dirName, "data", "data");
++      expect(await storage.read(dirName, "data/one.txt")).toBe("1");
++
++      await expect(
++        storage.rename(dirName, "data", "data/nested"),
++      ).rejects.toThrow(/into itself/);
++      expect(await storage.read(dirName, "data/one.txt")).toBe("1");
++    });
++
++    it("deletes project.json and the directory record last", async () => {
++      await storage.write(dirName, "in.script", "run 100");
++      const removed: string[] = [];
++      const remove = files.removeItem.bind(files);
++      vi.spyOn(files, "removeItem").mockImplementation((key) => {
++        removed.push(key);
++        return remove(key);
++      });
++
++      await storage.deleteProject(dirName);
++
++      expect(removed.slice(-2)).toEqual([
++        `${dirName}/.atomify/project.json`,
++        dirName,
++      ]);
++      expect(await files.keys()).toEqual([]);
++    });
++
+     it("rejects paths JupyterLite cannot handle", async () => {
+       await expect(storage.write(dirName, "bad%name", "x")).rejects.toThrow(
+         /%/,
+diff --git a/src/storage/contentsProjectStorage.ts b/src/storage/contentsProjectStorage.ts
+index 852e2bde..dd697462 100644
+--- a/src/storage/contentsProjectStorage.ts
++++ b/src/storage/contentsProjectStorage.ts
+@@ -7,7 +7,9 @@
+  * construction) or an in-memory store (quick runs, embeds, tests). Listing
+  * never bulk-reads file bodies beyond the directory being listed: project
+  * and run discovery scan keys and read only the small `.atomify/*.json`
+- * records.
++ * records. Key scans are scoped too — a key range under the directory
++ * (keysWithPrefix), or a skip-scan of top-level names for the library — so
++ * their cost follows the project, not every file in the whole library.
+  */
+ 
+ import {
+@@ -22,7 +24,9 @@ import {
+ import {
+   createJupyterCheckpointsStore,
+   createJupyterFilesStore,
++  keysWithPrefix,
+   MemoryStore,
++  topLevelNames,
+ } from "./kv";
+ import type { KeyValueStore } from "./kv";
+ import { uniqueSlug } from "./slug";
+@@ -54,12 +58,7 @@ export class ContentsProjectStorage implements ProjectStorage {
+   // --- Projects -----------------------------------------------------------
+ 
+   async listProjects(): Promise<ProjectMeta[]> {
+-    const keys = await this.files.keys();
+-    const topLevel = new Set<string>();
+-    for (const key of keys) {
+-      const slash = key.indexOf("/");
+-      topLevel.add(slash === -1 ? key : key.slice(0, slash));
+-    }
++    const topLevel = await topLevelNames(this.files);
+     const projects: ProjectMeta[] = [];
+     for (const dirName of topLevel) {
+       const meta = await this.readProjectMeta(dirName);
+@@ -71,13 +70,7 @@ export class ContentsProjectStorage implements ProjectStorage {
+   }
+ 
+   async createProject(meta: NewProjectMeta): Promise<ProjectMeta> {
+-    const keys = await this.files.keys();
+-    const taken = new Set(
+-      keys.map((key) => {
+-        const slash = key.indexOf("/");
+-        return slash === -1 ? key : key.slice(0, slash);
+-      }),
+-    );
++    const taken = new Set(await topLevelNames(this.files));
+     const dirName = uniqueSlug(meta.displayName, taken);
+     const color =
+       meta.color ?? PROJECT_COLORS[taken.size % PROJECT_COLORS.length];
+@@ -126,14 +119,14 @@ export class ContentsProjectStorage implements ProjectStorage {
+ 
+   async deleteProject(dirName: string): Promise<void> {
+     validateRelativePath(dirName);
+-    const prefix = `${dirName}/`;
+-    const keys = await this.files.keys();
+-    for (const key of keys) {
+-      if (key === dirName || key.startsWith(prefix)) {
+-        await this.files.removeItem(key);
+-        await this.checkpoints.removeItem(key);
+-      }
+-    }
++    // project.json goes after the files and the directory record last: a
++    // closed tab mid-delete leaves a still-listed project to delete again,
++    // never invisible orphaned records eating quota.
++    const metaKey = `${dirName}/${PROJECT_META_PATH}`;
++    const keys = await keysWithPrefix(this.files, `${dirName}/`);
++    await this.removeKeys(keys.filter((key) => key !== metaKey));
++    await this.removeKeys([metaKey]);
++    await this.removeKeys([dirName]);
+   }
+ 
+   // --- Files ----------------------------------------------------------------
+@@ -145,15 +138,12 @@ export class ContentsProjectStorage implements ProjectStorage {
+     }
+     const base = subdir ? `${dirName}/${subdir}` : dirName;
+     const prefix = `${base}/`;
+-    const keys = await this.files.keys();
++    const keys = await keysWithPrefix(this.files, prefix);
+ 
+     // Direct children, plus directories implied by deeper keys whose own
+     // record is missing (defensive against externally-written trees).
+     const children = new Set<string>();
+     for (const key of keys) {
+-      if (!key.startsWith(prefix)) {
+-        continue;
+-      }
+       const rest = key.slice(prefix.length);
+       const slash = rest.indexOf("/");
+       children.add(slash === -1 ? rest : rest.slice(0, slash));
+@@ -201,6 +191,14 @@ export class ContentsProjectStorage implements ProjectStorage {
+     return recordToStat(record, path);
+   }
+ 
++  /**
++   * Move a file or directory tree. The store has no multi-key transaction
++   * (writes stay on localforage, see kv.ts), so the order is what makes it
++   * crash-safe: every new key (and its checkpoints) is written before any
++   * old key is removed. A tab closed mid-rename leaves the tree under BOTH
++   * names — a duplicate the user can delete — never a half-moved directory
++   * with records missing from both.
++   */
+   async rename(dirName: string, from: string, to: string): Promise<void> {
+     validateRelativePath(dirName);
+     validateRelativePath(from);
+@@ -208,20 +206,26 @@ export class ContentsProjectStorage implements ProjectStorage {
+     const fromFull = `${dirName}/${from}`;
+     const toFull = `${dirName}/${to}`;
+     const record = await this.requireRecord(dirName, from);
+-
+-    if (record.type === "directory") {
+-      const prefix = `${fromFull}/`;
+-      const keys = await this.files.keys();
+-      for (const key of keys) {
+-        if (key === fromFull || key.startsWith(prefix)) {
+-          const target = toFull + key.slice(fromFull.length);
+-          await this.moveKey(key, target);
+-        }
+-      }
++    if (fromFull === toFull) {
++      // Copy-then-delete onto itself would delete the file.
+       return;
+     }
++    if (toFull.startsWith(`${fromFull}/`)) {
++      throw new Error(`Cannot move ${from} into itself`);
++    }
++
++    // Ascending key order puts each directory record before its children,
++    // so the new tree is coherent at every point of the copy phase.
++    const keys =
++      record.type === "directory"
++        ? [fromFull, ...(await keysWithPrefix(this.files, `${fromFull}/`))]
++        : [fromFull];
+     await this.ensureParents(toFull);
+-    await this.moveKey(fromFull, toFull);
++    for (const key of keys) {
++      await this.copyKey(key, toFull + key.slice(fromFull.length));
++    }
++    await this.removeKeys(keys.slice(1));
++    await this.removeKeys([fromFull]);
+   }
+ 
+   async remove(dirName: string, path: string): Promise<void> {
+@@ -230,17 +234,10 @@ export class ContentsProjectStorage implements ProjectStorage {
+     const fullPath = `${dirName}/${path}`;
+     const record = await this.files.getItem<ContentsRecord>(fullPath);
+     if (record?.type === "directory") {
+-      const prefix = `${fullPath}/`;
+-      const keys = await this.files.keys();
+-      for (const key of keys) {
+-        if (key.startsWith(prefix)) {
+-          await this.files.removeItem(key);
+-          await this.checkpoints.removeItem(key);
+-        }
+-      }
++      await this.removeKeys(await keysWithPrefix(this.files, `${fullPath}/`));
+     }
+-    await this.files.removeItem(fullPath);
+-    await this.checkpoints.removeItem(fullPath);
++    // The directory record last, so an interrupted remove stays visible.
++    await this.removeKeys([fullPath]);
+   }
+ 
+   async stat(dirName: string, path: string): Promise<FileStat | null> {
+@@ -309,7 +306,18 @@ export class ContentsProjectStorage implements ProjectStorage {
+     return record;
+   }
+ 
+-  private async moveKey(from: string, to: string): Promise<void> {
++  /** Remove records and their checkpoints (independent keys, in parallel). */
++  private async removeKeys(keys: string[]): Promise<void> {
++    await Promise.all(
++      keys.flatMap((key) => [
++        this.files.removeItem(key),
++        this.checkpoints.removeItem(key),
++      ]),
++    );
++  }
++
++  /** Write `from`'s record (and checkpoints) under `to`; `from` is kept. */
++  private async copyKey(from: string, to: string): Promise<void> {
+     const record = await this.files.getItem<ContentsRecord>(from);
+     if (!record) {
+       return;
+@@ -334,13 +342,11 @@ export class ContentsProjectStorage implements ProjectStorage {
+     } else {
+       await this.files.setItem(to, moved);
+     }
+-    await this.files.removeItem(from);
+     // Checkpoints follow the file (mirrors BrowserStorageDrive's own rename).
+     const checkpoint = await this.checkpoints.getItem(from);
+     if (checkpoint !== null) {
+       await this.checkpoints.setItem(to, checkpoint);
+     }
+-    await this.checkpoints.removeItem(from);
+   }
+ }
+ 
+diff --git a/src/storage/contentsSchema.test.ts b/src/storage/contentsSchema.test.ts
+index d0afdf12..05d4466f 100644
+--- a/src/storage/contentsSchema.test.ts
++++ b/src/storage/contentsSchema.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from "vitest";
+ import {
+   base64ToBytes,
++  buildFileRecord,
+   bytesToBase64,
+   bytesToWriteContent,
+   classifyPath,
+@@ -59,6 +60,28 @@ describe("base64 round-trip", () => {
+   });
+ });
+ 
++describe("buildFileRecord size", () => {
++  // BrowserStorageDrive.save (@jupyterlite/services 0.8) sizes records in
++  // UTF-8 bytes of the stored content; the app's records must agree.
++  it("counts UTF-8 bytes for text, not UTF-16 code units", () => {
++    expect(buildFileRecord("p/notes.txt", "Å ø 😀").size).toBe(
++      new TextEncoder().encode("Å ø 😀").length,
++    );
++  });
++
++  it("counts the compact JSON encoding for parsed json records", () => {
++    const pretty = JSON.stringify({ name: "Ångström", n: [1, 2] }, null, 2);
++    const record = buildFileRecord("p/.atomify/project.json", pretty);
++    expect(record.size).toBe(
++      new TextEncoder().encode('{"name":"Ångström","n":[1,2]}').length,
++    );
++  });
++
++  it("counts decoded bytes for binary records", () => {
++    expect(buildFileRecord("p/frame.png", new Uint8Array(10)).size).toBe(10);
++  });
++});
++
+ describe("bytesToWriteContent", () => {
+   it("decodes text files to strings and keeps binaries as bytes", () => {
+     const text = bytesToWriteContent(
+diff --git a/src/storage/contentsSchema.ts b/src/storage/contentsSchema.ts
+index e8f3b472..2bd30a5d 100644
+--- a/src/storage/contentsSchema.ts
++++ b/src/storage/contentsSchema.ts
+@@ -95,6 +95,7 @@ export function validateRelativePath(path: string): void {
+ }
+ 
+ const CHUNK = 0x8000;
++const utf8 = new TextEncoder();
+ 
+ export function bytesToBase64(bytes: Uint8Array): string {
+   let binary = "";
+@@ -167,7 +168,12 @@ export function buildFileRecord(
+     format,
+     mimetype,
+     content: stored,
+-    size: content.length,
++    // UTF-8 bytes of what is stored, as BrowserStorageDrive.save computes
++    // it (@jupyterlite/services 0.8: text -> encode(content), json ->
++    // encode(JSON.stringify(content))) — not UTF-16 string length.
++    size: utf8.encode(
++      format === "json" ? JSON.stringify(stored) : (stored as string),
++    ).length,
+     writable: true,
+     type,
+   };
+diff --git a/src/storage/index.ts b/src/storage/index.ts
+index 38ffdb6f..e58beb79 100644
+--- a/src/storage/index.ts
++++ b/src/storage/index.ts
+@@ -24,3 +24,4 @@ export {
+   validateRelativePath,
+ } from "./contentsSchema";
+ export { slugify, uniqueSlug } from "./slug";
++export { isQuotaExceededError, StorageFullError } from "./kv";
+diff --git a/src/storage/kv.test.ts b/src/storage/kv.test.ts
+new file mode 100644
+index 00000000..a36b0a42
+--- /dev/null
++++ b/src/storage/kv.test.ts
+@@ -0,0 +1,169 @@
++// Must load before localforage, which captures `indexedDB` at import time.
++import "fake-indexeddb/auto";
++import { describe, expect, it, vi, afterEach } from "vitest";
++import { createIndexedDbProjectStorage } from "./contentsProjectStorage";
++import {
++  createJupyterCheckpointsStore,
++  createJupyterFilesStore,
++  isQuotaExceededError,
++  StorageFullError,
++} from "./kv";
++
++/** Read one value straight from the database JupyterLite reads. */
++function rawGet(storeName: string, key: string): Promise<unknown> {
++  return new Promise((resolve, reject) => {
++    const open = indexedDB.open("JupyterLite Storage");
++    open.onerror = () => reject(open.error);
++    open.onsuccess = () => {
++      const db = open.result;
++      const req = db
++        .transaction(storeName, "readonly")
++        .objectStore(storeName)
++        .get(key);
++      req.onsuccess = () => {
++        db.close();
++        resolve(req.result);
++      };
++      req.onerror = () => reject(req.error);
++    };
++  });
++}
++
++afterEach(() => {
++  vi.restoreAllMocks();
++});
++
++describe("IndexedDB key-value store", () => {
++  // One shared fake database per file (as in the browser); each test uses
++  // its own top-level names.
++
++  it("keeps localforage's storage format: plain values under path keys", async () => {
++    const files = createJupyterFilesStore();
++    const record = { path: "fmt/a.txt", content: "hello", size: 5 };
++
++    await files.setItem("fmt/a.txt", record);
++
++    expect(await rawGet("files", "fmt/a.txt")).toEqual(record);
++  });
++
++  it("lists keys under a prefix with a key-range query", async () => {
++    const files = createJupyterFilesStore();
++    for (const key of ["kp", "kp/a", "kp/b/c", "kp-2/x", "kp0", "kq/y"]) {
++      await files.setItem(key, { key });
++    }
++    const getAllKeys = vi.spyOn(IDBObjectStore.prototype, "getAllKeys");
++
++    expect(await files.keysWithPrefix!("kp/")).toEqual(["kp/a", "kp/b/c"]);
++    expect(getAllKeys).toHaveBeenCalled();
++    expect(await files.keysWithPrefix!("kp-2/")).toEqual(["kp-2/x"]);
++    expect(await files.keysWithPrefix!("missing/")).toEqual([]);
++  });
++
++  it("finds top-level names with one seek per entry, not per file", async () => {
++    const files = createJupyterFilesStore();
++    const before = await files.topLevelNames!();
++    await files.setItem("tl", {});
++    await files.setItem("tl-2", {});
++    await files.setItem("tl.ipynb", {});
++    for (let i = 0; i < 40; i++) {
++      await files.setItem(`tl/runs/run-${i}/log.lammps`, {});
++    }
++    const advance = vi.spyOn(IDBCursor.prototype, "continue");
++
++    const names = await files.topLevelNames!();
++
++    expect(names.filter((name) => !before.includes(name))).toEqual([
++      "tl",
++      "tl-2",
++      "tl.ipynb",
++    ]);
++    expect(advance.mock.calls.length).toBeLessThan(before.length + 10);
++    expect(advance).toHaveBeenCalledWith("tl0");
++  });
++
++  it("steps aside when localforage upgrades the database to add a store", async () => {
++    const files = createJupyterFilesStore();
++    await files.setItem("up/a", {});
++    // Holds the raw read connection open…
++    expect(await files.keysWithPrefix!("up/")).toEqual(["up/a"]);
++
++    // …which must not block localforage adding the checkpoints store.
++    const checkpoints = createJupyterCheckpointsStore();
++    await checkpoints.setItem("up/a", [{ id: "0" }]);
++
++    // Both still answer through the raw key range (reconnected), not the
++    // keys() fallback.
++    const getAllKeys = vi.spyOn(IDBObjectStore.prototype, "getAllKeys");
++    expect(await checkpoints.keysWithPrefix!("up/")).toEqual(["up/a"]);
++    expect(await files.keysWithPrefix!("up/")).toEqual(["up/a"]);
++    expect(getAllKeys).toHaveBeenCalledTimes(2);
++  });
++
++  it("surfaces quota errors from writes as StorageFullError", async () => {
++    const files = createJupyterFilesStore();
++    await files.setItem("quota/ok", {});
++    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(() => {
++      throw new DOMException("Quota exceeded", "QuotaExceededError");
++    });
++
++    const write = files.setItem("quota/big", { content: "x" });
++
++    await expect(write).rejects.toBeInstanceOf(StorageFullError);
++    await expect(write).rejects.toSatisfy(isQuotaExceededError);
++  });
++
++  it("runs ContentsProjectStorage end to end on the shared database", async () => {
++    const storage = createIndexedDbProjectStorage();
++    const { dirName } = await storage.createProject({ displayName: "E2E" });
++    await storage.write(dirName, "data/one.txt", "1");
++    await storage.write(dirName, "data/deep/two.txt", "2");
++
++    await storage.rename(dirName, "data", "inputs");
++
++    expect((await storage.list(dirName, "inputs")).map((s) => s.path)).toEqual([
++      "inputs/deep",
++      "inputs/one.txt",
++    ]);
++    expect(await storage.stat(dirName, "data")).toBeNull();
++    expect((await storage.listProjects()).map((p) => p.dirName)).toContain(
++      dirName,
++    );
++
++    await storage.deleteProject(dirName);
++    expect((await storage.listProjects()).map((p) => p.dirName)).not.toContain(
++      dirName,
++    );
++    expect(await createJupyterFilesStore().keysWithPrefix!(dirName)).toEqual(
++      [],
++    );
++  });
++});
++
++describe("isQuotaExceededError", () => {
++  it("recognizes the browser and localforage shapes", () => {
++    expect(
++      isQuotaExceededError(new DOMException("full", "QuotaExceededError")),
++    ).toBe(true);
++    expect(isQuotaExceededError({ name: "NS_ERROR_DOM_QUOTA_REACHED" })).toBe(
++      true,
++    );
++    expect(isQuotaExceededError({ code: 22 })).toBe(true);
++    expect(
++      isQuotaExceededError(
++        new Error("wrapped", {
++          cause: new DOMException("full", "QuotaExceededError"),
++        }),
++      ),
++    ).toBe(true);
++    expect(isQuotaExceededError(new StorageFullError())).toBe(true);
++  });
++
++  it("rejects everything else", () => {
++    expect(isQuotaExceededError(new Error("nope"))).toBe(false);
++    expect(
++      isQuotaExceededError(new DOMException("closed", "InvalidStateError")),
++    ).toBe(false);
++    expect(isQuotaExceededError(undefined)).toBe(false);
++    expect(isQuotaExceededError("QuotaExceededError")).toBe(false);
++  });
++});
+diff --git a/src/storage/kv.ts b/src/storage/kv.ts
+index c5dd20be..88725641 100644
+--- a/src/storage/kv.ts
++++ b/src/storage/kv.ts
+@@ -14,16 +14,118 @@ export interface KeyValueStore {
+   setItem<T>(key: string, value: T): Promise<void>;
+   removeItem(key: string): Promise<void>;
+   keys(): Promise<string[]>;
++  /**
++   * Keys starting with `prefix`, in ascending order. Optional: callers go
++   * through the module-level keysWithPrefix(), which falls back to
++   * filtering keys().
++   */
++  keysWithPrefix?(prefix: string): Promise<string[]>;
++  /**
++   * Distinct first path segments (text before the first "/") of all keys —
++   * the top-level entries of the contents tree. Optional, see topLevelNames().
++   */
++  topLevelNames?(): Promise<string[]>;
++}
++
++/**
++ * A write was refused because the origin's storage quota is exhausted.
++ * Thrown by the IndexedDB backend so callers can tell "storage full" apart
++ * from other failures (ADR-001 Consequences: such a run is marked failed).
++ */
++export class StorageFullError extends Error {
++  constructor(cause?: unknown) {
++    super("Browser storage is full.", { cause });
++    this.name = "StorageFullError";
++  }
++}
++
++/**
++ * Whether an error (as thrown by IndexedDB, localforage, or a wrapper that
++ * sets `cause`) means the storage quota was exceeded.
++ */
++export function isQuotaExceededError(error: unknown): boolean {
++  for (let current = error, depth = 0; current && depth < 5; depth++) {
++    if (current instanceof StorageFullError) {
++      return true;
++    }
++    const { name, code } = current as { name?: unknown; code?: unknown };
++    if (
++      name === "QuotaExceededError" ||
++      // Firefox's legacy name (localStorage driver).
++      name === "NS_ERROR_DOM_QUOTA_REACHED" ||
++      // Legacy DOMException.QUOTA_EXCEEDED_ERR.
++      code === 22
++    ) {
++      return true;
++    }
++    current = (current as { cause?: unknown }).cause;
++  }
++  return false;
++}
++
++/** keysWithPrefix via the store's own implementation, else keys(). */
++export async function keysWithPrefix(
++  store: KeyValueStore,
++  prefix: string,
++): Promise<string[]> {
++  if (store.keysWithPrefix) {
++    return store.keysWithPrefix(prefix);
++  }
++  return (await store.keys()).filter((key) => key.startsWith(prefix)).sort();
++}
++
++/** topLevelNames via the store's own implementation, else keys(). */
++export async function topLevelNames(store: KeyValueStore): Promise<string[]> {
++  if (store.topLevelNames) {
++    return store.topLevelNames();
++  }
++  return firstSegments(await store.keys());
++}
++
++function firstSegments(keys: string[]): string[] {
++  const names = new Set<string>();
++  for (const key of keys) {
++    const slash = key.indexOf("/");
++    names.add(slash === -1 ? key : key.slice(0, slash));
++  }
++  return [...names].sort();
++}
++
++/**
++ * The smallest string greater than every string starting with `prefix`
++ * (IndexedDB compares string keys by UTF-16 code unit, like JS `<`), or
++ * null when no such bound exists (prefix ends in U+FFFF).
++ */
++function prefixUpperBound(prefix: string): string | null {
++  const last = prefix.charCodeAt(prefix.length - 1);
++  if (prefix.length === 0 || last === 0xffff) {
++    return null;
++  }
++  return prefix.slice(0, -1) + String.fromCharCode(last + 1);
++}
++
++function request<T>(req: IDBRequest<T>): Promise<T> {
++  return new Promise((resolve, reject) => {
++    req.onsuccess = () => resolve(req.result);
++    req.onerror = () => reject(req.error);
++  });
+ }
+ 
+ class LocalForageStore implements KeyValueStore {
++  /** Cached raw connection for key-range reads (see withRawStore). */
++  private rawDb?: Promise<IDBDatabase>;
++
+   constructor(private readonly instance: LocalForage) {}
+ 
+   async getItem<T>(key: string): Promise<T | null> {
+     return this.instance.getItem<T>(key);
+   }
+   async setItem<T>(key: string, value: T): Promise<void> {
+-    await this.instance.setItem(key, value);
++    try {
++      await this.instance.setItem(key, value);
++    } catch (error) {
++      throw isQuotaExceededError(error) ? new StorageFullError(error) : error;
++    }
+   }
+   async removeItem(key: string): Promise<void> {
+     await this.instance.removeItem(key);
+@@ -31,6 +133,131 @@ class LocalForageStore implements KeyValueStore {
+   async keys(): Promise<string[]> {
+     return this.instance.keys();
+   }
++
++  async keysWithPrefix(prefix: string): Promise<string[]> {
++    const upper = prefixUpperBound(prefix);
++    const fallback = async () =>
++      (await this.keys()).filter((key) => key.startsWith(prefix)).sort();
++    if (upper === null) {
++      return fallback();
++    }
++    return this.withRawStore(async (store) => {
++      const keys = await request(
++        store.getAllKeys(IDBKeyRange.bound(prefix, upper, false, true)),
++      );
++      return keys.filter((key): key is string => typeof key === "string");
++    }, fallback);
++  }
++
++  async topLevelNames(): Promise<string[]> {
++    return this.withRawStore(
++      (store) =>
++        // Skip-scan: after the first key under "name/", seek straight past
++        // the whole subtree ("name0" — "0" is the code unit after "/"), so
++        // the cost is one seek per top-level entry, not one per stored file.
++        new Promise<string[]>((resolve, reject) => {
++          const names = new Set<string>();
++          const cursorRequest = store.openKeyCursor();
++          cursorRequest.onerror = () => reject(cursorRequest.error);
++          cursorRequest.onsuccess = () => {
++            const cursor = cursorRequest.result;
++            if (!cursor) {
++              resolve([...names].sort());
++              return;
++            }
++            const key = String(cursor.key);
++            const slash = key.indexOf("/");
++            const name = slash === -1 ? key : key.slice(0, slash);
++            names.add(name);
++            if (slash === -1) {
++              cursor.continue();
++            } else {
++              cursor.continue(`${name}0`);
++            }
++          };
++        }),
++      async () => firstSegments(await this.keys()),
++    );
++  }
++
++  /**
++   * Run a key read against the raw IndexedDB object store localforage
++   * writes to, or `fallback` when that path is unavailable (non-IndexedDB
++   * driver, store missing, connection closed, request failed).
++   *
++   * Only key reads go through this path; every write stays on localforage
++   * so its storage format (and blob handling) is never second-guessed.
++   * localforage's IndexedDB driver keeps keys as plain out-of-line strings
++   * in an object store named after `storeName` inside the `name` database
++   * (here "JupyterLite Storage" / "files" or "checkpoints"), so a key range
++   * over that store sees exactly what keys() returns.
++   */
++  private async withRawStore<T>(
++    read: (store: IDBObjectStore) => Promise<T>,
++    fallback: () => Promise<T>,
++  ): Promise<T> {
++    let pending: Promise<T>;
++    try {
++      // ready() makes localforage create the database and object store
++      // first, so the raw open below never creates or upgrades anything.
++      await this.instance.ready();
++      if (
++        this.instance.driver() !== localforage.INDEXEDDB ||
++        typeof indexedDB === "undefined"
++      ) {
++        return fallback();
++      }
++      const name = this.instance.config("name") as string;
++      const storeName = this.instance.config("storeName") as string;
++      this.rawDb ??= this.openRaw(name);
++      const db = await this.rawDb;
++      if (!db.objectStoreNames.contains(storeName)) {
++        // Opened before localforage added this store (e.g. by another
++        // instance on the same database) — reopen next time.
++        this.dropRaw(db);
++        return fallback();
++      }
++      // Transaction and request in one synchronous block: an IndexedDB
++      // transaction auto-commits once control returns with nothing queued.
++      pending = read(
++        db.transaction(storeName, "readonly").objectStore(storeName),
++      );
++    } catch {
++      // E.g. InvalidStateError on a connection the browser closed.
++      this.rawDb = undefined;
++      return fallback();
++    }
++    return pending.catch(() => fallback());
++  }
++
++  private openRaw(name: string): Promise<IDBDatabase> {
++    return new Promise<IDBDatabase>((resolve, reject) => {
++      // No version: open at whatever version localforage left it.
++      const req = indexedDB.open(name);
++      req.onupgradeneeded = () => {
++        // The database did not exist — never create it from here.
++        req.transaction?.abort();
++      };
++      req.onerror = () => reject(req.error);
++      req.onsuccess = () => {
++        const db = req.result;
++        // localforage (here or in the JupyterLite iframe) bumps the version
++        // to add object stores; an open connection would block that, so
++        // step aside like localforage's own connections do.
++        db.onversionchange = () => this.dropRaw(db);
++        db.onclose = () => this.dropRaw(db);
++        resolve(db);
++      };
++    }).catch((error: unknown) => {
++      this.rawDb = undefined;
++      throw error;
++    });
++  }
++
++  private dropRaw(db: IDBDatabase): void {
++    db.close();
++    this.rawDb = undefined;
++  }
+ }
+ 
+ export class MemoryStore implements KeyValueStore {
+@@ -50,6 +277,12 @@ export class MemoryStore implements KeyValueStore {
+   async keys(): Promise<string[]> {
+     return [...this.map.keys()];
+   }
++  async keysWithPrefix(prefix: string): Promise<string[]> {
++    return [...this.map.keys()].filter((key) => key.startsWith(prefix)).sort();
++  }
++  async topLevelNames(): Promise<string[]> {
++    return firstSegments([...this.map.keys()]);
++  }
+ }
+ 
+ const JUPYTERLITE_DB = "JupyterLite Storage";
+diff --git a/src/store/projects.integration.test.ts b/src/store/projects.integration.test.ts
+index 4a935908..0f9a9ca2 100644
+--- a/src/store/projects.integration.test.ts
++++ b/src/store/projects.integration.test.ts
+@@ -23,8 +23,14 @@ vi.mock(import("../utils/metrics"), () => ({
+ import { track } from "../utils/metrics";
+ 
+ import { storeModel, type StoreModel } from "./model";
+-import type { RunRequest, StoreInjections } from "./projects";
+ import {
++  STORAGE_FULL_RUN_ERROR,
++  type RunRequest,
++  type StoreInjections,
++} from "./projects";
++import { MemoryStore } from "../storage/kv";
++import {
++  ContentsProjectStorage,
+   createMemoryProjectStorage,
+   PROJECT_META_PATH,
+   readRunMeta,
+@@ -583,6 +589,69 @@ describe("projects store integration", () => {
+     });
+   });
+ 
++  describe("storage full", () => {
++    it("marks the run failed with a storage-full reason, keeps partial outputs, and stops the sweep", async () => {
++      const engine = createFakeEngine({
++        manual: true,
++        outputs: [
++          { path: "dump.first", content: "copied before the quota hit" },
++          { path: "log.lammps", content: FAKE_LOG },
++        ],
++      });
++      // The quota "fills up" mid-run: output writes after dump.first fail
++      // the way IndexedDB does; run.json still fits.
++      const files = new QuotaMemoryStore(
++        (key) =>
++          /\/runs\/run-\d+\//.test(key) &&
++          !key.endsWith("dump.first") &&
++          !key.endsWith(RUN_META_PATH),
++      );
++      const { store, libraryStorage } = await createTestStore(engine, {
++        libraryStorage: new ContentsProjectStorage(files, new MemoryStore()),
++      });
++      await store.getActions().projects.createProject({
++        displayName: "Big Outputs",
++        files: [{ fileName: "in.lmp", content: SCRIPT }],
++      });
++      const dirName = activeDirName(store);
++
++      const sweepPromise = store
++        .getActions()
++        .projects.startRuns([
++          runRequest({ vars: { T: 1 } }),
++          runRequest({ vars: { T: 2 } }),
++        ]);
++      await waitForCondition(
++        () => engine.runFilePaths.length === 1,
++        "first runFile call",
++      );
++      files.full = true;
++      engine.resolveRun();
++      await sweepPromise;
++
++      const meta = await readRunMeta(libraryStorage, dirName, "run-001");
++      expect(meta?.status).toBe("failed");
++      expect(meta?.error).toBe(STORAGE_FULL_RUN_ERROR);
++      // Partial outputs are kept, never silently dropped.
++      expect(
++        await libraryStorage.read(dirName, `${RUNS_DIR}/run-001/dump.first`),
++      ).toBe("copied before the quota hit");
++      expect(
++        await libraryStorage.stat(dirName, `${RUNS_DIR}/run-001/log.lammps`),
++      ).toBeNull();
++      // The warning names the project and where to free space.
++      const notice = store.getState().projects.notice;
++      expect(notice).toContain("Browser storage is full");
++      expect(notice).toContain('"Big Outputs"');
++      expect(notice).toContain("Settings > Storage");
++      // The rest of the sweep would hit the same wall: it is not started.
++      expect(engine.runFilePaths).toHaveLength(1);
++      expect(store.getState().projects.runQueue).toEqual([]);
++      expect(store.getState().projects.activeRun).toBeUndefined();
++      expect(store.getState().projects.residentRun).toBeUndefined();
++    });
++  });
++
+   describe("debounced saves", () => {
+     it("saveFileDebounced does not persist immediately; flushPendingSaves persists", async () => {
+       const { store, libraryStorage } =
+@@ -1293,12 +1362,32 @@ function createFakeWasm(): AtomifyWasmModule {
+   return wasm as AtomifyWasmModule;
+ }
+ 
+-async function createTestStore(engine: FakeEngine): Promise<{
++/** Memory KV that refuses matching writes like a full IndexedDB once `full`. */
++class QuotaMemoryStore extends MemoryStore {
++  full = false;
++  constructor(private readonly refuses: (key: string) => boolean) {
++    super();
++  }
++  async setItem<T>(key: string, value: T): Promise<void> {
++    if (this.full && this.refuses(key)) {
++      throw new DOMException(
++        "The quota has been exceeded.",
++        "QuotaExceededError",
++      );
++    }
++    return super.setItem(key, value);
++  }
++}
++
++async function createTestStore(
++  engine: FakeEngine,
++  options: { libraryStorage?: ProjectStorage } = {},
++): Promise<{
+   store: Store<StoreModel>;
+   libraryStorage: ProjectStorage;
+   scratchStorage: ProjectStorage;
+ }> {
+-  const libraryStorage = createMemoryProjectStorage();
++  const libraryStorage = options.libraryStorage ?? createMemoryProjectStorage();
+   const scratchStorage = createMemoryProjectStorage();
+   const injections: StoreInjections = { libraryStorage, scratchStorage };
+   const store = createStore(storeModel, { injections });
+diff --git a/src/store/projects.ts b/src/store/projects.ts
+index 29c61998..bb71c849 100644
+--- a/src/store/projects.ts
++++ b/src/store/projects.ts
+@@ -28,6 +28,7 @@ import type {
+ import {
+   allocateRunDir,
+   bytesToWriteContent,
++  isQuotaExceededError,
+   listRuns,
+   readRunMeta,
+   reconcileRuns,
+@@ -123,6 +124,11 @@ const MID_RUN_COPY_INTERVAL_MS = 3000;
+ /** Wrapper artifacts from the vars-injection mechanism — engine detail. */
+ const RUN_INTERNAL_FILE = /^(_vars_|_wrapper_)/;
+ 
++/** run.json `error` for a run whose outputs hit the quota (ADR-001
++ *  Consequences). Settings > Storage lists per-project usage with delete. */
++export const STORAGE_FULL_RUN_ERROR =
++  "Browser storage is full — free space in Settings > Storage.";
++
+ const SCRIPT_FILE = /(^|\/)in\.[^/]*$|\.in$/;
+ 
+ export function isScriptFile(fileName: string): boolean {
+@@ -1314,6 +1320,16 @@ export const projectsModel: ProjectsModel = {
+     const workdirId =
+       continuation && resident ? resident.workdirId : simulation.id;
+     const workdir = `/${workdirId}`;
++    // A quota error while copying outputs fails the run with a clear reason
++    // and keeps what was copied (ADR-001 Consequences: never silent loss).
++    let storageFull = false;
++    const projectName =
++      getState().projects.find((p) => p.dirName === request.dirName)
++        ?.displayName ?? request.dirName;
++    const storageFullNotice = () =>
++      `Browser storage is full: run #${runId.replace(/^run-0*/, "")} of ` +
++      `"${projectName}" failed and kept partial outputs. Free space in ` +
++      `Settings > Storage.`;
+     const copyOutputs = async (maxBytes?: number) => {
+       if (!lammps.snapshotWorkdir) {
+         return;
+@@ -1341,6 +1357,11 @@ export const projectsModel: ProjectsModel = {
+           );
+         }
+       } catch (error) {
++        if (isQuotaExceededError(error)) {
++          storageFull = true;
++          actions.setNotice(storageFullNotice());
++          return;
++        }
+         actions.setNotice(
+           `Could not copy run outputs to storage: ${
+             error instanceof Error ? error.message : String(error)
+@@ -1401,20 +1422,27 @@ export const projectsModel: ProjectsModel = {
+           fullLog.join("\n") + "\n",
+         );
+       }
+-    } catch {
+-      // The log is a convenience copy; never fail the run over it.
++    } catch (error) {
++      // The log is a convenience copy; never fail the run over it — unless
++      // storage is full, in which case the outputs are incomplete too.
++      storageFull ||= isQuotaExceededError(error);
+     }
+     const existing = await readRunMeta(storage, request.dirName, runId);
+     runMeta = {
+       ...(existing ?? runMeta),
+-      status:
+-        stopReason === "canceled"
++      status: storageFull
++        ? "failed"
++        : stopReason === "canceled"
+           ? "canceled"
+           : stopReason === "failed"
+             ? "failed"
+             : "completed",
+       finishedAt: new Date().toISOString(),
+-      error: stopReason === "failed" ? errorMessage : undefined,
++      error: storageFull
++        ? STORAGE_FULL_RUN_ERROR
++        : stopReason === "failed"
++          ? errorMessage
++          : undefined,
+       stats: {
+         timesteps: lammps.getTimesteps(),
+         numAtoms: lammps.getNumAtoms(),
+@@ -1422,14 +1450,24 @@ export const projectsModel: ProjectsModel = {
+           (Date.now() - new Date(runMeta.startedAt).getTime()) / 1000,
+       },
+     };
+-    await writeRunMeta(storage, request.dirName, runMeta);
++    try {
++      await writeRunMeta(storage, request.dirName, runMeta);
++    } catch (error) {
++      if (!isQuotaExceededError(error)) {
++        throw error;
++      }
++      // Not even run.json fits: it stays "running" on disk until
++      // reconcileRuns marks it interrupted; the notice below says why.
++      storageFull = true;
++      runMeta = { ...runMeta, status: "failed", error: STORAGE_FULL_RUN_ERROR };
++    }
+     track("Run.Finish", {
+       status: runMeta.status,
+       wallSeconds: runMeta.stats?.wallSeconds,
+       timesteps: runMeta.stats?.timesteps,
+       exampleId: request.exampleId,
+     });
+-    const frame = await captureViewport();
++    const frame = storageFull ? undefined : await captureViewport();
+     if (frame) {
+       try {
+         await storage.write(
+@@ -1458,7 +1496,14 @@ export const projectsModel: ProjectsModel = {
+     actions.setActiveRun(undefined);
+     await actions.refreshActive();
+     const state = getState();
+-    if (state.screen.name !== "project" || state.screen.runId !== runId) {
++    if (storageFull) {
++      // Queued sweep runs would hit the same wall; stop them here.
++      actions.setRunQueue([]);
++      actions.setNotice(storageFullNotice());
++    } else if (
++      state.screen.name !== "project" ||
++      state.screen.runId !== runId
++    ) {
+       actions.setNotice(
+         `Run #${runId.replace(/^run-0*/, "")} ${runMeta.status}.`,
+       );

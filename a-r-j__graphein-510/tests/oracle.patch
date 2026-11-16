@@ -1,0 +1,784 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f10a799a..0dc2d421 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,9 @@
+ * Fix `add_peptide_bonds` / `add_sequence_distance_edges` and `peptide_bonds` overwriting the kinds of existing edges (they checked `G.has_edge` with loop positions instead of node IDs). [#461](https://github.com/a-r-j/graphein/pull/461)
+ * Fix `compute_chain_graph` and `compute_secondary_structure_graph` with `return_weighted_graph=True` adding edge kinds to the input graph (edge kind sets were shared rather than copied). [#461](https://github.com/a-r-j/graphein/pull/461)
+ * Fix the sdist (and the wheel `uv build` builds from it) containing no Python code: the hatch sdist `include` list only listed the README, LICENSE and two CSVs. It now includes `graphein/`. Removes the unused `MANIFEST.in`, which hatchling ignores.
++* Fix `graphein.protein.tensor.to_dataframe` (and `to_pdb`) raising `ValueError: All arrays must be of the same length` for any `fill_value` other than `1e-5`: atoms were selected with `fill_value` but their coordinates with the default. Both now come from one `get_full_atom_coords(x, fill_value)` call.
++* Fix `sidechain_torsion` raising `KeyError: 'SE'` for selenocysteine in 38-atom tensors (the layout it checks for to keep SEC's chi angle). Chi atom indices now come from `ATOM_NUMBERING_MODIFIED`, which includes `SE`.
++* Fix `sidechain_torsion` returning fewer rows than residues when the structure ends in residues without chi angles other than ALA, GLY, UNK or SEC (e.g. PYL or a non-standard residue): rows stopped at the last residue with chi angles. It now always returns one (masked) row per residue.
+ * Replace deprecated class-based `Config` with `model_config = ConfigDict(...)` in `GRNGraphConfig` and `PPIGraphConfig` to silence `PydanticDeprecatedSince20` warnings.
+ * Pin `setuptools<81` so `bioservices` can still import `pkg_resources`, which setuptools 81 removed. Newer `bioservices` releases drop `pkg_resources` but require `lxml<6`, which is affected by CVE-2026-41066.
+ 
+@@ -24,6 +27,9 @@
+ * Build the docs with a GitHub Actions workflow (`.github/workflows/docs.yaml`) on every PR and deploy them to GitHub Pages on pushes to `master`, replacing manual pushes to the `gh-pages` branch (last updated in 2022). Notebooks are rendered from their saved outputs. Fixes the docs build with Sphinx 9 (`NewTypeDataDocumenter` removed, duplicate intersphinx URLs rejected) and `rdkit.Mol` annotations in `graphein.molecule.graphs` (now `Chem.Mol`), which broke `sphinx_codeautolink`.
+ * Remove `.gitattributes`, whose only rule (`export-subst` for versioneer's `graphein/_version.py`) targeted a file deleted in [#276](https://github.com/a-r-j/graphein/pull/276).
+ * Speed up `graphein.protein.tensor` helpers by replacing per-atom and per-residue tensor loops with single `.tolist()` calls and dict lookups: `to_dataframe` (~6x on 4hhb), `infer_residue_types` and `is_complete_structure` (~7x), `protein_df_to_tensor`, and the sidechain torsion atom indexing used by `sidechain_torsion`. Output is unchanged. Adds tests for `is_complete_structure` and `has_complete_residue`. [#472](https://github.com/a-r-j/graphein/pull/472)
++* Speed up `graphein.protein.tensor.build_sidechain` ~12x (50 ms → 4 ms on 4hhb) by building all residues of a type together, one atom at a time, instead of one `sn_nerf` call per atom per residue. `sn_nerf` now accepts batched points. Output is unchanged up to float32 rounding (< 5e-5 Å). Single-residue inputs no longer raise `IndexError`.
++* Speed up `graphein.protein.tensor.sidechain_torsion` ~2.5x (0.71 → 0.31 ms on 4hhb with `embed=True`) by looking up each residue's chi atoms in a per-residue-type index table and computing all chi angles in one call, instead of a Python loop over residues followed by `to_dense_batch` and padding. Output is unchanged.
++* Tidy `graphein.protein.tensor`: `dihedrals_to_rad` / `torsion_to_rad` use one strided `atan2`; `idealize_backbone` builds its target tensors once instead of every step; `protein_df_to_chain_tensor` uses `pd.factorize` instead of a one-hot matrix and `argmax`; `kabsch` uses `torch.linalg.svd` instead of the deprecated `torch.svd`. `angles` no longer imports `einops`. Output is unchanged.
+ * Allow NumPy 2 (`numpy<3`, was `numpy<2`). The `<2` pin blocked installing graphein next to packages that need NumPy 2; graphein no longer uses any API NumPy 2 removed. [#475](https://github.com/a-r-j/graphein/pull/475)
+ * Drop support for Python 3.10, which has reached end of life. Minimum supported version is now Python 3.11.
+ * Use `tqdm.auto` in `graphein.protein.tensor.dataset`, the remaining module still importing plain `tqdm`, so its progress bars render as widgets in Jupyter instead of printing a new line per update. [#422](https://github.com/a-r-j/graphein/pull/422)
+diff --git a/graphein/protein/tensor/angles.py b/graphein/protein/tensor/angles.py
+index ccc51dfa..a037672c 100644
+--- a/graphein/protein/tensor/angles.py
++++ b/graphein/protein/tensor/angles.py
+@@ -6,24 +6,16 @@
+ # Project Website: https://github.com/a-r-j/graphein
+ # Code Repository: https://github.com/a-r-j/graphein
+ 
++from functools import lru_cache
++
+ import numpy as np
+ from loguru import logger as log
+ 
+ from graphein.utils.dependencies import import_message
+ 
+-from ..resi_atoms import ATOM_NUMBERING, CHI_ANGLES_ATOMS
++from ..resi_atoms import ATOM_NUMBERING_MODIFIED, CHI_ANGLES_ATOMS
+ from .types import AtomTensor, CoordTensor, DihedralTensor, TorsionTensor
+ 
+-try:
+-    from einops import rearrange
+-except ImportError:
+-    message = import_message(
+-        "graphein.protein.tensor.angles",
+-        "einops",
+-        pip_install=True,
+-        extras=True,
+-    )
+-
+ try:
+     from torch_geometric.utils import to_dense_batch
+ except ImportError:
+@@ -46,55 +38,29 @@
+     )
+     log.warning(message)
+ 
++# Row of each residue type in the chi atom table; the extra last row is for
++# residues without chi angles
++_CHI_ROWS = {res: i for i, res in enumerate(CHI_ANGLES_ATOMS)}
++_NO_CHI = len(_CHI_ROWS)
+ 
+-def _extract_torsion_coords(
+-    coords: AtomTensor, res_types: list[str]
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Returns a ``(L*?) x 4 x 3`` tensor of the coordinates of the atoms for
+-    each sidechain torsion angle. The first dimension will be larger than the
+-    input as we flatten the array of torsion angles per residue.
+ 
+-    Also returns a ``(L*?) x 1`` indexing tensor to map back to each residue
+-    (this is because we have variable numbers of torsion angles per residue).
+-
+-    :param coords: AtomTensor of shape ``(L*?, 37, 3)``
+-    :type coords: AtomTensor
+-    :param res_types: List of 3-letter residue types
+-    :type res_types: List[str]
+-    :return: Coordinates for computing each sidechain torsion angle
+-        and indexing tensor.
+-    :rtype: Tuple[torch.Tensor, torch.Tensor]
++@lru_cache(maxsize=None)
++def _chi_atom_table(
++    device: torch.device,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Returns the atom indices of the (up to) four chi angles of each residue
++    type (``(num types + 1) x 4 x 4``) and a mask of which chi angles exist
++    (``(num types + 1) x 4``). Rows follow ``_CHI_ROWS``.
+     """
+-    res_atoms = []
+-    idxs = []
+-
+-    # Whether or not the protein contains selenocysteine
+-    selenium = coords.shape[1] == 38
+-
+-    # Iterate over residues and grab indices of the atoms for each Chi angle
+-    for i, res in enumerate(res_types):
+-        try:
+-            angle_groups = CHI_ANGLES_ATOMS[res]
+-        except KeyError:
+-            log.warning(
+-                f"Can't determine chi angle groups for non-standard residue: {res}. These will be set to 0"
++    index = torch.zeros(_NO_CHI + 1, 4, 4, dtype=torch.long)
++    mask = torch.zeros(_NO_CHI + 1, 4, dtype=torch.bool)
++    for res, row in _CHI_ROWS.items():
++        for k, group in enumerate(CHI_ANGLES_ATOMS[res]):
++            index[row, k] = torch.tensor(
++                [ATOM_NUMBERING_MODIFIED[a] for a in group]
+             )
+-            angle_groups = []
+-        if (not selenium and res == "SEC") or res == "PYL":
+-            angle_groups = []
+-
+-        for angle_coord_set in angle_groups:
+-            res_atoms.append([ATOM_NUMBERING[a] for a in angle_coord_set])
+-            idxs.append(i)
+-
+-    idxs = torch.tensor(idxs, device=coords.device).long()
+-    res_atoms = torch.tensor(res_atoms, device=coords.device).long()
+-
+-    # Select the coordinates for each chi angle
+-    coords = torch.take_along_dim(
+-        coords[idxs, :, :], dim=1, indices=res_atoms.unsqueeze(-1)
+-    )
+-    return idxs, coords
++            mask[row, k] = True
++    return index.to(device), mask.to(device)
+ 
+ 
+ def sidechain_torsion(
+@@ -108,73 +74,60 @@ def sidechain_torsion(
+     Computes sidechain torsion angles for a protein.
+ 
+     Atom groups used to define each chi angle are specified in
+-    :ref:`graphein.protein.resi_atoms.CHI_ANGLES_ATOMS`.
++    :ref:`graphein.protein.resi_atoms.CHI_ANGLES_ATOMS`. Missing chi angles
++    are ``0`` (``[1, 0]`` if ``embed=True``) and ``False`` in the mask.
+ 
+     :param coords: Tensor of shape ``(L, N, 3)`` where ``L`` is the number of
+         residues, ``N`` is the number of atoms per residue (Default is 37;
+-        problems may occur with differing selections).
++        problems may occur with differing selections). With ``N = 38``,
++        selenocysteine (``SEC``) has a chi angle (``SE`` at index 37).
+     :type coords: AtomTensor
+     :param res_types: List of three-letter residue types.
+     :type res_types: List[str]
+     :param rad: If ``True``, returns angles in radians, else in degrees.
+         Defaults to ``True``.
+     :type rad: bool, optional
+-    :param return_mask: _description_, defaults to False
++    :param embed: If ``True``, returns ``[cos(chi1), sin(chi1), ...]``
++        (``L x 8``). Defaults to ``False``.
++    :type embed: bool, optional
++    :param return_mask: Whether to also return a boolean mask of the chi angles
++        that exist, defaults to ``False``.
+     :type return_mask: bool, optional
+-    :return: _description_
++    :return: Torsion tensor of shape ``(L, 4)`` (``(L, 8)`` if ``embed=True``)
++        and, if ``return_mask=True``, the mask of the same shape.
+     :rtype: Union[TorsionTensor, Tuple[TorsionTensor, torch.Tensor]]
+     """
+-    # Whether or not the protein contains selenocysteine
+-    selenium = coords.shape[1] == 38
+-
+-    idxs, coords = _extract_torsion_coords(coords, res_types)
+-    angles = _dihedral_angle(
+-        coords[:, 0, :].unsqueeze(1),
+-        coords[:, 1, :].unsqueeze(1),
+-        coords[:, 2, :].unsqueeze(1),
+-        coords[:, 3, :].unsqueeze(1),
+-    )
+-
+     if embed and not rad:
+         raise ValueError("Cannot embed torsion angles in degrees.")
+ 
++    for res in sorted(set(res_types) - _CHI_ROWS.keys()):
++        log.warning(
++            f"Can't determine chi angle groups for non-standard residue: {res}. These will be set to 0"
++        )
++    # Without Se atoms (38th atom type), SEC has no chi angles
++    no_chi = {"PYL"} if coords.shape[1] == 38 else {"PYL", "SEC"}
++    rows = torch.tensor(
++        [
++            _NO_CHI if res in no_chi else _CHI_ROWS.get(res, _NO_CHI)
++            for res in res_types
++        ],
++        device=coords.device,
++    )
++    index, mask = _chi_atom_table(coords.device)
++    index, mask = index[rows], mask[rows]
++
++    # (L, 4 chi angles, 4 atoms, 3)
++    chi_coords = coords[
++        torch.arange(len(rows), device=coords.device).view(-1, 1, 1), index
++    ]
++    angles = _dihedral_angle(*chi_coords.unbind(2)).masked_fill(~mask, 0.0)
++
+     if not rad:
+         angles = angles * 180 / torch.pi
+ 
+-    # Always 4 chi angles per residue, even if no residue has all 4
+-    angles, mask = to_dense_batch(angles, idxs, max_num_nodes=4)
+-    angles = angles.squeeze(-1)
+-
+-    # Interleave sin and cos transformed tensors
+     if embed:
+-        angles = rearrange(
+-            [torch.cos(angles), torch.sin(angles)], "t h w-> h (w t)"
+-        )
+-        mask = rearrange([mask, mask], "t h w -> h (w t)")
+-
+-    # Pad if last residues are a run of ALA, GLY or UNK
+-    # If we have selenocysteine but no Se atoms, SEC is padded too
+-    pad_residues = (
+-        {"ALA", "GLY", "UNK"} if selenium else {"ALA", "GLY", "UNK", "SEC"}
+-    )
+-    post_pad_len = 0
+-    for res in reversed(res_types):
+-        if res not in pad_residues:
+-            break
+-        post_pad_len += 1
+-
+-    if post_pad_len != 0:
+-        if embed:
+-            msk = torch.tensor([1.0, 0.0] * 4, device=coords.device).repeat(
+-                post_pad_len, 1
+-            )
+-        else:
+-            msk = torch.zeros(post_pad_len, 4, device=coords.device)
+-        mask_msk = torch.zeros(
+-            msk.shape, device=coords.device, dtype=torch.bool
+-        )
+-        angles = torch.vstack([angles, msk])
+-        mask = torch.vstack([mask, mask_msk])
++        angles = angle_to_unit_circle(angles)
++        mask = mask.repeat_interleave(2, dim=1)
+ 
+     return (angles, mask) if return_mask else angles
+ 
+@@ -419,9 +372,7 @@ def angle_to_unit_circle(x: torch.Tensor) -> torch.Tensor:
+     """
+     if x.ndim == 1:
+         x = x.unsqueeze(0)
+-    cosines = torch.cos(x)
+-    sines = torch.sin(x)
+-    return rearrange([cosines, sines], "t h w -> h (w t)")
++    return torch.stack([torch.cos(x), torch.sin(x)], dim=-1).flatten(-2)
+ 
+ 
+ def _dihedral_angle(
+@@ -520,11 +471,8 @@ def dihedrals_to_rad(
+     :return: Dihedral tensor of shape ``(L, 3)`` or a tuple of tensors
+     :rtype: Union[DihedralTensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+     """
+-    phi = torch.atan2(x_dihedrals[:, 1], x_dihedrals[:, 0])
+-    psi = torch.atan2(x_dihedrals[:, 3], x_dihedrals[:, 2])
+-    omg = torch.atan2(x_dihedrals[:, 5], x_dihedrals[:, 4])
+-
+-    return torch.stack([phi, psi, omg], dim=1) if concat else (phi, psi, omg)
++    angles = torch.atan2(x_dihedrals[:, 1::2], x_dihedrals[:, 0::2])
++    return angles if concat else angles.unbind(1)
+ 
+ 
+ def torsion_to_rad(
+@@ -549,12 +497,5 @@ def torsion_to_rad(
+     :rtype: Union[graphein.protein.tensor.types.TorsionTensor,
+         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+     """
+-    chi1 = torch.atan2(x_torsion[:, 1], x_torsion[:, 0])
+-    chi2 = torch.atan2(x_torsion[:, 3], x_torsion[:, 2])
+-    chi3 = torch.atan2(x_torsion[:, 5], x_torsion[:, 4])
+-    chi4 = torch.atan2(x_torsion[:, 7], x_torsion[:, 6])
+-
+-    if concat:
+-        return torch.stack([chi1, chi2, chi3, chi4], dim=1)
+-
+-    return chi1, chi2, chi3, chi4
++    angles = torch.atan2(x_torsion[:, 1::2], x_torsion[:, 0::2])
++    return angles if concat else angles.unbind(1)
+diff --git a/graphein/protein/tensor/geometry.py b/graphein/protein/tensor/geometry.py
+index ffc7cff1..9a763875 100644
+--- a/graphein/protein/tensor/geometry.py
++++ b/graphein/protein/tensor/geometry.py
+@@ -158,7 +158,8 @@ def kabsch(
+ 
+     # Covariance matrix
+     H = AA.mT @ BB if residue_wise else AA.T @ BB
+-    U, _, V = torch.svd(H)
++    U, _, Vh = torch.linalg.svd(H)
++    V = Vh.mT
+ 
+     if not allow_reflections:
+         # Flip the last singular vector of V where needed so R is a proper
+@@ -322,25 +323,17 @@ def idealize_backbone(
+     x_constant = x.detach().clone()
+     x.requires_grad = True
+ 
+-    def mse(x, y):
+-        return torch.mean((x - y) ** 2)
++    ideal_lengths = torch.tensor(IDEAL_BB_BOND_LENGTHS, device=x.device)
++    ideal_angles = torch.tensor(IDEAL_BB_BOND_ANGLES, device=x.device)
+ 
+     def ideal_loss(x, x_constant) -> torch.Tensor:
+         bl = get_backbone_bond_lengths(x)
+         ba = get_backbone_bond_angles(x)
+ 
+-        loss_ideal = torch.sum(
+-            torch.norm(
+-                torch.tensor(IDEAL_BB_BOND_LENGTHS, device=bl.device) - bl,
+-                dim=-1,
+-            )
+-        ) + torch.sum(
+-            torch.norm(
+-                torch.tensor(IDEAL_BB_BOND_ANGLES, device=ba.device) - ba
+-            ),
+-            dim=-1,
++        loss_ideal = torch.norm(ideal_lengths - bl, dim=-1).sum() + torch.norm(
++            ideal_angles - ba
+         )
+-        loss_ms = mse(x[:, :4, :], x_constant[:, :4, :])
++        loss_ms = F.mse_loss(x[:, :4, :], x_constant[:, :4, :])
+ 
+         return loss_ideal + loss_ms
+ 
+diff --git a/graphein/protein/tensor/io.py b/graphein/protein/tensor/io.py
+index a9b11f1d..2daa0619 100644
+--- a/graphein/protein/tensor/io.py
++++ b/graphein/protein/tensor/io.py
+@@ -56,6 +56,7 @@
+ 
+ try:
+     import torch
++    import torch.nn.functional as F
+ except ImportError:
+     message = import_message(
+         submodule="graphein.protein.tensor.io",
+@@ -286,14 +287,11 @@ def protein_df_to_chain_tensor(
+     else:
+         chains = df.chain_id
+ 
+-    # One-hot encode chain IDs
+-    chains = pd.get_dummies(chains)
+-    chains = torch.tensor(chains.values, dtype=dtype, device=device)
+-
+-    # Integers instead of one-hot
+-    if not one_hot:
+-        chains = torch.argmax(chains, dim=1)
+-
++    # Integer chain IDs in sorted chain order
++    codes, uniques = pd.factorize(chains, sort=True)
++    chains = torch.as_tensor(codes, device=device)
++    if one_hot:
++        chains = F.one_hot(chains, num_classes=len(uniques)).to(dtype)
+     return chains
+ 
+ 
+@@ -407,13 +405,14 @@ def to_dataframe(
+     :return: ``DataFrame`` or ``PandasPdb object``.
+     :rtype: Union[pd.DataFrame, PandasPdb]
+     """
+-    nz = (x - fill_value).nonzero()
+-    nz = nz[torch.where(nz[:, 2] == 0)]
+-    res_nums = nz[:, 0] + 1
++    coords, residue_index, atom_index = get_full_atom_coords(
++        x, fill_value=fill_value
++    )
++    res_nums = residue_index + 1
+ 
+     atom_number = np.arange(1, len(res_nums) + 1)
+     numbering_map = {v: k for k, v in ATOM_NUMBERING.items()}
+-    atom_indices = nz[:, 1].tolist()
++    atom_indices = atom_index.tolist()
+     atom_type = [numbering_map[a] for a in atom_indices]
+ 
+     if residue_types is None:
+@@ -455,33 +454,29 @@ def to_dataframe(
+     if alt_loc is None:
+         alt_loc = [""] * len(res_nums)
+ 
+-    blank_1 = [""] * len(res_nums)
+-    blank_2 = [""] * len(res_nums)
+-    blank_3 = [""] * len(res_nums)
+-    blank_4 = [""] * len(res_nums)
++    blank = [""] * len(res_nums)
+ 
+     # NB brittle, bad assumption; may break
+     record_names = ["ATOM" if i < 37 else "HETATM" for i in atom_indices]
+-    coords = get_full_atom_coords(x)[0]
+ 
+     out = {
+         "record_name": record_names,
+         "atom_number": atom_number,
+-        "blank_1": blank_1,
++        "blank_1": blank,
+         "atom_name": atom_type,
+         "alt_loc": alt_loc,
+         "residue_name": residue_types,
+-        "blank_2": blank_2,
++        "blank_2": blank,
+         "chain_id": chains,
+         "residue_number": res_nums,
+         "insertion": insertions,
+-        "blank_3": blank_3,
++        "blank_3": blank,
+         "x_coord": coords[:, 0],
+         "y_coord": coords[:, 1],
+         "z_coord": coords[:, 2],
+         "occupancy": occupancy,
+         "b_factor": b_factors,
+-        "blank_4": blank_4,
++        "blank_4": blank,
+         "segment_id": segment_id,
+         "element_symbol": element_symbols,
+         "charge": charge,
+diff --git a/graphein/protein/tensor/pnerf.py b/graphein/protein/tensor/pnerf.py
+index d5f166eb..8e71c2a2 100644
+--- a/graphein/protein/tensor/pnerf.py
++++ b/graphein/protein/tensor/pnerf.py
+@@ -300,49 +300,43 @@ def sn_nerf(
+ 
+ 
+     Args:
+-        a (torch.float32 tensor): (3 x 1) tensor describing point a.
+-        b (torch.float32 tensor): (3 x 1) tensor describing point b.
+-        c (torch.float32 tensor): (3 x 1) tensor describing point c.
+-        l_cd (torch.float32 tensor): (1) tensor describing the length between points
+-            c & d.
+-        theta (torch.float32 tensor): (1) tensor describing angle between points b, c,
+-            and d.
+-        chi (torch.float32 tensor): (1) tensor describing dihedral angle between points
+-            a, b, c, and d.
+-        l_bc (torch.float32 tensor): (1) tensor describing length between points b and c.
++        a (torch.float32 tensor): ``(..., 3)`` tensor describing point a.
++        b (torch.float32 tensor): ``(..., 3)`` tensor describing point b.
++        c (torch.float32 tensor): ``(..., 3)`` tensor describing point c.
++        l_cd (torch.float32 tensor): Length between points c & d.
++        theta (torch.float32 tensor): Angle between points b, c, and d.
++        chi (torch.float32 tensor): Dihedral angle between points a, b, c,
++            and d. Scalar or of shape ``(...)``.
++        l_bc (torch.float32 tensor): Length between points b and c.
+     Raises:
+         ValueError: Raises ValueError when value of theta is not in [-pi, pi].
+     Returns:
+-        torch.float32 tensor: (3 x 1) tensor describing coordinates of point c after
+-        placement using points a, b, c, and several parameters.
++        torch.float32 tensor: ``(..., 3)`` tensor of the coordinates of point d.
+     """
+-    if not (-np.pi <= theta <= np.pi):
++    if (theta.abs() > np.pi).any():
+         raise ValueError(
+             f"theta must be in radians and in [-pi, pi]. theta = {theta}"
+         )
+     AB = b - a
+     BC = c - b
+     bc = BC / l_bc
+-    n = F.normalize(torch.linalg.cross(AB, bc), dim=0)
+-    n_x_bc = torch.linalg.cross(n, bc)
++    n = F.normalize(torch.linalg.cross(AB, bc, dim=-1), dim=-1)
++    n_x_bc = torch.linalg.cross(n, bc, dim=-1)
+ 
+-    M = torch.stack([bc, n_x_bc, n], dim=1).to(chi.device)
++    M = torch.stack([bc, n_x_bc, n], dim=-1).to(chi.device)
+ 
+     l_cd = l_cd.to(chi.device)
+     theta = theta.to(chi.device)
+     c = c.to(chi.device)
+-    D2 = (
+-        torch.stack(
+-            [
+-                -l_cd * torch.cos(theta),
+-                l_cd * torch.sin(theta) * torch.cos(chi),
+-                l_cd * torch.sin(theta) * torch.sin(chi),
+-            ]
+-        )
+-        .to(torch.float32)
+-        .unsqueeze(1)
+-    )
+-
+-    D = torch.mm(M, D2).squeeze()
++    D2 = torch.stack(
++        torch.broadcast_tensors(
++            -l_cd * torch.cos(theta),
++            l_cd * torch.sin(theta) * torch.cos(chi),
++            l_cd * torch.sin(theta) * torch.sin(chi),
++        ),
++        dim=-1,
++    ).to(torch.float32)
++
++    D = (M @ D2.unsqueeze(-1)).squeeze(-1)
+ 
+     return D + c
+diff --git a/graphein/protein/tensor/reconstruction.py b/graphein/protein/tensor/reconstruction.py
+index b72cbb14..49c1da73 100644
+--- a/graphein/protein/tensor/reconstruction.py
++++ b/graphein/protein/tensor/reconstruction.py
+@@ -1,5 +1,6 @@
+ """Utilities for reconstructing protein structures."""
+ 
++from collections import defaultdict
+ from functools import lru_cache
+ 
+ import numpy as np
+@@ -162,7 +163,7 @@ def build_sidechain(
+         torsion_angles = torsion_to_rad(torsion_angles)
+     # Initialise new atom tensor [L x 37 x 3] and fill it with backbone atoms.
+     # pos = torch.ones_like(x.atom_tensor) * 1e-5
+-    pos = torch.ones((bb.shape[0], 37, 3), device=bb.device) * 1e-5
++    pos = torch.full((bb.shape[0], 37, 3), 1e-5, device=bb.device)
+ 
+     if bb.shape[1] == 5:
+         pos[:, :5, :] = bb
+@@ -171,43 +172,31 @@ def build_sidechain(
+         pos[:, :4, :] = bb
+         cb_skip = False
+ 
+-    # Get the residues in the batch (list of 3-letter AA codes)
+-    # batch_seq = list(chain.from_iterable(x.node_id))
+-    # nodes = [n.split(":")[1] for n in batch_seq]
+-
+-    # Iterate over residues
+-    # for i, res in enumerate(nodes):
++    # Residues of the same type are built together, one atom at a time
++    groups = defaultdict(list)
+     for i, res in enumerate(residue_types):
+-        start = i == 0
+-        next_res = pos[i, :] if i == len(residue_types) - 1 else None
++        groups[res].append(i)
+ 
+-        build_vals = _get_build_params(res)
++    for res, members in groups.items():
++        rows = torch.tensor(members, device=bb.device)
+         last_torsion = None
+-        # Iterate over atoms
+-        for j, (bond, pbond, angle, torsion, atom_name) in enumerate(
+-            build_vals
++        for j, (bond, pbond, angle, torsion, atom_name, idxs) in enumerate(
++            _get_build_params(res)
+         ):
+             # Skip CB as we place it in BB construction
+             if atom_name[-1] == "CB" and cb_skip:
+                 continue
+-            if start and next_res is not None:
+-                a, b, c = pos[i + 1, 0], pos[i, 1], pos[i, 2]  # N+, CA, C
+-            elif start:
+-                a, b, c = pos[i - 1, 2], pos[i, 0], pos[i, 1]  # C-, N, CA
+-            else:
+-                idxs = [ATOM_NUMBERING[atom] for atom in atom_name[:-1]]
+-                a, b, c = (
+-                    pos[i, idxs[0]],
+-                    pos[i, idxs[1]],
+-                    pos[i, idxs[2]],
+-                )  # N, CA, C
++            abc = pos[rows][:, list(idxs[:3])]
++            if members[0] == 0:
++                # The first residue is built from C-, N, CA
++                abc[0] = pos[[-1, 0, 0], [2, 0, 1]]
+ 
+             # Select correct torsion angle
+             if isinstance(torsion, str) and torsion == "p":
+                 if j == 5 and res == "ARG":
+                     torsion = torch.tensor(0.0)
+                 else:
+-                    torsion = torsion_angles[i, j - 1]
++                    torsion = torsion_angles[rows, j - 1]
+             elif (
+                 isinstance(torsion, str)
+                 and torsion == "i"
+@@ -215,10 +204,9 @@ def build_sidechain(
+             ):
+                 torsion = last_torsion - np.pi
+ 
+-            # Get coordinates of new point
+-            new_pt = sn_nerf(a, b, c, bond, angle, torsion, pbond)
+-            # Assign new point to atom tensor
+-            pos[i, ATOM_NUMBERING[atom_name[-1]]] = new_pt
++            pos[rows, idxs[3]] = sn_nerf(
++                *abc.unbind(1), bond, angle, torsion, pbond
++            )
+             last_torsion = torsion
+ 
+     return pos
+@@ -234,6 +222,7 @@ def _get_build_params(
+         torch.Tensor,
+         torch.Tensor | str,
+         list[str],
++        tuple[int, ...],
+     ],
+     ...,
+ ]:
+@@ -246,7 +235,7 @@ def _get_build_params(
+     :param res: Residue name (3-letter code)
+     :type res: str
+     :return: Iterable of sidechain construction params
+-    :rtype: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Union[torch.Tensor, str], List[str]]]
++    :rtype: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Union[torch.Tensor, str], List[str], Tuple[int, ...]]]
+     """
+     build_params = SC_BUILD_INFO[res]
+     bond_vals = [
+@@ -266,7 +255,15 @@ def _get_build_params(
+         for t in build_params["torsion-vals"]
+     ]
+     atom_names = [t.split("-") for t in build_params["torsion-names"]]
++    atom_indices = [tuple(ATOM_NUMBERING[a] for a in n) for n in atom_names]
+ 
+     return tuple(
+-        zip(bond_vals, pbond_vals, angle_vals, torsion_vals, atom_names)
++        zip(
++            bond_vals,
++            pbond_vals,
++            angle_vals,
++            torsion_vals,
++            atom_names,
++            atom_indices,
++        )
+     )
+diff --git a/tests/protein/tensor/test_angles.py b/tests/protein/tensor/test_angles.py
+index 5c7fe7e9..305f6b45 100644
+--- a/tests/protein/tensor/test_angles.py
++++ b/tests/protein/tensor/test_angles.py
+@@ -6,6 +6,7 @@
+ import numpy as np
+ import pytest
+ 
++from graphein.protein.resi_atoms import ATOM_NUMBERING
+ from graphein.protein.tensor.angles import (
+     _dihedral_angle,
+     angle_to_unit_circle,
+@@ -188,3 +189,38 @@ def test_sidechain_torsion_pads_trailing_residues(embed):
+     assert angles[1:].tolist() == [pad] * 3
+     assert not mask[1:].any()
+     assert mask[0, : 2 if embed else 1].all()
++
++
++@pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
++def test_sidechain_torsion_selenocysteine():
++    # With 38 atom types (SE at index 37), SEC has a chi1 angle
++    torch.manual_seed(0)
++    coords = torch.rand(2, 38, 3)
++    angles, mask = sidechain_torsion(coords, ["SEC", "CYS"], return_mask=True)
++    assert mask[:, 0].all() and not mask[:, 1:].any()
++    # SEC's chi1 (N-CA-CB-SE) matches CYS's (N-CA-CB-SG) on the same coords
++    n, ca, cb, sg = (ATOM_NUMBERING[a] for a in ("N", "CA", "CB", "SG"))
++    coords[1, [n, ca, cb, sg]] = coords[0, [n, ca, cb, 37]]
++    angles = sidechain_torsion(coords, ["SEC", "CYS"])
++    assert angles[0, 0] == pytest.approx(angles[1, 0].item())
++
++
++@pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
++@pytest.mark.parametrize("last", ["PYL", "MSE"])
++def test_sidechain_torsion_one_row_per_residue(last):
++    # Residues without chi angles at the end must still get a (masked) row
++    torch.manual_seed(0)
++    coords = torch.rand(3, 37, 3, requires_grad=True)
++    angles, mask = sidechain_torsion(
++        coords, ["SER", "LYS", last], return_mask=True
++    )
++    assert angles.shape == mask.shape == (3, 4)
++    assert mask.tolist() == [
++        [True, False, False, False],
++        [True, True, True, True],
++        [False] * 4,
++    ]
++    assert not angles[2].any()
++    # Masked chi angles don't give NaN gradients
++    angles.sum().backward()
++    assert not coords.grad.isnan().any()
+diff --git a/tests/protein/tensor/test_io.py b/tests/protein/tensor/test_io.py
+index 3c29af93..32aa9b07 100644
+--- a/tests/protein/tensor/test_io.py
++++ b/tests/protein/tensor/test_io.py
+@@ -9,6 +9,7 @@
+ import os
+ from pathlib import Path
+ 
++import pandas as pd
+ import pytest
+ from biopandas.pdb import PandasPdb
+ from pandas.testing import assert_frame_equal
+@@ -18,6 +19,7 @@
+     protein_df_to_chain_tensor,
+     protein_df_to_tensor,
+     protein_to_pyg,
++    to_dataframe,
+     to_pdb,
+ )
+ from graphein.protein.tensor.sequence import get_residue_id
+@@ -155,3 +157,31 @@ def test_protein_to_pyg_ids_and_hetatms():
+         assert list(data["atoms"]) == list(expected.atom_name)
+         assert data["residue_number"].tolist() == list(expected.residue_number)
+         assert list(data["element_symbol"]) == list(expected.element_symbol)
++
++
++@pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
++def test_to_dataframe_custom_fill_value():
++    x = protein_to_pyg(path=str(PDB_DATA_PATH)).coords
++    expected = to_dataframe(x)
++    x[x == 1e-5] = 0.0
++    df = to_dataframe(x, fill_value=0.0)
++    assert len(df) == len(expected)
++    assert_frame_equal(
++        df[["atom_name", "x_coord", "y_coord", "z_coord"]],
++        expected[["atom_name", "x_coord", "y_coord", "z_coord"]],
++    )
++
++
++@pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
++def test_protein_df_to_chain_tensor_sorts_chain_ids():
++    # Chains appear in the file as L, H, A; IDs follow sorted order
++    path = PDB_DATA_PATH.parent / "input_pdb_cryst1.pdb"
++    df = PandasPdb().read_pdb(str(path)).df["ATOM"]
++    chains = pd.Series(get_residue_id(df)).str.split(":").str[0]
++    expected = chains.map({c: i for i, c in enumerate(sorted(set(chains)))})
++
++    ids = protein_df_to_chain_tensor(df)
++    assert ids.tolist() == expected.tolist()
++    one_hot = protein_df_to_chain_tensor(df, one_hot=True)
++    assert one_hot.shape == (len(chains), 3)
++    assert one_hot.argmax(dim=1).tolist() == expected.tolist()
+diff --git a/tests/protein/tensor/test_pnerf.py b/tests/protein/tensor/test_pnerf.py
+index c6f7f291..d4878efd 100644
+--- a/tests/protein/tensor/test_pnerf.py
++++ b/tests/protein/tensor/test_pnerf.py
+@@ -6,6 +6,7 @@
+ from graphein.protein.tensor.pnerf import (
+     dihedrals_to_coords,
+     reconstruct_dihedrals,
++    sn_nerf,
+ )
+ 
+ try:
+@@ -34,3 +35,25 @@ def test_embedded_and_radian_dihedrals_give_same_coords():
+         reconstruct_dihedrals(rad, x),
+         atol=1e-5,
+     )
++
++
++@pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
++def test_sn_nerf_batched_matches_single():
++    torch.manual_seed(0)
++    a, b, c = (torch.randn(5, 3) * 3 for _ in range(3))
++    chi = torch.randn(5)
++    l_cd, theta = torch.tensor(1.5), torch.tensor(1.9)
++    l_bc = (c - b).norm(dim=-1, keepdim=True)
++    out = sn_nerf(a, b, c, l_cd, theta, chi, l_bc)
++    assert out.shape == (5, 3)
++    single = torch.stack(
++        [
++            sn_nerf(a[i], b[i], c[i], l_cd, theta, chi[i], l_bc[i])
++            for i in range(5)
++        ]
++    )
++    assert torch.allclose(out, single, atol=1e-6)
++    # d is l_cd from c, at angle theta to b
++    assert torch.allclose((out - c).norm(dim=-1), torch.full((5,), 1.5))
++    with pytest.raises(ValueError):
++        sn_nerf(a, b, c, l_cd, torch.tensor(4.0), chi, l_bc)
+diff --git a/tests/protein/tensor/test_reconstruction.py b/tests/protein/tensor/test_reconstruction.py
+index 411ddee2..807d29a8 100644
+--- a/tests/protein/tensor/test_reconstruction.py
++++ b/tests/protein/tensor/test_reconstruction.py
+@@ -8,7 +8,7 @@
+ 
+ import pytest
+ 
+-from graphein.protein.resi_atoms import BB_BUILD_INFO
++from graphein.protein.resi_atoms import ATOM_NUMBERING, BB_BUILD_INFO
+ from graphein.protein.tensor.geometry import kabsch
+ from graphein.protein.tensor.reconstruction import (
+     _get_build_params,
+@@ -57,9 +57,12 @@ def test_build_sidechain_accepts_sin_cos_torsions():
+ @pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")
+ def test_get_build_params():
+     assert _get_build_params("ARG") is _get_build_params("ARG")
+-    bonds, pbonds, _, _, _ = zip(*_get_build_params("ARG"))
++    bonds, pbonds, _, _, names, idxs = zip(*_get_build_params("ARG"))
+     assert pbonds[0].item() == pytest.approx(BB_BUILD_INFO["BONDLENS"]["n-ca"])
+     assert pbonds[1:] == bonds[:-1]
++    assert idxs == tuple(
++        tuple(ATOM_NUMBERING[a] for a in atoms) for atoms in names
++    )
+ 
+ 
+ @pytest.mark.skipif(not TORCH_AVAIL, reason="PyTorch not available")

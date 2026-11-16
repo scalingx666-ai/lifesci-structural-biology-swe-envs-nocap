@@ -1,0 +1,305 @@
+diff --git a/docs/references.bib b/docs/references.bib
+index d5a430f89..e5ab154f5 100644
+--- a/docs/references.bib
++++ b/docs/references.bib
+@@ -251,3 +251,17 @@ @article{HeWu2021
+ URL = { https://doi.org/10.1021/acs.jpca.1c04429},
+ eprint = { https://doi.org/10.1021/acs.jpca.1c04429}
+ }
++
++
++@article{HammesSchiffer1994,
++author = {Hammes‐Schiffer,Sharon  and Tully,John C. },
++title = {Proton transfer in solution: Molecular dynamics with quantum transitions},
++journal = {The Journal of Chemical Physics},
++volume = {101},
++number = {6},
++pages = {4657-4667},
++year = {1994},
++doi = {10.1063/1.467455},
++URL = {https://doi.org/10.1063/1.467455},
++eprint = { https://doi.org/10.1063/1.467455}
++}
+diff --git a/src/DynamicsMethods/SurfaceHoppingMethods/fssh.jl b/src/DynamicsMethods/SurfaceHoppingMethods/fssh.jl
+index 3150c08a8..84cbcabbd 100644
+--- a/src/DynamicsMethods/SurfaceHoppingMethods/fssh.jl
++++ b/src/DynamicsMethods/SurfaceHoppingMethods/fssh.jl
+@@ -1,5 +1,6 @@
+ using StatsBase: mean
+ using .NonadiabaticDistributions: NonadiabaticDistribution
++using NonadiabaticMolecularDynamics: masses
+ 
+ export FSSH
+ 
+@@ -47,7 +48,7 @@ function acceleration!(dv, v, r, sim::AbstractSimulation{<:FSSH}, t, state)
+     for I in eachindex(dv)
+         dv[I] = -sim.calculator.adiabatic_derivative[I][state, state]
+     end
+-    DynamicsUtils.divide_by_mass!(dv, sim.atoms.masses)
++    DynamicsUtils.divide_by_mass!(dv, masses(sim))
+     return nothing
+ end
+ 
+@@ -109,51 +110,98 @@ function select_new_state(sim::AbstractSimulation{<:FSSH}, u)
+     return sim.method.state
+ end
+ 
++"""
++    rescale_velocity!(sim::AbstractSimulation{<:FSSH}, u)::Bool
++
++Rescale the velocity in the direction of the nonadiabatic coupling.
++
++# References
++
++[HammesSchiffer1994](@cite)
++"""
+ function rescale_velocity!(sim::AbstractSimulation{<:FSSH}, u)::Bool
+     sim.method.rescaling === :off && return true
+ 
+-    old_state = sim.method.state
+-    new_state = sim.method.new_state
++    new_state, old_state = unpack_states(sim)
+     velocity = get_hopping_velocity(sim, u)
++    eigs = get_hopping_eigenvalues(sim)
+     
+-    c = calculate_potential_energy_change(sim, new_state, old_state)
+-    a, b = evaluate_a_and_b(sim, velocity, new_state, old_state)
+-    discriminant = b.^2 .- 2a.*c
++    d = extract_nonadiabatic_coupling(get_hopping_nonadiabatic_coupling(sim), new_state, old_state)
++    a = calculate_a(sim, d)
++    b = calculate_b(d, velocity)
++    c = calculate_potential_energy_change(eigs, new_state, old_state)
++
++    discriminant = b^2 - 4a * c
++    discriminant < 0 && return false # Frustrated hop with insufficient kinetic energy
++
++    root = sqrt(discriminant)
++    if b < 0
++        γ = (b + root) / 2a
++    else
++        γ = (b - root) / 2a
++    end
++    perform_rescaling!(sim, DynamicsUtils.get_velocities(u), γ, d)
+ 
+-    any(discriminant .< 0) && return false
++    return true
++end
+ 
+-    root = sqrt.(discriminant)
+-    plus = (b .+ root) ./ a
+-    minus = (b .- root) ./ a 
+-    velocity_rescale = sum(abs.(plus)) < sum(abs.(minus)) ? plus : minus
+-    perform_rescaling!(sim, DynamicsUtils.get_velocities(u), velocity_rescale, new_state, old_state)
++"""
++    unpack_states(sim)
+ 
+-    return true
++Get the two states that we are hopping between.
++"""
++function unpack_states(sim::AbstractSimulation{<:FSSH})
++    return (sim.method.new_state, sim.method.state)
+ end
+ 
+-function evaluate_a_and_b(sim::AbstractSimulation{<:SurfaceHopping}, velocity, new_state, old_state)
+-    a = zeros(length(sim.atoms))
+-    b = zero(a)
+-    d = get_hopping_nonadiabatic_coupling(sim)
+-    @views for i in range(sim.atoms)
+-        coupling = [d[j,i][new_state, old_state] for j=1:ndofs(sim)]
+-        a[i] = dot(coupling, coupling) / sim.atoms.masses[i]
+-        b[i] = dot(velocity[:,i], coupling)
++"""
++    extract_nonadiabatic_coupling(coupling, new_state, old_state)
++
++Extract the nonadiabatic coupling vector between states `new_state` and `old_state`
++"""
++function extract_nonadiabatic_coupling(coupling, new_state, old_state)
++    [coupling[I][new_state, old_state] for I ∈ CartesianIndices(coupling)]
++end
++
++"""
++    calculate_a(sim::AbstractSimulation{<:SurfaceHopping}, coupling::AbstractMatrix)
++
++Equation 40 from [HammesSchiffer1994](@cite).
++"""
++function calculate_a(sim::AbstractSimulation{<:SurfaceHopping}, coupling::AbstractMatrix)
++    a = zero(eltype(coupling))
++    for I in CartesianIndices(coupling)
++        a += coupling[I]^2 * masses(sim, I)
+     end
+-    return (a, b)
++    return a / 2
+ end
+ 
+-function perform_rescaling!(sim::AbstractSimulation{<:SurfaceHopping}, velocity, velocity_rescale, new_state, old_state)
+-    d = get_hopping_nonadiabatic_coupling(sim)
+-    for i in range(sim.atoms)
+-        coupling = [d[j,i][new_state, old_state] for j=1:ndofs(sim)]
+-        velocity[:,i] .-= velocity_rescale[i] .* coupling ./ sim.atoms.masses[i]
++"""
++    calculate_b(coupling::AbstractMatrix, velocity::AbstractMatrix)
++
++Equation 41 from [HammesSchiffer1994](@cite).
++"""
++function calculate_b(coupling::AbstractMatrix, velocity::AbstractMatrix)
++    return dot(coupling, velocity)
++end
++
++"""
++    perform_rescaling!(
++        sim::AbstractSimulation{<:SurfaceHopping}, velocity, velocity_rescale, d
++    )
++
++Equation 33 from [HammesSchiffer1994](@cite).
++"""
++function perform_rescaling!(
++    sim::AbstractSimulation{<:SurfaceHopping}, velocity, γ, d
++)
++    for I in CartesianIndices(d)
++        velocity[I] -= γ * d[I] / masses(sim, I)
+     end
+     return nothing
+ end
+ 
+-function calculate_potential_energy_change(sim::AbstractSimulation{<:SurfaceHopping}, new_state::Integer, current_state::Integer)
+-    eigs = get_hopping_eigenvalues(sim)
++function calculate_potential_energy_change(eigs::AbstractVector, new_state::Integer, current_state::Integer)
+     return eigs[new_state] - eigs[current_state]
+ end
+ 
+diff --git a/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl b/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl
+index 0b6a3fadf..776cb3580 100644
+--- a/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl
++++ b/src/DynamicsMethods/SurfaceHoppingMethods/iesh.jl
+@@ -192,24 +192,7 @@ function Estimators.adiabatic_population(sim::Simulation{<:IESH}, u)
+     return population
+ end
+ 
+-function rescale_velocity!(sim::Simulation{<:IESH}, u)::Bool
+-    new_state, old_state = symdiff(sim.method.new_state, sim.method.state)
+-    velocity = DynamicsUtils.get_velocities(u)
+-    
+-    c = calculate_potential_energy_change(sim, new_state, old_state)
+-    a, b = evaluate_a_and_b(sim, velocity, new_state, old_state)
+-    discriminant = b.^2 .- 2a.*c
+-
+-    any(discriminant .< 0) && return false
+-
+-    root = sqrt.(discriminant)
+-    plus = (b .+ root) ./ a
+-    minus = (b .- root) ./ a 
+-    velocity_rescale = sum(abs.(plus)) < sum(abs.(minus)) ? plus : minus
+-    perform_rescaling!(sim, velocity, velocity_rescale, new_state, old_state)
+-
+-    return true
+-end
++unpack_states(sim::Simulation{<:IESH}) = symdiff(sim.method.new_state, sim.method.state)
+ 
+ # function impurity_summary(model::DiabaticModel, R::AbstractMatrix, state::AbstractArray, σ::AbstractArray)
+ #     """Calculate impurity population according to MiaoSubotnik_JChemPhys_150_041711_2019"""
+diff --git a/src/DynamicsMethods/SurfaceHoppingMethods/rpsh.jl b/src/DynamicsMethods/SurfaceHoppingMethods/rpsh.jl
+index 1dae43ec6..38deb272a 100644
+--- a/src/DynamicsMethods/SurfaceHoppingMethods/rpsh.jl
++++ b/src/DynamicsMethods/SurfaceHoppingMethods/rpsh.jl
+@@ -38,11 +38,11 @@ function get_hopping_eigenvalues(sim::RingPolymerSimulation{<:FSSH})
+     sim.calculator.centroid_eigenvalues
+ end
+ 
+-function perform_rescaling!(sim::RingPolymerSimulation{<:FSSH}, velocity, velocity_rescale, new_state, old_state)
+-    d = get_hopping_nonadiabatic_coupling(sim)
+-    for i in range(sim.atoms)
+-        coupling = [d[j,i][new_state, old_state] for j=1:ndofs(sim)]
+-        velocity[:,i,:] .-= velocity_rescale[i] .* coupling ./ sim.atoms.masses[i]
++function perform_rescaling!(
++    sim::RingPolymerSimulation{<:SurfaceHopping}, velocity, γ, d
++)
++    for I in CartesianIndices(d)
++        velocity[I,:] .-= γ * d[I] / masses(sim, I)
+     end
+     return nothing
+ end
+diff --git a/src/simulations.jl b/src/simulations.jl
+index a363dc422..bbc698bf4 100644
+--- a/src/simulations.jl
++++ b/src/simulations.jl
+@@ -65,7 +65,11 @@ NonadiabaticModels.ndofs(sim::AbstractSimulation) = NonadiabaticModels.ndofs(sim
+ natoms(sim::AbstractSimulation) = length(sim.atoms)
+ RingPolymers.nbeads(sim::RingPolymerSimulation) = RingPolymers.nbeads(sim.beads)
+ masses(sim::AbstractSimulation) = sim.atoms.masses
+-masses(sim::AbstractSimulation, i) = sim.atoms.masses[i]
++masses(sim::AbstractSimulation, i::Int) = sim.atoms.masses[i]
++
++function masses(sim::AbstractSimulation, I::CartesianIndex)
++    masses(sim, I[2])
++end
+ 
+ Base.size(sim::Simulation) = (ndofs(sim), natoms(sim))
+ Base.size(sim::RingPolymerSimulation) = (ndofs(sim), natoms(sim), RingPolymers.nbeads(sim))
+diff --git a/test/Core/simulations.jl b/test/Core/simulations.jl
+index f32aac326..524403cc3 100644
+--- a/test/Core/simulations.jl
++++ b/test/Core/simulations.jl
+@@ -44,3 +44,15 @@ end
+     @test nbeads(sim) == 10
+     @test size(sim) == (1, 2, 10)
+ end
++
++@testset "masses" begin
++    sim = Simulation(atoms, model)
++    @test masses(sim) == atoms.masses
++    @test masses(sim, 2) == atoms.masses[2]
++    @test masses(sim, CartesianIndex(1, 2)) == atoms.masses[2]
++
++    sim = RingPolymerSimulation(atoms, model, 5)
++    @test masses(sim) == atoms.masses
++    @test masses(sim, 2) == atoms.masses[2]
++    @test masses(sim, CartesianIndex(1, 2, 3)) == atoms.masses[2]
++end
+diff --git a/test/Dynamics/fssh.jl b/test/Dynamics/fssh.jl
+index 712254c81..681600ebd 100644
+--- a/test/Dynamics/fssh.jl
++++ b/test/Dynamics/fssh.jl
+@@ -64,8 +64,9 @@ atoms = Atoms(1)
+ 
+     @testset "calculate_potential_energy_change" begin
+         integrator.p.calculator.eigenvalues = SVector{2}([0.9, -0.3])
+-        @test 1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(integrator.p, 1, 2)
+-        @test -1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(integrator.p, 2, 1)
++        eigs = SurfaceHoppingMethods.get_hopping_eigenvalues(integrator.p)
++        @test 1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(eigs, 1, 2)
++        @test -1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(eigs, 2, 1)
+     end
+ 
+     @testset "execute_hop!" begin
+@@ -73,7 +74,8 @@ atoms = Atoms(1)
+         DynamicsUtils.get_velocities(integrator.u) .= 2 # Set high momentum to ensure successful hop
+         integrator.u.state = 1
+         integrator.p.method.new_state = 2
+-        ΔE = SurfaceHoppingMethods.calculate_potential_energy_change(integrator.p, 2, 1)
++        eigs = SurfaceHoppingMethods.get_hopping_eigenvalues(integrator.p)
++        ΔE = SurfaceHoppingMethods.calculate_potential_energy_change(eigs, 2, 1)
+ 
+         KE_initial = DynamicsUtils.classical_kinetic_energy(integrator.p, get_velocities(integrator.u))
+         H_initial = DynamicsUtils.classical_hamiltonian(integrator.p, integrator.u)
+@@ -126,8 +128,9 @@ end
+ 
+     @testset "calculate_potential_energy_change" begin
+         integrator.p.calculator.centroid_eigenvalues = SVector{2}([0.9, -0.3])
+-        @test 1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(integrator.p, 1, 2)
+-        @test -1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(integrator.p, 2, 1)
++        eigs = SurfaceHoppingMethods.get_hopping_eigenvalues(integrator.p)
++        @test 1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(eigs, 1, 2)
++        @test -1.2 ≈ SurfaceHoppingMethods.calculate_potential_energy_change(eigs, 2, 1)
+     end
+ 
+     @testset "execute_hop!" begin
+@@ -135,7 +138,8 @@ end
+         get_velocities(integrator.u) .= 5 # Set high momentum to ensure successful hop
+         integrator.u.state = 1
+         integrator.p.method.new_state = 2
+-        ΔE = SurfaceHoppingMethods.calculate_potential_energy_change(integrator.p, 2, 1)
++        eigs = SurfaceHoppingMethods.get_hopping_eigenvalues(integrator.p)
++        ΔE = SurfaceHoppingMethods.calculate_potential_energy_change(eigs, 2, 1)
+ 
+         KE_initial = DynamicsUtils.classical_kinetic_energy(integrator.p, get_velocities(integrator.u))
+         H_initial = DynamicsUtils.classical_hamiltonian(integrator.p, integrator.u)

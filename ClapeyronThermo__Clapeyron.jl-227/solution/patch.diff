@@ -1,0 +1,798 @@
+diff --git a/Project.toml b/Project.toml
+index b97197783a..e16a9ee7cc 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -58,6 +58,7 @@ CoolProp = "e084ae63-2819-5025-826e-f8e611a84251"
+ Metaheuristics = "bcdb8e00-2c21-11e9-3065-2b553b22f898"
+ MultiComponentFlash = "35e5bd01-9722-4017-9deb-64a5d32478ff"
+ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
++JutulDarcy = "82210473-ab04-4dce-b31b-11573c4f8e0a"
+ 
+ [extensions]
+ ClapeyronSymbolicsExt = "Symbolics"
+@@ -65,6 +66,7 @@ ClapeyronCoolPropExt = "CoolProp"
+ ClapeyronMetaheuristicsExt = "Metaheuristics"
+ ClapeyronMultiComponentFlashExt = "MultiComponentFlash"
+ ClapeyronUnitfulExt = "Unitful"
++ClapeyronJutulDarcyExt = "JutulDarcy"
+ 
+ [extras]
+ Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+@@ -73,6 +75,7 @@ Metaheuristics = "bcdb8e00-2c21-11e9-3065-2b553b22f898"
+ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+ MultiComponentFlash = "35e5bd01-9722-4017-9deb-64a5d32478ff"
+ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
++JutulDarcy = "82210473-ab04-4dce-b31b-11573c4f8e0a"
+ 
+ [targets]
+ test = ["CoolProp", "Test", "Unitful", "MultiComponentFlash"]
+diff --git a/ext/ClapeyronJutulDarcyExt.jl b/ext/ClapeyronJutulDarcyExt.jl
+new file mode 100644
+index 0000000000..1db435c54b
+--- /dev/null
++++ b/ext/ClapeyronJutulDarcyExt.jl
+@@ -0,0 +1,73 @@
++module ClapeyronJutulDarcyExt
++    using Clapeyron: Clapeyron
++    using JutulDarcy: JutulDarcy, MultiComponentFlash, Jutul
++    const C = Clapeyron
++    const M = MultiComponentFlash
++    const J = JutulDarcy
++    function J.MultiPhaseCompositionalSystemLV(equation_of_state::C.EoSModel, phases = (J.LiquidPhase(), J.VaporPhase()); reference_densities = ones(length(phases)), other_name = "Water")
++        c = copy(equation_of_state.components)
++        phases = tuple(phases...)
++        T = typeof(phases)
++        nph = length(phases)
++        @assert nph == 2 || nph == 3
++        reference_densities = tuple(reference_densities...)
++        @assert length(reference_densities) == nph
++        if nph == 3
++            other = only(filter(x -> !(isa(x, LiquidPhase) || isa(x, VaporPhase)), phases))
++            O = typeof(other)
++            push!(c, other_name)
++        else
++            O = Nothing
++        end
++        only(findall(isequal(J.LiquidPhase()), phases))
++        only(findall(isequal(J.VaporPhase()), phases))
++        J.MultiPhaseCompositionalSystemLV{typeof(equation_of_state), T, O, typeof(reference_densities)}(phases, c, equation_of_state, reference_densities)
++    end
++
++    function Base.show(io::IO, sys::J.MultiPhaseCompositionalSystemLV{<:C.EoSModel})
++        n = length(sys.equation_of_state)
++        if J.has_other_phase(sys)
++            name = "(with water)"
++            n = n - 1
++        else
++            name = "(no water)"
++        end
++        eos = sys.equation_of_state
++        cnames = join(eos.components, ", ")
++        print(io, "MultiPhaseCompositionalSystemLV $name with $(Base.summary(eos)) EOS with $n components: $cnames")
++    end
++
++    J.get_compressibility_factor(forces, eos::C.EoSModel, P, T, Z,phase = :unknown) = C.compressibility_factor(eos, P, T, Z,phase = phase)
++    
++    @inline function J.single_phase_update!(P, T, Z, x, y, forces, eos::C.EoSModel, c)
++        AD = Base.promote_type(eltype(Z), typeof(P), typeof(T))
++        @. x = Z
++        @. y = Z
++        V = M.single_phase_label(eos, c)
++        if V > 0.5
++            phase_state = MultiComponentFlash.single_phase_v
++            Z_V = J.get_compressibility_factor(forces, eos, P, T, Z, :v)
++            Z_L = Z_V
++        else
++            phase_state = MultiComponentFlash.single_phase_l
++            Z_L = J.get_compressibility_factor(forces, eos, P, T, Z, :l)
++            Z_V = Z_L
++        end
++        V = convert(AD, V)
++        out = (Z_L::AD, Z_V::AD, V::AD, phase_state::M.PhaseState2Phase)
++        return out
++    end
++
++    @inline function J.two_phase_update!(S, P, T, Z, x, y, K, vapor_frac, forces, eos::C.EoSModel, c)
++        AD = Base.promote_type(typeof(P), eltype(Z), typeof(T))
++        @. x = J.liquid_mole_fraction(Z, K, vapor_frac)
++        @. y = J.vapor_mole_fraction(x, K)
++        V = J.two_phase_pre!(S, P, T, Z, x, y, vapor_frac, eos, c)
++        Z_L = J.get_compressibility_factor(forces, eos, P, T, x, :l)
++        Z_V = J.get_compressibility_factor(forces, eos, P, T, y, :v)
++        phase_state = MultiComponentFlash.two_phase_lv
++    
++        return (Z_L::AD, Z_V::AD, V::AD, phase_state)
++    end
++
++end #module
+diff --git a/ext/ClapeyronMultiComponentFlashExt.jl b/ext/ClapeyronMultiComponentFlashExt.jl
+index 0eadb6a2d5..836129a360 100644
+--- a/ext/ClapeyronMultiComponentFlashExt.jl
++++ b/ext/ClapeyronMultiComponentFlashExt.jl
+@@ -6,12 +6,14 @@ module ClapeyronMultiComponentFlashExt
+     const S = C.StaticArrays
+     const ForwardDiff = C.ForwardDiff
+ 
+-    struct CubicWrapper{T} <: C.EoSModel
+-        model::T
+-    end
++
++
++    ##
++    ##passing GenericCubicEoS to Clapeyron.jl userlocations
++    ##
+ 
+     C.can_nt(x::M.GenericCubicEOS) = true
+-    C.to_nt(x::M.GenericCubicEOS) = C.to_nt(x.mixture)
++    C.can_nt(x::M.MultiComponentMixture) = true
+ 
+     function C.to_nt(x::M.MultiComponentMixture)
+         res = Dict{Symbol,Any}()
+@@ -26,38 +28,29 @@ module ClapeyronMultiComponentFlashExt
+         res[:acetricfactor] = [getfield(props_i,:ω) for props_i in props]
+         return res
+     end
++    function C.to_nt(x::M.GenericCubicEOS)
++        res = C.to_nt(x.mixture)
++        #TODO:check that volume shift
++    end
+ 
++    ##
++    ##EoS properties to MultiComponentFlash.jl properties
++    ##
+     M.number_of_components(model::C.EoSModel) = length(model)
+ 
+-    function M.initial_guess_K!(K, eos::C.EoSModel, cond)
+-        C.tp_flash_K0!(K, eos, cond.p, cond.T)
++    function M.mixture_compressibility_factor(eos::C.EoSModel, cond,
++        forces = M.force_coefficients(eos, cond),
++        scalars = M.force_scalars(eos, cond, forces))
++        phase::Symbol = get(cond,:phase,:unknown)
++        C.compressibility_factor(eos,cond.p,cond.T,cond.z,phase = phase)
+     end
+ 
+-    function M.flash_storage_internal!(out, eos::C.EoSModel, cond, method; inc_jac = isa(method, M.AbstractNewtonFlash), static_size = false, kwarg...)
+-        n = M.number_of_components(eos)
+-        TT = typeof(cond.p+cond.T+one(eltype(eos)))
+-        splt = C.split_model(eos)
+-        out[:split_model] = splt
+-        out[:forces] = nothing
+-        out[:crit] = C.crit_pure.(splt)
+-        if static_size
+-            alloc_vec = () -> C.StaticArrays.@MVector zeros(TT,n)
+-        else
+-            alloc_vec = () -> zeros(TT,n)
+-        end
+-        out[:x] = alloc_vec()
+-        out[:y] = alloc_vec()
+-        #for fugacities
+-        out[:buffer1] = alloc_vec()
+-        out[:buffer2] = alloc_vec()
+-        if inc_jac
+-            M.flash_storage_internal_newton!(out, eos, cond, method, static_size = static_size; kwarg...)
+-        end
+-        return out
++    function M.initial_guess_K!(K, eos::C.EoSModel, cond)
++        C.tp_flash_K0!(K, eos, cond.p, cond.T)
+     end
+ 
+     #this is only defined with cubic EoS.
+-    M.force_coefficients(eos::C.EoSModel, cond) = nothing
++    M.force_coefficients(eos::C.EoSModel, cond;static_size = false) = nothing
+     M.force_scalars(eos::C.EoSModel, cond, forces) = nothing
+     M.force_coefficients!(forces, eos::C.EoSModel, c) = nothing
+ 
+@@ -68,89 +61,37 @@ module ClapeyronMultiComponentFlashExt
+         f .= f .* cond.z
+         return f
+     end
+-    #TODO: this could be removed
+-    function M.stability_2ph!(storage, K, eos::C.EoSModel, c; verbose = false, kwarg...)
+-        forces = storage.forces
+-        f_z = storage.buffer1
+-        f_xy = storage.buffer2
+-        x, y = storage.x, storage.y
+-        z, p, T = c.z, c.p, c.T
+-        liquid = (p = p, T = T, z = x, phase = :liquid)
+-        vapor = (p = p, T = T, z = y,phase = :vapor)
+-        # Update fugacities for current conditions used in both tests
+-        M.mixture_fugacities!(f_z, eos, c, forces)
+-        #props = eos.mixture.properties
+-        C.wilson_k_values!(K,eos,p,T,storage.crit)
+-        stable_vapor, i_v = M.michelsen_test!(vapor, f_z, f_xy, vapor.z, z, K, eos, c, forces, Val(true); kwarg...)
+-        C.wilson_k_values!(K,eos,p,T,storage.crit)
+-        stable_liquid, i_l = M.michelsen_test!(liquid, f_z, f_xy, liquid.z, z, K, eos, c, forces, Val(false); kwarg...)
+-        stable = stable_vapor && stable_liquid
+-        if !stable
+-            @. K = y/x
+-        end
+-        if verbose
+-            @info "Stability done. Iterations:\nV: $i_v\nL: $i_l" stable_vapor stable_liquid stable
++
++    function M.component_fugacity(model::C.EoSModel, cond, i, Z = C.compressibility_factor(model,cond.p,cond.T,cond.z), forces = nothing, s_v = nothing)
++        p,T,z = cond.p,cond.T,cond.z
++        R = C.Rgas(model)
++        RT = R*T
++        function fun(x)
++            V = Z*C.Rgas(model)*T/p
++            C.eos_res(model,V,T,x)
+         end
+-        return stable
++        TT = eltype(p+T+first(z) + Z + one(eltype(model)))
++        μᵢ = C.Solvers.grad_at_i(fun,z,i,TT)
++        ϕᵢ = exp(μᵢ/RT)/Z
++        return ϕᵢ*p*z[i]
+     end
+ 
+-
+-    function M.flash_update!(K, storage, type::M.SSIFlash, eos::C.EoSModel, cond, forces, V::F, iteration) where F
+-        z = cond.z
+-        x, y = storage.x, storage.y
+-        p, T = cond.p, cond.T
+-        x = M.liquid_mole_fraction!(x, z, K, V)
+-        y = M.vapor_mole_fraction!(y, x, K)
+-        phi_l = storage.buffer1
+-        phi_v = storage.buffer2
+-        liquid = (p = p, T = T, z = x,phase = :liquid)
+-        vapor = (p = p, T = T, z = y,phase = :vapor)
+-        ϵ = zero(F)
+-        M.mixture_fugacities!(phi_l, eos, liquid, forces)
+-        M.mixture_fugacities!(phi_v, eos, vapor, forces)
+-        r = phi_l
+-        r ./= phi_v
+-        K .*= r
+-        ϵ = mapreduce(ri -> abs(1-ri), max ,r)
+-        V = C.rachfordrice(K, z; β0=V)
+-        return (V, ϵ)::Tuple{F, F}
++    if isdefined(M,:eostype)
++        M.eostype(model::C.EoSModel) = Base.summary(model)
+     end
+ 
+-    #support for tp_flash interface
+-
+-    function C.MCFlashJL(;method = M.SSIFlash(),
+-        storage = nothing,
+-        V = NaN,
+-        K = nothing,
+-        tolerance = 1e-8,
+-        maxiter = 20000,
+-        verbose = false,
+-        check = true,
+-        z_min = nothing,
+-        update_forces = true)
+-        kwargs = (;tolerance,maxiter,verbose,check,z_min,update_forces)
+-        return C.MCFlashJL(method,storage,K,V,kwargs)
++    if isdefined(M,:molar_masses)
++        M.molar_masses(model::C.EoSModel) = C.mw(model) .* 0.001
+     end
+ 
+-    function M.flash_storage(model::C.EoSModel,p,T,z,method::C.MCFlashJL)
+-        cond = (p = p,T = T,z = z)
+-        mcf_method = method.method
+-        M.flash_storage(model,cond;method = mcf_method,method.kwarg...)
++    if isdefined(M,:component_names)
++        M.component_names(model::C.EoSModel) = model.components #TODO: we need an abstraction of this type on our code
+     end
+ 
+-    function C.tp_flash_impl(model,p,T,z,method::C.MCFlashJL)
+-        S = method.storage == nothing ? M.flash_storage(model,p,T,z,method) : method.storage
+-        K = method.K === nothing ? C.wilson_k_values!(zeros(typeof(p+T+one(eltype(model))),length(model)),model,p,T,S.crit) : method.K
+-        
+-        conditions = (p = p, T = T,z = z)
+-        V = M.flash_2ph!(S,K,model,conditions;method = method.method,method.kwarg...)
+-        x = M.liquid_mole_fraction!(S.x, z, K, V)
+-        y = M.vapor_mole_fraction!(S.y, x, K)
+-        G = C.__tpflash_gibbs_reduced(model,p,T,x,y,V,:vle)
+-        X = hcat(x,y)'
+-        nvals = X.*[1-V
+-                V] .* sum(z)
+-        return (X, nvals, G)
+-    end
+-end #module
+ 
++    include("MultiComponentFlash/stability.jl")
++    include("MultiComponentFlash/flash.jl")
++    include("MultiComponentFlash/flow_coupler.jl")
++    include("MultiComponentFlash/viscosity.jl")
++    include("MultiComponentFlash/Clapeyron_flash.jl")
++end #module
+diff --git a/ext/MultiComponentFlash/Clapeyron_flash.jl b/ext/MultiComponentFlash/Clapeyron_flash.jl
+new file mode 100644
+index 0000000000..5663c38b98
+--- /dev/null
++++ b/ext/MultiComponentFlash/Clapeyron_flash.jl
+@@ -0,0 +1,38 @@
++##
++## Support for Clapeyron.tp_flash interface
++## MCFlashJL is defined as a stub in Clapeyron, here we define the initializer.
++##
++function C.MCFlashJL(;method = M.SSIFlash(),
++    storage = nothing,
++    V = NaN,
++    K = nothing,
++    tolerance = 1e-8,
++    maxiter = 20000,
++    verbose = false,
++    check = true,
++    z_min = nothing,
++    update_forces = true)
++    kwargs = (;tolerance,maxiter,verbose,check,z_min,update_forces)
++    return C.MCFlashJL(method,storage,K,V,kwargs)
++end
++
++function M.flash_storage(model::C.EoSModel,p,T,z,method::C.MCFlashJL)
++    cond = (p = p,T = T,z = z)
++    mcf_method = method.method
++    M.flash_storage(model,cond;method = mcf_method,method.kwarg...)
++end
++
++function C.tp_flash_impl(model,p,T,z,method::C.MCFlashJL)
++    S = method.storage == nothing ? M.flash_storage(model,p,T,z,method) : method.storage
++    K = method.K === nothing ? C.wilson_k_values!(zeros(typeof(p+T+one(eltype(model))),length(model)),model,p,T,S.crit) : method.K
++
++    conditions = (p = p, T = T,z = z)
++    V = M.flash_2ph!(S,K,model,conditions;method = method.method,method.kwarg...)
++    x = M.liquid_mole_fraction!(S.x, z, K, V)
++    y = M.vapor_mole_fraction!(S.y, x, K)
++    G = C.__tpflash_gibbs_reduced(model,p,T,x,y,V,:vle)
++    X = hcat(x,y)'
++    nvals = X.*[1-V
++            V] .* sum(z)
++    return (X, nvals, G)
++end
+diff --git a/ext/MultiComponentFlash/flash.jl b/ext/MultiComponentFlash/flash.jl
+new file mode 100644
+index 0000000000..03ae09ee34
+--- /dev/null
++++ b/ext/MultiComponentFlash/flash.jl
+@@ -0,0 +1,165 @@
++function M.flash_storage_internal!(out, eos::C.EoSModel, cond, method; inc_jac = isa(method, M.AbstractNewtonFlash), static_size = false, kwarg...)
++    n = M.number_of_components(eos)
++    TT = typeof(one(eltype(eos)))
++    splt = C.split_model(eos)
++    out[:split_model] = splt
++    out[:forces] = nothing
++    out[:crit] = C.crit_pure.(splt)
++    if static_size
++        alloc_vec = () -> C.StaticArrays.@MVector zeros(TT,n)
++    else
++        alloc_vec = () -> zeros(TT,n)
++    end
++    out[:x] = alloc_vec()
++    out[:y] = alloc_vec()
++    out[:buffer1] = alloc_vec()
++    out[:buffer2] = alloc_vec()
++    if inc_jac
++        M.flash_storage_internal_newton!(out, eos, cond, method, static_size = static_size; kwarg...)
++    end
++    return out
++end
++
++#TODO: this function can be removed when a new version with https://github.com/moyner/MultiComponentFlash.jl/pull/17 is released
++function M.flash_storage_internal_newton!(out, eos::C.EoSModel, cond, method; static_size = false, diff_externals = false, kwarg...)
++    n = M.number_of_components(eos)
++    np = 2*n + 1
++    TT = typeof(C.ForwardDiff.Tag(Val(:Flash),Nothing))
++    primary_ad(ix) = M.get_ad(0.0, np, TT, ix)
++    V_ad = primary_ad(np)
++    T = typeof(V_ad)
++    if static_size
++        x_ad = C.StaticArrays.@MVector zeros(T, n)
++        y_ad = C.StaticArrays.@MVector zeros(T, n)
++        r = C.StaticArrays.@MVector zeros(np)
++        J = C.StaticArrays.@MMatrix zeros(np, np)
++    else
++        x_ad = zeros(T, n)
++        y_ad = zeros(T, n)
++        r = zeros(np)
++        J = zeros(np, np)
++    end
++    out[:r] = r
++    out[:J] = J
++
++    for i = 1:n
++        x_ad[i] = primary_ad(i)
++        y_ad[i] = primary_ad(i+n)
++    end
++    out[:AD] = (x = x_ad, y = y_ad, V = V_ad)
++    if diff_externals
++        M.flash_storage_internal_inverse!(out, eos, cond, method, static_size = static_size; kwarg...)
++    end
++    return out
++end
++
++#TODO: this function can be removed when a new version with https://github.com/moyner/MultiComponentFlash.jl/pull/17 is released
++function M.flash_storage_internal_inverse!(out, eos::C.EoSModel, cond, method; static_size = false, npartials = nothing)
++    n = M.number_of_components(eos)
++    np = length(out[:r])
++    external_partials = n + 2 # p, T, z_1, ... z_n
++    secondary_ad(ix) = M.get_ad(0.0, external_partials, typeof(ForwardDiff.Tag(Val(:InverseFlash),Nothing)), ix)
++    p_ad = secondary_ad(1)
++    T_ad = secondary_ad(2)
++    T_cond = typeof(p_ad)
++    if static_size
++        z_ad = C.StaticArrays.@MVector zeros(T_cond, n)
++        J_inv = C.StaticArrays.@MMatrix zeros(np, external_partials)
++    else
++        z_ad = zeros(T_cond, n)
++        J_inv = zeros(np, external_partials)
++    end
++    out[:J_inv] = J_inv
++    for i = 1:n
++        z_ad[i] = secondary_ad(i+2)
++    end
++    cond_ad = (p = p_ad, T = T_ad, z = z_ad)
++    if !isnothing(npartials)
++        if static_size
++            buf = C.StaticArrays.@MVector zeros(npartials)
++        else
++            buf = zeros(npartials)
++        end
++        out[:buf_inv] = buf
++    end
++    out[:AD_cond] = cond_ad
++    out[:forces_secondary] = M.force_coefficients(eos, cond_ad, static_size = static_size)
++end
++
++function M.flash_update!(K, storage, type::M.SSIFlash, eos::C.EoSModel, cond, forces, V::F, iteration) where F
++    z = cond.z
++    x, y = storage.x, storage.y
++    p, T = cond.p, cond.T
++    x = M.liquid_mole_fraction!(x, z, K, V)
++    y = M.vapor_mole_fraction!(y, x, K)
++    phi_l = storage.buffer1
++    phi_v = storage.buffer2
++    liquid = (p = p, T = T, z = x,phase = :liquid)
++    vapor = (p = p, T = T, z = y,phase = :vapor)
++    ϵ = zero(F)
++    M.mixture_fugacities!(phi_l, eos, liquid, forces)
++    M.mixture_fugacities!(phi_v, eos, vapor, forces)
++    r = phi_l
++    r ./= phi_v
++    K .*= r
++    ϵ = mapreduce(ri -> abs(1-ri), max ,r)
++    V = C.rachfordrice(K, z; β0=V)
++    return (V, ϵ)::Tuple{F, F}
++end
++
++function M.update_flash_jacobian!(J, r, eos::C.EoSModel, p, T, z, x, y, V, forces)
++    has_r = !isnothing(r)
++    n = M.number_of_components(eos)
++    liquid = (p = p, T = T, z = x)
++    vapor = (p = p, T = T, z = y)
++
++    #those 3 lines are the only difference. we need an overload here
++    Z_l = C.compressibility_factor(eos,p,T,x,phase = :l)
++    Z_v = C.compressibility_factor(eos,p,T,y,phase = :v)
++    s_l,s_v = nothing,nothing
++
++    if isa(V, ForwardDiff.Dual)
++        np = length(V.partials)
++    else
++        np = length(p.partials)
++    end
++    # Isofugacity constraint
++    # f_li - f_vi ∀ i
++    @inbounds for c in 1:n
++        f_l = M.component_fugacity(eos, liquid, c, Z_l, forces, s_l)
++        f_v = M.component_fugacity(eos, vapor, c, Z_v, forces, s_v)
++        Δf = f_l - f_v
++        if has_r
++            @inbounds r[c+n] = Δf.value
++        end
++        for i = 1:np
++            @inbounds J[c+n, i] = Δf.partials[i]
++        end
++    end
++    # x_i*(1-V) - V*y_i - z_i = 0 ∀ i
++    # Σ_i x_i - y_i = 0
++    T = Base.promote_type(eltype(x), eltype(y))
++    L = 1 - V
++    Σxy = zero(T)
++    @inbounds for c in 1:n
++        xc, yc = x[c], y[c]
++        Σxy += (xc - yc)
++        M = L*xc + V*yc - z[c]
++        if has_r
++            @inbounds r[c] = M.value
++        end
++        @inbounds for i = 1:np
++            J[c, i] = MultiComponentFlash.∂(M, i)
++        end
++    end
++    if has_r
++        @inbounds r[end] = Σxy.value
++    end
++    if isa(Σxy, ForwardDiff.Dual)
++        @inbounds for i = 1:np
++            J[end, i] = M.∂(Σxy, i)
++        end
++    else
++        @. J[end, :] = 0
++    end
++end
+diff --git a/ext/MultiComponentFlash/flow_coupler.jl b/ext/MultiComponentFlash/flow_coupler.jl
+new file mode 100644
+index 0000000000..738df28b13
+--- /dev/null
++++ b/ext/MultiComponentFlash/flow_coupler.jl
+@@ -0,0 +1,83 @@
++function M.FlashedMixture2Phase(eos::C.EoSModel, T = Float64, T_num = Float64)
++    n = M.number_of_components(eos)
++    V = zero(T)
++    # K values are always doubles
++    K = zeros(T_num, n)
++    liquid = M.FlashedPhase(n, T)
++    vapor = M.FlashedPhase(n, T)
++    return M.FlashedMixture2Phase(M.unknown_phase_state_lv, K, V, liquid, vapor)
++end
++
++function M.single_phase_label(model::C.EoSModel,cond)
++    V,_,_ = C._label_and_volumes(model,cond)
++    return V
++end
++
++function M.flashed_mixture_2ph(eos::C.EoSModel, cond, _K = nothing; method = M.SSIFlash(), kwarg...)
++    # Convenience function for getting flashed phases
++    S = M.flash_storage(eos, cond, method = method)
++    p,T,z = cond.p,cond.T,cond.z
++    K = _K === nothing ? C.wilson_k_values!(zeros(typeof(p+T+one(eltype(eos))),length(eos)),eos,p,T,S.crit) : _K
++    return M.flashed_mixture_2ph!(S, eos, cond, K; method = method, kwarg...)
++end
++
++function M.flashed_mixture_2ph!(storage, eos::C.EoSModel, conditions, K; kwarg...)
++    V, K, rep = M.flash_2ph!(storage, K, eos, conditions; kwarg..., extra_out = true)
++    p = conditions.p
++    T = conditions.T
++    z = conditions.z
++
++    x = @. M.liquid_mole_fraction(z, K, V)
++    y = @. M.vapor_mole_fraction(x, K)
++    if V == 0 || V == 1
++    #=
++    instead of Li correlation, we just check the gibbs energies of the mixtures.
++    we do this anyway in the volume calculation, so it better to be more explicit.
++    =#
++        V,Vl,Vv = C._label_and_volumes(eos, conditions)
++        if V == 0
++            state = single_phase_l
++            Zx = Vl*p/C.Rgas(model)/T/sum(z)
++        else
++            state = single_phase_v
++            Zx = Vv*p/C.Rgas(model)/T/sum(z)
++        end
++        Z_L,Z_V = Zx,Zx
++    else
++        state = M.two_phase_lv
++        Z_L = C.compressibility_factor(eos, p, T, x, phase = :l)
++        Z_V = C.compressibility_factor(eos, p, T, y, phase = :v)
++    end
++    return M.FlashedMixture2Phase(state, K, V, x, y, Z_L, Z_V)
++end
++
++@inline function M.two_phase_vapor_saturation(eos::C.EoSModel, p, Temp, f::M.FlashedMixture2Phase{T}) where T
++    state = f.state
++    # A faster definition that doesn't go via molar volume, but assumes no shifts:
++    V = f.V
++    Z_l = f.liquid.Z
++    Z_v = f.vapor.Z
++    S_v = Z_v*V/(Z_l*(1-V) + Z_v*V)
++    return S_v
++    #the volume calculated in
++    #=
++    V = f.V
++    L = one(V) - V
++    vol_v = V*molar_volume(eos, p, Temp, f.vapor)
++    vol_l = L*molar_volume(eos, p, Temp, f.liquid)
++    S_v = vol_v/(vol_v + vol_l)
++    return S_v =#
++end
++
++function M.molar_volume(model::C.EoSModel, p, T, ph::M.FlashedPhase{X}) where X
++    Z = ph.Z
++    v = convert(X,Z*C.Rgas(model)*T/p)
++    return v
++end
++
++function M.mass_density(model::C.EoSModel, p, T, ph::M.FlashedPhase{X}) where X
++    Z = ph.Z
++    v = Z*C.Rgas(model)*T/p
++    molar_weight = C.molecular_weight(model,ph.mole_fractions)
++    return convert(X,molar_weight/v)
++end
+\ No newline at end of file
+diff --git a/ext/MultiComponentFlash/stability.jl b/ext/MultiComponentFlash/stability.jl
+new file mode 100644
+index 0000000000..4658a55b37
+--- /dev/null
++++ b/ext/MultiComponentFlash/stability.jl
+@@ -0,0 +1,25 @@
++    #TODO: this could be removed
++    function M.stability_2ph!(storage, K, eos::C.EoSModel, c; verbose = false, kwarg...)
++        forces = storage.forces
++        f_z = storage.buffer1
++        f_xy = storage.buffer2
++        x, y = storage.x, storage.y
++        z, p, T = c.z, c.p, c.T
++        liquid = (p = p, T = T, z = x, phase = :liquid)
++        vapor = (p = p, T = T, z = y,phase = :vapor)
++        # Update fugacities for current conditions used in both tests
++        M.mixture_fugacities!(f_z, eos, c, forces)
++        #props = eos.mixture.properties
++        C.wilson_k_values!(K,eos,p,T,storage.crit)
++        stable_vapor, i_v = M.michelsen_test!(vapor, f_z, f_xy, vapor.z, z, K, eos, c, forces, Val(true); kwarg...)
++        C.wilson_k_values!(K,eos,p,T,storage.crit)
++        stable_liquid, i_l = M.michelsen_test!(liquid, f_z, f_xy, liquid.z, z, K, eos, c, forces, Val(false); kwarg...)
++        stable = stable_vapor && stable_liquid
++        if !stable
++            @. K = y/x
++        end
++        if verbose
++            @info "Stability done. Iterations:\nV: $i_v\nL: $i_l" stable_vapor stable_liquid stable
++        end
++        return stable
++    end
+diff --git a/ext/MultiComponentFlash/viscosity.jl b/ext/MultiComponentFlash/viscosity.jl
+new file mode 100644
+index 0000000000..1c438dc0c3
+--- /dev/null
++++ b/ext/MultiComponentFlash/viscosity.jl
+@@ -0,0 +1,87 @@
++function M.lbc_viscosity(eos::C.EoSModel, p, temperature, ph::M.FlashedPhase{T}; coeff = (0.1023, 0.023364, 0.058533, -0.040758, 0.0093324), shift = -1e-4) where T
++    z = ph.mole_fractions
++
++    mw_mix, P_pc, T_pc, V_pc = M.pseudo_critical_properties(eos, z)
++    mu_atm = M.atmospheric_mu_estimate(eos, z, temperature)
++    e_mix = M.mixture_viscosity_parameter(mw_mix, T_pc, P_pc)
++    # From Jossi et al
++    # coeffs = [0.1023, 0.023364, 0.058533, -0.040758, 0.0093724, 1e-4]
++    # From LBC paper
++    # coeffs = [0.1023, 0.023364, 0.058533, -0.040758, 0.0093324, -1e-4]
++    # Compute reduced density
++    V = M.molar_volume(eos, p, temperature, ph)
++    rho_r = V_pc/V
++    corr = zero(T)
++    for (i, c) in enumerate(coeff)
++        corr += c*rho_r^(i-1)
++    end
++    mu_correction = (corr^4 + shift)/e_mix
++    # Final expression is compound and given in centi poise. We convert to Pa s
++    # instead for strict SI outputs.
++    mu = 1e-3*(mu_atm + mu_correction)
++    return mu::T
++end
++
++function M.pseudo_critical_properties(model::C.EoSModel, z::V) where V<:AbstractVector{T} where T
++    mw = C.molecular_weight(model,z)
++    pure = C.split_model(model)
++    crit = C.crit_pure.(pure)
++    tc = [crit[i][1] for i in 1:length(model)]
++    pc = [crit[i][2] for i in 1:length(model)]
++    vc = [crit[i][3] for i in 1:length(model)]
++    Tc = C.dot(tc,z)
++    Pc = C.dot(pc,z)
++    Vc = C.dot(vc,z)
++    return mw,Pc,Tc,Vc
++end
++
++function M.pseudo_critical_properties(model::C.MultiFluid, z::V) where V<:AbstractVector{T} where T
++    mw = C.molecular_weight(model,z)
++    tc = model.params.Tc.values
++    pc = model.params.Pc.values
++    vc = model.params.Vc.values
++    Tc = C.dot(tc,z)
++    Pc = C.dot(pc,z)
++    Vc = C.dot(vc,z)
++    return mw,Pc,Tc,Vc
++end
++
++function M.pseudo_critical_properties(model::C.CubicModel, z::V) where V<:AbstractVector{T} where T
++    mw = C.molecular_weight(model,z)
++    tc = model.params.Tc.values
++    pc = model.params.Pc.values
++    Tc = C.dot(tc,z)
++    Pc = C.dot(pc,z)
++    if hasfield(typeof(model.params),:Vc)
++        Vc = C.dot(model.params.Vc.values,z)
++    else
++        Vc = volume(model,Pc,Tc,z)
++    end
++    return mw,Pc,Tc,Vc
++end
++
++function M.atmospheric_mu_estimate(model::C.EoSModel, z::V, temperature) where V<:AbstractVector{T} where T
++    a = zero(T)
++    b = zero(T)
++    Tc = model.params.Tc.values
++    Pc = model.params.Pc.values
++    Mw = C.mw(model)
++    @inbounds for i in 1:length(model)
++        mw = Mw[i]/1000.
++        T_c = Tc[i]
++        p_c = Pc[i]
++        zi = z[i]
++        # Add contributions to atmospheric mu
++        T_r = temperature/T_c
++        e_i = M.mixture_viscosity_parameter(mw, T_c, p_c)
++        if T_r > 1.5
++            mu_i = 17.78e-5*(4.58*T_r - 1.67)^0.625
++        else
++            mu_i = 34e-5*T_r^(0.94)
++        end
++        tmp = sqrt(1000.0*mw)*zi
++        a += tmp*mu_i/e_i
++        b += tmp
++    end
++    return a/b
++end
+diff --git a/src/methods/property_solvers/volume.jl b/src/methods/property_solvers/volume.jl
+index a649a7e9c4..44ec69b642 100755
+--- a/src/methods/property_solvers/volume.jl
++++ b/src/methods/property_solvers/volume.jl
+@@ -205,4 +205,25 @@ function volume_impl(model::EoSModel,p,T,z=SA[1.0],phase=:unknown,threaded=true,
+     end
+ end
+ 
++#=
++used by MultiComponentFlash.jl extension
++=#
++function _label_and_volumes(model::EoSModel,cond)
++    #gibbs comparison, the phase with the least amount of gibbs energy is the most stable.
++    p,T,z = cond.p,cond.T,cond.z
++    Vl = volume(model,p,T,z,phase =:l)
++    Vv = volume(model,p,T,z,phase =:v)
++    function gibbs(fV)
++        isnan(fV) && return one(fV)/zero(fV)
++        _df,_f =  ∂f(model,fV,T,z)
++        dV,_ = _df
++        return ifelse(abs((p+dV)/p) > 0.03,zero(dV)/one(dV),_f + p*fV)
++    end
++    isnan(Vl) && return 1,Vv,Vv #could not converge on gas volume, assuming stable liquid phase
++    isnan(Vv) && return 0,Vl,Vl #could not converge on liquid volume, assuming stable gas phase
++    gl,gv = gibbs(Vl),gibbs(Vv)
++    V = gv < gl ? 1 : 0
++    return V,Vl,Vv
++end
++
+ export volume
+diff --git a/src/modules/solvers/ad.jl b/src/modules/solvers/ad.jl
+index 8ee428a67b..58b257f897 100644
+--- a/src/modules/solvers/ad.jl
++++ b/src/modules/solvers/ad.jl
+@@ -166,6 +166,36 @@ function primalval(x::AbstractArray{T}) where T <: ForwardDiff.Dual
+     return primalval.(x)
+ end
+ 
++#=
++gradient at index i
+ 
++=#
++
++struct GradᵢVector{T,V} <: AbstractVector{T}
++    i::Int
++    val::T
++    vector::V
++end
++
++function Base.getindex(x::GradᵢVector{T,V},i) where {T,V}
++    idx = x.i
++    if idx == i
++        return x.val
++    else
++        return convert(T,x.vector[i])
++    end
++end
++
++Base.length(x::GradᵢVector) = length(x.vector)
++Base.size(x::GradᵢVector) = size(x.vector)
++
++function grad_at_i(f::F,x::X,i,TT = eltype(x)) where {F,X <: AbstractVector{R}} where R
++    T = typeof(ForwardDiff.Tag(f, TT))
++    xᵢ = TT(x[i])
++    ∂xᵢ = ForwardDiff.Dual{T}(xᵢ, oneunit(xᵢ))
++    ∂x = GradᵢVector(i,∂xᵢ,x)
++    fx = f(∂x)
++    return ForwardDiff.extract_derivative(T, fx)
++end
+ 
+ 

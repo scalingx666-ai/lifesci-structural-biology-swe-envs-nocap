@@ -1,0 +1,624 @@
+diff --git a/docs/Integrator/BrownianHydrodynamics.rst b/docs/Integrator/BrownianHydrodynamics.rst
+index 37f6d6e6..b6e811e5 100644
+--- a/docs/Integrator/BrownianHydrodynamics.rst
++++ b/docs/Integrator/BrownianHydrodynamics.rst
+@@ -582,7 +582,8 @@ The following parameters are available:
+   * :cpp:`real dt`  Time step
+   * :cpp:`real tolerance` Overall tolerance of the algorithm (FCM in the far field and Lanczos iterative solver in the near field).
+   * :cpp:`Box box` A :cpp:class:`Box` with the domain size information.
+-  * :cpp:`real split` The splitting parameter of the PSE algorithm in units of inverse of length. This parameter only affects performance and must be manually tuned in a case by case basis to find the optimal (usually between 0.1/hydrodynamicRadius-1/hydrodynamicRadius).
++  * :cpp:`real psi` The splitting parameter of the PSE algorithm in units of inverse of length. This parameter only affects performance and must be manually tuned in a case by case basis to find the optimal (usually between 0.1/hydrodynamicRadius-1/hydrodynamicRadius).
++  * :cpp:`real shearStrain` The shear strain of the system. If enabled, a shear flow will be applied to the system. This parameter is optional and defaults to 0, meaning no shear flow.
+ 
+ .. code:: c++
+ 
+@@ -601,8 +602,9 @@ The following parameters are available:
+     par.hydrodynamicRadius = 1.0;
+     par.dt = 0.01;
+     par.tolerance = 1e-3;
+-    par.split = 0.5;
++    par.psi = 0.5;
+     par.box = Box({128, 128, 128});
++    //par.shearStrain = 1.0;
+     auto bdhi = std::make_shared<PSE>(pd, par);
+     ...
+     //Add any interactor
+@@ -622,6 +624,8 @@ Here, :code:`pd` is a :ref:`ParticleData` instance.
+ 
+ .. note:: As usual, any :ref:`Interactor` can be added to this :ref:`Integrator`, as long as it is able to compute forces.
+ 
++.. hint:: The shear strain can be dynamically updated via the :cpp:`setShearStrain` method of the :cpp:class:`PSE` class.	  
++
+ 
+ .. _FIB:
+ 
+diff --git a/src/Integrator/BDHI/BDHI_PSE.cuh b/src/Integrator/BDHI/BDHI_PSE.cuh
+index 63db91f6..1d941de0 100644
+--- a/src/Integrator/BDHI/BDHI_PSE.cuh
++++ b/src/Integrator/BDHI/BDHI_PSE.cuh
+@@ -1,4 +1,4 @@
+-/*Raul P. Pelaez 2017-2020. Positively Split Edwald Rotne-Prager-Yamakawa Brownian Dynamics with Hydrodynamic interactions.
++/*Raul P. Pelaez 2017-2022. Positively Split Edwald Rotne-Prager-Yamakawa Brownian Dynamics with Hydrodynamic interactions.
+ 
+ 
+   As this is a BDHI module. BDHI_PSE computes the terms M·F and B·dW in the differential equation:
+@@ -73,9 +73,9 @@ namespace uammd{
+ 	PSE(std::make_shared<ParticleGroup>(pd, "All"), par){}
+ 
+       PSE(shared_ptr<ParticleGroup> pg, Parameters par);
+-      
++
+       ~PSE(){}
+-      
++
+       void setup_step(cudaStream_t st = 0){}
+       /*Compute M·F = Mr·F + Mw·F, also includes the far field stochastic displacements*/
+       void computeMF(real3* MF, cudaStream_t st){
+@@ -83,9 +83,23 @@ namespace uammd{
+ 	int numberParticles = pg->getNumberParticles();
+ 	thrust::fill(thrust::cuda::par.on(st), MF, MF+numberParticles, real3());
+ 	auto pd = pg->getParticleData();
+-	auto pos = pd->getPos(access::gpu, access::read);
+-	auto force = pd->getForce(access::gpu, access::read);	
++	computeMFFarField(MF, st);
++	computeMFNearField(MF, st);
++      }
++
++      void computeMFNearField(real3* MF, cudaStream_t st){
++	System::log<System::DEBUG1>("[BDHI::PSE] Computing MFNearField....");
++	auto pd = pg->getParticleData();
++	auto force = pd->getForce(access::location::gpu, access::mode::read);
+ 	nearField->Mdot(force.begin(), MF, st);
++      }
++
++      void computeMFFarField(real3* MF, cudaStream_t st){
++	System::log<System::DEBUG1>("[BDHI::PSE] Computing MFFarField....");
++	auto pd = pg->getParticleData();
++	int numberParticles = pg->getNumberParticles();
++	auto pos = pd->getPos(access::gpu, access::read);
++	auto force = pd->getForce(access::gpu, access::read);
+ 	farField->computeHydrodynamicDisplacements(pos.begin(), force.begin(), MF, numberParticles,
+ 						   temperature, 1.0/sqrt(dt), st);
+       }
+@@ -115,14 +129,20 @@ namespace uammd{
+ 						   temperature, noise_prefactor, st);
+       }
+ 
++      void setShearStrain(real newStrain){
++	System::log<System::DEBUG>("[BDHI::PSE] Shear strain changed to %g", newStrain);
++        nearField->setShearStrain(newStrain);
++	farField->setShearStrain(newStrain);
++      }
++
+       real getHydrodynamicRadius(){
+ 	return hydrodynamicRadius;
+       }
+-      
++
+       real getSelfMobility(){
+-	return this->M0;	
++	return this->M0;
+       }
+-      
++
+     private:
+       shared_ptr<ParticleGroup> pg;
+       real hydrodynamicRadius, M0;
+diff --git a/src/Integrator/BDHI/PSE/FarField.cuh b/src/Integrator/BDHI/PSE/FarField.cuh
+index 03d391a4..4b791b33 100644
+--- a/src/Integrator/BDHI/PSE/FarField.cuh
++++ b/src/Integrator/BDHI/PSE/FarField.cuh
+@@ -2,6 +2,7 @@
+ 
+ Far field
+ 
++Ondrej implemented the sheared cell functionality.
+ */
+ 
+ #ifndef BDHI_PSE_FARFIELD_CUH
+@@ -67,8 +68,9 @@ namespace uammd{
+ 
+ 	/* Precomputes the fourier scaling factor B (see eq. 9 and 20.5 in [1]),
+ 	   Returns B(||k||^2, xi, eta) = 1/(vis·Vol) · sinc(k·rh)^2/k^2·Hashimoto(k,xi,eta)
+-      */
++	*/
+ 	__device__ real greensFunction(real3 waveVector,
++				       real shearStrain,
+ 				       real rh, //Hydrodynamic radius
+ 				       real viscosity,
+ 				       real split, //Ewald splitting
+@@ -78,18 +80,26 @@ namespace uammd{
+ 	  if(k2 == 0){
+ 	    return real(0.0);
+ 	  }
++	  const real3 K_NUFFT = waveVector;
++	  const real3 K_Ewald = shearWaveVector(waveVector, shearStrain);
+ 	  /*Compute the scaling factor for this node*/
+-	  const real k = sqrt(k2);
+-	  const real sinck = sin(k*rh)/k;
+-	  const real k2_invsplit2_4 = k2/(4.0*split*split);
++	  real K_Ewald2 = dot(K_Ewald,K_Ewald);
++	  real K_NUFFT2 = dot(K_NUFFT,K_NUFFT);
++	  real kmod = sqrt(K_Ewald2);
++	  real invk2 = real(1.0)/K_Ewald2;
++	  real sink = sin(kmod*rh);
++	  real kEw2_invsplit2_4 = K_Ewald2/(real(4.0)*split*split);
++	  real kNU2_invsplit2_4 = K_NUFFT2/(real(4.0)*split*split);
+ 	  /*The Hashimoto splitting function,
+ 	    split is the splitting between near and far contributions,
+ 	    eta is the splitting of the gaussian kernel used in the grid interpolation, see sec. 2 in [2]*/
+ 	  /*See eq. 11 in [1] and eq. 11 and 14 in [2]*/
+-	  const real tau = -k2_invsplit2_4*(1.0-eta);
+-	  const real hashimoto = (1.0 + k2_invsplit2_4)*exp(tau)/k2;
++	  /* Modification for shear strain: the right exponential is 
++	     exp ((eta*kNUFFT^2- kEwald^2)/(4*xi^2)) */
++	  real tau = eta*kNU2_invsplit2_4-kEw2_invsplit2_4;
++	  real hashimoto = (real(1.0) + kEw2_invsplit2_4)*exp(tau)/K_Ewald2;
+ 	  /*eq. 20.5 in [1]*/
+-	  real B = sinck*sinck*hashimoto/(viscosity*rh*rh);
++	  real B = sink*sink*invk2*hashimoto/(viscosity*rh*rh);
+ 	  B /= real(n.x*n.y*n.z);
+ 	  //B(k)*(I- k^k/k^2)
+ 	  return B;
+@@ -104,6 +114,7 @@ namespace uammd{
+ 	*/
+ 	__global__ void forceFourier2Vel(cufftComplex3 * gridForces, /*Input array*/
+ 					 cufftComplex3 * gridVels, /*Output array, can be the same as input*/
++					 real shearStrain,
+ 					 real hydrodynamicRadius, real viscosity, real split, real eta,
+ 					 Grid grid){
+ 	  const int id = blockIdx.x*blockDim.x + threadIdx.x;
+@@ -115,9 +126,10 @@ namespace uammd{
+ 	  if(id>=(ncells.z*ncells.y*(ncells.x/2+1))) return;
+ 	  const int3 waveNumber = indexToWaveNumber(id, ncells);
+ 	  const real3 waveVector = waveNumberToWaveVector(waveNumber, grid.box.boxSize);
+-	  const real B = greensFunction(waveVector,
++	  const real B = greensFunction(waveVector, shearStrain,
+ 					hydrodynamicRadius, viscosity, split, eta, ncells);
+-	  gridVels[id] = B*projectFourier(waveVector, gridForces[id]);
++	  gridVels[id] = projectFourier(shearWaveVector(waveVector, shearStrain),
++					B*gridForces[id]);
+ 	}
+ 
+ 	/*Compute gaussian complex noise dW, std = prefactor -> ||z||^2 = <x^2>/sqrt(2)+<y^2>/sqrt(2) = prefactor*/
+@@ -175,15 +187,16 @@ namespace uammd{
+ 	}
+ 
+ 	/*Computes the long range stochastic velocity term
+-	Mw·F + sqrt(Mw)·dWw = σ·St·FFTi·B·FFTf·S·F+ √σ·St·FFTi·√B·dWw =
+-	= σ·St·FFTi( B·FFTf·S·F + 1/√σ·√B·dWw)
+-	See sec. B.2 in [1]
+-	This kernel gets v_k = gridVelsFourier = B·FFtt·S·F as input and adds 1/√σ·√B(k)·dWw.
+-	Keeping special care that v_k = v*_{N-k}, which implies that dWw_k = dWw*_{N-k}
++	  Mw·F + sqrt(Mw)·dWw = σ·St·FFTi·B·FFTf·S·F+ √σ·St·FFTi·√B·dWw =
++	  = σ·St·FFTi( B·FFTf·S·F + 1/√σ·√B·dWw)
++	  See sec. B.2 in [1]
++	  This kernel gets v_k = gridVelsFourier = B·FFtt·S·F as input and adds 1/√σ·√B(k)·dWw.
++	  Keeping special care that v_k = v*_{N-k}, which implies that dWw_k = dWw*_{N-k}
+ 	*/
+ 	__global__ void fourierBrownianNoise(cufftComplex3 *gridVelsFourier,
+ 					     Grid grid,
+ 					     real prefactor,/* sqrt(2·T/dt)*/
++					     real shearStrain,
+ 					     real hydrodynamicRadius, real viscosity, real split, real eta,
+ 					     uint seed1, uint seed2){
+ 	  const uint id = blockIdx.x*blockDim.x + threadIdx.x;
+@@ -219,8 +232,8 @@ namespace uammd{
+ 	  {// Compute for v_k wave number
+ 	    const int3 ik = indexToWaveNumber(id, nk);
+ 	    const real3 k = waveNumberToWaveVector(ik, grid.box.boxSize);
+-	    const real B = greensFunction(k, hydrodynamicRadius, viscosity, split, eta, nk);
+-	    gridVelsFourier[id] += sqrt(B)*projectFourier(k, noise);
++	    const real B = greensFunction(k, shearStrain, hydrodynamicRadius, viscosity, split, eta, nk);
++	    gridVelsFourier[id] += sqrt(B)*projectFourier(shearWaveVector(k, shearStrain), noise);
+ 	  }
+ 	  /*Compute for conjugate v_{N-k} if needed*/
+ 	  /*Take care of conjugate wave number -> v_{Nx-kx,Ny-ky, Nz-kz}*/
+@@ -239,8 +252,8 @@ namespace uammd{
+ 	    factor.x.y *= real(-1.0);
+ 	    factor.y.y *= real(-1.0);
+ 	    factor.z.y *= real(-1.0);
+-	    const real B = greensFunction(k, hydrodynamicRadius, viscosity, split, eta, nk);
+-	    gridVelsFourier[id_conj] += sqrt(B)*projectFourier(k, factor);
++	    const real B = greensFunction(k, shearStrain, hydrodynamicRadius, viscosity, split, eta, nk);
++	    gridVelsFourier[id_conj] += sqrt(B)*projectFourier(shearWaveVector(k, shearStrain), factor);
+ 	  }
+ 	}
+ 
+@@ -265,6 +278,7 @@ namespace uammd{
+ 	  hydrodynamicRadius(par.hydrodynamicRadius),
+ 	  psi(par.psi){
+ 	  this->seed = sys->rng().next32();
++	  setShearStrain(par.shearStrain);
+ 	  initializeGrid(par.tolerance);
+ 	  initializeKernel(par.tolerance);
+ 	  initializeCuFFT();
+@@ -288,6 +302,10 @@ namespace uammd{
+ 	void computeHydrodynamicDisplacements(real4* pos, real4* forces, real3 *Mv, int numberParticles,
+ 					      real temperature, real prefactor, cudaStream_t st);
+ 
++	void setShearStrain(real newStrain){
++	  this->shearStrain = newStrain;
++	}
++
+       private:
+ 	std::shared_ptr<System> sys;
+ 	template<class T> using cached_vector = uninitialized_cached_vector<T>;
+@@ -295,6 +313,7 @@ namespace uammd{
+ 	Box box;
+ 	uint seed;
+ 
++	real shearStrain;
+ 	real hydrodynamicRadius;
+ 	real viscosity;
+ 	real psi; /*Splitting factor*/
+@@ -350,6 +369,7 @@ namespace uammd{
+ 	  int Nthreads = 128;
+ 	  int Nblocks = (n.z*n.y*(n.x/2+1))/Nthreads +1;
+ 	  detail::forceFourier2Vel<<<Nblocks, Nthreads, 0, st>>> (d_gridVelsFourier, d_gridVelsFourier,
++								  shearStrain,
+ 								  hydrodynamicRadius, viscosity, psi, eta,
+ 								  grid);
+ 	  CudaCheckError();
+@@ -394,6 +414,7 @@ namespace uammd{
+ 	    //In: B·FFT·S·F -> Out: B·FFT·S·F + 1/√σ·√B·dWw
+ 	    detail::fourierBrownianNoise<<<Nblocks, Nthreads, 0, st>>>(d_gridVelsFourier, grid,
+ 								       noise_prefactor, // 1/√σ· sqrt(2*T/dt),
++								       shearStrain,
+ 								       hydrodynamicRadius, viscosity, psi, eta,
+ 								       seed, //Saru needs two seeds apart from thread id
+ 								       seed2);
+@@ -449,7 +470,7 @@ namespace uammd{
+ 	interpolateVelocity(gridVels, pos, MF, numberParticles, st);
+ 	System::log<System::DEBUG2>("[BDHI::PSE] MF wave space Done");
+       }
+-      
++
+       void FarField::initializeCuFFT(){
+ 	CufftSafeCall(cufftCreate(&cufft_plan_forward));
+ 	CufftSafeCall(cufftCreate(&cufft_plan_inverse));
+@@ -533,7 +554,7 @@ namespace uammd{
+ 	this->eta = pow(2.0*psi*w/gaussM, 2);
+ 	System::log<System::MESSAGE>("[BDHI::PSE] eta: %g", eta);
+ 	kernel = std::make_shared<Kernel>(P, sqrt(eta)/(2.0*psi));
+-}
++      }
+ 
+       void FarField::initializeGrid(real tolerance){
+ 	real kcut = 2*psi*sqrt(-log(tolerance));
+@@ -542,7 +563,7 @@ namespace uammd{
+ 	int3 cellDim = make_int3(2*box.boxSize/hgrid)+1;
+ 	cellDim = nextFFTWiseSize3D(cellDim);
+ 	this->grid = Grid(box, cellDim);
+-}
++      }
+     }
+   }
+ }
+diff --git a/src/Integrator/BDHI/PSE/NearField.cuh b/src/Integrator/BDHI/PSE/NearField.cuh
+index 74c467db..fe0d77fc 100644
+--- a/src/Integrator/BDHI/PSE/NearField.cuh
++++ b/src/Integrator/BDHI/PSE/NearField.cuh
+@@ -2,6 +2,7 @@
+ 
+ Near field
+ 
++Ondrej implemented the sheared-cell functionality.
+ */
+ 
+ #ifndef BDHI_PSE_NEARFIELD_CUH
+@@ -19,6 +20,10 @@ Near field
+ namespace uammd{
+   namespace BDHI{
+     namespace pse_ns{
++      real cutOffShearedSafetyFactor(real shearStrain){
++	real g = shearStrain;
++	return 1+0.5*g*g+0.5*sqrt(g*g*(g*g+4.0));
++      }
+ 
+       class NearField{
+       public:
+@@ -28,6 +33,7 @@ namespace uammd{
+ 	  pg(pg),
+ 	  tolerance(par.tolerance)
+ 	{
++	  setShearStrain(par.shearStrain);
+ 	  initializeDeterministicPart(par);
+ 	  this->seed = pg->getParticleData()->getSystem()->rng().next32();
+ 	  CudaCheckError();
+@@ -41,10 +47,15 @@ namespace uammd{
+ 	//Computes the stochastic part of the hydrodynamic displacements as prefactor*sqrt(2*T*M)*dW
+ 	void computeStochasticDisplacements(real3* BdW, real temperature, real prefactor, cudaStream_t st);
+ 
++	void setShearStrain(real newStrain){
++	  this->shearStrain = newStrain;
++	}
++
+       private:
+ 	shared_ptr<ParticleGroup> pg;
+ 	Box box;
+ 	real rcut;
++	real shearStrain;
+ 	//Rodne Prager Yamakawa PSE real space part textures
+ 	thrust::device_vector<real2> tableDataRPY;
+ 	shared_ptr<TabulatedFunction<real2>> RPY_near;
+@@ -58,8 +69,8 @@ namespace uammd{
+ 	  /*Near neighbour list cutoff distance, see sec II:C in [1]*/
+ 	  this->rcut = sqrt(-log(par.tolerance))/split;
+ 	  if(0.5*box.boxSize.x < rcut){
+-	    System::log<System::WARNING>("[BDHI::PSE] A real space cut off (%e) larger than half the box size (%e) can result in artifacts!, try increasing the splitting parameter (%e)", rcut, 0.5*box.boxSize.x, split);
+-	    rcut = box.boxSize.x*0.5;
++	    System::log<System::EXCEPTION>("[BDHI::PSE] A real space cut off (%e) larger than half the box size (%e) can result in artifacts!, try increasing the splitting parameter (%e)", rcut, 0.5*box.boxSize.x, split);
++	    throw std::runtime_error("[BDHI::PSE] Cut off is too large, try decrasing psi");
+ 	  }
+ 	  this->cl = std::make_shared<NeighbourList>(pg);
+ 	  const double a = par.hydrodynamicRadius;
+@@ -78,6 +89,8 @@ namespace uammd{
+ 	  System::log<System::MESSAGE>("[BDHI::PSE] Number of real RPY texture points: %d", nPointsTable);
+ 	  System::log<System::MESSAGE>("[BDHI::PSE] Close range distance cut off: %f", rcut);
+ 	}
++
++	void updateNeighbourList(cudaStream_t st);
+       };
+ 
+       namespace pse_ns{
+@@ -102,8 +115,8 @@ namespace uammd{
+ 	  RPYNearTransverser(vtype *v, real3 *Mv,
+ 			     /*RPY_near(r) = F(r)·(I-r^r) + G(r)·r^r*/
+ 			     TabulatedFunction<real2> FandG, real rcut,
+-			     Box box):
+-	    v(v), Mv(Mv), FandG(FandG), box(box){
++			     Box box, real shearStrain):
++	    v(v), Mv(Mv), FandG(FandG), box(box), shearStrain(shearStrain){
+ 	    this->rcut2 = (rcut*rcut);
+ 	  }
+ 
+@@ -111,11 +124,30 @@ namespace uammd{
+ 	    return make_real3(v[pi]);
+ 	  }
+ 
++	  __device__ real3 computeShearedDistancePBC(real3 pi, real3 pj){
++	    // You are passing in sheared coordinates
++	    real3 rij = make_real3(pj)-make_real3(pi);
++	    const real Ly = box.boxSize.y;
++	    const real Lx = box.boxSize.x;
++	    const real Lz = box.boxSize.z;
++	    // Make standard coordinates from sheared
++	    rij.x += shearStrain*rij.y; // standard coordinates
++	    // Now periodically shift on sheared domain
++	    real s1 = round(rij.y/Ly);
++	    // Shift in (y', z') directions
++	    rij.x-= shearStrain*Ly*s1;
++	    rij.y-= Ly*s1;
++	    rij.z-= Lz*round(rij.z/Lz);
++	    // Shift in x direction
++	    rij.x-= Lx*round(rij.x/Lx);
++	    return rij;
++	  }
+ 	  /*Compute the dot product Mr_ij(3x3)·vj(3)*/
+ 	  inline __device__ computeType compute(const real4 &pi, const real4 &pj,
+ 						const infoType &vi, const infoType &vj){
+-	    real3 rij = box.apply_pbc(make_real3(pj)-make_real3(pi));
++	    real3 rij = computeShearedDistancePBC(make_real3(pi), make_real3(pj));
+ 	    const real r2 = dot(rij, rij);
++	    if(r2>=rcut2) return real3();
+ 	    /*Fetch RPY coefficients from a table, see RPYPSE_near*/
+ 	    /* Mreal(r) = (F(r)·I + (G(r)-F(r))·rr)/(6*pi*vis*a) */
+ 	    //f and g are divided by 6*pi*vis*a in the texture
+@@ -148,6 +180,7 @@ namespace uammd{
+ 	  TabulatedFunction<real2> FandG;
+ 	  real rcut2;
+ 	  Box box;
++	  real shearStrain;
+ 	};
+ 
+ 	/*LanczosAlgorithm needs a functor that computes the product M·v*/
+@@ -186,12 +219,19 @@ namespace uammd{
+ 
+       }
+ 
++      void NearField::updateNeighbourList(cudaStream_t st){
++	//Sheared coordinates fix. The rcut must be increased by a safety factor
++	real safetyFactor = cutOffShearedSafetyFactor(shearStrain);
++	System::log<System::DEBUG1>("[BDHI::PSE] Safety factor %f", safetyFactor);
++	cl->update(box, rcut*safetyFactor, st);
++      }
++
+       void NearField::Mdot(real4* forces, real3 *MF, cudaStream_t st){
+-	//The deterministic part can be skipped if there are no forces
+ 	if(forces){
+-	  cl->update(box, rcut, st);
++	  updateNeighbourList(st);
+ 	  System::log<System::DEBUG1>("[BDHI::PSE] Computing MF real space...");
+-	  pse_ns::RPYNearTransverser<real4> tr(forces, MF, *RPY_near, rcut, box);
++	  pse_ns::RPYNearTransverser<real4> tr(forces, MF, *RPY_near, rcut, box, shearStrain);
++	  System::log<System::DEBUG1>("[BDHI::PSE] Shear strain %f", shearStrain);
+ 	  cl->transverseList(tr, st);
+ 	}
+       }
+@@ -199,13 +239,13 @@ namespace uammd{
+       void NearField::computeStochasticDisplacements(real3* BdW, real temperature, real prefactor, cudaStream_t st){
+ 	//Compute stochastic term only if T>0
+ 	if(temperature == real(0.0)) return;
++	updateNeighbourList(st);
++	pse_ns::RPYNearTransverser<real3> tr(nullptr, nullptr, *RPY_near, rcut, box, shearStrain);
+ 	if(not lanczos){
+ 	  //It appears that this tolerance is unnecesary for lanczos, but I am not sure so better leave it like this.
+ 	  this->lanczosTolerance = this->tolerance; //std::min(0.05f, sqrt(par.tolerance));
+ 	  this->lanczos = std::make_shared<lanczos::Solver>();
+ 	}
+-	cl->update(box, rcut, st);
+-	pse_ns::RPYNearTransverser<real3> tr(nullptr, nullptr, *RPY_near, rcut, box);
+ 	int numberParticles = pg->getNumberParticles();
+ 	pse_ns::Dotctor Mvdot_near(tr, cl, numberParticles, st);
+ 	/*Lanczos algorithm to compute M_near^1/2 · noise. See LanczosAlgorithm.cuh*/
+diff --git a/src/Integrator/BDHI/PSE/utils.cuh b/src/Integrator/BDHI/PSE/utils.cuh
+index 098cb5d1..90b4983f 100644
+--- a/src/Integrator/BDHI/PSE/utils.cuh
++++ b/src/Integrator/BDHI/PSE/utils.cuh
+@@ -18,6 +18,7 @@ namespace uammd{
+ 	//lower values will give more importance to the near part (neighbour list) and higher values will
+ 	// put the weight of the computation in the far part (FFT).
+ 	real psi = 0.5;
++	real shearStrain = 0;
+       };
+ 
+       __device__ int3 indexToWaveNumber(int i, int3 nk){
+@@ -30,8 +31,14 @@ namespace uammd{
+ 	return make_int3(ikx, iky, ikz);
+       }
+ 
++      __device__ real3 shearWaveVector(real3 kvec, real shearStrain){
++	kvec.y -= shearStrain*kvec.x;
++	return kvec;
++      }
++
+       __device__ real3 waveNumberToWaveVector(int3 ik, real3 L){
+-	return (real(2.0)*real(M_PI)/L)*make_real3(ik.x, ik.y, ik.z);
++	auto kvec = (real(2.0)*real(M_PI)/L)*make_real3(ik.x, ik.y, ik.z);
++	return kvec;
+       }
+     }
+   }
+diff --git a/test/BDHI/PSE/CMakeLists.txt b/test/BDHI/PSE/CMakeLists.txt
+new file mode 100644
+index 00000000..53065093
+--- /dev/null
++++ b/test/BDHI/PSE/CMakeLists.txt
+@@ -0,0 +1,11 @@
++add_executable(pse_test pse_test.cu)
++target_include_directories(pse_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(pse_test cufft cublas curand)
++set_target_properties(pse_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++target_link_libraries(
++  pse_test
++  GTest::gtest_main
++  GTest::gmock_main
++)
++include(GoogleTest)
++gtest_discover_tests(pse_test)
+diff --git a/test/BDHI/PSE/pse_test.cu b/test/BDHI/PSE/pse_test.cu
+new file mode 100644
+index 00000000..bfe9fcfa
+--- /dev/null
++++ b/test/BDHI/PSE/pse_test.cu
+@@ -0,0 +1,107 @@
++/*Raul P. Pelaez 2022. Tests for the FCM algorithm and integrator
++
++ */
++#include <fstream>
++#include <gtest/gtest.h>
++#include "gmock/gmock.h"
++#include "Integrator/BDHI/BDHI_PSE.cuh"
++#include "utils/container.h"
++#include <memory>
++#include<random>
++#include<thrust/iterator/constant_iterator.h>
++#include<thrust/host_vector.h>
++
++using namespace uammd;
++using BDHI::PSE;
++//Different  kernels can  achieve different  maximum accuracies.   For
++//instance,  the  Gaussian  kernel  can safely  achieve  8  digits  of
++//accuracy in the  self mobility, but the Peskin 3pt  kernel will only
++//give about 3.  Place the maximum expected accuracy  in this variable
++//if you want to check a new kernel.
++constexpr real expectedAccuracy = 1e-8;
++//Although the  Gaussian kernel  should be able  to achieve  even more
++//accuracy, beyond 8 digits the  approximate solution for the periodic
++//correction of the self mobility I am using starts to fail.
++
++template<class T> using cached_vector = uninitialized_cached_vector<T>;
++
++TEST(PSE, CanBeCreated){
++  PSE::Parameters par;
++  real hydrodynamicRadius = 1;
++  real3 L = {128, 128, 128};
++  par.temperature = 1;
++  par.viscosity = 1;
++  par.tolerance = 1e-3;
++  par.dt = 1;
++  par.box = Box(L);
++  par.psi = 1.0;
++  auto pd = std::make_shared<ParticleData>(1);
++  auto pse = std::make_shared<PSE>(pd, par);
++}
++
++real selfMobility(real hydrodynamicRadius, real viscosity, real L){
++  //O(a^8) accuracy. See Hashimoto 1959.
++  //With a Gaussian this expression has a minimum deviation from measuraments of 7e-7*rh at L=64*rh.
++  //The translational invariance of the hydrodynamic radius however decreases arbitrarily with the tolerance.
++  //Seems that this deviation decreases with L, so probably is due to the correction below missing something.
++  long double rh = hydrodynamicRadius;
++  long double a = rh/L;
++  long double a2= a*a; long double a3 = a2*a;
++  long double c = 2.83729747948061947666591710460773907l;
++  long double b = 0.19457l;
++  long double a6pref = 16.0l*M_PIl*M_PIl/45.0l + 630.0L*b*b;
++  return  1.0l/(6.0l*M_PIl*viscosity*rh)*(1.0l-c*a+(4.0l/3.0l)*M_PIl*a3-a6pref*a3*a3);
++}
++
++//Check that the self mobility stays below tolerance at a series of random points inside the domain
++// in every direction when pulling a particle
++TEST(PSE, SelfMobilityIsCorrectUpToTolerance){
++  PSE::Parameters par;
++  real hydrodynamicRadius = 1.012312;
++  par.viscosity = 1.12321;
++  par.tolerance = expectedAccuracy;
++  par.dt = 1;
++  real3 L = make_real3(128*hydrodynamicRadius);
++  par.box = Box(L);
++  par.hydrodynamicRadius = hydrodynamicRadius;
++  par.psi = 1.0;
++  int numberParticles = 1;
++  auto pd = std::make_shared<ParticleData>(numberParticles);
++  auto pse = std::make_shared<PSE>(pd, par);
++  cached_vector<real4> force(numberParticles);
++  cached_vector<real3> MF(numberParticles);
++  real temperature = 0;
++  real prefactor = 0;
++  real3 m0;
++  int ntest = 20;
++  Saru rng(1234);
++  for(int j = 0; j<ntest; j++){
++    {
++      auto pos = pd->getPos(access::cpu, access::write);
++      real3 randomPos = make_real3(rng.f(-0.5, 0.5), rng.f(-0.5, 0.5), rng.f(-0.5, 0.5))*L;
++      pos[0] = make_real4(randomPos);
++    }
++    for(int i = 0; i<3; i++){
++      switch(i){
++      case 0:
++	force[0] = make_real4(1,0,0,0);
++	m0 = make_real3(selfMobility(hydrodynamicRadius, par.viscosity, L.x),0,0);
++	break;
++      case 1:
++	force[0] = make_real4(0,1,0,0);
++	m0 = make_real3(0, selfMobility(hydrodynamicRadius, par.viscosity, L.x),0);
++	break;
++      case 2:
++	force[0] = make_real4(0,0,1,0);
++	m0 = make_real3(0, 0, selfMobility(hydrodynamicRadius, par.viscosity, L.x));
++	break;
++      }
++      pse->computeHydrodynamicDisplacements(force.data().get(),
++					    MF.data().get(), temperature, prefactor, 0);
++      real3 dx = MF[0];
++      ASSERT_THAT(dx.x, ::testing::DoubleNear(m0.x, par.tolerance));
++      ASSERT_THAT(dx.y, ::testing::DoubleNear(m0.y, par.tolerance));
++      ASSERT_THAT(dx.z, ::testing::DoubleNear(m0.z, par.tolerance));
++    }
++  }
++}
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 89741b4e..f61d5d26 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -66,6 +66,7 @@ enable_testing()
+ include(CTest)
+ add_subdirectory(BDHI/DPStokes)
+ add_subdirectory(BDHI/FCM)
++add_subdirectory(BDHI/PSE)
+ add_subdirectory(BDHI/quasi2D)
+ add_subdirectory(utils)
+ add_subdirectory(misc/chebyshev)

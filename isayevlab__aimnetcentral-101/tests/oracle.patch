@@ -1,0 +1,182 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 808f47b..a39b588 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Added `deterministic=True` calculator option: routes external DFT-D3 and DSF Coulomb through their differentiable pure-torch paths, making repeated identical evaluations bitwise reproducible on the same machine/build (issue #93). Ewald/PME kernels are not covered and warn once.
++
+ ### Changed
+ 
+ - Bumped `nvalchemi-toolkit-ops` to `>=0.4.0` and `warp-lang` to `>=1.13,<2` (installs 1.15). Energies, charges, and Hessians are bit-identical to 0.3.1; explicit force/virial outputs shift within float32 accumulation noise (max 6.7e-05 eV/A on a periodic system, 40x inside the project's cross-version acceptance of 1e-4 Hartree/A). The 0.4.0 direct-output flags used by the Ewald/PME path (`compute_forces`/`compute_virial`) are deprecated upstream and now emit `DeprecationWarning`; migrating to the autograd-based API is tracked as follow-up work.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 1dc3146..f2b37cd 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -191,6 +191,15 @@ class AIMNet2Calculator:
+         When False, all model parameters have requires_grad=False, which
+         improves torch.compile compatibility and reduces memory usage.
+         Set to True only when training the model.
++    deterministic : bool
++        Route external DFT-D3 (and DSF Coulomb) through their differentiable
++        pure-torch paths instead of the atomics-based nvalchemiops CUDA
++        kernels, making repeated identical evaluations bitwise reproducible
++        (same machine, same build). Default is False. The kernel defaults are
++        faster on large systems but accumulate in nondeterministic order,
++        giving run-to-run noise of ~1e-7 eV that iterative optimizers can
++        amplify. Ewald/PME Coulomb is not covered (a one-time warning fires);
++        the static DFTD3 cache does not apply in this mode.
+ 
+     Attributes
+     ----------
+@@ -245,6 +254,7 @@ def __init__(
+         compile_kwargs: dict | None = None,
+         cache_static: bool = False,
+         train: bool = False,
++        deterministic: bool = False,
+         ensemble_member: int = 0,
+         revision: str | None = None,
+         token: str | None = None,
+@@ -403,6 +413,11 @@ def __init__(
+ 
+         # Set training mode (default False for inference)
+         self._train = train
++        # Deterministic LR mode: route external D3 (and DSF Coulomb) through
++        # their differentiable pure-torch paths, whose reductions are run-to-run
++        # deterministic, instead of the atomics-based nvalchemiops kernels.
++        self._deterministic = bool(deterministic)
++        self._warned_deterministic_lr = False
+         self.model.train(train)
+         if not train:
+             # Disable gradients on all parameters for inference mode
+@@ -1011,12 +1026,25 @@ def _run_external_modules(
+         wrapper for force/stress training.
+         """
+         coulomb_terms = None
++        deterministic = getattr(self, "_deterministic", False)
+         if self.external_coulomb is not None:
+             training_derivatives = (
+                 self.external_coulomb.method in ("ewald", "pme", "dsf")
+                 and getattr(self, "_train", False)
+                 and (forces or stress)
+             )
++            if deterministic:
++                if self.external_coulomb.method == "dsf":
++                    # Torch DSF path: deterministic reductions, energy stays in
++                    # the autograd graph so forces/stress come from autograd.
++                    training_derivatives = True
++                elif self.external_coulomb.method in ("ewald", "pme") and not self._warned_deterministic_lr:
++                    warnings.warn(
++                        "deterministic=True does not cover the Ewald/PME Coulomb kernels; "
++                        "their outputs remain subject to run-to-run float32 accumulation noise.",
++                        stacklevel=2,
++                    )
++                    self._warned_deterministic_lr = True
+             kwargs: dict[str, Any] = {
+                 "compute_forces": forces,
+                 "compute_virial": stress,
+@@ -1036,8 +1064,10 @@ def _run_external_modules(
+         dftd3_terms = None
+         if self.external_dftd3 is not None:
+             coord = data.get("coord")
+-            dftd3_energy_graph = hessian or (
+-                not forces and not stress and isinstance(coord, Tensor) and coord.requires_grad
++            dftd3_energy_graph = (
++                hessian
++                or deterministic
++                or (not forces and not stress and isinstance(coord, Tensor) and coord.requires_grad)
+             )
+             if dftd3_energy_graph:
+                 data = self.external_dftd3(data, hessian=True)
+diff --git a/docs/calculator.md b/docs/calculator.md
+index dd6aa83..c0cdca6 100644
+--- a/docs/calculator.md
++++ b/docs/calculator.md
+@@ -74,6 +74,7 @@ AIMNet2Calculator(
+     compile_kwargs: dict | None = None,
+     cache_static: bool = False,
+     train: bool = False,
++    deterministic: bool = False,
+     ensemble_member: int = 0,
+     revision: str | None = None,
+     token: str | None = None,
+@@ -197,6 +198,23 @@ Whether to put the model in training mode. Default: `False`.
+ 
+ For ordinary energy/force/charge inference (including external autograd through the calculator), leave this `False`. Set `True` only when using the calculator inside a training loop where model parameters need gradients.
+ 
++#### `deterministic`
++
++Route external DFT-D3 (and DSF Coulomb) through their differentiable pure-torch paths instead of the atomics-based nvalchemiops CUDA kernels. Default: `False`.
++
++The kernel defaults accumulate pairwise terms with atomic adds, so repeated identical evaluations differ at the float32 rounding level (~1e-7 eV in energies). That noise is physically negligible but is amplified chaotically by iterative optimizers: batched geometry optimizations from byte-identical inputs can follow different trajectories. With `deterministic=True`, identical inputs give bitwise-identical energies and forces on the same machine and build, at negligible cost for typical batched workloads.
++
++```python
++calc = AIMNet2Calculator("aimnet2", deterministic=True)
++```
++
++Notes:
++
++- Covers external D3 and `simple`/`dsf` Coulomb. Ewald/PME kernels are not covered; a one-time `UserWarning` fires if combined.
++- The pure-torch paths materialize pairwise tensors, so for very large single systems the kernel defaults are faster; benchmark before enabling in large-system MD.
++- Reproducibility holds per machine/build; a different GPU or PyTorch build still shifts results at rounding level.
++- The `cache_static` DFTD3 term cache does not apply in this mode.
++
+ #### `ensemble_member`
+ 
+ Which ensemble member to load when loading from a Hugging Face repo. Default: `0`.
+diff --git a/tests/test_calculator.py b/tests/test_calculator.py
+index d4ee193..fc3d150 100644
+--- a/tests/test_calculator.py
++++ b/tests/test_calculator.py
+@@ -1978,3 +1978,20 @@ def test_set_lr_cutoff_updates_lr_state(water_molecule):
+     assert torch.isfinite(e_after).all()
+     # Water is far smaller than either cutoff, so the energy must not change.
+     assert torch.allclose(e_before, e_after)
++
++
++class TestDeterministicMode:
++    def test_deterministic_matches_default_numerics(self, water_molecule):
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, device="cpu")
++        calc_det = AIMNet2Calculator("aimnet2", nb_threshold=0, device="cpu", deterministic=True)
++        r = calc(dict(water_molecule), forces=True)
++        rd = calc_det(dict(water_molecule), forces=True)
++        assert torch.allclose(r["energy"].double(), rd["energy"].double(), atol=1e-6)
++        assert torch.allclose(r["forces"].double(), rd["forces"].double(), atol=1e-5)
++
++    def test_deterministic_warns_for_ewald(self, water_molecule):
++        calc = AIMNet2Calculator("aimnet2", nb_threshold=0, device="cpu", deterministic=True)
++        calc.set_lrcoulomb_method("ewald")
++        cell = torch.eye(3) * 20.0
++        with pytest.warns(UserWarning, match="Ewald/PME"):
++            calc({**water_molecule, "cell": cell}, forces=True)
+diff --git a/tests/test_calculator_gpu.py b/tests/test_calculator_gpu.py
+index 1dfd528..dc0ac08 100644
+--- a/tests/test_calculator_gpu.py
++++ b/tests/test_calculator_gpu.py
+@@ -615,3 +615,22 @@ def vjp(go):
+         assert H_func.shape == (3, 3, 3, 3)
+         assert torch.isfinite(H_func).all()
+         assert (H_internal - H_func).abs().max().item() < 5e-3
++
++
++class TestDeterministicMode:
++    @pytest.mark.ase
++    def test_batched_evals_bitwise_reproducible(self):
++        """deterministic=True makes repeated identical batched evals bitwise equal."""
++        water = TestGPUBatching._water_data()
++        B = 8
++        data = {
++            "coord": water["coord"].unsqueeze(0).expand(B, -1, -1).contiguous().cuda(),
++            "numbers": water["numbers"].unsqueeze(0).expand(B, -1).contiguous().cuda(),
++            "charge": torch.zeros(B, device="cuda"),
++        }
++        calc = AIMNet2Calculator("aimnet2", deterministic=True)
++        out0 = calc(dict(data), forces=True)
++        for _ in range(6):
++            out = calc(dict(data), forces=True)
++            assert torch.equal(out["energy"], out0["energy"])
++            assert torch.equal(out["forces"], out0["forces"])

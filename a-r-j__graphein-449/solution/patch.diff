@@ -1,0 +1,757 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0b19f3f7..a20b578a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ 
+ #### Bugfixes
+ 
++* Mesh creation no longer hangs forever if PyMOL fails to start, stops responding or doesn't write the `.obj` file. `ProteinMeshConfig.max_wait_seconds` (default `600`, `None` to wait indefinitely) limits each step: PyMOL starting, each call to it, and writing the `.obj` file. On a timeout `create_mesh` raises `TimeoutError` and stops the hung PyMOL, so the next call starts a fresh one; it raises `RuntimeError` if PyMOL exits. The limit applies only while `create_mesh` runs, so a PyMOL session you started yourself keeps its own (no) timeout. Also, `create_mesh` waits for the `.obj` file to finish writing before reading it, and saves it to an absolute path, so `os.chdir` no longer makes it wait in the wrong directory. The `.obj` path for a structure file replaces its whole extension (`model.mmtf` gave `model.mobj`), and `out_dir` no longer needs a trailing slash (`out_dir="meshes"` gave `meshes3eiy.obj`). Fixes [#431](https://github.com/a-r-j/graphein/issues/431) [#449](https://github.com/a-r-j/graphein/pull/449)
+ * Fix `construct_graph` with `insertions=False` dropping residues that have an insertion after them (e.g. both H 52 and 52A of an antibody). `remove_alt_locs` sorted the dataframe by occupancy but never restored the original order (it checked `keep` after overwriting it), so `remove_insertions` could keep 52A's atoms as the "first" of each residue number and then drop them as insertions. `remove_alt_locs` now restores the order and keeps the first conformer in file order on occupancy ties. [#483](https://github.com/a-r-j/graphein/pull/483)
+ * `read_pdb_to_dataframe` returns mmCIF and MMTF atoms in file order. biopandas splits `ATOM` and `HETATM` records, which were joined with every `HETATM` after the `ATOM`s, so modified residues such as `MSE` were moved out of their chain. [#483](https://github.com/a-r-j/graphein/pull/483)
+ * Fix `PDBManager` failing to initialise with `URLError: <urlopen error [Errno 111] Connection refused>`, which also broke the `creating_datasets_from_the_pdb` notebook. EBI's `ftp.ebi.ac.uk` refuses or times out HTTPS connections, so the SIFTS CATH/UniProt and EC number maps could not be downloaded. They are now fetched over HTTP, which EBI still serves (the CATH domain list already used FTP). [#514](https://github.com/a-r-j/graphein/pull/514)
+diff --git a/graphein/protein/config.py b/graphein/protein/config.py
+index d24517e4..0772ff41 100644
+--- a/graphein/protein/config.py
++++ b/graphein/protein/config.py
+@@ -14,7 +14,7 @@
+ from typing import Any
+ 
+ from deepdiff import DeepDiff
+-from pydantic import BaseModel, validator
++from pydantic import BaseModel, PositiveFloat, validator
+ 
+ from graphein.protein.edges.distance import add_peptide_bonds
+ from graphein.protein.features.nodes.amino_acid import meiler_embedding
+@@ -257,7 +257,13 @@ class ProteinMeshConfig(BaseModel):
+     :param pymol_commands: List of Commands passed to PyMol in surface
+         construction.
+     :type pymol_commands: List[str], optional
++    :param max_wait_seconds: Seconds to wait for each step of mesh creation:
++        the PyMOL server starting, each call to it, and the ``.obj`` file
++        being written. This is not a limit on the total time. ``None`` waits
++        indefinitely.
++    :type max_wait_seconds: float | None
+     """
+ 
+     pymol_command_line_options: str | None = "-cKq"
+     pymol_commands: list[str] | None = ["show surface"]
++    max_wait_seconds: PositiveFloat | None = 600.0
+diff --git a/graphein/protein/meshes.py b/graphein/protein/meshes.py
+index 234c9760..0ba1e763 100644
+--- a/graphein/protein/meshes.py
++++ b/graphein/protein/meshes.py
+@@ -20,7 +20,7 @@
+     requires_external_dependencies,
+     requires_python_libs,
+ )
+-from graphein.utils.pymol import MolViewer
++from graphein.utils.pymol import viewer
+ 
+ if TYPE_CHECKING:
+     import torch
+@@ -58,15 +58,17 @@ def configure_pymol_session(
+     :param config: :class:`~graphein.protein.config.ProteinMeshConfig` to use. Defaults to ``None`` which uses default config.
+     :type config: graphein.protein.config.ProteinMeshConfig
+     """
+-    pymol = MolViewer()
+-    pymol.delete("all")  # delete all objects from other sessions if necessary.
++    pymol = viewer
+ 
+     # If no config is provided, use default
+     if config is None:
+         config = ProteinMeshConfig()
+ 
+     # Start PyMol session
+-    pymol.start([config.pymol_command_line_options])
++    pymol.start(
++        [config.pymol_command_line_options], timeout=config.max_wait_seconds
++    )
++    pymol.delete("all")  # delete all objects from other sessions if necessary.
+ 
+ 
+ @requires_external_dependencies("pymol")
+@@ -91,7 +93,7 @@ def get_obj_file(
+     :return: returns path to ``.obj`` file (str)
+     :rtype: str
+     """
+-    pymol = MolViewer()
++    pymol = viewer
+ 
+     # Check inputs
+     if not pdb_code and not pdb_file:
+@@ -104,23 +106,33 @@ def get_obj_file(
+     if out_dir is None:
+         out_dir = "/tmp/"
+ 
+-    configure_pymol_session()
+-
+-    # Load structure
+-    pymol.load(pdb_file) if pdb_file else pymol.fetch(pdb_code)
+-    # Create file_name
+-    file_name = (
+-        f"{pdb_file[:-3]}obj" if pdb_file else out_dir + pdb_code + ".obj"
+-    )
+-
+     if config is None:
+         config = ProteinMeshConfig()
+ 
+-    commands = parse_pymol_commands(config)
+-    run_pymol_commands(commands)
++    # The mesh timeout applies only while making this mesh, so a session
++    # the user started keeps its own
++    with pymol.call_timeout(config.max_wait_seconds):
++        configure_pymol_session(config)
++
++        # Load structure
++        pymol.load(pdb_file) if pdb_file else pymol.fetch(pdb_code)
++        # Create file_name
++        # Absolute, as PyMOL resolves relative paths against its own cwd
++        file_name = os.path.abspath(
++            os.path.splitext(pdb_file)[0] + ".obj"
++            if pdb_file
++            else os.path.join(out_dir, pdb_code + ".obj")
++        )
++
++        commands = parse_pymol_commands(config)
++        run_pymol_commands(commands)
++
++        # Remove stale output so it can't be mistaken for this run's mesh
++        if os.path.isfile(file_name):
++            os.remove(file_name)
+ 
+-    # Save surface object as .obj
+-    pymol.do(f"save {file_name}")
++        # Save surface object as .obj
++        pymol.do(f"save {file_name}")
+     log.debug(f"Saved {file_name}")
+     return file_name
+ 
+@@ -149,7 +161,7 @@ def run_pymol_commands(commands: list[str]) -> None:
+     :param commands: List of commands to pass to PyMol.
+     :type commands: List[str]
+     """
+-    pymol = MolViewer()
++    pymol = viewer
+ 
+     for c in commands:
+         log.debug(c)
+@@ -185,14 +197,56 @@ def create_mesh(
+     obj_file = get_obj_file(
+         pdb_code=pdb_code, pdb_file=pdb_file, out_dir=out_dir, config=config
+     )
+-    # Wait for PyMol to finish
+-    while os.path.isfile(obj_file) is False:
+-        time.sleep(0.1)
++    wait_for_obj_file(obj_file, max_wait_seconds=config.max_wait_seconds)
+ 
+     verts, faces, aux = load_obj(obj_file)
+     return verts, faces, aux
+ 
+ 
++def wait_for_obj_file(
++    obj_file: str, max_wait_seconds: float | None = None
++) -> None:
++    """Waits for PyMOL to finish writing an ``.obj`` mesh file.
++
++    The file is taken as written once it is non-empty and its size is
++    unchanged between two checks 0.1 s apart. If the wait times out, the PyMOL process is stopped so that a hung
++    session isn't reused.
++
++    :param obj_file: Path PyMOL is saving the mesh to.
++    :type obj_file: str
++    :param max_wait_seconds: Seconds to wait. ``None`` waits indefinitely.
++    :type max_wait_seconds: float | None
++    :raises RuntimeError: if the PyMOL process exits before writing the file.
++    :raises TimeoutError: if the file is not written after
++        ``max_wait_seconds``.
++    """
++
++    def size():
++        return os.path.getsize(obj_file) if os.path.isfile(obj_file) else 0
++
++    # ponytail: size-stable heuristic, a write stalled >0.1 s mid-file
++    # passes. Unverified against real PyMOL whether `do("save ...")` returns
++    # only after the save (then this wait is unneeded) or is queued.
++    start_time = time.monotonic()
++    last_size = 0
++    while True:
++        current_size = size()
++        if current_size and current_size == last_size:
++            return
++        last_size = current_size
++        if not viewer._process_is_running():
++            raise RuntimeError(f"PyMOL exited before writing {obj_file}")
++        if (
++            max_wait_seconds is not None
++            and time.monotonic() - start_time >= max_wait_seconds
++        ):
++            viewer.stop()
++            raise TimeoutError(
++                f"{obj_file} not written after {max_wait_seconds} seconds"
++            )
++        time.sleep(0.1)
++
++
+ @requires_python_libs("torch")
+ def normalize_and_center_mesh_vertices(
+     verts: torch.FloatTensor,
+diff --git a/graphein/utils/pymol/core.py b/graphein/utils/pymol/core.py
+index c90a2c4f..4a24469b 100644
+--- a/graphein/utils/pymol/core.py
++++ b/graphein/utils/pymol/core.py
+@@ -4,6 +4,7 @@
+ import tempfile
+ import time
+ from xmlrpc.client import ServerProxy as Server
++from xmlrpc.client import Transport
+ 
+ from ..dependencies import requires_external_dependencies
+ 
+@@ -11,53 +12,158 @@
+ PORT = 9123
+ 
+ 
++class _TimeoutTransport(Transport):
++    """XML-RPC transport whose connections time out after ``timeout`` s."""
++
++    def __init__(self, timeout):
++        super().__init__()
++        self._timeout = timeout
++
++    def make_connection(self, host):
++        conn = super().make_connection(host)
++        conn.timeout = self._timeout
++        return conn
++
++
++class _StopOnTimeout:
++    """Wraps an XML-RPC method so a timed-out call stops PyMOL. Dotted
++    names (e.g. ``system.listMethods``) resolve as with ``ServerProxy``.
++    """
++
++    def __init__(self, viewer, method):
++        self._viewer = viewer
++        self._method = method
++
++    def __getattr__(self, name):
++        return _StopOnTimeout(self._viewer, getattr(self._method, name))
++
++    def __call__(self, *args):
++        try:
++            return self._method(*args)
++        except TimeoutError:
++            # Don't leave a hung PyMOL to be reused by the next call
++            self._viewer.stop()
++            raise
++
++
+ class MolViewer:
+     def __init__(self, host=HOST, port=PORT):
+         self.host = host
+         self.port = int(port)
+         self._process = None
++        self._start_args = ["-cKQ"]
++        self._timeout = None
+ 
+     def __del__(self):
+-        self.stop()
++        # Don't wait for PyMOL to exit: this can run at interpreter shutdown
++        with contextlib.suppress(Exception):
++            if self._process_is_running():
++                self._process.terminate()
+ 
+     def __getattr__(self, key):
++        # Protocol probes (copy, pickle, hasattr) aren't PyMOL commands
++        if key.startswith("_"):
++            raise AttributeError(key)
+         if not self._process_is_running():
+-            self.start(["-cKQ"])
++            self.start(self._start_args, timeout=self._timeout)
+ 
+-        return getattr(self._server, key)
++        return _StopOnTimeout(self, getattr(self._server, key))
++
++    @contextlib.contextmanager
++    def call_timeout(self, timeout):
++        """Time out calls after ``timeout`` seconds (``None`` waits
++        indefinitely) inside this block, then restore the previous timeout.
++        """
++        previous, self._timeout = self._timeout, timeout
++        if self._process_is_running():
++            self._connect(timeout)
++        try:
++            yield
++        finally:
++            self._timeout = previous
++            if self._process_is_running():
++                self._connect(previous)
++
++    def _connect(self, timeout=None):
++        """Create the XML-RPC client. Calls raise ``TimeoutError`` after
++        ``timeout`` seconds without a reply (``None`` waits indefinitely).
++        """
++        self._server = Server(
++            uri=f"http://{self.host}:{self.port}/RPC2",
++            transport=_TimeoutTransport(timeout),
++        )
+ 
+     def _process_is_running(self):
+         return self._process is not None and self._process.poll() is None
+ 
+     @requires_external_dependencies("pymol")
+-    def start(self, args=("-Q",), exe="pymol"):
++    def start(self, args=("-Q",), exe="pymol", timeout=None):
+         """Start the PyMOL RPC server and connect to it
+         Start simple GUI (-xi), suppress all output (-Q):
+             >>> viewer.start(["-xiQ"])
+         Start headless (-cK), with some output (-q):
+             >>> viewer.start(["-cKq"])
++
++        :param args: PyMOL command line options.
++        :type args: list[str] | tuple[str, ...]
++        :param exe: PyMOL executable.
++        :type exe: str
++        :param timeout: Seconds to wait for the server to start, and for
++            each later call to it. ``None`` waits indefinitely. If PyMOL is
++            already running, nothing changes: use :meth:`call_timeout` to
++            bound calls to it.
++        :type timeout: float | None
++        :raises RuntimeError: if PyMOL exits before the server is up.
++        :raises TimeoutError: if the server is not up after ``timeout``
++            seconds.
+         """
++        assert isinstance(args, (list, tuple))
++
+         if self._process_is_running():
+-            print("A PyMOL RPC server is already running.")
+             return
+ 
+-        assert isinstance(args, (list, tuple))
+-
++        # Used to restart PyMOL the same way if it dies
++        self._start_args, self._timeout = list(args), timeout
+         self._process = subprocess.Popen([exe, "-R"] + list(args))
+ 
+-        self._server = Server(uri=f"http://{self.host}:{self.port}/RPC2")
+-
+-        # wait for the server
++        # wait for the server, giving each probe only the time remaining
++        start_time = time.monotonic()
+         while True:
++            remaining = (
++                None
++                if timeout is None
++                else max(timeout - (time.monotonic() - start_time), 0.01)
++            )
++            self._connect(remaining)
+             try:
+                 self._server.bg_color("white")
++                self._connect(timeout)
+                 break
+             except OSError:
++                if self._process.poll() is not None:
++                    raise RuntimeError(
++                        f"PyMOL exited with code {self._process.returncode} "
++                        "before its RPC server started"
++                    )
++                if (
++                    timeout is not None
++                    and time.monotonic() - start_time >= timeout
++                ):
++                    self.stop()
++                    raise TimeoutError(
++                        f"PyMOL RPC server not up after {timeout} seconds"
++                    )
+                 time.sleep(0.1)
+ 
+     def stop(self):
+         if self._process_is_running():
+             self._process.terminate()
++            try:
++                self._process.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                self._process.kill()
++                self._process.wait()
++        self._process = None
+ 
+     def display(self, width=0, height=0, ray=False, timeout=120):
+         """Display PyMol session
+diff --git a/tests/protein/test_meshes.py b/tests/protein/test_meshes.py
+index 7b40e74d..d28b6bc3 100644
+--- a/tests/protein/test_meshes.py
++++ b/tests/protein/test_meshes.py
+@@ -1,13 +1,76 @@
++"""Tests for graphein.protein.meshes."""
++
++import contextlib
++import os
++import socket
++import subprocess
++import threading
++import time
++
++import pydantic
+ import pytest
+ 
++from graphein.protein import meshes
+ from graphein.protein.config import ProteinMeshConfig
+ from graphein.protein.meshes import convert_verts_and_face_to_mesh, create_mesh
++from graphein.utils.pymol import core
++
++
++@pytest.fixture
++def pymol_running(monkeypatch):
++    monkeypatch.setattr(meshes.viewer, "_process_is_running", lambda: True)
++    monkeypatch.setattr(meshes.viewer, "stop", lambda: None)
++
++
++def test_wait_for_obj_file_returns_when_file_is_found(tmp_path, pymol_running):
++    obj_file = tmp_path / "test.obj"
++    obj_file.write_text("v 0 0 0\n")
++    meshes.wait_for_obj_file(str(obj_file), max_wait_seconds=1.0)
++
++
++def test_wait_for_obj_file_raises_timeout(tmp_path, pymol_running):
++    with pytest.raises(TimeoutError, match="missing.obj not written"):
++        meshes.wait_for_obj_file(
++            str(tmp_path / "missing.obj"), max_wait_seconds=0.2
++        )
++
++
++def test_wait_for_obj_file_raises_if_pymol_exits(tmp_path, monkeypatch):
++    monkeypatch.setattr(meshes.viewer, "_process_is_running", lambda: False)
++    with pytest.raises(RuntimeError, match="PyMOL exited"):
++        meshes.wait_for_obj_file(str(tmp_path / "missing.obj"))
++
++
++def test_molviewer_start_raises_if_pymol_exits(monkeypatch):
++    class DeadProcess:
++        returncode = 1
+ 
+-pytest.importorskip("pymol")
+-pytest.importorskip("pytorch3d")
++        def poll(self):
++            return self.returncode
++
++    class UnreachableServer:
++        def __init__(self, uri, **kwargs):
++            pass
++
++        def bg_color(self, colour):
++            raise ConnectionRefusedError
++
++    monkeypatch.setattr(core.subprocess, "Popen", lambda *_: DeadProcess())
++    monkeypatch.setattr(core, "Server", UnreachableServer)
++
++    # Skip the pymol-on-PATH check; the process is mocked.
++    with pytest.raises(RuntimeError, match="exited with code 1"):
++        core.MolViewer.start.__wrapped__(core.MolViewer(), timeout=1.0)
++
++
++def test_mesh_config_rejects_non_positive_wait():
++    with pytest.raises(pydantic.ValidationError):
++        ProteinMeshConfig(max_wait_seconds=0)
+ 
+ 
+ def test_create_mesh():
++    pytest.importorskip("pymol")
++    pytest.importorskip("pytorch3d")
+     config = ProteinMeshConfig(
+         pymol_commands=[
+             "show surface",
+@@ -18,3 +81,294 @@ def test_create_mesh():
+     verts, faces, _ = create_mesh(pdb_code="3eiy", config=config)
+     mesh = convert_verts_and_face_to_mesh(verts, faces)
+     assert mesh.verts_packed().shape[0] == verts.shape[0]
++
++
++class FakeViewer:
++    """Stands in for the shared PyMOL viewer in ``get_obj_file``."""
++
++    def __init__(self):
++        self.commands = []
++
++    def load(self, path):
++        self.commands.append(("load", path))
++
++    def fetch(self, code):
++        self.commands.append(("fetch", code))
++
++    def do(self, command):
++        self.commands.append(("do", command))
++
++    @contextlib.contextmanager
++    def call_timeout(self, timeout):
++        self.commands.append(("call_timeout", timeout))
++        yield
++
++
++def test_obj_file_name_replaces_whole_extension(tmp_path, monkeypatch):
++    monkeypatch.setattr(meshes, "viewer", FakeViewer())
++    monkeypatch.setattr(meshes, "configure_pymol_session", lambda _: None)
++    monkeypatch.setattr(meshes, "run_pymol_commands", lambda _: None)
++    unrelated = tmp_path / "model.mobj"
++    unrelated.touch()
++
++    obj_file = meshes.get_obj_file.__wrapped__(
++        pdb_file=str(tmp_path / "model.mmtf")
++    )
++
++    assert obj_file == str(tmp_path / "model.obj")
++    assert unrelated.exists()
++
++
++def test_wait_for_obj_file_stops_pymol_on_timeout(
++    tmp_path, pymol_running, monkeypatch
++):
++    stopped = []
++    monkeypatch.setattr(meshes.viewer, "stop", lambda: stopped.append(True))
++    with pytest.raises(TimeoutError):
++        meshes.wait_for_obj_file(
++            str(tmp_path / "missing.obj"), max_wait_seconds=0.2
++        )
++    assert stopped
++
++
++def test_wait_for_obj_file_waits_for_writing_to_finish(tmp_path, monkeypatch):
++    obj_file = tmp_path / "test.obj"
++    obj_file.write_text("v 0 0 0\n")
++    writes = iter(["v 1 1 1\n", "f 1 1 1\n"])
++
++    def still_writing():
++        line = next(writes, None)
++        if line is not None:
++            with obj_file.open("a") as f:
++                f.write(line)
++        return True
++
++    monkeypatch.setattr(meshes.viewer, "_process_is_running", still_writing)
++    meshes.wait_for_obj_file(str(obj_file), max_wait_seconds=5.0)
++    assert obj_file.read_text().endswith("f 1 1 1\n")
++    assert next(writes, None) is None
++
++
++def test_server_calls_time_out():
++    # Accepts connections (via the backlog) but never answers.
++    with socket.socket() as listener:
++        listener.bind(("localhost", 0))
++        listener.listen()
++        v = core.MolViewer(port=listener.getsockname()[1])
++        v._connect(timeout=0.2)
++        with pytest.raises(TimeoutError):
++            v._server.delete("all")
++
++
++def test_server_call_timeout_stops_pymol(monkeypatch):
++    class HungServer:
++        def delete(self, name):
++            raise TimeoutError
++
++    v = core.MolViewer()
++    v._server = HungServer()
++    stopped = []
++    monkeypatch.setattr(v, "_process_is_running", lambda: True)
++    monkeypatch.setattr(v, "stop", lambda: stopped.append(True))
++    with pytest.raises(TimeoutError):
++        v.delete("all")
++    assert stopped
++
++
++def test_restart_reuses_start_args_and_timeout(monkeypatch):
++    v = core.MolViewer()
++    calls = []
++
++    def fake_start(args, timeout=None):
++        calls.append((list(args), timeout))
++        v._server = FakeViewer()
++
++    monkeypatch.setattr(v, "start", fake_start)
++    v._start_args, v._timeout = ["-cq"], 5.0
++    v.load("model.pdb")
++    assert calls == [(["-cq"], 5.0)]
++
++
++def test_stop_waits_for_exit_and_forgets_process():
++    class StubbornProcess:
++        returncode = None
++
++        def poll(self):
++            return self.returncode
++
++        def terminate(self):
++            pass
++
++        def wait(self, timeout=None):
++            if self.returncode is None and timeout is not None:
++                raise subprocess.TimeoutExpired("pymol", timeout)
++            return self.returncode
++
++        def kill(self):
++            self.returncode = -9
++
++    v = core.MolViewer()
++    process = v._process = StubbornProcess()
++    v.stop()
++    assert process.returncode == -9
++    assert v._process is None
++
++
++class AliveProcess:
++    returncode = None
++
++    def __init__(self):
++        self.terminated = False
++
++    def poll(self):
++        return self.returncode
++
++    def terminate(self):
++        self.terminated = True
++        self.returncode = -15
++
++    def wait(self, timeout=None):
++        return self.returncode
++
++    def kill(self):
++        self.returncode = -9
++
++
++def free_port():
++    with socket.socket() as s:
++        s.bind(("localhost", 0))
++        return s.getsockname()[1]
++
++
++def test_start_leaves_running_pymol_alone(monkeypatch):
++    # A session the user started keeps its options and timeout
++    v = core.MolViewer(port=free_port())
++    v._process, v._start_args, v._timeout = AliveProcess(), ["-xiQ"], None
++    monkeypatch.setattr(v, "_connect", lambda timeout: pytest.fail())
++    core.MolViewer.start.__wrapped__(v, ["-cKq"], timeout=600.0)
++    assert v._timeout is None
++    assert not v._process.terminated
++
++
++def test_call_timeout_is_restored(monkeypatch):
++    v = core.MolViewer(port=free_port())
++    v._process, v._timeout = AliveProcess(), None
++    timeouts = []
++    monkeypatch.setattr(
++        v, "_connect", lambda timeout: timeouts.append(timeout)
++    )
++    with v.call_timeout(600.0):
++        assert v._timeout == 600.0
++    assert v._timeout is None
++    assert timeouts == [600.0, None]
++
++
++def test_get_obj_file_bounds_pymol_calls(tmp_path, monkeypatch):
++    fake = FakeViewer()
++    monkeypatch.setattr(meshes, "viewer", fake)
++    monkeypatch.setattr(meshes, "configure_pymol_session", lambda _: None)
++    monkeypatch.setattr(meshes, "run_pymol_commands", lambda _: None)
++    meshes.get_obj_file.__wrapped__(
++        pdb_code="3eiy",
++        out_dir=str(tmp_path),
++        config=ProteinMeshConfig(max_wait_seconds=5.0),
++    )
++    assert fake.commands[0] == ("call_timeout", 5.0)
++
++
++def test_dotted_rpc_names_still_resolve(monkeypatch):
++    class Server:
++        class system:
++            @staticmethod
++            def listMethods():
++                return ["do"]
++
++    v = core.MolViewer()
++    v._process, v._server = AliveProcess(), Server()
++    assert v.system.listMethods() == ["do"]
++
++
++def test_start_timeout_includes_slow_probes(monkeypatch):
++    # The server isn't up for 0.5 s, then accepts but never answers. A
++    # probe given the full timeout would take until ~1.5 s.
++    port = free_port()
++    listener = socket.socket()
++
++    def come_up_hung():
++        time.sleep(0.5)
++        listener.bind(("localhost", port))
++        listener.listen()
++
++    v = core.MolViewer(port=port)
++    monkeypatch.setattr(core.subprocess, "Popen", lambda cmd: AliveProcess())
++    thread = threading.Thread(target=come_up_hung)
++    thread.start()
++    start = time.monotonic()
++    try:
++        with pytest.raises(TimeoutError):
++            core.MolViewer.start.__wrapped__(v, timeout=1.0)
++        elapsed = time.monotonic() - start
++    finally:
++        thread.join()
++        listener.close()
++    assert elapsed < 1.4
++
++
++def test_del_does_not_wait_for_pymol():
++    class SlowProcess(AliveProcess):
++        def wait(self, timeout=None):
++            raise AssertionError("__del__ must not block")
++
++    v = core.MolViewer()
++    process = v._process = SlowProcess()
++    v.__del__()
++    assert process.terminated
++
++
++def test_private_attribute_lookup_does_not_start_pymol(monkeypatch):
++    v = core.MolViewer()
++
++    def fail(*args, **kwargs):
++        raise AssertionError("PyMOL started")
++
++    monkeypatch.setattr(v, "start", fail)
++    assert not hasattr(v, "__deepcopy__")
++
++
++def test_obj_file_path_is_absolute(tmp_path, monkeypatch):
++    fake = FakeViewer()
++    monkeypatch.setattr(meshes, "viewer", fake)
++    monkeypatch.setattr(meshes, "configure_pymol_session", lambda _: None)
++    monkeypatch.setattr(meshes, "run_pymol_commands", lambda _: None)
++    monkeypatch.chdir(tmp_path)
++
++    obj_file = meshes.get_obj_file.__wrapped__(pdb_file="model.pdb")
++
++    assert obj_file == os.path.join(os.getcwd(), "model.obj")
++    assert ("do", f"save {obj_file}") in fake.commands
++
++
++def test_obj_file_joins_out_dir_without_trailing_slash(tmp_path, monkeypatch):
++    monkeypatch.setattr(meshes, "viewer", FakeViewer())
++    monkeypatch.setattr(meshes, "configure_pymol_session", lambda _: None)
++    monkeypatch.setattr(meshes, "run_pymol_commands", lambda _: None)
++
++    obj_file = meshes.get_obj_file.__wrapped__(
++        pdb_code="3eiy", out_dir=str(tmp_path / "meshes")
++    )
++
++    assert obj_file == str(tmp_path / "meshes" / "3eiy.obj")
++
++
++def test_wait_for_obj_file_rejects_partial_file_if_pymol_dies(
++    tmp_path, monkeypatch
++):
++    obj_file = tmp_path / "test.obj"
++
++    def crash_mid_write():
++        obj_file.write_text("v 0 0 0\n")
++        return False
++
++    monkeypatch.setattr(meshes.viewer, "_process_is_running", crash_mid_write)
++    with pytest.raises(RuntimeError, match="PyMOL exited"):
++        meshes.wait_for_obj_file(str(obj_file), max_wait_seconds=1.0)

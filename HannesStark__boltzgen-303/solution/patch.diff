@@ -1,0 +1,295 @@
+diff --git a/README.md b/README.md
+index 54e57684..9ee16bd5 100755
+--- a/README.md
++++ b/README.md
+@@ -193,6 +193,8 @@ After you constructed your `.yaml` file we recommend that you run the `check` co
+ 3. Select B-factor coloring in your viewer to inspect the design and binding annotations. These values encode input settings, not model confidence.
+ 
+ 
++YAML mapping keys must be unique. Repeating `id:` or `structure_groups:` in the same mapping raises an error with the file and line number. Use separate list entries to select multiple chains. Anchors and YAML merge keys (`<<`) remain supported, including explicit overrides of inherited values.
++
+ ## Example based explanation:
+ We provide many example `.yaml` files in the `example/` directory, including:
+ 
+diff --git a/src/boltzgen/cli/boltzgen.py b/src/boltzgen/cli/boltzgen.py
+index 34e06fd4..c1a90f5d 100644
+--- a/src/boltzgen/cli/boltzgen.py
++++ b/src/boltzgen/cli/boltzgen.py
+@@ -51,6 +51,7 @@
+ import omegaconf
+ import torch
+ from rdkit import Chem  # noqa: E402
++from boltzgen.data.parse.yaml import load_yaml  # noqa: E402
+ 
+ from boltzgen.data import const
+ from boltzgen.data.mol import load_canonicals
+@@ -875,7 +876,7 @@ def execute_command(args: argparse.Namespace) -> None:
+ 
+     # Load steps from steps.yaml
+     with open(steps_yaml_path, "r") as f:
+-        steps_data = yaml.safe_load(f)
++        steps_data = load_yaml(f)
+ 
+     if not isinstance(steps_data, dict) or "steps" not in steps_data:
+         raise ValueError(f"Invalid steps.yaml format in {steps_yaml_path}")
+diff --git a/src/boltzgen/data/parse/schema.py b/src/boltzgen/data/parse/schema.py
+index c1e5012f..e75414bd 100644
+--- a/src/boltzgen/data/parse/schema.py
++++ b/src/boltzgen/data/parse/schema.py
+@@ -14,12 +14,12 @@
+ from rdkit.Chem.rdchem import Conformer, Mol
+ from rdkit.Chem.rdMolDescriptors import CalcNumHeavyAtoms
+ from scipy.spatial.distance import cdist
+-import yaml
+ 
+ from boltzgen.data import const
+ from boltzgen.data import source_context as source_context_utils
+ from boltzgen.data.mol import load_molecules
+ from boltzgen.data.parse.mmcif import parse_mmcif
++from boltzgen.data.parse.yaml import load_yaml
+ from boltzgen.data.data import (
+     Atom,
+     Bond,
+@@ -1270,7 +1270,7 @@ def parse_redesign_yaml(
+     """parse a design mask override yaml file"""
+     with path.open("r") as file:
+         if path.suffix in {".yaml", ".yml"}:
+-            data = yaml.safe_load(file)
++            data = load_yaml(file)
+         else:
+             raise ValueError(f"Unsupported file type: {str(path)}")
+     target = parse_redesign_schema(data, tokenized)
+@@ -1301,7 +1301,7 @@ def parse_yaml(
+         """Parse a Boltz input yaml / json."""
+         with path.open("r") as file:
+             if path.suffix in {".yaml", ".yml"}:
+-                data = yaml.safe_load(file)
++                data = load_yaml(file)
+             elif path.suffix == ".pdb":
+                 data = parse_pdb(file)
+             else:
+@@ -1959,7 +1959,7 @@ def parse_file(self, item, mols, mol_dir, ligand_id, base_file_path=Path(".")):
+ 
+             resolved_path = (base_file_path / path).resolve()
+             with resolved_path.open("r") as f:
+-                file = yaml.safe_load(f)
++                file = load_yaml(f)
+                 base_file_path = resolved_path.parent
+ 
+         # Extract values of file
+diff --git a/src/boltzgen/data/parse/yaml.py b/src/boltzgen/data/parse/yaml.py
+new file mode 100644
+index 00000000..b6c28cf5
+--- /dev/null
++++ b/src/boltzgen/data/parse/yaml.py
+@@ -0,0 +1,57 @@
++"""Safe YAML loading with diagnostics for repeated explicit mapping keys."""
++
++from collections.abc import Hashable
++from typing import Any, TextIO
++
++import yaml
++from yaml.constructor import ConstructorError
++from yaml.nodes import MappingNode
++
++
++class _UniqueKeyLoader(yaml.SafeLoader):
++    def __init__(self, stream: str | TextIO) -> None:
++        super().__init__(stream)
++        self._checked_mappings: set[MappingNode] = set()
++
++    def flatten_mapping(self, node: MappingNode) -> None:
++        # Check before flattening: inherited keys and explicit overrides may
++        # legitimately overlap. Aliases can revisit an already flattened node.
++        if node not in self._checked_mappings:
++            self._checked_mappings.add(node)
++            keys = set()
++            merge_seen = False
++            for key_node, _ in node.value:
++                if key_node.tag == "tag:yaml.org,2002:merge":
++                    key = "<<"
++                    duplicate = merge_seen
++                    merge_seen = True
++                else:
++                    if key_node.tag == "tag:yaml.org,2002:value":
++                        key_node.tag = "tag:yaml.org,2002:str"
++                    key = self.construct_object(key_node)
++                    if not isinstance(key, Hashable):
++                        raise ConstructorError(
++                            "while constructing a mapping",
++                            node.start_mark,
++                            "found unhashable key",
++                            key_node.start_mark,
++                        )
++                    duplicate = key in keys
++                    keys.add(key)
++                if duplicate:
++                    raise ConstructorError(
++                        "while constructing a mapping",
++                        node.start_mark,
++                        f"found duplicate key {key!r}",
++                        key_node.start_mark,
++                    )
++        super().flatten_mapping(node)
++
++
++def load_yaml(stream: str | TextIO) -> Any:
++    """Load one safe YAML document, rejecting duplicate explicit keys.
++
++    Merge keys retain normal YAML precedence, including explicit overrides.
++    Open file streams retain their filename in parser error messages.
++    """
++    return yaml.load(stream, Loader=_UniqueKeyLoader)
+diff --git a/tests/test_yaml_duplicate_keys.py b/tests/test_yaml_duplicate_keys.py
+new file mode 100644
+index 00000000..176d0784
+--- /dev/null
++++ b/tests/test_yaml_duplicate_keys.py
+@@ -0,0 +1,147 @@
++"""YAML validation rejects discarded settings while preserving safe merge semantics."""
++
++from pathlib import Path
++from functools import partial
++from types import SimpleNamespace
++
++import pytest
++import yaml
++from yaml.constructor import ConstructorError
++
++from boltzgen.cli.boltzgen import execute_command
++from boltzgen.data.parse.schema import YamlDesignParser, parse_redesign_yaml
++from boltzgen.data.parse.yaml import load_yaml
++from test_structure_transform_boundaries import molecule
++
++
++@pytest.mark.parametrize(
++    "document",
++    [
++        "id: A\nid: B\n",
++        "file: {structure_groups: [], structure_groups: []}",
++        "entities: [{protein: {id: A, id: B, sequence: GG}}]",
++        "{id: A, 'id': B}",
++        "{true: A, 1: B}",
++        "{null: A, ~: B}",
++        "{1: A, 01: B}",
++        "{=: A, '=': B}",
++        "a: &a {id: A, id: B}\nb: {<<: *a}",
++        "a: &a {id: A}\nb: {<<: *a, <<: *a}",
++        "a: &a {id: A, id: B}\nb: *a",
++    ],
++)
++def test_duplicate_keys_are_rejected(document: str) -> None:
++    with pytest.raises(ConstructorError, match="duplicate key"):
++        load_yaml(document)
++
++
++@pytest.mark.parametrize(
++    "document",
++    [
++        "",
++        "# comment only\n",
++        "null",
++        "[]",
++        "{}",
++        "{id: A, ID: B}",
++        "{true: A, 'true': B}",
++        "{1: A, '1': B}",
++        "- {id: A}\n- {id: B}",
++        "a: &a {id: A}\nb: *a",
++        "a: &a {id: A, sequence: GG}\nb: {<<: *a, id: B}",
++        "a: &a {id: A}\nb: &b {id: B}\nc: {<<: [*a, *b]}",
++        "a: &a {id: A}\nb: &b {<<: *a, id: B}\nc: {<<: *b, id: C}",
++        "a: &a {id: A}\nb: &b {<<: *a, id: B}\nc: {<<: *b}\nd: {<<: *b}",
++        "a: &a {id: A}\nb: {<<: *a, '<<': ordinary}",
++        "{=: ordinary}",
++    ],
++)
++def test_safe_yaml_values_and_merge_precedence_are_preserved(document: str) -> None:
++    assert load_yaml(document) == yaml.safe_load(document)
++
++
++def test_recursive_value_alias_retains_identity() -> None:
++    result = load_yaml("&a {self: *a}")
++    assert result["self"] is result
++
++
++@pytest.mark.parametrize(
++    "document",
++    [
++        "{[a, b]: value}",
++        "{<<: 1}",
++        "a: [",
++        "a: *undefined",
++        "---\na: 1\n---\nb: 2",
++        "!!python/name:os.system",
++        "!unknown value",
++    ],
++)
++def test_safe_yaml_restrictions_remain(document: str) -> None:
++    with pytest.raises(yaml.YAMLError):
++        load_yaml(document)
++
++
++@pytest.mark.parametrize("entrypoint", ["design", "scaffold", "redesign", "steps"])
++def test_file_entrypoints_report_duplicate_key_location(
++    tmp_path: Path, entrypoint: str
++) -> None:
++    path = tmp_path / ("steps.yaml" if entrypoint == "steps" else "input.yaml")
++    if entrypoint == "design":
++        path.write_text(
++            "entities:\n  - protein:\n      id: A\n      id: B\n      sequence: GG\n"
++        )
++        invoke = partial(YamlDesignParser(tmp_path).parse_yaml, path, {}, tmp_path)
++        line = 4
++    elif entrypoint == "scaffold":
++        path.write_text(
++            "path: target.pdb\ninclude:\n  - chain:\n      id: A\n      id: B\n"
++        )
++        invoke = partial(
++            YamlDesignParser(tmp_path).parse_file,
++            {"file": {"path": str(path)}},
++            {},
++            tmp_path,
++            1,
++            tmp_path,
++        )
++        line = 5
++    elif entrypoint == "redesign":
++        path.write_text(
++            "restrictions:\n  design:\n    - chain:\n        id: A\n        id: B\n"
++        )
++        invoke = partial(parse_redesign_yaml, path, None)
++        line = 5
++    else:
++        path.write_text("steps: []\nsteps: []\n")
++        invoke = partial(execute_command, SimpleNamespace(output=tmp_path, steps=None))
++        line = 2
++    with pytest.raises(ConstructorError, match="duplicate key") as caught:
++        invoke()
++    assert str(path) in str(caught.value)
++    assert f"line {line}" in str(caught.value)
++
++
++def test_merged_entities_reach_real_design_parser(tmp_path: Path) -> None:
++    path = tmp_path / "input.yaml"
++    path.write_text(
++        "entities:\n  - protein: &template {id: A, sequence: GG}\n  - protein: {<<: *template, id: B}\n"
++    )
++    target = YamlDesignParser(tmp_path).parse_yaml(path, {"GLY": molecule()}, tmp_path)
++    assert target.structure.chains["name"].tolist() == ["A", "B"]
++    assert target.structure.chains["res_num"].tolist() == [2, 2]
++
++
++def test_repository_examples_remain_valid_yaml() -> None:
++    paths = sorted((Path(__file__).parents[1] / "example").rglob("*.yaml"))
++    assert paths
++    for path in paths:
++        with path.open() as stream:
++            actual = load_yaml(stream)
++        assert actual == yaml.safe_load(path.read_text()), str(path)
++
++
++def test_validation_does_not_modify_pyyaml_global_loader() -> None:
++    with pytest.raises(ConstructorError):
++        load_yaml("id: A\nid: B")
++    assert yaml.safe_load("id: A\nid: B") == {"id": "B"}

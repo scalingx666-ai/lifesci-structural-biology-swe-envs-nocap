@@ -1,0 +1,120 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 611e162f0..4f375d0a2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,6 @@
+ # Changelog
+ 
++- 2026-11-15: Added retrial when dirac communication fails - Issue #1769
+ - 2026-11-14: Modified the packaging of jobs for grid submission - Issue #1768
+ - 2026-10-28: Added check to detect insertion codes and return an error message - Issue #1746
+ - 2026-10-28: Turned true by default the generation of ligand topo/param files - Issue #1743
+diff --git a/src/haddock/libs/libgrid.py b/src/haddock/libs/libgrid.py
+index 089bd4a22..7005ed202 100644
+--- a/src/haddock/libs/libgrid.py
++++ b/src/haddock/libs/libgrid.py
+@@ -4,6 +4,7 @@
+ import shutil
+ import subprocess
+ import tempfile
++import time
+ import uuid
+ import warnings
+ import zipfile
+@@ -34,6 +35,10 @@
+ # =====================================================================#
+ JOB_TYPE = os.getenv("HADDOCK3_GRID_JOB_TYPE", "WeNMR-DEV")
+ MAX_RETRIES = 10
++# Seconds to wait before retrying a failed submission, doubled after each
++#  retry up to SUBMIT_RETRY_MAX_DELAY (10 retries then cover ~37 minutes)
++SUBMIT_RETRY_DELAY = 30
++SUBMIT_RETRY_MAX_DELAY = 300
+ 
+ # Number of models (CNS jobs) packed into one grid job, per module.
+ #  Chosen from grid tests on the protein-protein docking example (#1768):
+@@ -285,22 +290,34 @@ def submit(self) -> None:
+ 
+         self.timings[JobStatus.WAITING] = datetime.now()
+ 
+-        try:
+-            # The SUBMIT_CMD returns the job ID in stdout
+-            result = subprocess.run(
+-                ["dirac-wms-job-submit", f"{self.loc}/job.jdl"],
+-                shell=False,
+-                capture_output=True,
+-                text=True,
+-                cwd=self.loc,
+-                check=True,
+-            )
+-        except subprocess.CalledProcessError as e:
+-            log.error(
+-                f"Job submission failed: {e}\nStdout: {e.stdout}\nStderr: {e.stderr}"
+-            )
+-            # TODO: Add some sort of retry/fallback mechanism here?
+-            raise
++        # Submissions can fail when DIRAC is briefly unavailable, retry them
++        #  and count them towards the same MAX_RETRIES as failed jobs
++        while True:
++            try:
++                # The SUBMIT_CMD returns the job ID in stdout
++                result = subprocess.run(
++                    ["dirac-wms-job-submit", f"{self.loc}/job.jdl"],
++                    shell=False,
++                    capture_output=True,
++                    text=True,
++                    cwd=self.loc,
++                    check=True,
++                )
++                break
++            except subprocess.CalledProcessError as e:
++                if self.retries >= MAX_RETRIES:
++                    log.error(
++                        f"Job submission failed: {e}\nStdout: {e.stdout}\nStderr: {e.stderr}"
++                    )
++                    raise
++                self.retries += 1
++                delay = min(
++                    SUBMIT_RETRY_DELAY * 2 ** (self.retries - 1), SUBMIT_RETRY_MAX_DELAY
++                )
++                log.warning(
++                    f"> Submission of job {self.name} failed ({e.stdout.strip()}), retrying in {delay}s - {self.retries}/{MAX_RETRIES} <"
++                )
++                time.sleep(delay)
+ 
+         # Add the ID to the object
+         self.id = int(result.stdout.split()[-1])
+diff --git a/tests/test_libgrid.py b/tests/test_libgrid.py
+index 2a1c500a3..0ad14520b 100644
+--- a/tests/test_libgrid.py
++++ b/tests/test_libgrid.py
+@@ -1,4 +1,6 @@
++import subprocess
+ from types import SimpleNamespace
++from unittest.mock import patch
+ 
+ import pytest
+ 
+@@ -176,3 +178,23 @@ def test_scheduler_create_batches(
+     assert [len(job.input_str_list) for job in scheduler.workload] == expected
+     for job in scheduler.workload:
+         job.clean()
++
++
++def test_submit_retries_failed_submission(dummy_paths):
++    toppar, module = dummy_paths
++    job = GridJob(input="input", toppar_path=toppar, module_path=module)
++    job.packaged = True
++    error = subprocess.CalledProcessError(
++        2, "dirac-wms-job-submit", output="Peer closed connection"
++    )
++    ok = subprocess.CompletedProcess([], 0, stdout="JobID = 123")
++    with (
++        patch("haddock.libs.libgrid.subprocess.run", side_effect=[error, error, ok]),
++        patch("haddock.libs.libgrid.time.sleep") as sleep,
++        patch.object(GridJob, "update_status"),
++    ):
++        job.submit()
++    assert job.id == 123
++    assert job.retries == 2
++    assert [c.args[0] for c in sleep.call_args_list] == [30, 60]
++    job.clean()

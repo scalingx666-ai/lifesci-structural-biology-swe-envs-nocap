@@ -1,0 +1,515 @@
+diff --git a/unimol_tools/unimol_tools/config/model_config.py b/unimol_tools/unimol_tools/config/model_config.py
+index a0d80b8..d65bd58 100644
+--- a/unimol_tools/unimol_tools/config/model_config.py
++++ b/unimol_tools/unimol_tools/config/model_config.py
+@@ -1,6 +1,6 @@
+ MODEL_CONFIG = {
+     "weight":{
+-        "protein": "pocket_pre_220816.pt",
++        "protein": "poc_pre_220816.pt",
+         "molecule_no_h": "mol_pre_no_h_220816.pt",
+         "molecule_all_h": "mol_pre_all_h_220816.pt",
+         "crystal": "mp_all_h_230313.pt",
+diff --git a/unimol_tools/unimol_tools/data/conformer.py b/unimol_tools/unimol_tools/data/conformer.py
+index bbb5591..997725c 100644
+--- a/unimol_tools/unimol_tools/data/conformer.py
++++ b/unimol_tools/unimol_tools/data/conformer.py
+@@ -123,7 +123,8 @@ def inner_coords(atoms, coordinates, remove_hs=True):
+     else:
+         return atoms, coordinates
+ 
+-def coords2unimol(atoms, coordinates, dictionary, max_atoms=256, **params):
++def coords2unimol(atoms, coordinates, dictionary, max_atoms=256, remove_hs=True, **params):
++    atoms, coordinates = inner_coords(atoms, coordinates, remove_hs=remove_hs)
+     atoms = np.array(atoms)
+     coordinates = np.array(coordinates).astype(np.float32)
+     ### cropping atoms and coordinates
+diff --git a/unimol_tools/unimol_tools/data/datahub.py b/unimol_tools/unimol_tools/data/datahub.py
+index f4869f1..8a67d69 100644
+--- a/unimol_tools/unimol_tools/data/datahub.py
++++ b/unimol_tools/unimol_tools/data/datahub.py
+@@ -22,7 +22,7 @@ def __init__(self, data=None, is_train=True, save_path=None, **params):
+         self.data = data
+         self.is_train = is_train
+         self.save_path = save_path
+-        self.task = params.get('task', None) 
++        self.task = params.get('task', None)
+         self.target_cols = params.get('target_cols', None)
+         self.multiclass_cnt = params.get('multiclass_cnt', None)
+         self.ss_method = params.get('target_normalize', 'none')
+@@ -50,7 +50,7 @@ def _init_data(self, **params):
+             target = np.array(self.data['raw_target']).reshape(-1,self.data['num_classes']).astype(np.float32)
+             if self.is_train:
+                 self.data['target_scaler'].fit(target, self.save_path)
+-                self.data['target'] = self.data['target_scaler'].transform(target)
++                self.data['target'] = self.data['target_scaler'].transform(target)                
+             else:
+                 self.data['target'] = target
+         elif self.task == 'multilabel_classification':
+@@ -60,7 +60,7 @@ def _init_data(self, **params):
+             self.data['target'] = self.data['raw_target']
+         else:
+             raise ValueError('Unknown task: {}'.format(self.task))
+-        
++
+         if 'atoms' in self.data and 'coordinates' in self.data:
+             no_h_list = ConformerGen(**params).transform_raw(self.data['atoms'], self.data['coordinates'])
+         else:
+diff --git a/unimol_tools/unimol_tools/data/datareader.py b/unimol_tools/unimol_tools/data/datareader.py
+index aa4d864..4cf50d7 100644
+--- a/unimol_tools/unimol_tools/data/datareader.py
++++ b/unimol_tools/unimol_tools/data/datareader.py
+@@ -35,6 +35,7 @@ def read_data(self, data=None, is_train=True, **params):
+         target_col_prefix = params.get('target_col_prefix', 'TARGET')
+         anomaly_clean = params.get('anomaly_clean', False)
+         smi_strict = params.get('smi_strict', False)
++        split_group_col = params.get('split_group_col', 'scaffold')
+ 
+         if isinstance(data, str):
+             # load from file
+@@ -99,8 +100,15 @@ def read_data(self, data=None, is_train=True, **params):
+             dd['smiles'] = data[smiles_col].tolist()
+             dd['scaffolds'] = data[smiles_col].map(self.smi2scaffold).tolist()
+         else:
+-            dd['smiles'] = np.arange(data.shape[0]).tolist()
+-            dd['scaffolds'] = np.arange(data.shape[0]).tolist()
++            dd['smiles'] = None
++            dd['scaffolds'] = None
++
++        if split_group_col in data.columns:
++            dd['group'] = data[split_group_col].tolist()
++        elif split_group_col == 'scaffold':
++            dd['group'] = dd['scaffolds']
++        else:
++            dd['group'] = None
+ 
+         if 'atoms' in data.columns and 'coordinates' in data.columns:
+             dd['atoms'] = data['atoms'].tolist()
+diff --git a/unimol_tools/unimol_tools/data/datascaler.py b/unimol_tools/unimol_tools/data/datascaler.py
+index 04076b7..8b9deb1 100644
+--- a/unimol_tools/unimol_tools/data/datascaler.py
++++ b/unimol_tools/unimol_tools/data/datascaler.py
+@@ -55,6 +55,7 @@ def transform(self, target):
+             return self.scaler.transform(target)
+         elif self.task == 'multilabel_regression':
+             assert isinstance(self.scaler, list) and len(self.scaler) == target.shape[1]
++            target = np.ma.masked_invalid(target)  # mask NaN value
+             new_target = np.zeros_like(target)
+             for i in range(target.shape[1]):
+                 new_target[:, i] = self.scaler[i].transform(target[:, i:i+1]).reshape(-1,)
+@@ -70,17 +71,18 @@ def fit(self, target, dump_dir):
+         elif self.ss_method == 'auto':
+             if self.task == 'regression':
+                 if self.is_skewed(target):
+-                    self.scaler = SCALER_MODE['power_trans'](method='box-cox') if min(target) > 0 else SCALER_MODE['power_trans'](method='yeo-johnson')
+-                    logger.info('Auto select power transformer.')
++                    self.scaler = SCALER_MODE['robust']()
++                    logger.info('Auto select robust transformer.')
+                 else:
+                     self.scaler = SCALER_MODE['standard']()
+                 self.scaler.fit(target)
+             elif self.task == 'multilabel_regression':
+                 self.scaler = []
++                target = np.ma.masked_invalid(target)  # mask NaN value
+                 for i in range(target.shape[1]):
+                     if self.is_skewed(target[:, i]):
+-                        self.scaler.append(SCALER_MODE['power_trans'](method='box-cox') if min(target[:, i]) > 0 else SCALER_MODE['power_trans'](method='yeo-johnson'))
+-                        logger.info('Auto select power transformer.')
++                        self.scaler.append(SCALER_MODE['robust']())
++                        logger.info('Auto select robust transformer.')
+                     else:
+                         self.scaler.append(SCALER_MODE['standard']())
+                     self.scaler[-1].fit(target[:, i:i+1])
+diff --git a/unimol_tools/unimol_tools/models/loss.py b/unimol_tools/unimol_tools/models/loss.py
+index ede8c0a..c0d271c 100644
+--- a/unimol_tools/unimol_tools/models/loss.py
++++ b/unimol_tools/unimol_tools/models/loss.py
+@@ -88,6 +88,14 @@ def _custom_loss_grad(self, x, target):
+         d = x - target
+         mu = self._mu
+         return d / torch.sqrt(d * d + mu * mu)
++    
++def MAEwithNan(y_pred, y_true):
++    mask = ~torch.isnan(y_true)
++    y_pred = y_pred[mask]
++    y_true = y_true[mask]
++    mae_loss = nn.L1Loss()
++    loss = mae_loss(y_pred, y_true)
++    return loss
+ 
+ def FocalLoss(y_pred, y_true, alpha=0.25, gamma=2):
+     if y_pred.shape != y_true.shape:
+@@ -105,7 +113,11 @@ def FocalLoss(y_pred, y_true, alpha=0.25, gamma=2):
+ 
+ def FocalLossWithLogits(y_pred, y_true, alpha=0.25, gamma=2.0):
+     y_pred = torch.sigmoid(y_pred)
+-    return FocalLoss(y_pred, y_true, alpha, gamma)
++    mask = ~torch.isnan(y_true)
++    y_pred = y_pred[mask]
++    y_true = y_true[mask]
++    loss = FocalLoss(y_pred, y_true)
++    return loss
+ 
+ def myCrossEntropyLoss(y_pred, y_true):
+     if y_pred.shape != y_true.shape:
+diff --git a/unimol_tools/unimol_tools/models/nnmodel.py b/unimol_tools/unimol_tools/models/nnmodel.py
+index a879ac5..3f38f71 100644
+--- a/unimol_tools/unimol_tools/models/nnmodel.py
++++ b/unimol_tools/unimol_tools/models/nnmodel.py
+@@ -15,7 +15,7 @@
+ import numpy as np
+ from ..utils import logger
+ from .unimol import UniMolModel
+-from .loss import GHMC_Loss, FocalLossWithLogits, myCrossEntropyLoss
++from .loss import GHMC_Loss, FocalLossWithLogits, myCrossEntropyLoss, MAEwithNan
+ 
+ 
+ NNMODEL_REGISTER = {
+@@ -31,7 +31,7 @@
+         'ghm': GHMC_Loss(bins=10, alpha=0.5),
+         'focal': FocalLossWithLogits,
+     },
+-    'multilabel_regression': nn.MSELoss(),
++    'multilabel_regression': MAEwithNan,
+ }
+ ACTIVATION_FN = {
+     # predict prob shape should be (N, K), especially for binary classification, K equals to 1.
+@@ -103,13 +103,13 @@ def run(self):
+         logger.info("start training Uni-Mol:{}".format(self.model_name))
+         X = np.asarray(self.features)
+         y = np.asarray(self.data['target'])
+-        scaffold = np.asarray(self.data['scaffolds'])
++        group = np.asarray(self.data['group']) if self.data['group'] is not None else None
+         if self.task == 'classification':
+             y_pred = np.zeros_like(
+                 y.reshape(y.shape[0], self.num_classes)).astype(float)
+         else:
+             y_pred = np.zeros((y.shape[0], self.model_params['output_dim']))
+-        for fold, (tr_idx, te_idx) in enumerate(self.splitter.split(X, y, scaffold)):
++        for fold, (tr_idx, te_idx) in enumerate(self.splitter.split(X, y, group)):
+             X_train, y_train = X[tr_idx], y[tr_idx]
+             X_valid, y_valid = X[te_idx], y[te_idx]
+             traindataset = NNDataset(X_train, y_train)
+diff --git a/unimol_tools/unimol_tools/models/unimol.py b/unimol_tools/unimol_tools/models/unimol.py
+index 342e46a..355a2b8 100644
+--- a/unimol_tools/unimol_tools/models/unimol.py
++++ b/unimol_tools/unimol_tools/models/unimol.py
+@@ -133,7 +133,7 @@ def forward(
+         pressure=None,
+         temperature=None,
+         return_repr=False,
+-
++        return_atomic_reprs=False,
+         **kwargs
+     ):
+         padding_mask = src_tokens.eq(self.padding_idx)
+@@ -160,20 +160,30 @@ def get_dist_features(dist, et):
+         all_repr = encoder_rep[:, :, :]  # all token repr
+ 
+         filtered_tensors = []
+-        for tokens in src_tokens:
++        filtered_coords = []
++        for tokens, coord in zip(src_tokens, src_coord):
+             filtered_tensor = tokens[(tokens != 0) & (tokens != 1) & (tokens != 2)] # filter out BOS(0), EOS(1), PAD(2)
++            filtered_coord = coord[(tokens != 0) & (tokens != 1) & (tokens != 2)]
+             filtered_tensors.append(filtered_tensor)
++            filtered_coords.append(filtered_coord)
+ 
+         lengths = [len(filtered_tensor) for filtered_tensor in filtered_tensors] # Compute the lengths of the filtered tensors
+-
+-        cls_atomic_reprs = [] 
+-        for i in range(len(all_repr)):
+-            atomic_repr = encoder_rep[i, 1:lengths[i]+1, :]
+-            cls_atomic_reprs.append(atomic_repr)
+-
+-        repr_dict = {'cls_repr': cls_repr, 'atomic_reprs': cls_atomic_reprs}        
+-        if return_repr:
+-            return repr_dict      
++        if return_repr and return_atomic_reprs:
++            cls_atomic_reprs = [] 
++            atomic_symbols = []
++            for i in range(len(all_repr)):
++                atomic_reprs = encoder_rep[i, 1:lengths[i]+1, :]
++                atomic_symbol = []
++                for atomic_num in filtered_tensors[i]:
++                    atomic_symbol.append(self.dictionary.symbols[atomic_num])
++                atomic_symbols.append(atomic_symbol)
++                cls_atomic_reprs.append(atomic_reprs)
++            return {'cls_repr': cls_repr, 
++                    'atomic_symbol': atomic_symbols, 
++                    'atomic_coords': filtered_coords, 
++                    'atomic_reprs': cls_atomic_reprs}        
++        if return_repr and not return_atomic_reprs:
++            return {'cls_repr': cls_repr}  
+ 
+         if self.data_type == 'mof':
+             gas_embed = self.gas_embed(gas_id, gas_attr) # shape of gas_embed is [batch_size, gas_dim*2]
+diff --git a/unimol_tools/unimol_tools/predict.py b/unimol_tools/unimol_tools/predict.py
+index 5b44539..012be55 100644
+--- a/unimol_tools/unimol_tools/predict.py
++++ b/unimol_tools/unimol_tools/predict.py
+@@ -86,4 +86,4 @@ def save_predict(self, data, dir, prefix):
+         name = prefix + f'.predict.{run_id}' + '.csv'
+         path = os.path.join(dir, name)
+         data.to_csv(path)
+-        logger.info("save predict result to {}".format(path))
+\ No newline at end of file
++        logger.info("save predict result to {}".format(path))
+diff --git a/unimol_tools/unimol_tools/predictor.py b/unimol_tools/unimol_tools/predictor.py
+index 4d8f06b..ac0d362 100644
+--- a/unimol_tools/unimol_tools/predictor.py
++++ b/unimol_tools/unimol_tools/predictor.py
+@@ -18,6 +18,7 @@
+ from .tasks import Trainer
+ from rdkit import Chem
+ 
++
+ class MolDataset(Dataset):
+     def __init__(self, data, label=None):
+         self.data = data
+@@ -29,28 +30,45 @@ def __getitem__(self, idx):
+     def __len__(self):
+         return len(self.data)
+     
++
+ class UniMolRepr(object):
+-    def __init__(self, data_type='molecule', remove_hs=False, use_gpu=True):
++    def __init__(self, data_type='molecule', 
++                 remove_hs=False, 
++                 use_gpu=True):
+         self.device = torch.device("cuda:0" if torch.cuda.is_available() and use_gpu else "cpu")
+         self.model = UniMolModel(output_dim=1, data_type=data_type, remove_hs=remove_hs).to(self.device)
+         self.model.eval()
+-        self.params = {'data_type':data_type, 'remove_hs': remove_hs}
+-    
+-    def get_repr(self, smiles_list):
+-        if isinstance(smiles_list, str):
+-            smiles_list = [smiles_list]
+-        datahub = DataHub(data = smiles_list, 
+-                         task = 'repr', 
+-                         is_train = False, 
++        self.params = {'data_type': data_type, 'remove_hs': remove_hs}
++   
++    def get_repr(self, data=None, return_atomic_reprs=False):
++
++        if isinstance(data, str):
++            # single smiles string.
++            data = [data]
++        elif isinstance(data, dict):
++            # custom conformers, should take atoms and coordinates as input.
++            assert 'atoms' in data and 'coordinates' in data
++        elif isinstance(data, list):
++            # list of smiles strings.
++            assert isinstance(data[-1], str)
++        else:
++            raise ValueError('Unknown data type: {}'.format(type(data)))
++        datahub = DataHub(data=data, 
++                         task='repr', 
++                         is_train=False, 
+                          **self.params,
+                         )
+         dataset = MolDataset(datahub.data['unimol_input'])
+         self.trainer = Trainer(task='repr')
+-        repr_output = self.trainer.inference(self.model, dataset=dataset)
++        repr_output = self.trainer.inference(self.model, 
++                                             return_repr=True, 
++                                             return_atomic_reprs=return_atomic_reprs, 
++                                             dataset=dataset)
+         return repr_output
+ 
+-scaler = {'CoRE_MAP': [1.318703908155812, 1.657051374039756,'log1p_standardization']}
+ 
++
++scaler = {'CoRE_MAP': [1.318703908155812, 1.657051374039756,'log1p_standardization']}
+ class MOFDataset(Dataset):
+     def __init__(self, mof_data, aux_data):
+         self.mof_data = mof_data
+@@ -65,13 +83,13 @@ def __getitem__(self, idx):
+             d[k] = self.aux_data[idx][k]
+         return d
+ 
++
+ class MOFPredictor(object):
+     def __init__(self, use_gpu=True):
+         self.device = torch.device("cuda:0" if torch.cuda.is_available() and use_gpu else "cpu")
+         self.model = UniMolModel(output_dim=1, data_type='mof').to(self.device).half()
+         self.model.eval()
+ 
+-
+     def single_predict(self, cif_path='1.cif', gas='CH4', pressure=10000, temperature=100):
+         d = MOFReader().read_with_gas(cif_path=cif_path, gas=gas)
+         d['pressure'] = np.log10(pressure)
+diff --git a/unimol_tools/unimol_tools/tasks/split.py b/unimol_tools/unimol_tools/tasks/split.py
+index 09fa818..3d2c46f 100644
+--- a/unimol_tools/unimol_tools/tasks/split.py
++++ b/unimol_tools/unimol_tools/tasks/split.py
+@@ -11,32 +11,33 @@
+ import numpy as np
+ import csv
+ from typing import List, Optional
+-from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
++from sklearn.model_selection import (
++    GroupKFold, 
++    KFold, 
++    StratifiedKFold,
++)
+ 
+ 
+ class Splitter(object):
+     def __init__(self, split_method='5fold_random', seed=42):
+-        self.split_method = split_method
++        self.n_splits, self.method = int(split_method.split('fold')[0]), split_method.split('_')[-1]    # Nfold_xxxx
+         self.seed = seed
+-        self.splitter = self._init_split(self.split_method, self.seed)
+-        self.n_splits = 5
+-        self.skf = None
++        self.splitter = self._init_split()
+ 
+-    def _init_split(self, split_method, seed=42):
+-        if split_method == '5fold_random':
+-            splitter = KFold(n_splits=5, shuffle=True, random_state=seed)
+-        elif split_method == '5fold_scaffold':
+-            splitter = GroupKFold(n_splits=5)
++    def _init_split(self):
++        if self.method == 'random':
++            splitter = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
++        elif self.method == 'scaffold' or self.method == 'group':
++            splitter = GroupKFold(n_splits=self.n_splits)
++        elif self.method == 'stratified':
++            splitter = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
+         else:
+-            raise ValueError('Unknown splitter method: {}'.format(split_method))
++            raise ValueError('Unknown splitter method: {}fold - {}'.format(self.n_splits, self.method))
+ 
+         return splitter
+ 
+     def split(self, data, target=None, group=None):
+-        if self.split_method in ['5fold_random']:
+-            self.skf = self.splitter.split(data)
+-        elif self.split_method in ['5fold_scaffold']:
+-            self.skf = self.splitter.split(data, target, group)
+-        else:
+-            raise ValueError('Unknown splitter method: {}'.format(self.split_method))
+-        return self.skf
+\ No newline at end of file
++        try:
++            return self.splitter.split(data, target, group)
++        except:
++            raise ValueError('Unknown splitter method: {}fold - {}'.format(self.n_splits, self.method))
+diff --git a/unimol_tools/unimol_tools/tasks/trainer.py b/unimol_tools/unimol_tools/tasks/trainer.py
+index 2caf319..df1ff26 100644
+--- a/unimol_tools/unimol_tools/tasks/trainer.py
++++ b/unimol_tools/unimol_tools/tasks/trainer.py
+@@ -259,7 +259,7 @@ def predict(self, model, dataset, loss_func, activation_fn, dump_dir, fold, targ
+         batch_bar.close()
+         return y_preds, val_loss, metric_score
+ 
+-    def inference(self, model, dataset, feature_name=None, return_repr=True):
++    def inference(self, model, dataset, return_repr=False, return_atomic_reprs=False, feature_name=None):
+         model = model.to(self.device)
+         dataloader = NNDataLoader(
+             feature_name=feature_name,
+@@ -269,21 +269,20 @@ def inference(self, model, dataset, feature_name=None, return_repr=True):
+             collate_fn=model.batch_collate_fn,
+         )
+         model = model.eval()
+-        batch_bar = tqdm(total=len(dataloader), dynamic_ncols=True,
+-                         position=0, leave=False, desc='val', ncols=5)
+-        repr_dict = {"cls_repr": [], "atomic_reprs": []}
+-        for i, batch in enumerate(dataloader):
++        repr_dict = {"cls_repr": [], "atomic_coords": [], "atomic_reprs": [], "atomic_symbol": []}
++        for batch in tqdm(dataloader):
+             net_input, _ = self.decorate_batch(batch, feature_name)
+             with torch.no_grad():
+-                outputs = model(return_repr=return_repr, **net_input)
++                outputs = model(**net_input,
++                                return_repr=return_repr,
++                                return_atomic_reprs=return_atomic_reprs)
+                 assert isinstance(outputs, dict)
+-                for key, value in outputs.items():
+-                    if isinstance(value, list):
+-                        value_list = [item.cpu().numpy() for item in value]
+-                        repr_dict[key].extend(value_list)
+-                    else:
+-                        repr_dict[key].extend([value.cpu().numpy()])
+-        repr_dict["cls_repr"] = np.concatenate(repr_dict["cls_repr"]).tolist()
++                repr_dict["cls_repr"].extend(item.cpu().numpy() for item in outputs["cls_repr"])
++                if return_atomic_reprs:
++                    repr_dict["atomic_symbol"].extend(outputs["atomic_symbol"])
++                    repr_dict['atomic_coords'].extend(item.cpu().numpy() for item in outputs['atomic_coords'])
++                    repr_dict['atomic_reprs'].extend(item.cpu().numpy() for item in outputs['atomic_reprs'])
++                    
+         return repr_dict
+ 
+     def set_seed(self, seed):
+@@ -304,4 +303,4 @@ def NNDataLoader(feature_name=None, dataset=None, batch_size=None, shuffle=False
+                                  shuffle=shuffle,
+                                  collate_fn=collate_fn,
+                                  drop_last=drop_last)
+-    return dataloader
+\ No newline at end of file
++    return dataloader
+diff --git a/unimol_tools/unimol_tools/train.py b/unimol_tools/unimol_tools/train.py
+index 70b2dd1..a4c75bf 100644
+--- a/unimol_tools/unimol_tools/train.py
++++ b/unimol_tools/unimol_tools/train.py
+@@ -27,9 +27,20 @@ def __init__(self,
+                 batch_size=16,
+                 early_stopping=5,
+                 metrics= "none",
+-                split='random',
++                split='random',                   # random, scaffold, group, stratified
++                split_group_col='scaffold',       # only active with group split
++                kfold=5,
+                 save_path='./exp',
+                 remove_hs=False,
++                smiles_col='SMILES',
++                target_col_prefix='TARGET',
++                target_anomaly_check="filter",
++                smiles_check="filter",
++                target_normalize="auto",
++                max_norm=5.0,
++                use_cuda=True,
++                use_amp=True,
++                **params,
+                 ):
+         config_path = os.path.join(os.path.dirname(__file__), 'config/default.yaml')
+         self.yamlhandler = YamlHandler(config_path)
+@@ -42,7 +53,17 @@ def __init__(self,
+         config.patience = early_stopping
+         config.metrics = metrics
+         config.split = split
++        config.split_group_col = split_group_col
++        config.kfold = kfold
+         config.remove_hs = remove_hs
++        config.smiles_col = smiles_col
++        config.target_col_prefix = target_col_prefix
++        config.anomaly_clean = target_anomaly_check in ['filter']
++        config.smi_strict = smiles_check in ['filter']
++        config.target_normalize = target_normalize
++        config.max_norm = max_norm
++        config.use_cuda = use_cuda
++        config.use_amp = use_amp
+         self.save_path = save_path
+         self.config = config
+ 
+@@ -75,11 +96,7 @@ def update_and_save_config(self):
+         if self.config['task'] == 'multiclass':
+             self.config['multiclass_cnt'] = self.data['multiclass_cnt']
+ 
+-        if self.config['split'] == 'random':
+-            self.config['split_method'] = '5fold_random'
+-        else:
+-            self.config['split_method'] = '5fold_scaffold'
+-
++        self.config['split_method'] = f"{self.config['kfold']}fold_{self.config['split']}"
+         if self.save_path is not None:
+             if not os.path.exists(self.save_path):
+                 logger.info('Create output directory: {}'.format(self.save_path))
+@@ -89,4 +106,4 @@ def update_and_save_config(self):
+                 logger.info('Warning: Overwrite output directory: {}'.format(self.save_path))
+             out_path = os.path.join(self.save_path, 'config.yaml')
+             self.yamlhandler.write_yaml(data = self.config, out_file_path = out_path)
+-        return
+\ No newline at end of file
++        return

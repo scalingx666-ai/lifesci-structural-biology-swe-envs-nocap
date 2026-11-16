@@ -1,0 +1,152 @@
+diff --git a/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl b/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl
+index ccaf4f7ed2..b92a491a0b 100755
+--- a/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl
++++ b/src/methods/property_solvers/multicomponent/tp_flash/Michelsentp_flash.jl
+@@ -293,14 +293,16 @@ function tp_flash_michelsen(model::EoSModel, p, T, z, method = MichelsenTPFlash(
+     end
+ 
+     lnK_old = similar(lnK)
++    β_old = typemax(Ktype)
+     gibbs = one(_1)
+     gibbs_dem = one(_1)
+     vcache = Ref((_1, _1))
+-    verbose && @info "iter         β      error_lnK            K"
+-    while error_lnK > K_tol && it < itss && status == RREq
++    verbose && @info "iter  status        β      error_lnK            K"
++    while (error_lnK > K_tol || abs(β_old-β) > 1e-9) && it < itss && status != RRTrivial
+         it += 1
+         itacc += 1
+         lnK_old .= lnK
++        β_old = β
+ 
+         x,y = update_rr!(K,β,z,x,y,non_inx,non_iny)
+ 
+@@ -332,25 +334,17 @@ function tp_flash_michelsen(model::EoSModel, p, T, z, method = MichelsenTPFlash(
+         end
+         K .= exp.(lnK)
+         β = rachfordrice(K, z; β0=β, non_inx=non_inx, non_iny=non_iny, K_tol = K_tol)
+-        verbose && @info "$it    $β  $(round(error_lnK,sigdigits=4)) $K"
++        status = rachfordrice_status(K,z,non_inx,non_iny;K_tol)
+ 
+-        if isnan(β) #try to save K? basically damping
+-            if rachfordrice_status(K,z,non_inx,non_iny;K_tol = K_tol) != RRTrivial
+-                K .= 0.5 * K .+ 0.5 * y ./ x
+-                β = rachfordrice(K, z; non_inx=non_inx, non_iny=non_iny, K_tol = K_tol)
+-            end
+-        end
++        verbose && @info "$it    $status   $β  $(round(error_lnK,sigdigits=4)) $K"
+ 
+-        status = rachfordrice_status(K,z,non_inx,non_iny;K_tol = K_tol)
++        if isnan(β) && status != RRTrivial
++            #try to save K? basically damping
++            K .= 0.5 * K .+ 0.5 * y ./ x
++            β = rachfordrice(K, z; non_inx=non_inx, non_iny=non_iny, K_tol = K_tol)
++        end
+ 
+         Kmin,Kmax = K_extrema(K,non_inx,non_iny)
+-        if status == RRLiquid && Kmin < 1
+-            status = RREq
+-            β = eps(Ktype)
+-        elseif status == RRVapour && Kmax > 1
+-            status = RREq
+-            β = 1 - eps(Ktype)
+-        end
+         # Computing error
+         # error_lnK = sum((lnK .- lnK_old).^2)
+         error_lnK = dnorm(@view(lnK[in_equilibria]),@view(lnK_old[in_equilibria]),1)
+@@ -359,13 +353,6 @@ function tp_flash_michelsen(model::EoSModel, p, T, z, method = MichelsenTPFlash(
+     verbose && it > 0 && @info "$it SS iterations done, error(lnK) = $error_lnK"
+ 
+     if it > 0 && !isnan(β)
+-        β_margin = min(β, _1 - β)
+-        verbose && @info "boundary check: β_margin = $(β_margin)"
+-        # 4 guards to pinpoint the scenario of #465
+-        if status == RREq && β_margin <= cbrt(K_tol) && Kmin < _1 && Kmax > _1
+-            status, newβ = rr_margin_check(K,z,non_inx,non_iny;K_tol = K_tol,verbose = verbose)
+-            status != RREq && (β = newβ)
+-        end
+         # single composition update with the (possibly projected) β
+         x, y = update_rr!(K, β, z, x, y, non_inx, non_iny)
+     end
+diff --git a/src/methods/property_solvers/multicomponent/tp_flash/michelsen_base.jl b/src/methods/property_solvers/multicomponent/tp_flash/michelsen_base.jl
+index 00ab3a88d6..d90c9cd18a 100644
+--- a/src/methods/property_solvers/multicomponent/tp_flash/michelsen_base.jl
++++ b/src/methods/property_solvers/multicomponent/tp_flash/michelsen_base.jl
+@@ -1,21 +1,38 @@
+ function rachfordrice(K, z; β0=nothing,K_tol = 4*eps(eltype(K)), non_inx=FillArrays.Fill(false,length(z)), non_iny=FillArrays.Fill(false,length(z)))
+     # Function to solve Rachdord-Rice mass balance
+     β,status,limits = rachfordrice_β0(K,z,β0,non_inx,non_iny;K_tol = K_tol)
+-    if length(z) <= 3 && all(Base.Fix2(>,0),z) && all(!,non_inx) && all(!,non_iny) && status == RREq
+-        βx = rr_vle_vapor_fraction_exact(K,z)
+-        return clamp(βx,zero(β),one(β))
++    _0,_1 = zero(β),one(β)
++    # single-phase shortcuts
++    if status == RRLiquid
++        return _0
++    elseif status == RRVapour
++        return _1
++    elseif status != RREq
++        return _0/_0
+     end
+ 
+-    if status == RREq
+-        βx = rr_flash_refine(K, z, β, non_inx, non_iny, limits) # bracketed Halley when possible
+-        return clamp(βx,zero(β),one(β))
+-    elseif status == RRLiquid
+-        return zero(β)   # or eps(eltype(β))
+-    elseif status == RRVapour
+-        return one(β)   # or 1 - eps(eltype(β))
++    if length(z) <= 3 && all(Base.Fix2(>,0),z) && all(!,non_inx) && all(!,non_iny)
++        βx = rr_vle_vapor_fraction_exact(K,z)
+     else
+-        return zero(β)/zero(β)
++        βx = rr_flash_refine(K, z, β, non_inx, non_iny, limits) # bracketed Halley when possible
++    end
++    βx = clamp(βx,_0,_1)
++
++    # near-boundary stabilization: if βx is within gate of 0 or 1 and K spans unity,
++    # use rr_margin_check to project to boundary.
++    Kmin,Kmax = K_extrema(K,non_inx,non_iny)
++    if (Kmin < one(eltype(K)) && Kmax > one(eltype(K)))
++        β_margin = min(βx,_1-βx)
++        gate = cbrt(K_tol)
++        if β_margin <= gate
++            status_p,βb = rr_margin_check(K,z,non_inx,non_iny;K_tol = K_tol)
++            if status_p != RREq
++                # verbose && @info("rachfordrice boundary project", βx=βx, βb=βb, β_margin=β_margin, gate=gate, status_p=status_p)
++                return clamp(βb,_0,_1)
++            end
++        end
+     end
++    return βx
+ end
+ 
+ function K_extrema(K::AbstractVector{T},non_inx,non_iny) where T
+@@ -487,4 +504,4 @@ function dgibbs_obj!(model::EoSModel, p, T, z, phasex, phasey,
+         return FO
+     end
+ end
+-=#
+\ No newline at end of file
++=#
+diff --git a/test/test_methods_api_flash.jl b/test/test_methods_api_flash.jl
+index 7a003f6305..6bac883598 100644
+--- a/test/test_methods_api_flash.jl
++++ b/test/test_methods_api_flash.jl
+@@ -130,11 +130,14 @@
+             @test iszero(res4.fractions[1])
+             @test res4.fractions[2] ≈ 36.50084374190448
+ 
+-            res5 = Clapeyron.tp_flash2(mix, 442595.31887270656, 318.91991913774194, [18.697907101753938, 9.208988950434023e-8, 2.317361697667793e-22, 1.9317538045050555e-32], RRTPFlash(equilibrium=:vle, verbose=true))
++            res5 = Clapeyron.tp_flash2(mix, 442595.31887270656, 318.91991913774194, [18.697907101753938, 9.208988950434023e-8, 2.317361697667793e-22, 1.9317538045050555e-32], RRTPFlash(equilibrium=:vle))
+             @test res5.fractions[1] ≈ 18.69790719384074 rtol = 1e-4
+ 
+-            res6 = Clapeyron.tp_flash2(mix, 2.2099578494144413e6, 464.63699168781847, [2.7561794126981888e-6, 55.964211412167195, 12.860133735598001, 1.0819681996211576], MichelsenTPFlash(equilibrium=:vle,verbose = true))
++            res6 = Clapeyron.tp_flash2(mix, 2.2099578494144413e6, 464.63699168781847, [2.7561794126981888e-6, 55.964211412167195, 12.860133735598001, 1.0819681996211576], MichelsenTPFlash(equilibrium=:vle))
+             @test res6.fractions[2] ≈ 69.90631610356577
++
++            res7 = Clapeyron.tp_flash2(mix, 505777.32016068726, 323.9598978773458, [75.83064821431964, 6.148759359393775e-10, 0, 0], MichelsenTPFlash(equilibrium=:vle))
++            @test res7.fractions[1] ≈ 75.83064821493451
+         end
+ 
+     end

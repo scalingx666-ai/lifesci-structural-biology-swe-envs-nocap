@@ -1,0 +1,378 @@
+diff --git a/src/biotite/structure/io/pdbx/convert.py b/src/biotite/structure/io/pdbx/convert.py
+index b3855f1c7..d47b7f84a 100644
+--- a/src/biotite/structure/io/pdbx/convert.py
++++ b/src/biotite/structure/io/pdbx/convert.py
+@@ -24,6 +24,7 @@
+ from typing import Any, Literal, TypeAlias, overload
+ import numpy as np
+ from biotite.file import InvalidFileError
++from biotite.rust.structure.io.pdbx import find_matches as rust_find_matches
+ from biotite.sequence.seqtypes import NucleotideSequence, ProteinSequence
+ from biotite.sequence.sequence import Sequence
+ from biotite.structure.atoms import (
+@@ -128,12 +129,6 @@
+     bond_type: order for order, bond_type in COMP_BOND_ORDER_TO_TYPE.items()
+ }
+ CANONICAL_RESIDUE_LIST = canonical_aa_list + canonical_nucleotide_list
+-# it was observed that when the number or rows in `atom_site` and `struct_conn`
+-# exceed a certain threshold,
+-# a dictionary approach is less computation and memory intensive than the dense
+-# vectorized approach.
+-# https://github.com/biotite-dev/biotite/pull/765#issuecomment-2708867357
+-FIND_MATCHES_SWITCH_THRESHOLD = 4000000
+ 
+ _proteinseq_type_list = ["polypeptide(D)", "polypeptide(L)"]
+ _nucleotideseq_type_list = [
+@@ -743,7 +738,7 @@ def _parse_inter_residue_bonds(
+             query_arrays.append(query[covale_mask])
+         # Match the combination of 'label_asym_id', 'label_comp_id', etc.
+         # in 'atom_site' and 'struct_conn'
+-        atom_indices[i] = _find_matches(query_arrays, reference_arrays)
++        atom_indices[i] = rust_find_matches(query_arrays, reference_arrays)
+     atoms_indices_1: NDArray1[Any, np.integer] = atom_indices[0]  # pyright: ignore[reportAssignmentType]
+     atoms_indices_2: NDArray1[Any, np.integer] = atom_indices[1]  # pyright: ignore[reportAssignmentType]
+ 
+@@ -769,91 +764,6 @@ def _parse_inter_residue_bonds(
+     )
+ 
+ 
+-def _find_matches(
+-    query_arrays: list[NDArray1[Any, Any]],
+-    reference_arrays: list[NDArray1[Any, Any]],
+-) -> NDArray1[Any, np.integer]:
+-    """
+-    For each index in the `query_arrays` find the indices in the
+-    `reference_arrays` where all query values match the reference counterpart.
+-    If no match is found for a query, the corresponding index is -1.
+-    """
+-    if (
+-        query_arrays[0].shape[0] * reference_arrays[0].shape[0]
+-        <= FIND_MATCHES_SWITCH_THRESHOLD
+-    ):
+-        match_indices = _find_matches_by_dense_array(query_arrays, reference_arrays)
+-    else:
+-        match_indices = _find_matches_by_dict(query_arrays, reference_arrays)
+-    return match_indices
+-
+-
+-def _find_matches_by_dense_array(
+-    query_arrays: list[NDArray1[Any, Any]],
+-    reference_arrays: list[NDArray1[Any, Any]],
+-) -> NDArray1[Any, np.integer]:
+-    match_masks_for_all_columns = np.stack(
+-        [
+-            query[:, np.newaxis] == reference[np.newaxis, :]
+-            for query, reference in zip(query_arrays, reference_arrays)
+-        ],
+-        axis=-1,
+-    )
+-    match_masks = np.all(match_masks_for_all_columns, axis=-1)
+-    query_matches, reference_matches = np.where(match_masks)
+-
+-    # Duplicate matches indicate that an atom from the query cannot
+-    # be uniquely matched to an atom in the reference
+-    unique_query_matches, counts = np.unique(query_matches, return_counts=True)
+-    if np.any(counts > 1):
+-        ambiguous_query = unique_query_matches[np.where(counts > 1)[0][0]]
+-        raise InvalidFileError(
+-            f"The covalent bond in the 'struct_conn' category at index "
+-            f"{ambiguous_query} cannot be unambiguously assigned to atoms in "
+-            f"the 'atom_site' category"
+-        )
+-
+-    # -1 indicates that no match was found in the reference
+-    match_indices = np.full(len(query_arrays[0]), -1, dtype=int)
+-    match_indices[query_matches] = reference_matches
+-    return match_indices
+-
+-
+-def _find_matches_by_dict(
+-    query_arrays: list[NDArray1[Any, Any]],
+-    reference_arrays: list[NDArray1[Any, Any]],
+-) -> NDArray1[Any, np.integer]:
+-    # Convert reference arrays to a dictionary for O(1) lookups
+-    reference_dict = {}
+-    ambiguous_keys = set()
+-    for ref_idx, ref_row in enumerate(zip(*reference_arrays)):
+-        ref_key = tuple(ref_row)
+-        if ref_key in reference_dict:
+-            ambiguous_keys.add(ref_key)
+-            continue
+-        reference_dict[ref_key] = ref_idx
+-
+-    match_indices = []
+-    for query_idx, query_row in enumerate(zip(*query_arrays)):
+-        query_key = tuple(query_row)
+-        occurrence = reference_dict.get(query_key)
+-
+-        if occurrence is None:
+-            # -1 indicates that no match was found in the reference
+-            match_indices.append(-1)
+-        elif query_key in ambiguous_keys:
+-            # The query cannot be uniquely matched to an atom in the reference
+-            raise InvalidFileError(
+-                f"The covalent bond in the 'struct_conn' category at index "
+-                f"{query_idx} cannot be unambiguously assigned to atoms in "
+-                f"the 'atom_site' category"
+-            )
+-        else:
+-            match_indices.append(occurrence)
+-
+-    return np.array(match_indices)
+-
+-
+ def _get_struct_conn_col_name(col_name: str, partner: int) -> str:
+     """
+     For a column name in ``atom_site`` get the corresponding column name
+diff --git a/src/rust/structure/io/pdbx/matching.rs b/src/rust/structure/io/pdbx/matching.rs
+new file mode 100644
+index 000000000..88e5b98c9
+--- /dev/null
++++ b/src/rust/structure/io/pdbx/matching.rs
+@@ -0,0 +1,199 @@
++use crate::util::check_signals_periodically;
++use numpy::{IntoPyArray, PyArray1, PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
++use pyo3::exceptions;
++use pyo3::prelude::*;
++use smallvec::SmallVec;
++use std::collections::HashMap;
++
++// Label as a separate module to indicate that this exception comes
++// from biotite
++mod biotite {
++    pyo3::import_exception!(biotite, InvalidFileError);
++}
++
++/// A view on the raw bytes of a 1-D NumPy array.
++///
++/// As the matching only requires equality checks, the values are never interpreted:
++/// each element is simply the `itemsize` bytes it occupies.
++/// Hence any dtype with a fixed item size is supported, including fixed-size strings.
++struct ByteColumn {
++    data: *const u8,
++    stride: isize,
++    itemsize: usize,
++    length: usize,
++}
++
++impl ByteColumn {
++    /// Get the bytes of the element at the given index.
++    ///
++    /// Safety
++    /// ------
++    /// The caller must ensure that `index < self.length` and that the underlying array
++    /// is still alive.
++    #[inline]
++    unsafe fn element(&self, index: usize) -> &[u8] {
++        unsafe {
++            std::slice::from_raw_parts(
++                self.data.offset(self.stride * index as isize),
++                self.itemsize,
++            )
++        }
++    }
++}
++
++/// Create a byte view on the given 1-D NumPy array.
++fn as_byte_column(array: &Bound<'_, PyUntypedArray>) -> PyResult<ByteColumn> {
++    if array.ndim() != 1 {
++        return Err(exceptions::PyValueError::new_err(
++            "Only 1-D arrays are supported",
++        ));
++    }
++    let dtype = array.dtype();
++    if dtype.has_object() {
++        // Elements would be pointers to Python objects, i.e. equal values may have
++        // different bytes
++        return Err(exceptions::PyValueError::new_err(
++            "Arrays with 'object' dtype are not supported",
++        ));
++    }
++    Ok(ByteColumn {
++        data: unsafe { (*array.as_array_ptr()).data } as *const u8,
++        stride: array.strides()[0],
++        itemsize: dtype.itemsize(),
++        length: array.len(),
++    })
++}
++
++/// Write the concatenated bytes of the given row into `key`.
++#[inline]
++fn write_key(columns: &[ByteColumn], index: usize, key: &mut [u8]) {
++    let mut offset = 0;
++    for column in columns {
++        let itemsize = column.itemsize;
++        key[offset..offset + itemsize].copy_from_slice(unsafe { column.element(index) });
++        offset += itemsize;
++    }
++}
++
++/// Check that all given arrays have the same length and return it.
++fn common_length(columns: &[ByteColumn]) -> PyResult<usize> {
++    let length = columns[0].length;
++    if columns.iter().any(|column| column.length != length) {
++        return Err(exceptions::PyValueError::new_err(
++            "All arrays must have the same length",
++        ));
++    }
++    Ok(length)
++}
++
++/// For each index in the `query_arrays` find the index in the `reference_arrays`, where
++/// all query values match the reference counterpart.
++///
++/// If no match is found for a query, the corresponding index is ``-1``.
++///
++/// Parameters
++/// ----------
++/// query_arrays, reference_arrays : list of ndarray
++///     The columns to match.
++///     Corresponding columns must have equivalent dtypes.
++///     Any dtype with a fixed item size is supported, as values are compared bytewise.
++///
++/// Returns
++/// -------
++/// match_indices : ndarray, dtype=int64
++///     For each query the index of the matching reference or ``-1``.
++///
++/// Raises
++/// ------
++/// InvalidFileError
++///     If a query matches more than one reference, i.e. the corresponding bond in
++///     ``struct_conn`` cannot be unambiguously assigned to an atom in ``atom_site``.
++///
++/// Notes
++/// -----
++/// This function uses a query-based hash map approach to find matches to the reference
++/// arrays.
++/// The values of a row are concatenated into a single key comprising the raw bytes of
++/// each column.
++/// As only equality is required, the values themselves are never interpreted, which
++/// makes the matching agnostic to the dtype of the given arrays.
++#[pyfunction]
++pub fn find_matches<'py>(
++    py: Python<'py>,
++    query_arrays: Vec<Bound<'py, PyUntypedArray>>,
++    reference_arrays: Vec<Bound<'py, PyUntypedArray>>,
++) -> PyResult<Bound<'py, PyArray1<i64>>> {
++    if query_arrays.is_empty() || query_arrays.len() != reference_arrays.len() {
++        return Err(exceptions::PyValueError::new_err(
++            "The same non-zero number of query and reference arrays is required",
++        ));
++    }
++    for (query, reference) in query_arrays.iter().zip(reference_arrays.iter()) {
++        if !query.dtype().is_equiv_to(&reference.dtype()) {
++            return Err(exceptions::PyValueError::new_err(format!(
++                "Query dtype '{}' does not match reference dtype '{}'",
++                query.dtype(),
++                reference.dtype()
++            )));
++        }
++    }
++
++    let query_columns = query_arrays
++        .iter()
++        .map(as_byte_column)
++        .collect::<PyResult<Vec<_>>>()?;
++    let reference_columns = reference_arrays
++        .iter()
++        .map(as_byte_column)
++        .collect::<PyResult<Vec<_>>>()?;
++    let query_count = common_length(&query_columns)?;
++    let reference_count = common_length(&reference_columns)?;
++    let key_size: usize = query_columns.iter().map(|column| column.itemsize).sum();
++
++    // Map the comparatively few queries instead of the references
++    // -> this keeps the map small
++    let mut query_keys = vec![0u8; query_count * key_size];
++    for index in 0..query_count {
++        write_key(
++            &query_columns,
++            index,
++            &mut query_keys[index * key_size..(index + 1) * key_size],
++        );
++    }
++    // Multiple queries may point to the same atom, hence a key can have multiple
++    // indices, but still the most common case is a single index per key
++    let mut query_indices: HashMap<&[u8], SmallVec<[usize; 1]>> =
++        HashMap::with_capacity(query_count);
++    for index in 0..query_count {
++        query_indices
++            .entry(&query_keys[index * key_size..(index + 1) * key_size])
++            .or_default()
++            .push(index);
++    }
++
++    // -1 indicates that no match was found in the reference
++    let mut match_indices = vec![-1i64; query_count];
++    let mut key = vec![0u8; key_size];
++    for reference_index in 0..reference_count {
++        check_signals_periodically(py, reference_index)?;
++        write_key(&reference_columns, reference_index, &mut key);
++        let Some(indices) = query_indices.get(key.as_slice()) else {
++            // No query matches this position in the reference
++            continue;
++        };
++        for &query_index in indices {
++            if match_indices[query_index] == -1 {
++                match_indices[query_index] = reference_index as i64;
++            } else {
++                // A second match means the query cannot be uniquely assigned
++                return Err(biotite::InvalidFileError::new_err(format!(
++                    "The covalent bond in the 'struct_conn' category at index \
++                    {query_index} cannot be unambiguously assigned to atoms in \
++                    the 'atom_site' category"
++                )));
++            }
++        }
++    }
++
++    Ok(match_indices.into_pyarray(py))
++}
+diff --git a/src/rust/structure/io/pdbx/mod.rs b/src/rust/structure/io/pdbx/mod.rs
+index 66ca9603e..97397b0c5 100644
+--- a/src/rust/structure/io/pdbx/mod.rs
++++ b/src/rust/structure/io/pdbx/mod.rs
+@@ -1,9 +1,11 @@
+ use pyo3::prelude::*;
+ 
+ pub mod encoding;
++pub mod matching;
+ 
+ pub fn module<'py>(parent_module: &Bound<'py, PyModule>) -> PyResult<Bound<'py, PyModule>> {
+     let module = PyModule::new(parent_module.py(), "pdbx")?;
++    module.add_function(wrap_pyfunction!(matching::find_matches, &module)?)?;
+     module.add_function(wrap_pyfunction!(encoding::run_length_encode, &module)?)?;
+     module.add_function(wrap_pyfunction!(encoding::run_length_decode, &module)?)?;
+     module.add_function(wrap_pyfunction!(encoding::integer_packing_encode, &module)?)?;
+diff --git a/tests/structure/io/test_pdbx.py b/tests/structure/io/test_pdbx.py
+index 3540eacfe..6ce3c369a 100644
+--- a/tests/structure/io/test_pdbx.py
++++ b/tests/structure/io/test_pdbx.py
+@@ -83,7 +83,6 @@ def test_split_one_line(cif_line, expected_fields):
+     assert list(pdbx.cif._split_one_line(cif_line)) == expected_fields
+ 
+ 
+-@pytest.mark.parametrize("find_matches_by_dict", [False, True])
+ @pytest.mark.parametrize("model", [None, 1, -1])
+ @pytest.mark.parametrize(
+     "path",
+@@ -91,17 +90,13 @@ def test_split_one_line(cif_line, expected_fields):
+     ids=lambda path: path.name,
+ )
+ @pytest.mark.parametrize("format", ["cif", "bcif"])
+-def test_conversion(monkeypatch, tmp_path, format, path, model, find_matches_by_dict):
++def test_conversion(tmp_path, format, path, model):
+     """
+     Test serializing and deserializing a structure from a file
+     restores the same structure.
+     """
+     DELETED_ANNOTATION = "auth_comp_id"
+ 
+-    if find_matches_by_dict:
+-        # Lower the threshold to 0 to force usage of `_find_matches_by_dict()`
+-        monkeypatch.setattr(pdbx.convert, "FIND_MATCHES_SWITCH_THRESHOLD", 0)
+-
+     if format == "cif":
+         data_path = path.with_suffix(".cif")
+         File = pdbx.CIFFile

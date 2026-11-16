@@ -1,0 +1,920 @@
+diff --git a/mdagent/mainagent/agent.py b/mdagent/mainagent/agent.py
+index cb9c81bc..d92ed5cf 100644
+--- a/mdagent/mainagent/agent.py
++++ b/mdagent/mainagent/agent.py
+@@ -8,7 +8,7 @@
+ from mdagent.utils import PathRegistry, _make_llm
+ 
+ from ..tools import get_tools, make_all_tools
+-from .prompt import openaifxn_prompt, structured_prompt
++from .query_filter import make_prompt
+ 
+ load_dotenv()
+ 
+@@ -76,11 +76,6 @@ def __init__(
+         else:
+             self.skip_subagents = True
+ 
+-        if agent_type == "Structured":
+-            self.prompt = structured_prompt
+-        elif agent_type == "OpenAIFunctionsAgent":
+-            self.prompt = openaifxn_prompt
+-
+         self.subagents_settings = SubAgentSettings(
+             path_registry=path_registry,
+             subagents_model=subagents_model,
+@@ -124,5 +119,6 @@ def _initialize_tools_and_agent(self, user_input=None):
+         )
+ 
+     def run(self, user_input, callbacks=None):
++        self.prompt = make_prompt(user_input, self.agent_type, model="gpt-3.5-turbo")
+         self.agent = self._initialize_tools_and_agent(user_input)
+-        return self.agent.run(self.prompt.format(input=user_input), callbacks=callbacks)
++        return self.agent.run(self.prompt, callbacks=callbacks)
+diff --git a/mdagent/mainagent/prompt.py b/mdagent/mainagent/prompt.py
+index a793faac..64dbf389 100644
+--- a/mdagent/mainagent/prompt.py
++++ b/mdagent/mainagent/prompt.py
+@@ -30,7 +30,65 @@
+         and you must explicitly state the actions you are taking.
+         Question: {input} """,
+ )
++modular_analysis_prompt = PromptTemplate(
++    input_variables=[
++        "Main_Task",
++        "Subtask_types",
++        "Proteins",
++        "Parameters",
++        "UserProposedPlan",
++    ],
++    template="""
++        Approach the molecular dynamics inquiry by dissecting it into its modular
++        components:
++        Main Task: {Main_Task}
++        Subtasks: {Subtask_types}
++        Target Proteins: {Proteins}
++        Parameters: {Parameters}
++        Initial Plan Proposed by User: {UserProposedPlan}
++
++        The Main Task is the user's request.
++
++        The Subtasks are (some of/all) the individual steps that may need to be taken
++        to complete the Main Task; Preprocessing/Preparation usually involves
++        cleaning the initial pdb file (adding hydrogens, removing/adding water, etc.)
++        or making the required box for the simulation, Simulation involves running the
++        simulation and/or modifying the simulation script, Postprocessing involves
++        analyzing the results of the simulation (either using provided tools or figuring
++        it out on your own). Finally, Question is used if the user query is more
++        of a question than a request for a specific task.
++
++        the Target Proteins are the protein(s) that the user wants to focus on,
++        the Parameters are the 'special' conditions that the user wants to set and use
++        for the simulation, preprocessing and or analysis.
++
++        Sometimes users already have an idea of what is needed to be done.
++        Initial Plan Proposed by User is the user's initial plan for the simulation. You
++        can use this as a guide to understand what the user wants to do. You can also
++        modify it if you think is necessary.
++
++        You can only respond with a single complete
++        'Thought, Action, Action Input' format
++        OR a single 'Final Answer' format.
++
++        Complete format:
++        Thought: (reflect on your progress and decide what " "to do next)
++        Action: (the action name, should be the name of a tool)
++        Action Input: (the input string to the action)
+ 
++        OR
++
++        Final Answer: (the final answer to the original input
++        question)
++
++        Use the tools provided, using the most specific tool
++        available for each action.
++        Your final answer should contain all information
++        necessary to answer the question and subquestions.
++        Your thought process should be clean and clear,
++        and you must explicitly state the actions you are taking.
++    """,
++)
+ 
+ openaifxn_prompt = PromptTemplate(
+     input_variables=["input"],
+diff --git a/mdagent/mainagent/query_filter.py b/mdagent/mainagent/query_filter.py
+new file mode 100644
+index 00000000..dd5a4795
+--- /dev/null
++++ b/mdagent/mainagent/query_filter.py
+@@ -0,0 +1,340 @@
++import json
++from dataclasses import dataclass
++from enum import Enum
++from typing import List, Optional
++
++import outlines
++from outlines import generate, models
++from pydantic import BaseModel
++
++from .prompt import modular_analysis_prompt, openaifxn_prompt, structured_prompt
++
++################################################################
++
++"""
++The following is based on outlines documentations and examples
++https://outlines-dev.github.io/outlines/welcome/
++
++Classes and functions described in this file:
++- Parameters
++- Task_type
++- FilteredQuery
++- Example
++- query_filter
++- create_filtered_query
++
++
++query_filter: A function that takes a raw query and a list of
++examples (Example classes) and returns a "prompt for filtering"
++that include the examples (similar to
++Few-shot prompting).
++
++create_filtered_query: A function that uses (so far an openai model) and the
++query_filter function to create a filtered query
++
++Parameters: A dataclass that represents the parameters of a molecular dynamics. I've
++included Temperature, Pressure, Time, ForceField, WaterModel, SaltConcentration, pH,
++Solvate, Ensemble, and Other_Parameters. All parameters are optional, depending on what
++the user includes in its input.
++it has two main methods: 1) to parse a string into a Parameters object.
++and a __repr__ method to print the object as a string (useful for making a
++pretty prompt)
++
++
++Task_type: An Enum class that represents the different types of tasks that a user can
++ask for, or that the model used in create_filtered_query assumes it needs.
++ It has a __repr__ method to print the object as a string (useful for making a
++pretty prompt) and a parse_task_type_string method to parse a string into a
++Task_type object.
++
++FilteredQuery: A pydantic BaseModel class that represents the final structure that will
++summarize the info from the users request. It uses the two classes defined above.
++
++Example: A dataclass that represents an example of a raw query and its filtered query.
++"""
++
++
++################################################################
++@dataclass
++class Parameters:
++    Temperature: Optional[str]
++    Pressure: Optional[str]
++    Time: Optional[str]
++    ForceField: Optional[str]
++    WaterModel: Optional[str]
++    SaltConcentration: Optional[str]
++    pH: Optional[str]
++    Solvate: Optional[bool]
++    Ensemble: Optional[str]
++    Other_Parameters: Optional[str]
++
++    def __repr__(self) -> str:
++        return (
++            f"Parameters(Temperature = '{self.Temperature}',"
++            f"Pressure = '{self.Pressure}',"
++            f"Time = '{self.Time}',"
++            f"ForceField = '{self.ForceField}',"
++            f"WaterModel = '{self.WaterModel}',"
++            f"SaltConcentration = '{self.SaltConcentration}',"
++            f"pH = '{self.pH}',"
++            f"Solvate = '{self.Solvate}',"
++            f"Ensemble = '{self.Ensemble}',"
++            f"Other_Parameters = '{self.Other_Parameters}'"
++            ")"
++        )
++
++    @staticmethod
++    def parse_parameters_string(param_str):
++        # Remove the 'Parameters' prefix and parentheses
++        param_str = param_str.replace("Parameters(", "").replace(")", "")
++        # Split the string into key-value pairs
++        pairs = param_str.split(",")
++        param_dict = {}
++        for pair in pairs:
++            key, value = pair.split("=")
++            key = key.strip()
++            value = value.strip().strip("'")
++            # Convert 'True' and 'False' strings to boolean values
++            if value == "True":
++                value = True
++            elif value == "False":
++                value = False
++            param_dict[key] = value
++        return Parameters(**param_dict)
++
++    def items(self):
++        return self.__dict__.items()
++
++
++class Task_type(str, Enum):
++    question = "Question"
++    preprocessing = "Preprocessing"
++    preparation = "Preparation"
++    simulation = "Simulation"
++    postnalysis = "Postanalysis"
++
++    def __repr__(self):
++        return f"{self.value}"
++
++    @staticmethod
++    def parse_task_type_string(task_type_str):
++        if type(task_type_str) == str:
++            if task_type_str.startswith("["):
++                task_type_str = task_type_str.replace("[", "").replace("]", "")
++                task_type_str = task_type_str.split(",")
++                return [Task_type(task_type.strip()) for task_type in task_type_str]
++            return Task_type(task_type_str.strip())
++        elif type(task_type_str) == list:
++            return [Task_type(task_type) for task_type in task_type_str]
++        elif type(task_type_str) == Task_type:
++            return task_type_str
++
++    def __str__(self):
++        return self.value
++
++
++class FilteredQuery(BaseModel):
++    Main_Task: str
++    Subtask_types: List[Task_type]  # conlist(Task_type, min_length=1)
++    ProteinS: List[str]
++    Parameters: Parameters
++    UserProposedPlan: List[str]  # conlist(str, min_length=0]
++
++
++@dataclass
++class Example:
++    Raw_query: str
++    Filtered_Query: FilteredQuery
++
++
++@outlines.prompt
++def query_filter(raw_query, examples: list[Example]):
++    """You are about to organize an user query. User will
++    ask for a specific Molecular Dynamics related task, from wich you will
++    extract:
++    1. The main task of the query
++    2. A list of subtasks that are part of the main task
++    3. The protein of interest mentioned in the raw query (as a PDB ID,
++      UniProt ID, name, or sequence)
++    4. Parameters or conditions specified by the user for the simulation
++    5. The plan proposed by the user for the simulation (if any)
++
++
++    {% for example in examples %}
++    Raw Query: "{{ example.Raw_query }}"
++    RESULT: {
++        "Main_Task": "{{ example.Filtered_Query.Main_Task }}",
++        "Subtask_types": "{{ example.Filtered_Query.Subtask_types }}",
++        "ProteinS": "{{ example.Filtered_Query.ProteinS }}",
++        "Parameters": "{{ example.Filtered_Query.Parameters }}",
++        "UserProposedPlan": "{{ example.Filtered_Query.UserProposedPlan }}"}
++    {% endfor %}
++
++    Here is the new raw query that you need to filter:
++    Raw Query: {{raw_query}}
++    RESULT:
++    """
++
++
++examples = [
++    Example(
++        Raw_query="I want a simulation of 1A3N at 280K",
++        Filtered_Query=FilteredQuery(
++            Main_Task="Simulate 1A3N at 280K",
++            Subtask_types=["Simulation"],
++            ProteinS=["1A3N"],
++            Parameters=Parameters(
++                Temperature="280K",
++                Pressure=None,
++                Time=None,
++                ForceField=None,
++                WaterModel=None,
++                SaltConcentration=None,
++                pH=None,
++                Solvate=None,
++                Ensemble=None,
++                Other_Parameters=None,
++            ),
++            UserProposedPlan=[],
++        ),
++    ),
++    Example(
++        Raw_query="What is the best force field for 1A3N?",
++        Filtered_Query=FilteredQuery(
++            Main_Task="Answer the question: best force field for 1A3N?",
++            Subtask_types=["Question"],
++            ProteinS=["1A3N"],
++            Parameters=Parameters(
++                Temperature=None,
++                Pressure=None,
++                Time=None,
++                ForceField=None,
++                WaterModel=None,
++                SaltConcentration=None,
++                pH=None,
++                Solvate=None,
++                Ensemble=None,
++                Other_Parameters=None,
++            ),
++            UserProposedPlan=[],
++        ),
++    ),
++    Example(
++        Raw_query="""Calculate the Radial Distribution Function of 1A3N with
++            water. Youll have to download the PDB file, clean it, and solvate it
++            for the simulation. The trajectory and
++            topology files can be used to calculate the RDF.""",
++        Filtered_Query=FilteredQuery(
++            Main_Task="Calculate the Radial Distribution Function of 1A3N with water.",
++            Subtask_types=["Preprocessing", "Simulation", "Postanalysis"],
++            ProteinS=["1A3N"],
++            Parameters=Parameters(
++                Temperature=None,
++                Pressure=None,
++                Time=None,
++                ForceField=None,
++                WaterModel=None,
++                SaltConcentration=None,
++                pH=None,
++                Solvate=True,
++                Ensemble=None,
++                Other_Parameters=None,
++            ),
++            UserProposedPlan=[
++                "Downlaod PDB file for 1A3N",
++                "Clean/Pre-process the PDB file",
++                "Calculate the Radial Distribution Function with water.",
++                "With the trajectory and topology files, calculate the RDF.",
++            ],
++        ),
++    ),
++]
++
++
++def create_filtered_query(raw_query, model="gpt-3.5-turbo", examples=examples):
++    filter_model = models.openai(model)
++    generator = generate.text(filter_model)
++    return generator(query_filter(raw_query, examples=examples))
++
++
++def make_prompt(user_input, agent_type, model="gpt-3.5-turbo"):
++    if agent_type == "Structured":
++        tries = 1
++
++        while tries <= 3:
++            try:
++                structured_query = create_filtered_query(user_input, model=model)
++                structured_query = json.loads(structured_query)
++                parameters = Parameters.parse_parameters_string(
++                    structured_query["Parameters"]
++                )
++                _parameters = ""
++                for key, value in parameters.items():
++                    if value == "None":
++                        continue
++                    else:
++                        _parameters += f"{key}: {value}, "
++                _plan = ""
++                if structured_query["UserProposedPlan"] == "[]":
++                    _plan += "None"
++                else:
++                    if type(structured_query["UserProposedPlan"]) == str:
++                        for plan in structured_query["UserProposedPlan"].split(","):
++                            _plan += f"{plan},"
++                    elif type(structured_query["UserProposedPlan"]) == list:
++                        for plan in structured_query["UserProposedPlan"]:
++                            _plan += f"{plan},"
++                _proteins = ""
++                if structured_query["ProteinS"] == "['None']":
++                    _proteins += "None"
++                elif structured_query["ProteinS"] == "[]":
++                    _proteins += "None"
++                else:
++                    for protein in eval(structured_query["ProteinS"]):
++                        _proteins += f"{protein}, "
++                _subtasks = ""
++                if structured_query["Subtask_types"] == "['None']":
++                    _subtasks += "None"
++                elif structured_query["Subtask_types"] == "[]":
++                    _subtasks += "None"
++                elif structured_query["Subtask_types"] == ["None"]:
++                    _subtasks += "None"
++                else:
++                    if type(structured_query["Subtask_types"]) == str:
++                        for subtask in Task_type.parse_task_type_string(
++                            structured_query["Subtask_types"]
++                        ):
++                            _subtasks += f"{subtask}, "
++                    elif type(structured_query["Subtask_types"]) == list:
++                        for subtask in structured_query["Subtask_types"]:
++                            _str = Task_type.parse_task_type_string(subtask)
++                            _subtasks += f"{_str}, "
++                prompt = modular_analysis_prompt.format(
++                    Main_Task=structured_query["Main_Task"],
++                    Subtask_types=_subtasks,
++                    Proteins=_proteins,
++                    Parameters=_parameters,
++                    UserProposedPlan=_plan,
++                )
++                break
++            except ValueError as e:
++                print(f"Failed to structure query, attempt {tries}/3. Retrying...")
++                print(e, e.args)
++                tries += 1
++                continue
++            except Exception as e:
++                print(f"Failed to structure query, attempt {tries}/3. Retrying...")
++                print(e, e.args)
++                tries += 1
++                continue
++
++        if tries > 3:
++            print(
++                "Failed to structure query after 3 attempts."
++                "Input will be used as is."
++            )
++            return structured_prompt.format(input=user_input)
++        else:
++            return prompt
++    elif agent_type == "OpenAIFunctionsAgent":
++        return openaifxn_prompt.format(input=user_input)
+diff --git a/mdagent/tools/base_tools/__init__.py b/mdagent/tools/base_tools/__init__.py
+index eecd0037..917c61aa 100644
+--- a/mdagent/tools/base_tools/__init__.py
++++ b/mdagent/tools/base_tools/__init__.py
+@@ -1,5 +1,6 @@
+ from .analysis_tools.plot_tools import SimulationOutputFigures
+ from .analysis_tools.ppi_tools import PPIDistance
++from .analysis_tools.rdf_tool import RDFTool
+ from .analysis_tools.rgy import (
+     RadiusofGyrationAverage,
+     RadiusofGyrationPerFrame,
+@@ -52,4 +53,5 @@
+     "CleaningToolFunction",
+     "SetUpandRunFunction",
+     "ModifyBaseSimulationScriptTool",
++    "RDFTool",
+ ]
+diff --git a/mdagent/tools/base_tools/analysis_tools/plot_tools.py b/mdagent/tools/base_tools/analysis_tools/plot_tools.py
+index 0dfe79de..ea708088 100644
+--- a/mdagent/tools/base_tools/analysis_tools/plot_tools.py
++++ b/mdagent/tools/base_tools/analysis_tools/plot_tools.py
+@@ -69,7 +69,6 @@ def plot_data(self) -> str:
+                     plt.ylabel(header)
+                     plt.title(f"{self.file_id}_{xlab} vs {header_lab}")
+                     fig_vs = f"{xlab}vs{header_lab}"
+-                    # PR: Mapping involves writing file name -> get file id
+                     plot_name = self.path_registry.write_file_name(
+                         type=FileType.FIGURE,
+                         Log_id=self.file_id,
+@@ -79,7 +78,7 @@ def plot_data(self) -> str:
+                     plot_id = self.path_registry.get_fileid(
+                         file_name=plot_name, type=FileType.FIGURE
+                     )
+-                    if not os.path.exists("files/figures"):  # PR: Needed to avoid error
++                    if not os.path.exists("files/figures"):
+                         os.makedirs("files/figures")
+                     plt.savefig(f"files/figures/{plot_name}")
+                     self.path_registry.map_path(
+diff --git a/mdagent/tools/base_tools/analysis_tools/rdf_tool.py b/mdagent/tools/base_tools/analysis_tools/rdf_tool.py
+new file mode 100644
+index 00000000..71e9746a
+--- /dev/null
++++ b/mdagent/tools/base_tools/analysis_tools/rdf_tool.py
+@@ -0,0 +1,177 @@
++from typing import List, Optional
++
++import matplotlib.pyplot as plt
++import mdtraj as md
++from langchain.tools import BaseTool
++from pydantic import BaseModel, Field
++
++from mdagent.utils import PathRegistry
++
++
++class RDFToolInput(BaseModel):
++    trajectory_fileid: str = Field(
++        None, description="Trajectory file. Either dcd, hdf5, xtc oe xyz"
++    )
++
++    topology_fileid: Optional[str] = Field(None, description="Topology file")
++    stride: Optional[int] = Field(None, description="Stride for reading trajectory")
++    atom_indices: Optional[List[int]] = Field(
++        None, description="Atom indices to load in the trajectory"
++    )
++    # TODO: Add pairs of atoms to calculate RDF within the tool
++    ##pairs: Optional[str] = Field(None, description="Pairs of atoms to calculate RDF ")
++
++
++class RDFutils:
++    # get the expression for select pairs
++    pass
++
++
++class RDFTool(BaseTool):
++    name = "RDFTool"
++    description = (
++        "Calculate the radial distribution function (RDF) of a trajectory "
++        "of a protein with respect to water molecules."
++    )
++    args_schema = RDFToolInput
++    path_registry: Optional[PathRegistry]
++
++    def _run(self, **input):
++        try:
++            inputs = self.validate_input(input)
++        except ValueError as e:
++            if "Incorrect Inputs" in str(e):
++                print("Error in Inputs in RDF tool: ", str(e))
++                return ("Error in Inputs", str(e))
++            elif "Invalid file extension" in str(e):
++                print("File Extension Not Supported in RDF tool: ", str(e))
++                return ("File Extension Not Supported", str(e))
++            else:
++                raise ValueError(f"Error during inputs in RDF tool {e}")
++
++        trajectory_id = inputs["trajectory_fileid"]
++        topology_id = inputs["topology_fileid"]
++        stride = inputs["stride"]
++        atom_indices = inputs["atom_indices"]
++
++        path_to_traj = self.path_registry.get_mapped_path(trajectory_id)
++        ending = path_to_traj.split(".")[-1]
++        if ending in ["dcd", "xtc", "xyz"]:
++            path_to_top = self.path_registry.get_mapped_path(topology_id)
++            traj = md.load(
++                path_to_traj, top=path_to_top, stride=stride, atom_indices=atom_indices
++            )
++        else:
++            # hdf5, h5, pdb already checked in validation of inputs
++            traj = md.load(path_to_traj, stride=stride, atom_indices=atom_indices)
++        try:
++            r, gr = md.compute_rdf(
++                traj,
++                traj.topology.select_pairs(
++                    ("protein and backbone and " "(name C or name N or name CA)"),
++                    "water and name O",
++                ),
++                r_range=(0.1, 2),  # Adjust these values based on your system
++                bin_width=0.005,
++            )
++        except Exception as e:
++            # not sure what exceptions to catch for now, will handle them as they come
++            print("Error in RDF calculation:", str(e))
++            raise ("Error in RDF calculation: ", str(e))
++        # save plot
++        fig, ax = plt.subplots()
++        ax.plot(r, gr)
++        ax.set_xlabel(r"$r$ (nm)")
++        ax.set_ylabel(r"$g(r)$")
++        ax.set_title("RDF")
++        plt.savefig("rdf_{}.png".format(trajectory_id))
++        plt.close()
++        return (
++            "RDF calculated successfully"
++            "rdf.png has been saved in the current directory"
++        )
++        # path_to_top = self.path_registry.get_mapped_path(topology_id)
++
++    def _arun(self, input):
++        pass
++
++    def validate_input(self, input):
++        trajectory_id = input.get("trajectory_fileid", None)
++
++        topology_id = input.get("topology_fileid", None)
++
++        stride = input.get("stride", None)
++
++        atom_indices = input.get("atom_indices", None)
++
++        if not trajectory_id:
++            raise ValueError("Incorrect Inputs: Trajectory file ID is required")
++
++        # check if trajectory id is valid
++        fileids = self.path_registry.list_path_names()
++
++        if trajectory_id not in fileids:
++            raise ValueError("Trajectory File ID not in path registry")
++
++        path_to_traj = self.path_registry.get_mapped_path(trajectory_id)
++
++        ending = path_to_traj.split(".")[-1]
++        if ending in ["dcd", "xtc", "xyz"]:
++            # requires topology
++            if not topology_id:
++                raise ValueError(
++                    "Incorrect Inputs: "
++                    "Topology file is required for trajectory "
++                    "file with extension {}".format(ending)
++                )
++            if topology_id not in fileids:
++                raise ValueError("Topology File ID not in path registry")
++
++        elif ending in ["hdf5", "h5", "pdb"]:
++            # does not require topology
++            pass
++
++        else:
++            raise ValueError(
++                "Invalid file extension for trajectory file. "
++                "For the moment only supported extensions are: "
++                "dcd, xtc, hdf5, h5, xyz, pdb"
++            )
++
++        if stride:
++            if type(stride) != int:
++                try:
++                    stride = int(stride)
++                    if stride <= 0:
++                        raise ValueError(
++                            "Incorrect Inputs: "
++                            "Stride must be a positive integer "
++                            "or None for default value of 1"
++                        )
++                except ValueError:
++                    raise ValueError(
++                        "Incorrect Inputs: Stride must be an integer "
++                        "or None for default value of 1"
++                    )
++            else:
++                if stride <= 0:
++                    raise ValueError(
++                        "Incorrect Inputs: " "Stride must be a positive integer"
++                    )
++
++        if atom_indices:
++            try:
++                atom_indices = list(map(int, atom_indices.split(",")))
++            except ValueError:
++                raise ValueError(
++                    "Incorrect Inputs: Atom indices must be a comma "
++                    "separated list of integers or None for all atoms"
++                )
++        inputs = {
++            "trajectory_fileid": trajectory_id,
++            "topology_fileid": topology_id,
++            "stride": stride,
++            "atom_indices": atom_indices,
++        }
++
++        return inputs
+diff --git a/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py b/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py
+index 0205f0c0..c707197b 100644
+--- a/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py
++++ b/mdagent/tools/base_tools/analysis_tools/rmsd_tools.py
+@@ -131,8 +131,6 @@ def compute_rmsd(self, selection="backbone", plot=True):
+                 file_name=plot_name, type=FileType.FIGURE
+             )
+             plt.savefig(f"files/figures/{plot_name}.png")
+-            # plt.close() # if you don't want to show the plot in notebooks
+-            # PRComment: Getting description only for the plot
+             plot_message = (
+                 f"Plotted RMSD over time for{self.pdb_file}."
+                 f" Saved with plot id {plot_id}.\n"
+diff --git a/mdagent/tools/base_tools/preprocess_tools/pdb_fix.py b/mdagent/tools/base_tools/preprocess_tools/pdb_fix.py
+index b63af3f3..64ceab5e 100644
+--- a/mdagent/tools/base_tools/preprocess_tools/pdb_fix.py
++++ b/mdagent/tools/base_tools/preprocess_tools/pdb_fix.py
+@@ -2,11 +2,11 @@
+ import re
+ import sys
+ import typing
+-from typing import Any, Dict, Optional, Type, Union
++from typing import Dict, Optional, Type
+ 
+ from langchain.tools import BaseTool
+ from pdbfixer import PDBFixer
+-from pydantic import BaseModel, Field, ValidationError, root_validator
++from pydantic import BaseModel, Field, ValidationError
+ 
+ from mdagent.utils import PathRegistry
+ 
+@@ -660,52 +660,6 @@ class PDBFilesFixInp(BaseModel):
+         ),
+     )
+ 
+-    @root_validator(skip_on_failure=True)
+-    def validate_input(cls, values: Union[str, Dict[str, Any]]) -> Dict:
+-        if isinstance(values, str):
+-            print("values is a string", values)
+-            raise ValidationError("Input must be a dictionary")
+-
+-        pdbfile = values.get("pdbfiles", "")
+-        occupancy = values.get("occupancy")
+-        tempFactor = values.get("tempFactor")
+-        ElemColum = values.get("ElemColum")
+-
+-        if occupancy is None and tempFactor is None and ElemColum is None:
+-            if pdbfile == "":
+-                return {"error": "No inputs given, failed use of tool."}
+-            else:
+-                return values
+-        else:
+-            if occupancy:
+-                if len(occupancy) != 2:
+-                    return {
+-                        "error": (
+-                            "if you want to fix the occupancy"
+-                            "column argument must be a tuple of (bool, float)"
+-                        )
+-                    }
+-                if not isinstance(occupancy[0], float):
+-                    return {"error": "occupancy first arg must be a float"}
+-                if not isinstance(occupancy[1], bool):
+-                    return {"error": "occupancy second arg must be a bool"}
+-            if tempFactor:
+-                if len(tempFactor != 2):
+-                    return {
+-                        "error": (
+-                            "if you want to fix the tempFactor"
+-                            "column argument must be a tuple of (float, bool)"
+-                        )
+-                    }
+-                if not isinstance(tempFactor[0], bool):
+-                    return {"error": "occupancy first arg must be a float"}
+-                if not isinstance(tempFactor[1], float):
+-                    return {"error": "tempFactor second arg must be a float"}
+-            if ElemColum is not None:
+-                if not isinstance(ElemColum[1], bool):
+-                    return {"error": "ElemColum must be a bool"}
+-            return values
+-
+ 
+ class FixPDBFile(BaseTool):
+     name: str = "PDBFileFixer"
+diff --git a/mdagent/tools/base_tools/simulation_tools/setup_and_run.py b/mdagent/tools/base_tools/simulation_tools/setup_and_run.py
+index bc8e7ed6..0605f032 100644
+--- a/mdagent/tools/base_tools/simulation_tools/setup_and_run.py
++++ b/mdagent/tools/base_tools/simulation_tools/setup_and_run.py
+@@ -1316,7 +1316,8 @@ def _parse_cutoff(self, cutoff):
+ 
+         # Remove spaces and convert to lowercase for easier parsing
+         cutoff = cutoff.replace(" ", "").lower()
+-
++        if cutoff.endswith("s"):
++            cutoff = cutoff[:-1]
+         # Check for multiplication symbol and split if necessary
+         if "*" in cutoff:
+             # Split on the '*' and extract the numerical part and the unit part
+diff --git a/setup.py b/setup.py
+index 4376dd32..eda78b46 100644
+--- a/setup.py
++++ b/setup.py
+@@ -17,7 +17,7 @@
+     license="MIT",
+     packages=find_packages(),
+     install_requires=[
+-        "chromadb==0.3.29",
++        "chromadb==0.4.24",
+         "google-search-results",
+         "langchain==0.0.336",
+         "langchain_experimental",
+@@ -30,9 +30,11 @@
+         "tiktoken",
+         "rdkit",
+         "streamlit",
+-        "paper-qa",
+-        "openmm",
++        "paper-qa==4.0.0rc8 ",
+         "MDAnalysis",
++        "pydantic>=2.6",
++        "outlines",
++        "mdtraj",
+         "paper-scraper @ git+https://github.com/blackadad/paper-scraper.git",
+     ],
+     test_suite="tests",
+diff --git a/tests/test_query_filter.py b/tests/test_query_filter.py
+new file mode 100644
+index 00000000..51a3c481
+--- /dev/null
++++ b/tests/test_query_filter.py
+@@ -0,0 +1,94 @@
++# test_query_filter.py
++from mdagent.mainagent.query_filter import (
++    Example,
++    FilteredQuery,
++    Parameters,
++    query_filter,
++)
++
++
++def test_parameters_repr():
++    params = Parameters(
++        Temperature=300,
++        Pressure=1.0,
++        Time=None,
++        ForceField="AMBER",
++        WaterModel=None,
++        SaltConcentration=None,
++        pH=7.0,
++        Solvate=None,
++        Ensemble="NVT",
++        Other_Parameters=None,
++    )
++    expected_repr = (
++        "Parameters(Temperature = '300',"
++        "Pressure = '1.0',"
++        "Time = 'None',"
++        "ForceField = 'AMBER',"
++        "WaterModel = 'None',"
++        "SaltConcentration = 'None',"
++        "pH = '7.0',"
++        "Solvate = 'None',"
++        "Ensemble = 'NVT',"
++        "Other_Parameters = 'None')"
++    )
++    assert repr(params) == expected_repr
++
++
++def test_query_filter_simple():
++    raw_query = "Find the melting point of NaCl"
++    example = Example(
++        Raw_query="Find the melting point of NaCl",
++        Filtered_Query=FilteredQuery(
++            Main_Task="Find the melting point of NaCl",
++            Subtask_types=["Question"],
++            ProteinS=["None"],
++            Parameters=Parameters(
++                Temperature=None,
++                Pressure=None,
++                Time=None,
++                ForceField=None,
++                WaterModel=None,
++                SaltConcentration=None,
++                pH=None,
++                Solvate=None,
++                Ensemble=None,
++                Other_Parameters=None,
++            ),
++            UserProposedPlan=[],
++        ),
++    )
++    examples = [example]
++    expected_output = """You are about to organize an user query. User will
++ask for a specific Molecular Dynamics related task, from wich you will
++extract:
++1. The main task of the query
++2. A list of subtasks that are part of the main task
++3. The protein of interest mentioned in the raw query (as a PDB ID,
++  UniProt ID, name, or sequence)
++4. Parameters or conditions specified by the user for the simulation
++5. The plan proposed by the user for the simulation (if any)
++
++
++Raw Query: "Find the melting point of NaCl"
++RESULT: {
++    "Main_Task": "Find the melting point of NaCl",
++    "Subtask_types": "[Question]",
++    "ProteinS": "['None']",
++    "Parameters": "Parameters(Temperature = 'None',\
++Pressure = 'None',\
++Time = 'None',\
++ForceField = 'None',\
++WaterModel = 'None',\
++SaltConcentration = 'None',\
++pH = 'None',\
++Solvate = 'None',\
++Ensemble = 'None',\
++Other_Parameters = 'None')",
++    "UserProposedPlan": "[]"}
++
++Here is the new raw query that you need to filter:
++Raw Query: Find the melting point of NaCl
++RESULT:"""
++    # Assuming the function query_filter returns a string for simplicity
++    assert query_filter(raw_query, examples=examples) == expected_output
+diff --git a/tests/test_util_tools.py b/tests/test_util_tools.py
+index 72f32f21..e52cefd0 100644
+--- a/tests/test_util_tools.py
++++ b/tests/test_util_tools.py
+@@ -8,7 +8,7 @@
+ from langchain.chat_models import ChatOpenAI
+ 
+ from mdagent.tools.base_tools import Scholar2ResultLLM
+-from mdagent.utils import FileType, PathRegistry
++from mdagent.utils import FileType
+ 
+ 
+ @pytest.fixture
+@@ -16,11 +16,6 @@ def todays_date():
+     return str(datetime.today().strftime("%Y%m%d"))
+ 
+ 
+-@pytest.fixture
+-def registry():
+-    return PathRegistry()
+-
+-
+ def test_write_to_file(get_registry):
+     registry = get_registry("raw", False)
+     with patch("builtins.open", mock_open()):

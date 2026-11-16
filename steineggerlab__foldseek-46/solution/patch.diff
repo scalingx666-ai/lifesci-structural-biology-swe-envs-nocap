@@ -1,0 +1,531 @@
+diff --git a/src/commons/CMakeLists.txt b/src/commons/CMakeLists.txt
+index 0a5a6b76b..431670788 100644
+--- a/src/commons/CMakeLists.txt
++++ b/src/commons/CMakeLists.txt
+@@ -1,4 +1,6 @@
+ set(commons_source_files
++        commons/LDDT.h
++        commons/LDDT.cpp
+         commons/LocalParameters.h
+         commons/LocalParameters.cpp
+         commons/StructureUtil.h
+diff --git a/src/commons/LDDT.cpp b/src/commons/LDDT.cpp
+new file mode 100644
+index 000000000..a4e3bca99
+--- /dev/null
++++ b/src/commons/LDDT.cpp
+@@ -0,0 +1,261 @@
++#include "LDDT.h"
++
++float dist(float* arr1, float* arr2) {
++    float D2 = 0;
++    for(int i = 0; i < 3; i++) {
++        D2 += (arr1[i] - arr2[i]) * (arr1[i] - arr2[i]);
++    }
++    return sqrt(D2);
++}
++
++LDDTcalculator::LDDTcalculator(unsigned int maxQueryLength, unsigned int maxTargetLength)
++    : maxQueryLength(maxQueryLength), maxTargetLength(maxTargetLength) {
++    maxAlignLength = std::max(maxQueryLength, maxTargetLength);
++
++    query_pos = new fptr_t[maxQueryLength];
++    for(unsigned int i = 0; i < maxQueryLength; i++) {
++        query_pos[i] = new float[3];
++    }
++    target_pos = new fptr_t[maxTargetLength];
++    for(unsigned int i = 0; i < maxTargetLength; i++) {
++        target_pos[i] = new float[3];
++    }    
++    dists_to_score = new fptr_t[maxQueryLength];
++    for(unsigned int i = 0; i < maxQueryLength; i++) {
++        dists_to_score[i] = new float[maxQueryLength];
++    }
++    aligned_dists_to_score = new fptr_t[maxAlignLength];
++    for(unsigned int i = 0; i < maxAlignLength; i++) {
++        aligned_dists_to_score[i] = new float[maxAlignLength];
++    }
++    dist_l1 = new fptr_t[maxAlignLength];
++    for(unsigned int i = 0; i < maxAlignLength; i++) {
++        dist_l1[i] = new float[maxAlignLength];
++    }
++    score = new fptr_t[maxAlignLength];
++    for(unsigned int i = 0; i < maxAlignLength; i++) {
++        score[i] = new float[maxAlignLength];
++    }
++    reduce_score = new float[maxAlignLength];
++    norm = new float[maxQueryLength];
++    norm_aligned = new float[maxAlignLength];
++}
++
++LDDTcalculator::~LDDTcalculator() {
++    if(query_pos) {
++        for(unsigned int i = 0; i < maxQueryLength; i++) {
++            delete[] query_pos[i];
++        }
++        delete[] query_pos;
++    }
++    if(target_pos) {
++        for(unsigned int i = 0; i < maxTargetLength; i++) {
++            delete[] target_pos[i];
++        }
++        delete[] target_pos;
++    }
++    if(dists_to_score) {
++        for(unsigned int i = 0; i < maxQueryLength; i++) {
++            delete[] dists_to_score[i];
++        }
++        delete[] dists_to_score;
++    }
++    if(aligned_dists_to_score) {
++        for(unsigned int i = 0; i < maxAlignLength; i++) {
++            delete[] aligned_dists_to_score[i];
++        }
++        delete[] aligned_dists_to_score;
++    }
++    if(dist_l1) {
++        for(unsigned int i = 0; i < maxAlignLength; i++) {
++            delete[] dist_l1[i];
++        }
++        delete[] dist_l1;
++    }
++    if(score) {
++        for(unsigned int i = 0; i < maxAlignLength; i++) {
++            delete[] score[i];
++        }
++        delete[] score;
++    }
++    if(reduce_score) delete[] reduce_score;
++    if(norm) delete[] norm;
++    if(norm_aligned) delete[] norm_aligned;
++}
++
++void LDDTcalculator::initQuery(unsigned int queryLen, float *qx, float *qy, float *qz) {
++    queryLength = queryLen;
++    for(unsigned int i = 0; i < queryLength; i++) {
++        query_pos[i][0] = qx[i];
++        query_pos[i][1] = qy[i];
++        query_pos[i][2] = qz[i];
++    }
++    query_grid = Grid(query_pos, queryLength);
++}
++
++LDDTcalculator::LDDTscoreResult LDDTcalculator::computeLDDTScore(unsigned int targetLen, int qStartPos, int tStartPos, const std::string &backtrace, float *tx, float *ty, float *tz) {
++    targetLength = targetLen, queryStart = qStartPos, targetStart = tStartPos, cigar = backtrace;
++    for(unsigned int i = 0; i < targetLength; i++) {
++        target_pos[i][0] = tx[i];
++        target_pos[i][1] = ty[i];
++        target_pos[i][2] = tz[i];
++    }
++
++    construct_hash_tables_align(0, qStartPos, tStartPos);
++    calculate_distance();
++    compute_scores();
++    return LDDTscoreResult(reduce_score, alignLength);
++}
++
++void LDDTcalculator::construct_hash_tables_align(int align_idx, int query_idx, int target_idx) {
++    for(int i = 0; i < query_idx; i++) query_to_align[i] = -1;
++    for(int i = 0; i < target_idx; i++) target_to_align[i] = -1;
++    for(std::size_t i = 0; i < cigar.length(); i++) {
++        if(cigar[i] == 'M') {
++            align_to_query[align_idx] = query_idx; query_to_align[query_idx] = align_idx;
++            align_to_target[align_idx] = target_idx; target_to_align[target_idx] = align_idx;
++            align_idx++; query_idx++; target_idx++;
++        } else if(cigar[i] == 'D') {
++            target_to_align[target_idx] = -1; // does not align
++            target_idx++;
++        } else if(cigar[i] == 'I') {
++            query_to_align[query_idx] = -1; // does not align
++            query_idx++;
++        }
++    }
++    for(; query_idx < (int)queryLength; query_idx++) query_to_align[query_idx] = -1;
++    for(; target_idx < (int)targetLength; target_idx++) target_to_align[target_idx] = -1;
++
++    alignLength = align_idx;
++}
++
++void LDDTcalculator::calculate_distance() {
++    // Directions
++    const int DIR = 14;
++    int dx[DIR] = {0,1,1, 1,1,1, 1, 1, 1, 1,0,0, 0,0};
++    int dy[DIR] = {0,1,1, 1,0,0, 0,-1,-1,-1,1,1, 1,0};
++    int dz[DIR] = {0,1,0,-1,1,0,-1, 1, 0,-1,1,0,-1,1};
++    typedef std::multimap<std::tuple<int, int, int>, int>::iterator box_iterator;
++
++    // Initialize arrays
++    for(unsigned int i = 0; i < queryLength; i++) {
++        for(unsigned int j = 0; j < queryLength; j++) {
++            dists_to_score[i][j] = 0;
++        }
++    }
++    for(unsigned int i = 0; i < alignLength; i++) {
++        for(unsigned int j = 0; j < alignLength; j++) {
++            aligned_dists_to_score[i][j] = 0;
++        }
++    }
++    for(unsigned int i = 0; i < alignLength; i++) {
++        for(unsigned int j = 0; j < alignLength; j++) {
++            dist_l1[i][j] = 0;
++        }
++    }
++
++    // Iterate through query_grid
++    // Update dists_to_score, aligned_dists_to_score, dist_l1
++    for(int i = 0; i <= query_grid.num_cells[0]; i++) {
++        for(int j = 0; j <= query_grid.num_cells[1]; j++) {
++            for(int k = 0; k <= query_grid.num_cells[2]; k++) {
++                // dir = 0 (same box)
++                std::pair<box_iterator, box_iterator> box_members = query_grid.box.equal_range(std::make_tuple(i, j, k));
++                for(box_iterator it = box_members.first; it != box_members.second; it++) { // it->second contains query_idx corresponding to a "point"
++                    for(box_iterator it2 = it; it2 != box_members.second; it2++) {
++                        int query_idx1 = it->second; int query_idx2 = it2->second;
++                        if(query_idx1 == query_idx2) continue; // no self-interaction
++                        float distance = dist(query_pos[query_idx1], query_pos[query_idx2]);
++                        bool isClose = (distance < cutoff);
++
++                        dists_to_score[query_idx1][query_idx2] = isClose;
++                        dists_to_score[query_idx2][query_idx1] = isClose;
++
++                        int align_idx1 = query_to_align[query_idx1]; int align_idx2 = query_to_align[query_idx2]; 
++                        if(align_idx1 == -1 || align_idx2 == -1) continue; // not aligned
++                        aligned_dists_to_score[align_idx1][align_idx2] = isClose;
++                        aligned_dists_to_score[align_idx2][align_idx1] = isClose;
++
++                        float dist_sub = dist(target_pos[align_to_target[align_idx1]], target_pos[align_to_target[align_idx2]]);
++                        float d_l = std::abs(distance - dist_sub);
++                        dist_l1[align_idx1][align_idx2] = d_l;
++                        dist_l1[align_idx2][align_idx1] = d_l;
++                    }
++                }
++                // different box
++                for(int dir = 1; dir < DIR; dir++) {
++                    std::pair<box_iterator, box_iterator> boxPrime_members = query_grid.box.equal_range(std::make_tuple(i+dx[dir], j+dy[dir], k+dz[dir]));
++                    for(box_iterator it = box_members.first; it != box_members.second; it++) {
++                        for(box_iterator it2 = boxPrime_members.first; it2 != boxPrime_members.second; it2++) {
++                            int query_idx1 = it->second; int query_idx2 = it2->second;
++                            if(query_idx1 == query_idx2) continue; // no self-interaction
++                            float distance = dist(query_pos[query_idx1], query_pos[query_idx2]);
++                            bool isClose = (distance < cutoff);
++
++                            dists_to_score[query_idx1][query_idx2] = isClose;
++                            dists_to_score[query_idx2][query_idx1] = isClose;
++
++                            int align_idx1 = query_to_align[query_idx1]; int align_idx2 = query_to_align[query_idx2]; 
++                            if(align_idx1 == -1 || align_idx2 == -1) continue; // not aligned
++                            aligned_dists_to_score[align_idx1][align_idx2] = isClose;
++                            aligned_dists_to_score[align_idx2][align_idx1] = isClose;
++
++                            float dist_sub = dist(target_pos[align_to_target[align_idx1]], target_pos[align_to_target[align_idx2]]);
++                            float d_l = std::abs(distance - dist_sub);
++                            dist_l1[align_idx1][align_idx2] = d_l;
++                            dist_l1[align_idx2][align_idx1] = d_l;
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++void LDDTcalculator::compute_scores() {
++    for(unsigned int i = 0; i < queryLength; i++) {
++        norm[i] = 0;
++    }
++    for(unsigned int i = 0; i < alignLength; i++) {
++        norm_aligned[i] = 0;
++    }
++    for(unsigned int i = 0; i < alignLength; i++) {
++        reduce_score[i] = 0;
++    }
++
++    // Compute score per residue using the matrices computed above
++    for(unsigned int i = 0; i < alignLength; i++) {
++        for(unsigned int j = 0; j < alignLength; j++) {
++            if(i == j) { // no self-interaction
++                score[i][j] = 0;
++            } else {
++                score[i][j] = 0.25 * ((dist_l1[i][j] < 0.5) +
++                                    (dist_l1[i][j] < 1.0) +
++                                    (dist_l1[i][j] < 2.0) +
++                                    (dist_l1[i][j] < 4.0));
++            }
++        }
++    }
++
++    // Normalize
++    for(unsigned int col = 0; col < queryLength; col++) {
++        for(unsigned int row = 0; row < queryLength; row++) {
++            norm[col] += dists_to_score[row][col];
++        }
++        if(norm[col] != 0) norm[col] = 1 / norm[col];
++        else norm[col] = INF;
++    }
++    for(unsigned int idx = 0; idx < alignLength; idx++) {
++        norm_aligned[idx] = norm[align_to_query[idx]];
++    }
++
++    for(unsigned int i = 0; i < alignLength; i++) {
++        for(unsigned int j = 0; j < alignLength; j++) {
++            score[i][j] *= aligned_dists_to_score[i][j];
++            reduce_score[j] += score[i][j];
++        }
++    }
++    for(unsigned int idx = 0; idx < alignLength; idx++) {
++        reduce_score[idx] *= norm_aligned[idx]; // reduce_score[] contains the lddt scores per residue
++    }
++}
+\ No newline at end of file
+diff --git a/src/commons/LDDT.h b/src/commons/LDDT.h
+new file mode 100644
+index 000000000..86eff1d59
+--- /dev/null
++++ b/src/commons/LDDT.h
+@@ -0,0 +1,111 @@
++#include <iostream>
++#include <unordered_map>
++#include <cmath>
++#include <map>
++
++#ifndef LDDT_H
++#define LDDT_H
++
++const float cutoff = 15.0;
++const float INF = std::numeric_limits<float>::infinity(); 
++typedef float* fptr_t;
++typedef float** farrptr_t;
++
++class LDDTcalculator {
++public:
++    LDDTcalculator(unsigned int maxQueryLength, unsigned int maxTargetLength);
++    ~LDDTcalculator();
++
++    struct Grid {
++        Grid() {};
++        Grid(farrptr_t& m1, unsigned int queryLength) {
++            int len = queryLength;
++            for(int i = 0; i < len; i++) {
++                for(int dim = 0; dim < 3; dim++) {
++                    if(m1[i][dim] < min[dim]) min[dim] = m1[i][dim];
++                    if(m1[i][dim] > max[dim]) max[dim] = m1[i][dim];
++                }
++            }
++            for(int i = 0; i < (int)queryLength; i++) {
++                int box_coord[3];
++                for(int dim = 0; dim < 3; dim++) {
++                    box_coord[dim] = (int)((m1[i][dim] - min[dim]) / cutoff);
++                }
++                box.insert(std::make_pair(std::make_tuple(box_coord[0], box_coord[1], box_coord[2]), i));
++            }
++
++            for(int dim = 0; dim < 3; dim++) {
++                num_cells[dim] = (int)((max[dim]-min[dim])/cutoff) + 1;
++            }
++        }
++
++        float min[3] = {INF, INF, INF};
++        float max[3] = {-INF, -INF, -INF};
++        int num_cells[3];
++        std::multimap<std::tuple<int, int, int>, int> box; // bottleneck
++    };
++
++    struct LDDTscoreResult {
++        LDDTscoreResult() {}
++        LDDTscoreResult(float *reduce_score, int alignLength) {
++            scoreLength = alignLength;
++            if(perCaLddtScore) {
++                delete[] perCaLddtScore;
++            }
++            perCaLddtScore = new float[scoreLength];
++            float sum = 0.0;
++            for(int i = 0; i < scoreLength; i++) {
++                sum += reduce_score[i];
++                perCaLddtScore[i] = reduce_score[i];
++            }
++            avgLddtScore = (double)(sum/(float)scoreLength);
++        }
++        LDDTscoreResult(const LDDTscoreResult& r1) {
++            scoreLength = r1.scoreLength;
++            avgLddtScore = r1.avgLddtScore;
++            perCaLddtScore = new float[scoreLength];
++            for(int i = 0; i < scoreLength; i++) {
++                perCaLddtScore[i] = r1.perCaLddtScore[i];
++            }
++        }
++        LDDTscoreResult& operator= (const LDDTscoreResult& r1) {
++            if(this == &r1) return *this;
++            if(perCaLddtScore) {
++                delete[] perCaLddtScore;
++            }
++            scoreLength = r1.scoreLength;
++            avgLddtScore = r1.avgLddtScore;
++            perCaLddtScore = new float[scoreLength];
++            for(int i = 0; i < scoreLength; i++) {
++                perCaLddtScore[i] = r1.perCaLddtScore[i];
++            }
++            return *this;
++        }
++        ~LDDTscoreResult() {
++            if(perCaLddtScore) {
++                delete[] perCaLddtScore;
++            }
++        }
++
++        fptr_t perCaLddtScore = NULL;
++        int scoreLength;
++        double avgLddtScore;
++    };
++
++    void initQuery(unsigned int queryLen, float *qx, float *qy, float *qz);
++    void construct_hash_tables_align(int align_idx, int query_idx, int target_idx);
++    void calculate_distance();
++    void compute_scores();
++    LDDTscoreResult computeLDDTScore(unsigned int targetLen, int qStartPos, int tStartPos, const std::string &backtrace, float *tx, float *ty, float *tz);
++
++private:
++    unsigned int queryStart, targetStart, queryLength, targetLength, alignLength;
++    unsigned int maxQueryLength, maxTargetLength, maxAlignLength;
++    fptr_t reduce_score, norm, norm_aligned;
++    std::unordered_map<int, int> query_to_align, target_to_align, align_to_query, align_to_target;
++    std::string cigar; // backtrace
++    farrptr_t query_pos, target_pos, dists_to_score, aligned_dists_to_score, dist_l1, score;
++    LDDTcalculator::Grid query_grid;
++};
++
++#endif
+\ No newline at end of file
+diff --git a/src/commons/LocalParameters.cpp b/src/commons/LocalParameters.cpp
+index 74274c7e7..14bf94638 100644
+--- a/src/commons/LocalParameters.cpp
++++ b/src/commons/LocalParameters.cpp
+@@ -134,7 +134,7 @@ LocalParameters::LocalParameters() :
+ 
+ 
+ std::vector<int> LocalParameters::getOutputFormat(int formatMode, const std::string &outformat, bool &needSequences, bool &needBacktrace, bool &needFullHeaders,
+-                                             bool &needLookup, bool &needSource, bool &needTaxonomyMapping, bool &needTaxonomy, bool &needCa, bool &needTMaligner) {
++                                             bool &needLookup, bool &needSource, bool &needTaxonomyMapping, bool &needTaxonomy, bool &needCa, bool &needTMaligner, bool &needLDDT) {
+     std::vector<int> formatCodes;
+     if (formatMode == Parameters::FORMAT_ALIGNMENT_SAM || formatMode == Parameters::FORMAT_ALIGNMENT_HTML) {
+         needSequences = true;
+@@ -183,6 +183,8 @@ std::vector<int> LocalParameters::getOutputFormat(int formatMode, const std::str
+         else if (outformatSplit[i].compare("taxname") == 0){ needTaxonomyMapping = true; needTaxonomy = true; code = Parameters::OUTFMT_TAXNAME;}
+         else if (outformatSplit[i].compare("taxlineage") == 0){ needTaxonomyMapping = true; needTaxonomy = true; code = Parameters::OUTFMT_TAXLIN;}
+         else if (outformatSplit[i].compare("empty") == 0){ code = Parameters::OUTFMT_EMPTY;}
++        else if (outformatSplit[i].compare("lddt") == 0) { needCa = true; needLDDT = true; needBacktrace = true; code = LocalParameters::OUTFMT_LDDT; }
++        else if (outformatSplit[i].compare("lddtfull") == 0) { needCa = true; needLDDT = true; needBacktrace = true; code = LocalParameters::OUTFMT_LDDT_FULL; }
+         else {
+             Debug(Debug::ERROR) << "Format code " << outformatSplit[i] << " does not exist.";
+             EXIT(EXIT_FAILURE);
+diff --git a/src/commons/LocalParameters.h b/src/commons/LocalParameters.h
+index a9205e251..435a3fc28 100644
+--- a/src/commons/LocalParameters.h
++++ b/src/commons/LocalParameters.h
+@@ -42,6 +42,8 @@ class LocalParameters : public Parameters {
+     static const int OUTFMT_T = 43;
+     static const int OUTFMT_ALNTMSCORE = 44;
+ 
++    static const int OUTFMT_LDDT = 45;
++    static const int OUTFMT_LDDT_FULL = 46;
+ 
+     static const unsigned int INDEX_DB_CA_KEY = 500;
+ 
+@@ -71,7 +73,7 @@ class LocalParameters : public Parameters {
+     int nsample;
+ 
+     static std::vector<int> getOutputFormat(int formatMode, const std::string &outformat, bool &needSequences, bool &needBacktrace, bool &needFullHeaders,
+-                                            bool &needLookup, bool &needSource, bool &needTaxonomyMapping, bool &needTaxonomy, bool &needCa, bool &needTMaligner);
++                                            bool &needLookup, bool &needSource, bool &needTaxonomyMapping, bool &needTaxonomy, bool &needCa, bool &needTMaligner, bool &needLDDT);
+ 
+ 
+ private:
+diff --git a/src/strucclustutils/structureconvertalis.cpp b/src/strucclustutils/structureconvertalis.cpp
+index 30a5f485a..f69fd07be 100644
+--- a/src/strucclustutils/structureconvertalis.cpp
++++ b/src/strucclustutils/structureconvertalis.cpp
+@@ -19,6 +19,7 @@
+ #include <zstd.h>
+ #include "result_viz_prelude_fs.html.zst.h"
+ #include "TMaligner.h"
++#include "LDDT.h"
+ #include <map>
+ 
+ #ifdef OPENMP
+@@ -176,9 +177,10 @@ int structureconvertalis(int argc, const char **argv, const Command &command) {
+     bool needCA = false;
+     bool needTaxonomyMapping = false;
+     bool needTMaligner = false;
++    bool needLDDT = false;
+ 
+     std::vector<int> outcodes = LocalParameters::getOutputFormat(format, par.outfmt, needSequenceDB, needBacktrace, needFullHeaders,
+-                                                                  needLookup, needSource, needTaxonomyMapping, needTaxonomy, needCA, needTMaligner);
++                                                                  needLookup, needSource, needTaxonomyMapping, needTaxonomy, needCA, needTMaligner, needLDDT);
+ 
+ 
+ 
+@@ -378,6 +380,10 @@ int structureconvertalis(int argc, const char **argv, const Command &command) {
+             tmaligner = new TMaligner(
+                     std::max(tDbr->sequenceReader->getMaxSeqLen() + 1, qDbr.sequenceReader->getMaxSeqLen() + 1), false);
+         }
++        LDDTcalculator *lddtcalculator = NULL;
++        if(needLDDT) {
++            lddtcalculator = new LDDTcalculator(qDbr.sequenceReader->getMaxSeqLen() + 1, tDbr->sequenceReader->getMaxSeqLen() + 1);
++        }
+ 
+         std::string result;
+         result.reserve(1024*1024);
+@@ -522,6 +528,11 @@ int structureconvertalis(int argc, const char **argv, const Command &command) {
+                     tmres = tmaligner->computeTMscore(targetCaData, &targetCaData[res.dbLen], &targetCaData[res.dbLen+res.dbLen], res.dbLen,
+                                                       res.qStartPos, res.dbStartPos, Matcher::uncompressAlignment(res.backtrace));
+                 }
++                LDDTcalculator::LDDTscoreResult lddtres;
++                if(needLDDT) {
++                    lddtcalculator->initQuery(res.qLen, queryCaData, &queryCaData[res.qLen], &queryCaData[res.qLen+res.qLen]);
++                    lddtres = lddtcalculator->computeLDDTScore(res.dbLen, res.qStartPos, res.dbStartPos, Matcher::uncompressAlignment(res.backtrace), targetCaData, &targetCaData[res.dbLen], &targetCaData[res.dbLen+res.dbLen]);
++                }
+                 switch (format) {
+                     case Parameters::FORMAT_ALIGNMENT_BLAST_TAB: {
+                         if (outcodes.empty()) {
+@@ -745,6 +756,17 @@ int structureconvertalis(int argc, const char **argv, const Command &command) {
+                                     case LocalParameters::OUTFMT_ALNTMSCORE:
+                                         result.append(SSTR(tmres.tmscore));
+                                         break;
++                                    case LocalParameters::OUTFMT_LDDT:
++                                        // TODO: make SSTR_approx that outputs %2f, not %3f
++                                        result.append(SSTR(lddtres.avgLddtScore));
++                                        break;
++                                    case LocalParameters::OUTFMT_LDDT_FULL:
++                                        for(int i = 0; i < lddtres.scoreLength - 1; i++) {
++                                            result.append(SSTR(lddtres.perCaLddtScore[i]));
++                                            result.push_back(',');
++                                        }
++                                        result.append(SSTR(lddtres.perCaLddtScore[lddtres.scoreLength - 1]));
++                                        break;
+                                 }
+                                 if (i < outcodes.size() - 1) {
+                                     result.push_back('\t');
+@@ -874,6 +896,9 @@ int structureconvertalis(int argc, const char **argv, const Command &command) {
+         if(tmaligner != NULL){
+             delete tmaligner;
+         }
++        if(lddtcalculator != NULL) {
++            delete lddtcalculator;
++        }
+     }
+     if (format == Parameters::FORMAT_ALIGNMENT_HTML) {
+         const char* endBlock = "]);</script>";
+diff --git a/src/workflow/EasyStructureSearch.cpp b/src/workflow/EasyStructureSearch.cpp
+index 411e2fa0a..1fff784ef 100644
+--- a/src/workflow/EasyStructureSearch.cpp
++++ b/src/workflow/EasyStructureSearch.cpp
+@@ -65,8 +65,9 @@ int easystructuresearch(int argc, const char **argv, const Command &command) {
+         bool needSource = false;
+         bool needCA = false;
+         bool needTMalign = false;
++        bool needLDDT = false;
+         LocalParameters::getOutputFormat(par.formatAlignmentMode, par.outfmt, needSequenceDB, needBacktrace, needFullHeaders,
+-                                    needLookup, needSource, needTaxonomyMapping, needTaxonomy, needCA, needTMalign);
++                                    needLookup, needSource, needTaxonomyMapping, needTaxonomy, needCA, needTMalign, needLDDT);
+     }
+ 
+     if (par.formatAlignmentMode == Parameters::FORMAT_ALIGNMENT_SAM || par.greedyBestHits) {

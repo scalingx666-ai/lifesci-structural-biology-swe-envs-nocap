@@ -1,0 +1,140 @@
+diff --git a/src/biotite/structure/molecules.py b/src/biotite/structure/molecules.py
+index 53f7aa9b1..177e538ee 100644
+--- a/src/biotite/structure/molecules.py
++++ b/src/biotite/structure/molecules.py
+@@ -12,9 +12,9 @@
+ from collections.abc import Iterator
+ from typing import Any, overload
+ import numpy as np
++from biotite.rust.structure import molecule_labels
+ from biotite.structure.atoms import AtomArray, AtomArrayStack
+ from biotite.structure.bonds import BondList
+-from biotite.structure.connect import find_connected
+ from biotite.typing import M, N, NDArray1, NDArray2
+ 
+ 
+@@ -123,14 +123,11 @@ def get_molecule_indices(
+             f"not '{type(array).__name__}'"
+         )
+ 
+-    molecule_indices = []
+-    visited_mask = np.zeros(bonds.get_atom_count(), dtype=bool)
+-    while not visited_mask.all():
+-        root = np.argmin(visited_mask)
+-        connected = find_connected(bonds, root)
+-        visited_mask[connected] = True
+-        molecule_indices.append(connected)
+-    return molecule_indices
++    labels = molecule_labels(bonds)
++    # Stable sort keeps the atom indices within each molecule in ascending order
++    order = np.argsort(labels, kind="stable")
++    bounds = np.concatenate(([0], np.cumsum(np.bincount(labels))))
++    return [order[start:stop] for start, stop in zip(bounds[:-1], bounds[1:])]
+ 
+ 
+ def get_molecule_masks(
+@@ -338,14 +335,5 @@ def molecule_iter(
+     HET         0  ATP H2     H         0.166   -2.014    8.490
+     <BLANKLINE>
+     """
+-    if array.bonds is None:
+-        raise ValueError("An associated BondList is required")
+-    bonds = array.bonds
+-
+-    visited_mask = np.zeros(bonds.get_atom_count(), dtype=bool)
+-    while not visited_mask.all():
+-        # Take the first atom that has not been considered yet as root
+-        root = np.argmin(visited_mask)
+-        connected = find_connected(bonds, root)
+-        visited_mask[connected] = True
+-        yield array[..., connected]
++    for indices in get_molecule_indices(array):
++        yield array[..., indices]
+diff --git a/src/rust/structure/connect.rs b/src/rust/structure/connect.rs
+index 887b3d0ab..88889314f 100644
+--- a/src/rust/structure/connect.rs
++++ b/src/rust/structure/connect.rs
+@@ -822,7 +822,6 @@ pub fn find_connected(
+     as_mask: bool,
+ ) -> PyResult<Py<PyAny>> {
+     let atom_count = bond_list.get_atom_count();
+-    let bonds = bond_list.get_bonds_ref();
+ 
+     if root >= atom_count {
+         return Err(exceptions::PyValueError::new_err(format!(
+@@ -831,12 +830,7 @@ pub fn find_connected(
+         )));
+     }
+ 
+-    // Build adjacency list
+-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); atom_count];
+-    for bond in bonds {
+-        adj[bond.atom1].push(bond.atom2);
+-        adj[bond.atom2].push(bond.atom1);
+-    }
++    let adj = adjacency_list(bond_list);
+ 
+     // Iterative breadth-first search
+     let mut visited = vec![false; atom_count];
+@@ -868,6 +862,49 @@ pub fn find_connected(
+     }
+ }
+ 
++/// Assign each atom the index of the molecule it belongs to.
++///
++/// Molecules are numbered in ascending order of their first atom.
++/// Used internally by ``get_molecule_indices()``.
++#[pyfunction]
++pub fn molecule_labels(py: Python<'_>, bond_list: &BondList) -> Py<PyAny> {
++    let atom_count = bond_list.get_atom_count();
++    let adj = adjacency_list(bond_list);
++    let mut labels = vec![-1i64; atom_count];
++    let mut n_molecules = 0;
++    let mut queue = VecDeque::new();
++    for root in 0..atom_count {
++        if labels[root] != -1 {
++            continue;
++        }
++        labels[root] = n_molecules;
++        queue.push_back(root);
++        while let Some(current) = queue.pop_front() {
++            for &neighbor in &adj[current] {
++                if labels[neighbor] == -1 {
++                    labels[neighbor] = n_molecules;
++                    queue.push_back(neighbor);
++                }
++            }
++        }
++        n_molecules += 1;
++    }
++    Array1::from_vec(labels)
++        .into_pyarray(py)
++        .into_any()
++        .unbind()
++}
++
++/// For each atom, the indices of the atoms bonded to it.
++fn adjacency_list(bond_list: &BondList) -> Vec<Vec<usize>> {
++    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); bond_list.get_atom_count()];
++    for bond in bond_list.get_bonds_ref() {
++        adj[bond.atom1].push(bond.atom2);
++        adj[bond.atom2].push(bond.atom1);
++    }
++    adj
++}
++
+ /// Squared Euclidean distance between two atoms in an Nx3 coordinate array.
+ #[inline(always)]
+ fn squared_distance(coord: &ArrayView2<f32>, a1: usize, a2: usize) -> f32 {
+diff --git a/src/rust/structure/mod.rs b/src/rust/structure/mod.rs
+index d156fd31a..fffe2e7ab 100644
+--- a/src/rust/structure/mod.rs
++++ b/src/rust/structure/mod.rs
+@@ -25,6 +25,7 @@ pub fn module<'py>(parent_module: &Bound<'py, PyModule>) -> PyResult<Bound<'py,
+     module.add_function(wrap_pyfunction!(connect::connect_via_distances, &module)?)?;
+     module.add_function(wrap_pyfunction!(connect::find_connected, &module)?)?;
+     module.add_function(wrap_pyfunction!(connect::infer_bond_types, &module)?)?;
++    module.add_function(wrap_pyfunction!(connect::molecule_labels, &module)?)?;
+     module.add_function(wrap_pyfunction!(sasa::sasa, &module)?)?;
+     module.add_function(wrap_pyfunction!(superimpose::superimpose, &module)?)?;
+     add_subpackage(&module, &io::module(&module)?, "biotite.rust.structure.io")?;

@@ -1,0 +1,143 @@
+diff --git a/src/fox b/src/fox
+index 67b28ffe7..5ad1c47f2 160000
+--- a/src/fox
++++ b/src/fox
+@@ -1 +1 @@
+-Subproject commit 67b28ffe75d434bfc59aab7db8ec23d02ed195ca
++Subproject commit 5ad1c47f266aa935d8262201dcac0b124ad9b02d
+diff --git a/src/libAtoms/System.F90 b/src/libAtoms/System.F90
+index 249218f3b..affc1377a 100644
+--- a/src/libAtoms/System.F90
++++ b/src/libAtoms/System.F90
+@@ -48,6 +48,7 @@
+ module system_module
+   use error_module
+   use kind_module
++  use m_common_error, only: FoX_set_error_handler
+ !$ use omp_lib
+ #ifdef _MPI
+ #ifndef _OLDMPI
+@@ -2320,8 +2321,22 @@ subroutine system_initialise(verbosity,seed, mpi_all_inoutput, common_seed, enab
+ 
+     system_quippy_running = optional_default(.false., quippy_running)
+ 
++    ! Route FoX parse errors through system_abort so they propagate to
++    ! Python as exceptions (libAtoms/QUIP#724). The handler is installed
++    ! unconditionally -- non-quippy callers still get system_abort, which
++    ! preserves the historical "abort on XML parse error" behaviour.
++    call FoX_set_error_handler(system_fox_error_handler)
++
+   end subroutine system_initialise
+ 
++  !% FoX error handler bridge: route FoX parse errors through system_abort
++  !% so they reach Python as exceptions when running under quippy
++  !% (see libAtoms/QUIP#724).
++  subroutine system_fox_error_handler(msg)
++    character(len=*), intent(in) :: msg
++    call system_abort('FoX: '//trim(msg))
++  end subroutine system_fox_error_handler
++
+   subroutine get_mainlog_errorlog_ptr(mainlog_ptr, errorlog_ptr)
+     type inoutput_ptr
+        type(inoutput), pointer :: p
+diff --git a/src/libAtoms/meson.build b/src/libAtoms/meson.build
+index 8f4d8a7ca..9bf96a531 100644
+--- a/src/libAtoms/meson.build
++++ b/src/libAtoms/meson.build
+@@ -83,6 +83,7 @@ libAtoms = library('libAtoms',
+     blas_dep,
+     mpi_dep,
+     ],
++  link_with: [fox],
+   c_args: ['-DPROTOTYPES=1'],
+   link_args: libatoms_link_args,
+   override_options: ['b_lundef=false'],  # Allow undefined symbols
+diff --git a/src/meson.build b/src/meson.build
+index 7636134d3..53257ba9e 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1,5 +1,5 @@
+-subdir('libAtoms')
+ subdir('fox')
++subdir('libAtoms')
+ 
+ if get_option('gap')
+   subdir('GAP')
+diff --git a/tests/test_fox_xml_errors.py b/tests/test_fox_xml_errors.py
+new file mode 100644
+index 000000000..504251d35
+--- /dev/null
++++ b/tests/test_fox_xml_errors.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""
++Regression test for https://github.com/libAtoms/QUIP/issues/724
++
++Invalid XML passed to quippy.potential.Potential(param_filename=...) must raise
++a catchable Python exception. Previously, FoX's error handler called Fortran
++`stop` directly, silently killing the Python process before any try/except
++could run.
++
++The test runs the user's reproducer in a subprocess because, in the RED state,
++the bug terminates the interpreter; an in-process assertRaises would crash the
++whole test runner instead of failing one test.
++"""
++
++import os
++import subprocess
++import sys
++import tempfile
++import textwrap
++import unittest
++
++
++class TestFoxXmlErrors(unittest.TestCase):
++
++    def _run_reproducer(self, args_str):
++        """Run a tiny quippy script in a subprocess and return its result.
++
++        The script writes a non-XML file, then tries to load it as a Potential
++        param_filename. It prints CAUGHT:<exc-type> on a Python exception,
++        NO_EXCEPTION if Potential() returned without raising.
++        """
++        with tempfile.TemporaryDirectory() as tmpdir:
++            bad_xml = os.path.join(tmpdir, "bad.xml")
++            with open(bad_xml, "w") as fh:
++                fh.write("pair_style lj/cut 3.5\n")
++
++            code = textwrap.dedent(f"""
++                import sys
++                from quippy.potential import Potential
++                try:
++                    pot = Potential({args_str!r}, param_filename={bad_xml!r})
++                    print("NO_EXCEPTION")
++                except BaseException as e:
++                    print("CAUGHT:" + type(e).__name__ + ":" + str(e)[:200])
++                    sys.exit(0)
++            """)
++
++            return subprocess.run(
++                [sys.executable, "-c", code],
++                capture_output=True,
++                text=True,
++                timeout=120,
++            )
++
++    def test_invalid_xml_raises_python_exception_sw(self):
++        """IP SW with a non-XML param file must raise, not silently exit."""
++        result = self._run_reproducer("IP SW")
++        self.assertIn(
++            "CAUGHT:",
++            result.stdout,
++            msg=(
++                "Expected Python exception from invalid XML.\n"
++                f"returncode={result.returncode}\n"
++                f"stdout={result.stdout!r}\n"
++                f"stderr={result.stderr!r}"
++            ),
++        )
++        self.assertNotIn("NO_EXCEPTION", result.stdout)
++
++
++if __name__ == "__main__":
++    unittest.main()

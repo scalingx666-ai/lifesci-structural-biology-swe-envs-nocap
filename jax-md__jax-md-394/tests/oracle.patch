@@ -1,0 +1,4543 @@
+diff --git a/jax_md/_nn/uma/blocks.py b/jax_md/_nn/uma/blocks.py
+index f1ecc953..7012bacb 100644
+--- a/jax_md/_nn/uma/blocks.py
++++ b/jax_md/_nn/uma/blocks.py
+@@ -11,6 +11,7 @@
+ from typing import List, Literal
+ 
+ import flax.linen as nn
++import jax
+ import jax.numpy as jnp
+ 
+ from jax_md._nn.uma.nn.so2_layers import SO2Convolution
+@@ -48,6 +49,7 @@ class Edgewise(nn.Module):
+   to_grid_mat: jnp.ndarray | None = None
+   from_grid_mat: jnp.ndarray | None = None
+   mapping_to_m: jnp.ndarray | None = None
++  use_kernels: bool = False
+ 
+   @nn.compact
+   def __call__(
+@@ -57,6 +59,8 @@ def __call__(
+     edge_index: jnp.ndarray,
+     wigner_and_M_mapping: jnp.ndarray,
+     wigner_and_M_mapping_inv: jnp.ndarray,
++    wigner: jnp.ndarray | None,
++    wigner_inv: jnp.ndarray | None,
+     edge_envelope: jnp.ndarray,
+     node_offset: int = 0,
+   ) -> jnp.ndarray:
+@@ -125,15 +129,31 @@ def __call__(
+         name='act',
+       )
+ 
+-    # Get source and target node features
+-    x_source = x[edge_index[0]]
+-    x_target = x[edge_index[1]]
++    # Gather source/target node features and rotate to edge-aligned frames.
++    if (
++      self.use_kernels
++      and wigner is not None
++      and wigner.shape[-2:] == (9, 9)
++      and x.shape[-2] == 9
++      and jax.default_backend() == 'gpu'
++    ):
++      from jax_md._nn.uma import kernels
++
++      x_message = kernels.node_to_edge_wigner_permute(x, edge_index, wigner)
++    else:
++      # Get source and target node features
++      if x.shape[0] == 0:
++        return jnp.zeros_like(x)
++      sender = jnp.where(edge_index[0] >= 0, edge_index[0], x.shape[0])
++      receiver = jnp.where(edge_index[1] >= 0, edge_index[1], x.shape[0])
++      x_source = jnp.take(x, sender, axis=0, mode='fill', fill_value=0.0)
++      x_target = jnp.take(x, receiver, axis=0, mode='fill', fill_value=0.0)
+ 
+-    # Concatenate source and target features
+-    x_message = jnp.concatenate([x_source, x_target], axis=2)
++      # Concatenate source and target features
++      x_message = jnp.concatenate([x_source, x_target], axis=2)
+ 
+-    # Rotate to edge-aligned frame
+-    x_message = jnp.einsum('nmj,njc->nmc', wigner_and_M_mapping, x_message)
++      # Rotate to edge-aligned frame
++      x_message = jnp.einsum('nmj,njc->nmc', wigner_and_M_mapping, x_message)
+ 
+     # First SO2 convolution
+     x_message, x_0_gating = so2_conv_1(x_message, x_edge)
+@@ -147,14 +167,32 @@ def __call__(
+     # Apply envelope
+     x_message = x_message * edge_envelope
+ 
+-    # Rotate back to global frame
+-    x_message = jnp.einsum('njm,nmc->njc', wigner_and_M_mapping_inv, x_message)
+-
+-    # Aggregate messages onto target nodes using scatter-add
+-    target_indices = edge_index[1] - node_offset
+-    new_embedding = jnp.zeros_like(x).at[target_indices].add(x_message)
++    # Rotate back to global frame and aggregate to target nodes
++    if (
++      self.use_kernels
++      and wigner_inv is not None
++      and wigner_inv.shape[-2:] == (9, 9)
++      and x_message.shape[-2] == 9
++      and jax.default_backend() == 'gpu'
++      and node_offset == 0
++    ):
++      from jax_md._nn.uma import kernels
++
++      return kernels.edge_to_node_wigner_inverse(
++        x_message, edge_index, wigner_inv, x.shape[0]
++      )
++    else:
++      # Rotate back to global frame
++      x_message = jnp.einsum(
++        'njm,nmc->njc', wigner_and_M_mapping_inv, x_message
++      )
+ 
+-    return new_embedding
++      # Aggregate messages onto target nodes using scatter-add
++      target_indices = edge_index[1] - node_offset
++      target_indices = jnp.where(
++        target_indices >= 0, target_indices, x.shape[0]
++      )
++      return jnp.zeros_like(x).at[target_indices].add(x_message, mode='drop')
+ 
+ 
+ class SpectralAtomwise(nn.Module):
+@@ -250,7 +288,6 @@ def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+     Returns:
+         Updated features, same shape.
+     """
+-    # Grid MLP
+     grid_mlp = nn.Sequential(
+       [
+         nn.Dense(self.hidden_channels, use_bias=False),
+@@ -261,14 +298,22 @@ def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+       ]
+     )
+ 
+-    # Project to grid
+-    x_grid = jnp.einsum('bai,zic->zbac', self.to_grid_mat, x)
++    num_nodes = x.shape[0]
++    lat, lon, num_coeffs = self.to_grid_mat.shape
++    grid_points = lat * lon
++
++    # Flatten grid dims for efficient matmul dispatch via cuBLAS.
++    to_grid_flat = self.to_grid_mat.reshape(grid_points, num_coeffs)
++    from_grid_flat = self.from_grid_mat.reshape(grid_points, num_coeffs)
++
++    # Project to grid: [N, coeffs, C] -> [N, grid_points, C]
++    x_grid = jnp.einsum('gi,nic->ngc', to_grid_flat, x)
+ 
+-    # Apply MLP in grid space
++    # Apply MLP per grid point (Dense applies to last dim).
+     x_grid = grid_mlp(x_grid)
+ 
+-    # Project back to coefficients
+-    x = jnp.einsum('bai,zbac->zic', self.from_grid_mat, x_grid)
++    # Project back: [N, grid_points, C] -> [N, coeffs, C]
++    x = jnp.einsum('gi,ngc->nic', from_grid_flat, x_grid)
+ 
+     return x
+ 
+@@ -306,6 +351,7 @@ class UMABlock(nn.Module):
+   to_grid_mat: jnp.ndarray | None = None
+   from_grid_mat: jnp.ndarray | None = None
+   mapping_to_m: jnp.ndarray | None = None
++  use_kernels: bool = False
+ 
+   @nn.compact
+   def __call__(
+@@ -315,6 +361,8 @@ def __call__(
+     edge_index: jnp.ndarray,
+     wigner_and_M_mapping: jnp.ndarray,
+     wigner_and_M_mapping_inv: jnp.ndarray,
++    wigner: jnp.ndarray | None,
++    wigner_inv: jnp.ndarray | None,
+     edge_envelope: jnp.ndarray,
+     sys_node_embedding: jnp.ndarray | None = None,
+     node_offset: int = 0,
+@@ -362,6 +410,7 @@ def __call__(
+       to_grid_mat=self.to_grid_mat,
+       from_grid_mat=self.from_grid_mat,
+       mapping_to_m=self.mapping_to_m,
++      use_kernels=self.use_kernels,
+       name='edge_wise',
+     )
+     x = edgewise(
+@@ -370,6 +419,8 @@ def __call__(
+       edge_index,
+       wigner_and_M_mapping,
+       wigner_and_M_mapping_inv,
++      wigner,
++      wigner_inv,
+       edge_envelope,
+       node_offset,
+     )
+diff --git a/jax_md/_nn/uma/common/rotation.py b/jax_md/_nn/uma/common/rotation.py
+index bdbf017c..ea378395 100644
+--- a/jax_md/_nn/uma/common/rotation.py
++++ b/jax_md/_nn/uma/common/rotation.py
+@@ -129,13 +129,19 @@ def load_jacobi_matrices_from_file(lmax: int) -> List[jnp.ndarray]:
+   if os.path.isdir(_JD_NPY_DIR):
+     try:
+       Jd_list = []
++      cache_ok = True
+       for l in range(lmax + 1):
+         path = os.path.join(_JD_NPY_DIR, f'Jd_{l}.npy')
+         if os.path.exists(path):
+-          Jd_list.append(jnp.array(np.load(path)))
++          Jd = np.load(path)
++          if jax.config.jax_enable_x64 and Jd.dtype != np.float64:
++            cache_ok = False
++            break
++          Jd_list.append(jnp.array(Jd))
+         else:
++          cache_ok = False
+           break
+-      if len(Jd_list) == lmax + 1:
++      if cache_ok and len(Jd_list) == lmax + 1:
+         return Jd_list
+     except Exception:
+       pass
+@@ -145,10 +151,15 @@ def load_jacobi_matrices_from_file(lmax: int) -> List[jnp.ndarray]:
+     import torch
+ 
+     Jd_torch = torch.load(_JD_FILE, map_location='cpu', weights_only=False)
+-    Jd_list = [jnp.array(Jd_torch[l].numpy()) for l in range(lmax + 1)]
+-
+-    # Cache as numpy for future torch-free loading
+-    _save_jacobi_as_numpy(Jd_list)
++    dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
++    Jd_list = [
++      jnp.array(Jd_torch[l].numpy(), dtype=dtype) for l in range(lmax + 1)
++    ]
++
++    # Keep the checked-in float32 cache stable. In x64 mode, use Jd.pt directly
++    # so tests can compare at tight tolerances without rewriting cache files.
++    if not jax.config.jax_enable_x64:
++      _save_jacobi_as_numpy(Jd_list)
+ 
+     return Jd_list
+   except (ImportError, FileNotFoundError):
+diff --git a/jax_md/_nn/uma/kernels.py b/jax_md/_nn/uma/kernels.py
+new file mode 100644
+index 00000000..e59b54ad
+--- /dev/null
++++ b/jax_md/_nn/uma/kernels.py
+@@ -0,0 +1,2203 @@
++"""Pallas implementations for UMA Wigner edge kernels."""
++
++from functools import partial
++
++import jax
++import jax.numpy as jnp
++
++from jax._src import core
++from jax.interpreters import ad
++from jax.interpreters import batching
++from jax.interpreters import mlir
++
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import triton as plt
++
++
++COEFFICIENT_DIM = 9
++CHANNEL_BLOCK_SIZE = 128
++MAX_GRID_EDGE_BLOCKS = 65535
++
++
++def ceil_div(x: int, y: int) -> int:
++  return (x + y - 1) // y
++
++
++def next_power_of_two(x: int) -> int:
++  return 1 << (x - 1).bit_length()
++
++
++def compiler_params(
++  block_c: int, *, num_stages: int = 1, num_warps: int | None = None
++):
++  """Compute Triton compiler parameters for a given channel block size.
++
++  Warp count heuristic: each warp handles 32 threads. For the 9-coefficient
++  Wigner kernels, the arithmetic intensity is moderate (scalar Wigner loads
++  multiplied against CHANNEL_BLOCK_SIZE-wide vectors). We scale warps to match the
++  vector width so that memory latency is hidden without over-subscribing
++  register files.
++
++  Args:
++    block_c: Channel block size processed per program instance.
++    num_stages: Software pipeline stages for memory latency hiding. Higher
++      values (2-3) can help when memory-bound, at the cost of register
++      pressure.
++    num_warps: Override warp count. If None, uses the block_c heuristic.
++  """
++  if num_warps is None:
++    if block_c <= 64:
++      num_warps = 1
++    elif block_c <= 128:
++      num_warps = 2
++    elif block_c <= 256:
++      num_warps = 4
++    else:
++      num_warps = 8
++  return plt.CompilerParams(num_warps=num_warps, num_stages=num_stages)
++
++
++def check_coefficients(*arrays: jnp.ndarray) -> None:
++  for array in arrays:
++    if array.shape[-2] != COEFFICIENT_DIM:
++      raise ValueError('UMA Pallas kernels currently require 9 coefficients.')
++
++
++def check_wigner_matrix(*arrays: jnp.ndarray) -> None:
++  for array in arrays:
++    if array.shape[-2:] != (COEFFICIENT_DIM, COEFFICIENT_DIM):
++      raise ValueError(
++        'UMA Pallas kernels require raw [E, 9, 9] Wigner matrices.'
++      )
++
++
++def node_to_edge_kernel(
++  x_ref,
++  edge_index_ref,
++  wigner_ref,
++  out_ref,
++  *,
++  block_c: int,
++):
++  edge = pl.program_id(0)
++  c_offsets = pl.program_id(1) * block_c + jnp.arange(0, block_c)
++  channels = x_ref.shape[2]
++  c_mask = c_offsets < channels
++
++  sender = plt.load(edge_index_ref.at[0, edge])
++  receiver = plt.load(edge_index_ref.at[1, edge])
++  sender_valid = (sender >= 0) & (sender < x_ref.shape[0])
++  receiver_valid = (receiver >= 0) & (receiver < x_ref.shape[0])
++  sender = jnp.clip(sender, 0, x_ref.shape[0] - 1)
++  receiver = jnp.clip(receiver, 0, x_ref.shape[0] - 1)
++
++  x0s = plt.load(
++    x_ref.at[sender, 0, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x0t = plt.load(
++    x_ref.at[receiver, 0, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x1s = plt.load(
++    x_ref.at[sender, 1, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x1t = plt.load(
++    x_ref.at[receiver, 1, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x2s = plt.load(
++    x_ref.at[sender, 2, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x2t = plt.load(
++    x_ref.at[receiver, 2, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x3s = plt.load(
++    x_ref.at[sender, 3, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x3t = plt.load(
++    x_ref.at[receiver, 3, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x4s = plt.load(
++    x_ref.at[sender, 4, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x4t = plt.load(
++    x_ref.at[receiver, 4, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x5s = plt.load(
++    x_ref.at[sender, 5, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x5t = plt.load(
++    x_ref.at[receiver, 5, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x6s = plt.load(
++    x_ref.at[sender, 6, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x6t = plt.load(
++    x_ref.at[receiver, 6, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x7s = plt.load(
++    x_ref.at[sender, 7, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x7t = plt.load(
++    x_ref.at[receiver, 7, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x8s = plt.load(
++    x_ref.at[sender, 8, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x8t = plt.load(
++    x_ref.at[receiver, 8, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++
++  w00 = plt.load(wigner_ref.at[edge, 0, 0])
++  y0s = w00 * x0s
++  y0t = w00 * x0t
++
++  w11 = plt.load(wigner_ref.at[edge, 1, 1])
++  w12 = plt.load(wigner_ref.at[edge, 1, 2])
++  w13 = plt.load(wigner_ref.at[edge, 1, 3])
++  w21 = plt.load(wigner_ref.at[edge, 2, 1])
++  w22 = plt.load(wigner_ref.at[edge, 2, 2])
++  w23 = plt.load(wigner_ref.at[edge, 2, 3])
++  w31 = plt.load(wigner_ref.at[edge, 3, 1])
++  w32 = plt.load(wigner_ref.at[edge, 3, 2])
++  w33 = plt.load(wigner_ref.at[edge, 3, 3])
++  y1s = w11 * x1s + w12 * x2s + w13 * x3s
++  y2s = w21 * x1s + w22 * x2s + w23 * x3s
++  y3s = w31 * x1s + w32 * x2s + w33 * x3s
++  y1t = w11 * x1t + w12 * x2t + w13 * x3t
++  y2t = w21 * x1t + w22 * x2t + w23 * x3t
++  y3t = w31 * x1t + w32 * x2t + w33 * x3t
++
++  w44 = plt.load(wigner_ref.at[edge, 4, 4])
++  w45 = plt.load(wigner_ref.at[edge, 4, 5])
++  w46 = plt.load(wigner_ref.at[edge, 4, 6])
++  w47 = plt.load(wigner_ref.at[edge, 4, 7])
++  w48 = plt.load(wigner_ref.at[edge, 4, 8])
++  w54 = plt.load(wigner_ref.at[edge, 5, 4])
++  w55 = plt.load(wigner_ref.at[edge, 5, 5])
++  w56 = plt.load(wigner_ref.at[edge, 5, 6])
++  w57 = plt.load(wigner_ref.at[edge, 5, 7])
++  w58 = plt.load(wigner_ref.at[edge, 5, 8])
++  w64 = plt.load(wigner_ref.at[edge, 6, 4])
++  w65 = plt.load(wigner_ref.at[edge, 6, 5])
++  w66 = plt.load(wigner_ref.at[edge, 6, 6])
++  w67 = plt.load(wigner_ref.at[edge, 6, 7])
++  w68 = plt.load(wigner_ref.at[edge, 6, 8])
++  w74 = plt.load(wigner_ref.at[edge, 7, 4])
++  w75 = plt.load(wigner_ref.at[edge, 7, 5])
++  w76 = plt.load(wigner_ref.at[edge, 7, 6])
++  w77 = plt.load(wigner_ref.at[edge, 7, 7])
++  w78 = plt.load(wigner_ref.at[edge, 7, 8])
++  w84 = plt.load(wigner_ref.at[edge, 8, 4])
++  w85 = plt.load(wigner_ref.at[edge, 8, 5])
++  w86 = plt.load(wigner_ref.at[edge, 8, 6])
++  w87 = plt.load(wigner_ref.at[edge, 8, 7])
++  w88 = plt.load(wigner_ref.at[edge, 8, 8])
++  y4s = w44 * x4s + w45 * x5s + w46 * x6s + w47 * x7s + w48 * x8s
++  y5s = w54 * x4s + w55 * x5s + w56 * x6s + w57 * x7s + w58 * x8s
++  y6s = w64 * x4s + w65 * x5s + w66 * x6s + w67 * x7s + w68 * x8s
++  y7s = w74 * x4s + w75 * x5s + w76 * x6s + w77 * x7s + w78 * x8s
++  y8s = w84 * x4s + w85 * x5s + w86 * x6s + w87 * x7s + w88 * x8s
++  y4t = w44 * x4t + w45 * x5t + w46 * x6t + w47 * x7t + w48 * x8t
++  y5t = w54 * x4t + w55 * x5t + w56 * x6t + w57 * x7t + w58 * x8t
++  y6t = w64 * x4t + w65 * x5t + w66 * x6t + w67 * x7t + w68 * x8t
++  y7t = w74 * x4t + w75 * x5t + w76 * x6t + w77 * x7t + w78 * x8t
++  y8t = w84 * x4t + w85 * x5t + w86 * x6t + w87 * x7t + w88 * x8t
++
++  plt.store(out_ref.at[edge, 0, c_offsets], y0s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 0, channels + c_offsets],
++    y0t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 5, c_offsets], y1s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 5, channels + c_offsets],
++    y1t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 1, c_offsets], y2s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 1, channels + c_offsets],
++    y2t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 3, c_offsets], y3s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 3, channels + c_offsets],
++    y3t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 8, c_offsets], y4s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 8, channels + c_offsets],
++    y4t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 6, c_offsets], y5s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 6, channels + c_offsets],
++    y5t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 2, c_offsets], y6s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 2, channels + c_offsets],
++    y6t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 4, c_offsets], y7s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 4, channels + c_offsets],
++    y7t,
++    mask=c_mask,
++  )
++  plt.store(out_ref.at[edge, 7, c_offsets], y8s, mask=c_mask)
++  plt.store(
++    out_ref.at[edge, 7, channels + c_offsets],
++    y8t,
++    mask=c_mask,
++  )
++
++
++def _node_to_edge_impl(
++  x: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  wigner_and_m_mapping: jnp.ndarray,
++) -> jnp.ndarray:
++  check_coefficients(x)
++  check_wigner_matrix(wigner_and_m_mapping)
++  num_edges = edge_index.shape[1]
++  channels = x.shape[2]
++  if num_edges == 0:
++    return jnp.zeros((0, COEFFICIENT_DIM, 2 * channels), dtype=x.dtype)
++  out_shape = jax.ShapeDtypeStruct(
++    (num_edges, COEFFICIENT_DIM, 2 * channels), dtype=x.dtype
++  )
++  kernel = partial(node_to_edge_kernel, block_c=CHANNEL_BLOCK_SIZE)
++  return pl.pallas_call(
++    kernel,
++    out_shape=out_shape,
++    grid=(num_edges, ceil_div(channels, CHANNEL_BLOCK_SIZE)),
++    compiler_params=compiler_params(CHANNEL_BLOCK_SIZE, num_stages=2),
++  )(x, edge_index, wigner_and_m_mapping)
++
++
++def gather_x_edge(x: jnp.ndarray, edge_index: jnp.ndarray) -> jnp.ndarray:
++  sender = edge_index[0]
++  receiver = edge_index[1]
++  sender_valid = (sender >= 0) & (sender < x.shape[0])
++  receiver_valid = (receiver >= 0) & (receiver < x.shape[0])
++  sender = jnp.clip(sender, 0, x.shape[0] - 1)
++  receiver = jnp.clip(receiver, 0, x.shape[0] - 1)
++  x_source = jnp.where(sender_valid[:, None, None], x[sender], 0.0)
++  x_target = jnp.where(receiver_valid[:, None, None], x[receiver], 0.0)
++  return jnp.concatenate([x_source, x_target], axis=2)
++
++
++def node_to_edge_bwd_dx_scatter_kernel(
++  gout_ref,
++  edge_index_ref,
++  wigner_ref,
++  init_ref,
++  out_ref,
++  *,
++  block_c: int,
++):
++  """Fused: transpose-Wigner on gout + atomic scatter-add to dx."""
++  del init_ref
++  edge = pl.program_id(0)
++  c_offsets = pl.program_id(1) * block_c + jnp.arange(0, block_c)
++  channels = gout_ref.shape[2] // 2
++  c_mask = c_offsets < channels
++
++  num_nodes = out_ref.shape[0]
++  sender = plt.load(edge_index_ref.at[0, edge])
++  receiver = plt.load(edge_index_ref.at[1, edge])
++  sender_valid = (sender >= 0) & (sender < num_nodes)
++  receiver_valid = (receiver >= 0) & (receiver < num_nodes)
++  sender = jnp.clip(sender, 0, num_nodes - 1)
++  receiver = jnp.clip(receiver, 0, num_nodes - 1)
++
++  dy0s = plt.load(gout_ref.at[edge, 0, c_offsets], mask=c_mask, other=0.0)
++  dy1s = plt.load(gout_ref.at[edge, 5, c_offsets], mask=c_mask, other=0.0)
++  dy2s = plt.load(gout_ref.at[edge, 1, c_offsets], mask=c_mask, other=0.0)
++  dy3s = plt.load(gout_ref.at[edge, 3, c_offsets], mask=c_mask, other=0.0)
++  dy4s = plt.load(gout_ref.at[edge, 8, c_offsets], mask=c_mask, other=0.0)
++  dy5s = plt.load(gout_ref.at[edge, 6, c_offsets], mask=c_mask, other=0.0)
++  dy6s = plt.load(gout_ref.at[edge, 2, c_offsets], mask=c_mask, other=0.0)
++  dy7s = plt.load(gout_ref.at[edge, 4, c_offsets], mask=c_mask, other=0.0)
++  dy8s = plt.load(gout_ref.at[edge, 7, c_offsets], mask=c_mask, other=0.0)
++  dy0t = plt.load(
++    gout_ref.at[edge, 0, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy1t = plt.load(
++    gout_ref.at[edge, 5, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy2t = plt.load(
++    gout_ref.at[edge, 1, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy3t = plt.load(
++    gout_ref.at[edge, 3, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy4t = plt.load(
++    gout_ref.at[edge, 8, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy5t = plt.load(
++    gout_ref.at[edge, 6, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy6t = plt.load(
++    gout_ref.at[edge, 2, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy7t = plt.load(
++    gout_ref.at[edge, 4, channels + c_offsets], mask=c_mask, other=0.0
++  )
++  dy8t = plt.load(
++    gout_ref.at[edge, 7, channels + c_offsets], mask=c_mask, other=0.0
++  )
++
++  w00 = plt.load(wigner_ref.at[edge, 0, 0])
++  w11 = plt.load(wigner_ref.at[edge, 1, 1])
++  w12 = plt.load(wigner_ref.at[edge, 1, 2])
++  w13 = plt.load(wigner_ref.at[edge, 1, 3])
++  w21 = plt.load(wigner_ref.at[edge, 2, 1])
++  w22 = plt.load(wigner_ref.at[edge, 2, 2])
++  w23 = plt.load(wigner_ref.at[edge, 2, 3])
++  w31 = plt.load(wigner_ref.at[edge, 3, 1])
++  w32 = plt.load(wigner_ref.at[edge, 3, 2])
++  w33 = plt.load(wigner_ref.at[edge, 3, 3])
++  w44 = plt.load(wigner_ref.at[edge, 4, 4])
++  w45 = plt.load(wigner_ref.at[edge, 4, 5])
++  w46 = plt.load(wigner_ref.at[edge, 4, 6])
++  w47 = plt.load(wigner_ref.at[edge, 4, 7])
++  w48 = plt.load(wigner_ref.at[edge, 4, 8])
++  w54 = plt.load(wigner_ref.at[edge, 5, 4])
++  w55 = plt.load(wigner_ref.at[edge, 5, 5])
++  w56 = plt.load(wigner_ref.at[edge, 5, 6])
++  w57 = plt.load(wigner_ref.at[edge, 5, 7])
++  w58 = plt.load(wigner_ref.at[edge, 5, 8])
++  w64 = plt.load(wigner_ref.at[edge, 6, 4])
++  w65 = plt.load(wigner_ref.at[edge, 6, 5])
++  w66 = plt.load(wigner_ref.at[edge, 6, 6])
++  w67 = plt.load(wigner_ref.at[edge, 6, 7])
++  w68 = plt.load(wigner_ref.at[edge, 6, 8])
++  w74 = plt.load(wigner_ref.at[edge, 7, 4])
++  w75 = plt.load(wigner_ref.at[edge, 7, 5])
++  w76 = plt.load(wigner_ref.at[edge, 7, 6])
++  w77 = plt.load(wigner_ref.at[edge, 7, 7])
++  w78 = plt.load(wigner_ref.at[edge, 7, 8])
++  w84 = plt.load(wigner_ref.at[edge, 8, 4])
++  w85 = plt.load(wigner_ref.at[edge, 8, 5])
++  w86 = plt.load(wigner_ref.at[edge, 8, 6])
++  w87 = plt.load(wigner_ref.at[edge, 8, 7])
++  w88 = plt.load(wigner_ref.at[edge, 8, 8])
++
++  dx_vals = [
++    (w00 * dy0s, w00 * dy0t),
++    (
++      w11 * dy1s + w21 * dy2s + w31 * dy3s,
++      w11 * dy1t + w21 * dy2t + w31 * dy3t,
++    ),
++    (
++      w12 * dy1s + w22 * dy2s + w32 * dy3s,
++      w12 * dy1t + w22 * dy2t + w32 * dy3t,
++    ),
++    (
++      w13 * dy1s + w23 * dy2s + w33 * dy3s,
++      w13 * dy1t + w23 * dy2t + w33 * dy3t,
++    ),
++    (
++      w44 * dy4s + w54 * dy5s + w64 * dy6s + w74 * dy7s + w84 * dy8s,
++      w44 * dy4t + w54 * dy5t + w64 * dy6t + w74 * dy7t + w84 * dy8t,
++    ),
++    (
++      w45 * dy4s + w55 * dy5s + w65 * dy6s + w75 * dy7s + w85 * dy8s,
++      w45 * dy4t + w55 * dy5t + w65 * dy6t + w75 * dy7t + w85 * dy8t,
++    ),
++    (
++      w46 * dy4s + w56 * dy5s + w66 * dy6s + w76 * dy7s + w86 * dy8s,
++      w46 * dy4t + w56 * dy5t + w66 * dy6t + w76 * dy7t + w86 * dy8t,
++    ),
++    (
++      w47 * dy4s + w57 * dy5s + w67 * dy6s + w77 * dy7s + w87 * dy8s,
++      w47 * dy4t + w57 * dy5t + w67 * dy6t + w77 * dy7t + w87 * dy8t,
++    ),
++    (
++      w48 * dy4s + w58 * dy5s + w68 * dy6s + w78 * dy7s + w88 * dy8s,
++      w48 * dy4t + w58 * dy5t + w68 * dy6t + w78 * dy7t + w88 * dy8t,
++    ),
++  ]
++
++  for j, (dxs, dxt) in enumerate(dx_vals):
++    plt.atomic_add(
++      out_ref, (sender, j, c_offsets), dxs, mask=c_mask & sender_valid
++    )
++    plt.atomic_add(
++      out_ref, (receiver, j, c_offsets), dxt, mask=c_mask & receiver_valid
++    )
++
++
++def _node_to_edge_bwd_dx_scatter(
++  gout: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  wigner_and_m_mapping: jnp.ndarray,
++  x_shape: tuple[int, int, int],
++) -> jnp.ndarray:
++  channels = x_shape[2]
++  block_c = CHANNEL_BLOCK_SIZE
++  init = jnp.zeros(x_shape, dtype=gout.dtype)
++  if gout.shape[0] == 0:
++    return init
++  kernel = partial(node_to_edge_bwd_dx_scatter_kernel, block_c=block_c)
++  return pl.pallas_call(
++    kernel,
++    out_shape=jax.ShapeDtypeStruct(init.shape, init.dtype),
++    grid=(gout.shape[0], ceil_div(channels, block_c)),
++    input_output_aliases={3: 0},
++    compiler_params=compiler_params(block_c),
++  )(gout, edge_index, wigner_and_m_mapping, init)
++
++
++def node_to_edge_bwd_dwigner_gather_kernel(
++  x_ref,
++  edge_index_ref,
++  gout_ref,
++  init_ref,
++  out_ref,
++  *,
++  block_c: int,
++  grid_x: int = MAX_GRID_EDGE_BLOCKS,
++  num_edges: int = 0,
++):
++  """Compute dW by gathering x[sender]/x[receiver] directly, no x_edge."""
++  del init_ref
++  edge = pl.program_id(0) + pl.program_id(1) * grid_x
++  safe_edge = jnp.minimum(edge, num_edges - 1)
++  channels = x_ref.shape[2]
++  c_offsets = jnp.arange(0, block_c)
++  c_mask = c_offsets < channels
++
++  sender = plt.load(edge_index_ref.at[0, safe_edge])
++  receiver = plt.load(edge_index_ref.at[1, safe_edge])
++  sender_valid = (sender >= 0) & (sender < x_ref.shape[0])
++  receiver_valid = (receiver >= 0) & (receiver < x_ref.shape[0])
++  sender = jnp.clip(sender, 0, x_ref.shape[0] - 1)
++  receiver = jnp.clip(receiver, 0, x_ref.shape[0] - 1)
++
++  dy0s = plt.load(gout_ref.at[safe_edge, 0, c_offsets], mask=c_mask, other=0.0)
++  dy0t = plt.load(
++    gout_ref.at[safe_edge, 0, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy1s = plt.load(gout_ref.at[safe_edge, 5, c_offsets], mask=c_mask, other=0.0)
++  dy1t = plt.load(
++    gout_ref.at[safe_edge, 5, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy2s = plt.load(gout_ref.at[safe_edge, 1, c_offsets], mask=c_mask, other=0.0)
++  dy2t = plt.load(
++    gout_ref.at[safe_edge, 1, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy3s = plt.load(gout_ref.at[safe_edge, 3, c_offsets], mask=c_mask, other=0.0)
++  dy3t = plt.load(
++    gout_ref.at[safe_edge, 3, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy4s = plt.load(gout_ref.at[safe_edge, 8, c_offsets], mask=c_mask, other=0.0)
++  dy4t = plt.load(
++    gout_ref.at[safe_edge, 8, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy5s = plt.load(gout_ref.at[safe_edge, 6, c_offsets], mask=c_mask, other=0.0)
++  dy5t = plt.load(
++    gout_ref.at[safe_edge, 6, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy6s = plt.load(gout_ref.at[safe_edge, 2, c_offsets], mask=c_mask, other=0.0)
++  dy6t = plt.load(
++    gout_ref.at[safe_edge, 2, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy7s = plt.load(gout_ref.at[safe_edge, 4, c_offsets], mask=c_mask, other=0.0)
++  dy7t = plt.load(
++    gout_ref.at[safe_edge, 4, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  dy8s = plt.load(gout_ref.at[safe_edge, 7, c_offsets], mask=c_mask, other=0.0)
++  dy8t = plt.load(
++    gout_ref.at[safe_edge, 7, channels + c_offsets],
++    mask=c_mask,
++    other=0.0,
++  )
++  x0s = plt.load(
++    x_ref.at[sender, 0, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x0t = plt.load(
++    x_ref.at[receiver, 0, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x1s = plt.load(
++    x_ref.at[sender, 1, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x1t = plt.load(
++    x_ref.at[receiver, 1, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x2s = plt.load(
++    x_ref.at[sender, 2, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x2t = plt.load(
++    x_ref.at[receiver, 2, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x3s = plt.load(
++    x_ref.at[sender, 3, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x3t = plt.load(
++    x_ref.at[receiver, 3, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x4s = plt.load(
++    x_ref.at[sender, 4, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x4t = plt.load(
++    x_ref.at[receiver, 4, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x5s = plt.load(
++    x_ref.at[sender, 5, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x5t = plt.load(
++    x_ref.at[receiver, 5, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x6s = plt.load(
++    x_ref.at[sender, 6, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x6t = plt.load(
++    x_ref.at[receiver, 6, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x7s = plt.load(
++    x_ref.at[sender, 7, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x7t = plt.load(
++    x_ref.at[receiver, 7, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x8s = plt.load(
++    x_ref.at[sender, 8, c_offsets],
++    mask=c_mask & sender_valid,
++    other=0.0,
++  )
++  x8t = plt.load(
++    x_ref.at[receiver, 8, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++
++  plt.store(out_ref.at[edge, 0, 0], jnp.sum(dy0s * x0s + dy0t * x0t))
++  plt.store(out_ref.at[edge, 1, 1], jnp.sum(dy1s * x1s + dy1t * x1t))
++  plt.store(out_ref.at[edge, 1, 2], jnp.sum(dy1s * x2s + dy1t * x2t))
++  plt.store(out_ref.at[edge, 1, 3], jnp.sum(dy1s * x3s + dy1t * x3t))
++  plt.store(out_ref.at[edge, 2, 1], jnp.sum(dy2s * x1s + dy2t * x1t))
++  plt.store(out_ref.at[edge, 2, 2], jnp.sum(dy2s * x2s + dy2t * x2t))
++  plt.store(out_ref.at[edge, 2, 3], jnp.sum(dy2s * x3s + dy2t * x3t))
++  plt.store(out_ref.at[edge, 3, 1], jnp.sum(dy3s * x1s + dy3t * x1t))
++  plt.store(out_ref.at[edge, 3, 2], jnp.sum(dy3s * x2s + dy3t * x2t))
++  plt.store(out_ref.at[edge, 3, 3], jnp.sum(dy3s * x3s + dy3t * x3t))
++  plt.store(out_ref.at[edge, 4, 4], jnp.sum(dy4s * x4s + dy4t * x4t))
++  plt.store(out_ref.at[edge, 4, 5], jnp.sum(dy4s * x5s + dy4t * x5t))
++  plt.store(out_ref.at[edge, 4, 6], jnp.sum(dy4s * x6s + dy4t * x6t))
++  plt.store(out_ref.at[edge, 4, 7], jnp.sum(dy4s * x7s + dy4t * x7t))
++  plt.store(out_ref.at[edge, 4, 8], jnp.sum(dy4s * x8s + dy4t * x8t))
++  plt.store(out_ref.at[edge, 5, 4], jnp.sum(dy5s * x4s + dy5t * x4t))
++  plt.store(out_ref.at[edge, 5, 5], jnp.sum(dy5s * x5s + dy5t * x5t))
++  plt.store(out_ref.at[edge, 5, 6], jnp.sum(dy5s * x6s + dy5t * x6t))
++  plt.store(out_ref.at[edge, 5, 7], jnp.sum(dy5s * x7s + dy5t * x7t))
++  plt.store(out_ref.at[edge, 5, 8], jnp.sum(dy5s * x8s + dy5t * x8t))
++  plt.store(out_ref.at[edge, 6, 4], jnp.sum(dy6s * x4s + dy6t * x4t))
++  plt.store(out_ref.at[edge, 6, 5], jnp.sum(dy6s * x5s + dy6t * x5t))
++  plt.store(out_ref.at[edge, 6, 6], jnp.sum(dy6s * x6s + dy6t * x6t))
++  plt.store(out_ref.at[edge, 6, 7], jnp.sum(dy6s * x7s + dy6t * x7t))
++  plt.store(out_ref.at[edge, 6, 8], jnp.sum(dy6s * x8s + dy6t * x8t))
++  plt.store(out_ref.at[edge, 7, 4], jnp.sum(dy7s * x4s + dy7t * x4t))
++  plt.store(out_ref.at[edge, 7, 5], jnp.sum(dy7s * x5s + dy7t * x5t))
++  plt.store(out_ref.at[edge, 7, 6], jnp.sum(dy7s * x6s + dy7t * x6t))
++  plt.store(out_ref.at[edge, 7, 7], jnp.sum(dy7s * x7s + dy7t * x7t))
++  plt.store(out_ref.at[edge, 7, 8], jnp.sum(dy7s * x8s + dy7t * x8t))
++  plt.store(out_ref.at[edge, 8, 4], jnp.sum(dy8s * x4s + dy8t * x4t))
++  plt.store(out_ref.at[edge, 8, 5], jnp.sum(dy8s * x5s + dy8t * x5t))
++  plt.store(out_ref.at[edge, 8, 6], jnp.sum(dy8s * x6s + dy8t * x6t))
++  plt.store(out_ref.at[edge, 8, 7], jnp.sum(dy8s * x7s + dy8t * x7t))
++  plt.store(out_ref.at[edge, 8, 8], jnp.sum(dy8s * x8s + dy8t * x8t))
++
++
++def _node_to_edge_bwd_dwigner_gather(
++  x: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  gout: jnp.ndarray,
++) -> jnp.ndarray:
++  num_edges = gout.shape[0]
++  if num_edges == 0:
++    return jnp.zeros((0, COEFFICIENT_DIM, COEFFICIENT_DIM), dtype=gout.dtype)
++  block_c = next_power_of_two(x.shape[2])
++  grid_x = min(num_edges, MAX_GRID_EDGE_BLOCKS)
++  grid_y = ceil_div(num_edges, grid_x)
++  padded = grid_x * grid_y
++  kernel = partial(
++    node_to_edge_bwd_dwigner_gather_kernel,
++    block_c=block_c,
++    grid_x=grid_x,
++    num_edges=num_edges,
++  )
++  params = compiler_params(block_c)
++  init = jnp.zeros((padded, COEFFICIENT_DIM, COEFFICIENT_DIM), dtype=gout.dtype)
++  result = pl.pallas_call(
++    kernel,
++    out_shape=jax.ShapeDtypeStruct(init.shape, init.dtype),
++    grid=(grid_x, grid_y),
++    input_output_aliases={3: 0},
++    compiler_params=params,
++  )(x, edge_index, gout, init)
++  return result[:num_edges]
++
++
++def inverse_wigner_kernel(
++  messages_ref,
++  wigner_inv_ref,
++  out_ref,
++  *,
++  block_c: int,
++):
++  edge = pl.program_id(0)
++  c_offsets = pl.program_id(1) * block_c + jnp.arange(0, block_c)
++  c_mask = c_offsets < messages_ref.shape[2]
++
++  x0 = plt.load(messages_ref.at[edge, 0, c_offsets], mask=c_mask, other=0.0)
++  x1 = plt.load(messages_ref.at[edge, 5, c_offsets], mask=c_mask, other=0.0)
++  x2 = plt.load(messages_ref.at[edge, 1, c_offsets], mask=c_mask, other=0.0)
++  x3 = plt.load(messages_ref.at[edge, 3, c_offsets], mask=c_mask, other=0.0)
++  x4 = plt.load(messages_ref.at[edge, 8, c_offsets], mask=c_mask, other=0.0)
++  x5 = plt.load(messages_ref.at[edge, 6, c_offsets], mask=c_mask, other=0.0)
++  x6 = plt.load(messages_ref.at[edge, 2, c_offsets], mask=c_mask, other=0.0)
++  x7 = plt.load(messages_ref.at[edge, 4, c_offsets], mask=c_mask, other=0.0)
++  x8 = plt.load(messages_ref.at[edge, 7, c_offsets], mask=c_mask, other=0.0)
++
++  w00 = plt.load(wigner_inv_ref.at[edge, 0, 0])
++  y0 = w00 * x0
++
++  w11 = plt.load(wigner_inv_ref.at[edge, 1, 1])
++  w12 = plt.load(wigner_inv_ref.at[edge, 1, 2])
++  w13 = plt.load(wigner_inv_ref.at[edge, 1, 3])
++  w21 = plt.load(wigner_inv_ref.at[edge, 2, 1])
++  w22 = plt.load(wigner_inv_ref.at[edge, 2, 2])
++  w23 = plt.load(wigner_inv_ref.at[edge, 2, 3])
++  w31 = plt.load(wigner_inv_ref.at[edge, 3, 1])
++  w32 = plt.load(wigner_inv_ref.at[edge, 3, 2])
++  w33 = plt.load(wigner_inv_ref.at[edge, 3, 3])
++  y1 = w11 * x1 + w12 * x2 + w13 * x3
++  y2 = w21 * x1 + w22 * x2 + w23 * x3
++  y3 = w31 * x1 + w32 * x2 + w33 * x3
++
++  w44 = plt.load(wigner_inv_ref.at[edge, 4, 4])
++  w45 = plt.load(wigner_inv_ref.at[edge, 4, 5])
++  w46 = plt.load(wigner_inv_ref.at[edge, 4, 6])
++  w47 = plt.load(wigner_inv_ref.at[edge, 4, 7])
++  w48 = plt.load(wigner_inv_ref.at[edge, 4, 8])
++  w54 = plt.load(wigner_inv_ref.at[edge, 5, 4])
++  w55 = plt.load(wigner_inv_ref.at[edge, 5, 5])
++  w56 = plt.load(wigner_inv_ref.at[edge, 5, 6])
++  w57 = plt.load(wigner_inv_ref.at[edge, 5, 7])
++  w58 = plt.load(wigner_inv_ref.at[edge, 5, 8])
++  w64 = plt.load(wigner_inv_ref.at[edge, 6, 4])
++  w65 = plt.load(wigner_inv_ref.at[edge, 6, 5])
++  w66 = plt.load(wigner_inv_ref.at[edge, 6, 6])
++  w67 = plt.load(wigner_inv_ref.at[edge, 6, 7])
++  w68 = plt.load(wigner_inv_ref.at[edge, 6, 8])
++  w74 = plt.load(wigner_inv_ref.at[edge, 7, 4])
++  w75 = plt.load(wigner_inv_ref.at[edge, 7, 5])
++  w76 = plt.load(wigner_inv_ref.at[edge, 7, 6])
++  w77 = plt.load(wigner_inv_ref.at[edge, 7, 7])
++  w78 = plt.load(wigner_inv_ref.at[edge, 7, 8])
++  w84 = plt.load(wigner_inv_ref.at[edge, 8, 4])
++  w85 = plt.load(wigner_inv_ref.at[edge, 8, 5])
++  w86 = plt.load(wigner_inv_ref.at[edge, 8, 6])
++  w87 = plt.load(wigner_inv_ref.at[edge, 8, 7])
++  w88 = plt.load(wigner_inv_ref.at[edge, 8, 8])
++  y4 = w44 * x4 + w45 * x5 + w46 * x6 + w47 * x7 + w48 * x8
++  y5 = w54 * x4 + w55 * x5 + w56 * x6 + w57 * x7 + w58 * x8
++  y6 = w64 * x4 + w65 * x5 + w66 * x6 + w67 * x7 + w68 * x8
++  y7 = w74 * x4 + w75 * x5 + w76 * x6 + w77 * x7 + w78 * x8
++  y8 = w84 * x4 + w85 * x5 + w86 * x6 + w87 * x7 + w88 * x8
++
++  plt.store(out_ref.at[edge, 0, c_offsets], y0, mask=c_mask)
++  plt.store(out_ref.at[edge, 1, c_offsets], y1, mask=c_mask)
++  plt.store(out_ref.at[edge, 2, c_offsets], y2, mask=c_mask)
++  plt.store(out_ref.at[edge, 3, c_offsets], y3, mask=c_mask)
++  plt.store(out_ref.at[edge, 4, c_offsets], y4, mask=c_mask)
++  plt.store(out_ref.at[edge, 5, c_offsets], y5, mask=c_mask)
++  plt.store(out_ref.at[edge, 6, c_offsets], y6, mask=c_mask)
++  plt.store(out_ref.at[edge, 7, c_offsets], y7, mask=c_mask)
++  plt.store(out_ref.at[edge, 8, c_offsets], y8, mask=c_mask)
++
++
++def _inverse_wigner(
++  messages: jnp.ndarray,
++  wigner_and_m_mapping_inv: jnp.ndarray,
++) -> jnp.ndarray:
++  check_coefficients(messages)
++  check_wigner_matrix(wigner_and_m_mapping_inv)
++  num_edges = messages.shape[0]
++  channels = messages.shape[2]
++  if num_edges == 0:
++    return jnp.zeros((0, COEFFICIENT_DIM, channels), dtype=messages.dtype)
++  out_shape = jax.ShapeDtypeStruct(
++    (num_edges, COEFFICIENT_DIM, channels), messages.dtype
++  )
++  kernel = partial(inverse_wigner_kernel, block_c=CHANNEL_BLOCK_SIZE)
++  return pl.pallas_call(
++    kernel,
++    out_shape=out_shape,
++    grid=(num_edges, ceil_div(channels, CHANNEL_BLOCK_SIZE)),
++    compiler_params=compiler_params(CHANNEL_BLOCK_SIZE, num_stages=2),
++  )(messages, wigner_and_m_mapping_inv)
++
++
++def edge_to_node_bwd_dmessages_kernel(
++  gout_ref,
++  edge_index_ref,
++  wigner_inv_ref,
++  out_ref,
++  *,
++  block_c: int,
++):
++  edge = pl.program_id(0)
++  c_offsets = pl.program_id(1) * block_c + jnp.arange(0, block_c)
++  c_mask = c_offsets < out_ref.shape[2]
++
++  receiver = plt.load(edge_index_ref.at[1, edge])
++  receiver_valid = (receiver >= 0) & (receiver < gout_ref.shape[0])
++  receiver = jnp.clip(receiver, 0, gout_ref.shape[0] - 1)
++
++  g0 = plt.load(
++    gout_ref.at[receiver, 0, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g1 = plt.load(
++    gout_ref.at[receiver, 1, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g2 = plt.load(
++    gout_ref.at[receiver, 2, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g3 = plt.load(
++    gout_ref.at[receiver, 3, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g4 = plt.load(
++    gout_ref.at[receiver, 4, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g5 = plt.load(
++    gout_ref.at[receiver, 5, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g6 = plt.load(
++    gout_ref.at[receiver, 6, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g7 = plt.load(
++    gout_ref.at[receiver, 7, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g8 = plt.load(
++    gout_ref.at[receiver, 8, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++
++  dx0 = plt.load(wigner_inv_ref.at[edge, 0, 0]) * g0
++
++  w11 = plt.load(wigner_inv_ref.at[edge, 1, 1])
++  w12 = plt.load(wigner_inv_ref.at[edge, 1, 2])
++  w13 = plt.load(wigner_inv_ref.at[edge, 1, 3])
++  w21 = plt.load(wigner_inv_ref.at[edge, 2, 1])
++  w22 = plt.load(wigner_inv_ref.at[edge, 2, 2])
++  w23 = plt.load(wigner_inv_ref.at[edge, 2, 3])
++  w31 = plt.load(wigner_inv_ref.at[edge, 3, 1])
++  w32 = plt.load(wigner_inv_ref.at[edge, 3, 2])
++  w33 = plt.load(wigner_inv_ref.at[edge, 3, 3])
++  dx1 = w11 * g1 + w21 * g2 + w31 * g3
++  dx2 = w12 * g1 + w22 * g2 + w32 * g3
++  dx3 = w13 * g1 + w23 * g2 + w33 * g3
++
++  w44 = plt.load(wigner_inv_ref.at[edge, 4, 4])
++  w45 = plt.load(wigner_inv_ref.at[edge, 4, 5])
++  w46 = plt.load(wigner_inv_ref.at[edge, 4, 6])
++  w47 = plt.load(wigner_inv_ref.at[edge, 4, 7])
++  w48 = plt.load(wigner_inv_ref.at[edge, 4, 8])
++  w54 = plt.load(wigner_inv_ref.at[edge, 5, 4])
++  w55 = plt.load(wigner_inv_ref.at[edge, 5, 5])
++  w56 = plt.load(wigner_inv_ref.at[edge, 5, 6])
++  w57 = plt.load(wigner_inv_ref.at[edge, 5, 7])
++  w58 = plt.load(wigner_inv_ref.at[edge, 5, 8])
++  w64 = plt.load(wigner_inv_ref.at[edge, 6, 4])
++  w65 = plt.load(wigner_inv_ref.at[edge, 6, 5])
++  w66 = plt.load(wigner_inv_ref.at[edge, 6, 6])
++  w67 = plt.load(wigner_inv_ref.at[edge, 6, 7])
++  w68 = plt.load(wigner_inv_ref.at[edge, 6, 8])
++  w74 = plt.load(wigner_inv_ref.at[edge, 7, 4])
++  w75 = plt.load(wigner_inv_ref.at[edge, 7, 5])
++  w76 = plt.load(wigner_inv_ref.at[edge, 7, 6])
++  w77 = plt.load(wigner_inv_ref.at[edge, 7, 7])
++  w78 = plt.load(wigner_inv_ref.at[edge, 7, 8])
++  w84 = plt.load(wigner_inv_ref.at[edge, 8, 4])
++  w85 = plt.load(wigner_inv_ref.at[edge, 8, 5])
++  w86 = plt.load(wigner_inv_ref.at[edge, 8, 6])
++  w87 = plt.load(wigner_inv_ref.at[edge, 8, 7])
++  w88 = plt.load(wigner_inv_ref.at[edge, 8, 8])
++  dx4 = w44 * g4 + w54 * g5 + w64 * g6 + w74 * g7 + w84 * g8
++  dx5 = w45 * g4 + w55 * g5 + w65 * g6 + w75 * g7 + w85 * g8
++  dx6 = w46 * g4 + w56 * g5 + w66 * g6 + w76 * g7 + w86 * g8
++  dx7 = w47 * g4 + w57 * g5 + w67 * g6 + w77 * g7 + w87 * g8
++  dx8 = w48 * g4 + w58 * g5 + w68 * g6 + w78 * g7 + w88 * g8
++
++  plt.store(out_ref.at[edge, 0, c_offsets], dx0, mask=c_mask)
++  plt.store(out_ref.at[edge, 5, c_offsets], dx1, mask=c_mask)
++  plt.store(out_ref.at[edge, 1, c_offsets], dx2, mask=c_mask)
++  plt.store(out_ref.at[edge, 3, c_offsets], dx3, mask=c_mask)
++  plt.store(out_ref.at[edge, 8, c_offsets], dx4, mask=c_mask)
++  plt.store(out_ref.at[edge, 6, c_offsets], dx5, mask=c_mask)
++  plt.store(out_ref.at[edge, 2, c_offsets], dx6, mask=c_mask)
++  plt.store(out_ref.at[edge, 4, c_offsets], dx7, mask=c_mask)
++  plt.store(out_ref.at[edge, 7, c_offsets], dx8, mask=c_mask)
++
++
++def _edge_to_node_bwd_dmessages(
++  gout: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  wigner_and_m_mapping_inv: jnp.ndarray,
++  messages_shape: tuple[int, int, int],
++) -> jnp.ndarray:
++  init_shape = messages_shape
++  if messages_shape[0] == 0:
++    return jnp.zeros(init_shape, dtype=gout.dtype)
++  kernel = partial(
++    edge_to_node_bwd_dmessages_kernel, block_c=CHANNEL_BLOCK_SIZE
++  )
++  return pl.pallas_call(
++    kernel,
++    out_shape=jax.ShapeDtypeStruct(init_shape, gout.dtype),
++    grid=(messages_shape[0], ceil_div(messages_shape[2], CHANNEL_BLOCK_SIZE)),
++    compiler_params=compiler_params(CHANNEL_BLOCK_SIZE),
++  )(gout, edge_index, wigner_and_m_mapping_inv)
++
++
++def edge_to_node_bwd_dwigner_kernel(
++  messages_ref,
++  gout_ref,
++  edge_index_ref,
++  init_ref,
++  out_ref,
++  *,
++  block_c: int,
++  grid_x: int = MAX_GRID_EDGE_BLOCKS,
++  num_edges: int = 0,
++):
++  del init_ref
++  edge = pl.program_id(0) + pl.program_id(1) * grid_x
++  safe_edge = jnp.minimum(edge, num_edges - 1)
++  channels = messages_ref.shape[2]
++  c_offsets = jnp.arange(0, block_c)
++  c_mask = c_offsets < channels
++
++  receiver = plt.load(edge_index_ref.at[1, safe_edge])
++  receiver_valid = (receiver >= 0) & (receiver < gout_ref.shape[0])
++  receiver = jnp.clip(receiver, 0, gout_ref.shape[0] - 1)
++
++  g0 = plt.load(
++    gout_ref.at[receiver, 0, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g1 = plt.load(
++    gout_ref.at[receiver, 1, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g2 = plt.load(
++    gout_ref.at[receiver, 2, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g3 = plt.load(
++    gout_ref.at[receiver, 3, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g4 = plt.load(
++    gout_ref.at[receiver, 4, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g5 = plt.load(
++    gout_ref.at[receiver, 5, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g6 = plt.load(
++    gout_ref.at[receiver, 6, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g7 = plt.load(
++    gout_ref.at[receiver, 7, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  g8 = plt.load(
++    gout_ref.at[receiver, 8, c_offsets],
++    mask=c_mask & receiver_valid,
++    other=0.0,
++  )
++  x0 = plt.load(
++    messages_ref.at[safe_edge, 0, c_offsets], mask=c_mask, other=0.0
++  )
++  x1 = plt.load(
++    messages_ref.at[safe_edge, 5, c_offsets], mask=c_mask, other=0.0
++  )
++  x2 = plt.load(
++    messages_ref.at[safe_edge, 1, c_offsets], mask=c_mask, other=0.0
++  )
++  x3 = plt.load(
++    messages_ref.at[safe_edge, 3, c_offsets], mask=c_mask, other=0.0
++  )
++  x4 = plt.load(
++    messages_ref.at[safe_edge, 8, c_offsets], mask=c_mask, other=0.0
++  )
++  x5 = plt.load(
++    messages_ref.at[safe_edge, 6, c_offsets], mask=c_mask, other=0.0
++  )
++  x6 = plt.load(
++    messages_ref.at[safe_edge, 2, c_offsets], mask=c_mask, other=0.0
++  )
++  x7 = plt.load(
++    messages_ref.at[safe_edge, 4, c_offsets], mask=c_mask, other=0.0
++  )
++  x8 = plt.load(
++    messages_ref.at[safe_edge, 7, c_offsets], mask=c_mask, other=0.0
++  )
++
++  plt.store(out_ref.at[edge, 0, 0], jnp.sum(g0 * x0))
++  plt.store(out_ref.at[edge, 1, 1], jnp.sum(g1 * x1))
++  plt.store(out_ref.at[edge, 1, 2], jnp.sum(g1 * x2))
++  plt.store(out_ref.at[edge, 1, 3], jnp.sum(g1 * x3))
++  plt.store(out_ref.at[edge, 2, 1], jnp.sum(g2 * x1))
++  plt.store(out_ref.at[edge, 2, 2], jnp.sum(g2 * x2))
++  plt.store(out_ref.at[edge, 2, 3], jnp.sum(g2 * x3))
++  plt.store(out_ref.at[edge, 3, 1], jnp.sum(g3 * x1))
++  plt.store(out_ref.at[edge, 3, 2], jnp.sum(g3 * x2))
++  plt.store(out_ref.at[edge, 3, 3], jnp.sum(g3 * x3))
++  plt.store(out_ref.at[edge, 4, 4], jnp.sum(g4 * x4))
++  plt.store(out_ref.at[edge, 4, 5], jnp.sum(g4 * x5))
++  plt.store(out_ref.at[edge, 4, 6], jnp.sum(g4 * x6))
++  plt.store(out_ref.at[edge, 4, 7], jnp.sum(g4 * x7))
++  plt.store(out_ref.at[edge, 4, 8], jnp.sum(g4 * x8))
++  plt.store(out_ref.at[edge, 5, 4], jnp.sum(g5 * x4))
++  plt.store(out_ref.at[edge, 5, 5], jnp.sum(g5 * x5))
++  plt.store(out_ref.at[edge, 5, 6], jnp.sum(g5 * x6))
++  plt.store(out_ref.at[edge, 5, 7], jnp.sum(g5 * x7))
++  plt.store(out_ref.at[edge, 5, 8], jnp.sum(g5 * x8))
++  plt.store(out_ref.at[edge, 6, 4], jnp.sum(g6 * x4))
++  plt.store(out_ref.at[edge, 6, 5], jnp.sum(g6 * x5))
++  plt.store(out_ref.at[edge, 6, 6], jnp.sum(g6 * x6))
++  plt.store(out_ref.at[edge, 6, 7], jnp.sum(g6 * x7))
++  plt.store(out_ref.at[edge, 6, 8], jnp.sum(g6 * x8))
++  plt.store(out_ref.at[edge, 7, 4], jnp.sum(g7 * x4))
++  plt.store(out_ref.at[edge, 7, 5], jnp.sum(g7 * x5))
++  plt.store(out_ref.at[edge, 7, 6], jnp.sum(g7 * x6))
++  plt.store(out_ref.at[edge, 7, 7], jnp.sum(g7 * x7))
++  plt.store(out_ref.at[edge, 7, 8], jnp.sum(g7 * x8))
++  plt.store(out_ref.at[edge, 8, 4], jnp.sum(g8 * x4))
++  plt.store(out_ref.at[edge, 8, 5], jnp.sum(g8 * x5))
++  plt.store(out_ref.at[edge, 8, 6], jnp.sum(g8 * x6))
++  plt.store(out_ref.at[edge, 8, 7], jnp.sum(g8 * x7))
++  plt.store(out_ref.at[edge, 8, 8], jnp.sum(g8 * x8))
++
++
++def _edge_to_node_bwd_dwigner(
++  messages: jnp.ndarray,
++  gout: jnp.ndarray,
++  edge_index: jnp.ndarray,
++) -> jnp.ndarray:
++  num_edges = messages.shape[0]
++  if num_edges == 0:
++    return jnp.zeros(
++      (0, COEFFICIENT_DIM, COEFFICIENT_DIM), dtype=messages.dtype
++    )
++  block_c = next_power_of_two(messages.shape[2])
++  grid_x = min(num_edges, MAX_GRID_EDGE_BLOCKS)
++  grid_y = ceil_div(num_edges, grid_x)
++  padded = grid_x * grid_y
++  kernel = partial(
++    edge_to_node_bwd_dwigner_kernel,
++    block_c=block_c,
++    grid_x=grid_x,
++    num_edges=num_edges,
++  )
++  params = compiler_params(block_c)
++  init = jnp.zeros(
++    (padded, COEFFICIENT_DIM, COEFFICIENT_DIM), dtype=messages.dtype
++  )
++  result = pl.pallas_call(
++    kernel,
++    out_shape=jax.ShapeDtypeStruct(init.shape, init.dtype),
++    grid=(grid_x, grid_y),
++    input_output_aliases={3: 0},
++    compiler_params=params,
++  )(messages, gout, edge_index, init)
++  return result[:num_edges]
++
++
++def _edge_to_node_scatter(
++  messages: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  wigner_and_m_mapping_inv: jnp.ndarray,
++  *,
++  num_nodes: int,
++) -> jnp.ndarray:
++  edge_messages = _inverse_wigner(messages, wigner_and_m_mapping_inv)
++  receiver = edge_index[1]
++  receiver = jnp.where(receiver >= 0, receiver, num_nodes)
++  return (
++    jnp.zeros(
++      (num_nodes, COEFFICIENT_DIM, messages.shape[2]), dtype=messages.dtype
++    )
++    .at[receiver]
++    .add(edge_messages, mode='drop')
++  )
++
++
++def _zero_tangent(tangent, primal):
++  return jnp.zeros_like(primal) if type(tangent) is ad.Zero else tangent
++
++
++def _zero_if_undefined(value):
++  if ad.is_undefined_primal(value):
++    return jnp.zeros(value.aval.shape, value.aval.dtype)
++  return value
++
++
++def _batch_size(vals, dims):
++  for val, dim in zip(vals, dims):
++    if dim is not batching.not_mapped:
++      return val.shape[dim]
++  raise ValueError('Expected at least one batched input.')
++
++
++def _move_or_broadcast_batch(value, dim, batch_size):
++  if dim is batching.not_mapped:
++    return jnp.broadcast_to(value, (batch_size,) + value.shape)
++  if dim != 0:
++    return jnp.moveaxis(value, dim, 0)
++  return value
++
++
++def _batched_edge_index(edge_index, batch_size, num_nodes):
++  edge = edge_index[None, :, :]
++  offsets = (jnp.arange(batch_size, dtype=edge_index.dtype) * num_nodes)[
++    :, None, None
++  ]
++  valid = (edge >= 0) & (edge < num_nodes)
++  batched = jnp.where(valid, edge + offsets, -1)
++  return jnp.transpose(batched, (1, 0, 2)).reshape(
++    2, batch_size * edge_index.shape[1]
++  )
++
++
++def _node_to_edge_backward_impl(x, edge_index, wigner, gout):
++  dx = _node_to_edge_bwd_dx_scatter(gout, edge_index, wigner, x.shape)
++  dwigner = _node_to_edge_bwd_dwigner_gather(x, edge_index, gout)
++  return dx, dwigner
++
++
++node_to_edge_backward_p = core.Primitive('uma_node_to_edge_backward')
++node_to_edge_backward_p.multiple_results = True
++
++
++def _node_to_edge_backward_abstract_eval(
++  x_aval, edge_index_aval, w_aval, gout_aval
++):
++  del edge_index_aval
++  return (
++    core.ShapedArray(x_aval.shape, gout_aval.dtype),
++    core.ShapedArray(w_aval.shape, gout_aval.dtype),
++  )
++
++
++def _node_to_edge_backward_jvp_rule(primals, tangents):
++  x, edge_index, wigner, gout = primals
++  tx, _, twigner, tgout = tangents
++  dx, dwigner = node_to_edge_backward_p.bind(x, edge_index, wigner, gout)
++  tangent_dx, tangent_dw = node_to_edge_backward_jvp_p.bind(
++    x,
++    edge_index,
++    wigner,
++    gout,
++    _zero_tangent(tx, x),
++    _zero_tangent(twigner, wigner),
++    _zero_tangent(tgout, gout),
++  )
++  return (dx, dwigner), (tangent_dx, tangent_dw)
++
++
++def _node_to_edge_backward_transpose_rule(
++  cotangents, x, edge_index, wigner, gout
++):
++  ddx, ddwigner = cotangents
++  grad_x = None
++  grad_wigner = None
++  grad_gout = None
++
++  gout = _zero_if_undefined(gout)
++  x_value = _zero_if_undefined(x)
++  wigner_value = _zero_if_undefined(wigner)
++
++  if ad.is_undefined_primal(x) and type(ddwigner) is not ad.Zero:
++    grad_x, _ = node_to_edge_backward_p.bind(
++      jnp.zeros(x.aval.shape, dtype=ddwigner.dtype),
++      edge_index,
++      ddwigner,
++      gout,
++    )
++  if ad.is_undefined_primal(wigner) and type(ddx) is not ad.Zero:
++    _, grad_wigner = node_to_edge_backward_p.bind(
++      ddx,
++      edge_index,
++      jnp.zeros(wigner.aval.shape, dtype=ddx.dtype),
++      gout,
++    )
++  if ad.is_undefined_primal(gout):
++    terms = []
++    if type(ddx) is not ad.Zero:
++      terms.append(node_to_edge_p.bind(ddx, edge_index, wigner_value))
++    if type(ddwigner) is not ad.Zero:
++      terms.append(node_to_edge_p.bind(x_value, edge_index, ddwigner))
++    if terms:
++      grad_gout = terms[0]
++      for term in terms[1:]:
++        grad_gout = grad_gout + term
++  return grad_x, None, grad_wigner, grad_gout
++
++
++def _node_to_edge_backward_batching_rule(vals, dims):
++  x, edge_index, wigner, gout = vals
++  x_bdim, edge_bdim, w_bdim, gout_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(dim is batching.not_mapped for dim in (x_bdim, w_bdim, gout_bdim)):
++    return node_to_edge_backward_p.bind(x, edge_index, wigner, gout), (
++      batching.not_mapped,
++      batching.not_mapped,
++    )
++  batch_size = _batch_size((x, wigner, gout), (x_bdim, w_bdim, gout_bdim))
++  x = _move_or_broadcast_batch(x, x_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  gout = _move_or_broadcast_batch(gout, gout_bdim, batch_size)
++  num_nodes, num_edges = x.shape[1], wigner.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  dx, dwigner = node_to_edge_backward_p.bind(
++    x.reshape(batch_size * num_nodes, *x.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    gout.reshape(batch_size * num_edges, *gout.shape[2:]),
++  )
++  return (
++    dx.reshape(batch_size, num_nodes, *dx.shape[1:]),
++    dwigner.reshape(batch_size, num_edges, *dwigner.shape[1:]),
++  ), (0, 0)
++
++
++node_to_edge_backward_jvp_p = core.Primitive('uma_node_to_edge_backward_jvp')
++node_to_edge_backward_jvp_p.multiple_results = True
++
++
++def _node_to_edge_backward_jvp_impl(
++  x, edge_index, wigner, gout, tx, twigner, tgout
++):
++  dx_from_gout, dw_from_gout = node_to_edge_backward_p.bind(
++    x, edge_index, wigner, tgout
++  )
++  dx_from_wigner, _ = node_to_edge_backward_p.bind(x, edge_index, twigner, gout)
++  _, dw_from_x = node_to_edge_backward_p.bind(
++    tx, edge_index, jnp.zeros_like(wigner), gout
++  )
++  return dx_from_gout + dx_from_wigner, dw_from_gout + dw_from_x
++
++
++def _node_to_edge_backward_jvp_abstract_eval(
++  x_aval, edge_index_aval, w_aval, gout_aval, tx_aval, tw_aval, tgout_aval
++):
++  del edge_index_aval, tx_aval, tw_aval, tgout_aval
++  return (
++    core.ShapedArray(x_aval.shape, gout_aval.dtype),
++    core.ShapedArray(w_aval.shape, gout_aval.dtype),
++  )
++
++
++def _node_to_edge_backward_jvp_transpose_rule(
++  cotangents, x, edge_index, wigner, gout, tx, twigner, tgout
++):
++  ddx, ddwigner = cotangents
++  x = _zero_if_undefined(x)
++  wigner = _zero_if_undefined(wigner)
++  gout = _zero_if_undefined(gout)
++
++  grad_tx = None
++  grad_twigner = None
++  grad_tgout = None
++  if ad.is_undefined_primal(tx) and type(ddwigner) is not ad.Zero:
++    grad_tx, _ = node_to_edge_backward_p.bind(
++      jnp.zeros(tx.aval.shape, dtype=ddwigner.dtype),
++      edge_index,
++      ddwigner,
++      gout,
++    )
++  if ad.is_undefined_primal(twigner) and type(ddx) is not ad.Zero:
++    _, grad_twigner = node_to_edge_backward_p.bind(
++      ddx,
++      edge_index,
++      jnp.zeros(twigner.aval.shape, dtype=ddx.dtype),
++      gout,
++    )
++  if ad.is_undefined_primal(tgout):
++    terms = []
++    if type(ddx) is not ad.Zero:
++      terms.append(node_to_edge_p.bind(ddx, edge_index, wigner))
++    if type(ddwigner) is not ad.Zero:
++      terms.append(node_to_edge_p.bind(x, edge_index, ddwigner))
++    if terms:
++      grad_tgout = terms[0]
++      for term in terms[1:]:
++        grad_tgout = grad_tgout + term
++  return None, None, None, None, grad_tx, grad_twigner, grad_tgout
++
++
++def _node_to_edge_backward_jvp_jvp_rule(primals, tangents):
++  x, edge_index, wigner, gout, tx, twigner, tgout = primals
++  tx0, _, tw0, tgout0, ttx, ttw, ttgout = tangents
++  diff_primals = (x, wigner, gout, tx, twigner, tgout)
++  diff_tangents = tuple(
++    jnp.zeros_like(primal) if type(tangent) is ad.Zero else tangent
++    for primal, tangent in zip(
++      diff_primals, (tx0, tw0, tgout0, ttx, ttw, ttgout)
++    )
++  )
++
++  def func(x_, wigner_, gout_, tx_, twigner_, tgout_):
++    return _node_to_edge_backward_jvp_impl(
++      x_, edge_index, wigner_, gout_, tx_, twigner_, tgout_
++    )
++
++  return jax.jvp(func, diff_primals, diff_tangents)
++
++
++def _node_to_edge_backward_jvp_batching_rule(vals, dims):
++  x, edge_index, wigner, gout, tx, twigner, tgout = vals
++  x_bdim, edge_bdim, w_bdim, gout_bdim, tx_bdim, tw_bdim, tgout_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(
++    dim is batching.not_mapped
++    for dim in (x_bdim, w_bdim, gout_bdim, tx_bdim, tw_bdim, tgout_bdim)
++  ):
++    return node_to_edge_backward_jvp_p.bind(
++      x, edge_index, wigner, gout, tx, twigner, tgout
++    ), (batching.not_mapped, batching.not_mapped)
++
++  batch_size = _batch_size(
++    (x, wigner, gout, tx, twigner, tgout),
++    (x_bdim, w_bdim, gout_bdim, tx_bdim, tw_bdim, tgout_bdim),
++  )
++  x = _move_or_broadcast_batch(x, x_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  gout = _move_or_broadcast_batch(gout, gout_bdim, batch_size)
++  tx = _move_or_broadcast_batch(tx, tx_bdim, batch_size)
++  twigner = _move_or_broadcast_batch(twigner, tw_bdim, batch_size)
++  tgout = _move_or_broadcast_batch(tgout, tgout_bdim, batch_size)
++  num_nodes, num_edges = x.shape[1], wigner.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  dx, dwigner = node_to_edge_backward_jvp_p.bind(
++    x.reshape(batch_size * num_nodes, *x.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    gout.reshape(batch_size * num_edges, *gout.shape[2:]),
++    tx.reshape(batch_size * num_nodes, *tx.shape[2:]),
++    twigner.reshape(batch_size * num_edges, *twigner.shape[2:]),
++    tgout.reshape(batch_size * num_edges, *tgout.shape[2:]),
++  )
++  return (
++    dx.reshape(batch_size, num_nodes, *dx.shape[1:]),
++    dwigner.reshape(batch_size, num_edges, *dwigner.shape[1:]),
++  ), (0, 0)
++
++
++node_to_edge_backward_jvp_p.def_impl(_node_to_edge_backward_jvp_impl)
++node_to_edge_backward_jvp_p.def_abstract_eval(
++  _node_to_edge_backward_jvp_abstract_eval
++)
++mlir.register_lowering(
++  node_to_edge_backward_jvp_p,
++  mlir.lower_fun(_node_to_edge_backward_jvp_impl, multiple_results=True),
++)
++ad.primitive_jvps[node_to_edge_backward_jvp_p] = (
++  _node_to_edge_backward_jvp_jvp_rule
++)
++ad.primitive_transposes[node_to_edge_backward_jvp_p] = (
++  _node_to_edge_backward_jvp_transpose_rule
++)
++batching.primitive_batchers[node_to_edge_backward_jvp_p] = (
++  _node_to_edge_backward_jvp_batching_rule
++)
++
++
++node_to_edge_backward_p.def_impl(_node_to_edge_backward_impl)
++node_to_edge_backward_p.def_abstract_eval(_node_to_edge_backward_abstract_eval)
++mlir.register_lowering(
++  node_to_edge_backward_p,
++  mlir.lower_fun(_node_to_edge_backward_impl, multiple_results=True),
++)
++ad.primitive_jvps[node_to_edge_backward_p] = _node_to_edge_backward_jvp_rule
++ad.primitive_transposes[node_to_edge_backward_p] = (
++  _node_to_edge_backward_transpose_rule
++)
++batching.primitive_batchers[node_to_edge_backward_p] = (
++  _node_to_edge_backward_batching_rule
++)
++
++
++node_to_edge_p = core.Primitive('uma_node_to_edge')
++node_to_edge_p.multiple_results = False
++
++
++def _node_to_edge_abstract_eval(x_aval, edge_index_aval, w_aval):
++  del w_aval
++  return core.ShapedArray(
++    (edge_index_aval.shape[1], COEFFICIENT_DIM, 2 * x_aval.shape[-1]),
++    x_aval.dtype,
++  )
++
++
++def _node_to_edge_jvp_rule(primals, tangents):
++  x, edge_index, wigner = primals
++  tx, _, twigner = tangents
++  out = node_to_edge_p.bind(x, edge_index, wigner)
++  tangent_out = node_to_edge_jvp_p.bind(
++    x,
++    edge_index,
++    wigner,
++    _zero_tangent(tx, x),
++    _zero_tangent(twigner, wigner),
++  )
++  return out, tangent_out
++
++
++def _node_to_edge_transpose_rule(cotangent, x, edge_index, wigner):
++  if type(cotangent) is ad.Zero:
++    return None, None, None
++  grad_x = None
++  grad_wigner = None
++  if ad.is_undefined_primal(x):
++    dummy_x = jnp.zeros(x.aval.shape, dtype=cotangent.dtype)
++    grad_x, _ = node_to_edge_backward_p.bind(
++      dummy_x, edge_index, wigner, cotangent
++    )
++  if ad.is_undefined_primal(wigner):
++    dummy_w = jnp.zeros(wigner.aval.shape, dtype=cotangent.dtype)
++    _, grad_wigner = node_to_edge_backward_p.bind(
++      x, edge_index, dummy_w, cotangent
++    )
++  return grad_x, None, grad_wigner
++
++
++def _node_to_edge_batching_rule(vals, dims):
++  x, edge_index, wigner = vals
++  x_bdim, edge_bdim, w_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(dim is batching.not_mapped for dim in (x_bdim, w_bdim)):
++    return node_to_edge_p.bind(x, edge_index, wigner), batching.not_mapped
++  batch_size = _batch_size((x, wigner), (x_bdim, w_bdim))
++  x = _move_or_broadcast_batch(x, x_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  num_nodes, num_edges = x.shape[1], wigner.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  out = node_to_edge_p.bind(
++    x.reshape(batch_size * num_nodes, *x.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++  )
++  return out.reshape(batch_size, num_edges, *out.shape[1:]), 0
++
++
++node_to_edge_jvp_p = core.Primitive('uma_node_to_edge_jvp')
++node_to_edge_jvp_p.multiple_results = False
++
++
++def _node_to_edge_jvp_impl(x, edge_index, wigner, tx, twigner):
++  return node_to_edge_p.bind(tx, edge_index, wigner) + node_to_edge_p.bind(
++    x, edge_index, twigner
++  )
++
++
++def _node_to_edge_jvp_abstract_eval(
++  x_aval, edge_index_aval, w_aval, tx_aval, tw_aval
++):
++  del w_aval, tx_aval, tw_aval
++  return core.ShapedArray(
++    (edge_index_aval.shape[1], COEFFICIENT_DIM, 2 * x_aval.shape[-1]),
++    x_aval.dtype,
++  )
++
++
++def _node_to_edge_jvp_transpose_rule(
++  cotangent, x, edge_index, wigner, tx, twigner
++):
++  if type(cotangent) is ad.Zero:
++    return None, None, None, None, None
++  x = _zero_if_undefined(x)
++  wigner = _zero_if_undefined(wigner)
++  grad_tx = None
++  grad_twigner = None
++  if ad.is_undefined_primal(tx):
++    grad_tx, _ = node_to_edge_backward_p.bind(
++      jnp.zeros(tx.aval.shape, dtype=cotangent.dtype),
++      edge_index,
++      wigner,
++      cotangent,
++    )
++  if ad.is_undefined_primal(twigner):
++    _, grad_twigner = node_to_edge_backward_p.bind(
++      x,
++      edge_index,
++      jnp.zeros(twigner.aval.shape, dtype=cotangent.dtype),
++      cotangent,
++    )
++  return None, None, None, grad_tx, grad_twigner
++
++
++def _node_to_edge_jvp_jvp_rule(primals, tangents):
++  x, edge_index, wigner, tx, twigner = primals
++  tx0, _, tw0, ttx, ttw = tangents
++  diff_primals = (x, wigner, tx, twigner)
++  diff_tangents = tuple(
++    jnp.zeros_like(primal) if type(tangent) is ad.Zero else tangent
++    for primal, tangent in zip(diff_primals, (tx0, tw0, ttx, ttw))
++  )
++
++  def func(x_, wigner_, tx_, twigner_):
++    return _node_to_edge_jvp_impl(x_, edge_index, wigner_, tx_, twigner_)
++
++  return jax.jvp(func, diff_primals, diff_tangents)
++
++
++def _node_to_edge_jvp_batching_rule(vals, dims):
++  x, edge_index, wigner, tx, twigner = vals
++  x_bdim, edge_bdim, w_bdim, tx_bdim, tw_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(
++    dim is batching.not_mapped for dim in (x_bdim, w_bdim, tx_bdim, tw_bdim)
++  ):
++    return node_to_edge_jvp_p.bind(
++      x, edge_index, wigner, tx, twigner
++    ), batching.not_mapped
++
++  batch_size = _batch_size(
++    (x, wigner, tx, twigner), (x_bdim, w_bdim, tx_bdim, tw_bdim)
++  )
++  x = _move_or_broadcast_batch(x, x_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  tx = _move_or_broadcast_batch(tx, tx_bdim, batch_size)
++  twigner = _move_or_broadcast_batch(twigner, tw_bdim, batch_size)
++  num_nodes, num_edges = x.shape[1], wigner.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  out = node_to_edge_jvp_p.bind(
++    x.reshape(batch_size * num_nodes, *x.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    tx.reshape(batch_size * num_nodes, *tx.shape[2:]),
++    twigner.reshape(batch_size * num_edges, *twigner.shape[2:]),
++  )
++  return out.reshape(batch_size, num_edges, *out.shape[1:]), 0
++
++
++node_to_edge_jvp_p.def_impl(_node_to_edge_jvp_impl)
++node_to_edge_jvp_p.def_abstract_eval(_node_to_edge_jvp_abstract_eval)
++mlir.register_lowering(
++  node_to_edge_jvp_p,
++  mlir.lower_fun(_node_to_edge_jvp_impl, multiple_results=False),
++)
++ad.primitive_jvps[node_to_edge_jvp_p] = _node_to_edge_jvp_jvp_rule
++ad.primitive_transposes[node_to_edge_jvp_p] = _node_to_edge_jvp_transpose_rule
++batching.primitive_batchers[node_to_edge_jvp_p] = (
++  _node_to_edge_jvp_batching_rule
++)
++
++
++node_to_edge_p.def_impl(_node_to_edge_impl)
++node_to_edge_p.def_abstract_eval(_node_to_edge_abstract_eval)
++mlir.register_lowering(
++  node_to_edge_p,
++  mlir.lower_fun(_node_to_edge_impl, multiple_results=False),
++)
++ad.primitive_jvps[node_to_edge_p] = _node_to_edge_jvp_rule
++ad.primitive_transposes[node_to_edge_p] = _node_to_edge_transpose_rule
++batching.primitive_batchers[node_to_edge_p] = _node_to_edge_batching_rule
++
++
++def node_to_edge_wigner_permute(
++  x: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  wigner_and_m_mapping: jnp.ndarray,
++) -> jnp.ndarray:
++  return node_to_edge_p.bind(x, edge_index, wigner_and_m_mapping)
++
++
++def _edge_to_node_backward_impl(
++  messages, edge_index, wigner, gout, *, num_nodes
++):
++  del num_nodes
++  dmessages = _edge_to_node_bwd_dmessages(
++    gout, edge_index, wigner, messages.shape
++  )
++  dwigner = _edge_to_node_bwd_dwigner(messages, gout, edge_index)
++  return dmessages, dwigner
++
++
++edge_to_node_backward_p = core.Primitive('uma_edge_to_node_backward')
++edge_to_node_backward_p.multiple_results = True
++
++
++def _edge_to_node_backward_abstract_eval(
++  messages_aval, edge_index_aval, w_aval, gout_aval, *, num_nodes
++):
++  del edge_index_aval, num_nodes
++  return (
++    core.ShapedArray(messages_aval.shape, gout_aval.dtype),
++    core.ShapedArray(w_aval.shape, gout_aval.dtype),
++  )
++
++
++def _edge_to_node_backward_jvp_rule(primals, tangents, *, num_nodes):
++  messages, edge_index, wigner, gout = primals
++  tmessages, _, twigner, tgout = tangents
++  dmessages, dwigner = edge_to_node_backward_p.bind(
++    messages, edge_index, wigner, gout, num_nodes=num_nodes
++  )
++  tangent_dmessages, tangent_dw = edge_to_node_backward_jvp_p.bind(
++    messages,
++    edge_index,
++    wigner,
++    gout,
++    _zero_tangent(tmessages, messages),
++    _zero_tangent(twigner, wigner),
++    _zero_tangent(tgout, gout),
++    num_nodes=num_nodes,
++  )
++  return (dmessages, dwigner), (tangent_dmessages, tangent_dw)
++
++
++def _edge_to_node_backward_transpose_rule(
++  cotangents, messages, edge_index, wigner, gout, *, num_nodes
++):
++  ddmessages, ddwigner = cotangents
++  grad_messages = None
++  grad_wigner = None
++  grad_gout = None
++  gout = _zero_if_undefined(gout)
++  messages_value = _zero_if_undefined(messages)
++  wigner_value = _zero_if_undefined(wigner)
++
++  if ad.is_undefined_primal(messages) and type(ddwigner) is not ad.Zero:
++    grad_messages, _ = edge_to_node_backward_p.bind(
++      jnp.zeros(messages.aval.shape, dtype=ddwigner.dtype),
++      edge_index,
++      ddwigner,
++      gout,
++      num_nodes=num_nodes,
++    )
++  if ad.is_undefined_primal(wigner) and type(ddmessages) is not ad.Zero:
++    _, grad_wigner = edge_to_node_backward_p.bind(
++      ddmessages,
++      edge_index,
++      jnp.zeros(wigner.aval.shape, dtype=ddmessages.dtype),
++      gout,
++      num_nodes=num_nodes,
++    )
++  if ad.is_undefined_primal(gout):
++    terms = []
++    if type(ddmessages) is not ad.Zero:
++      terms.append(
++        edge_to_node_p.bind(
++          ddmessages,
++          edge_index,
++          wigner_value,
++          num_nodes=num_nodes,
++        )
++      )
++    if type(ddwigner) is not ad.Zero:
++      terms.append(
++        edge_to_node_p.bind(
++          messages_value,
++          edge_index,
++          ddwigner,
++          num_nodes=num_nodes,
++        )
++      )
++    if terms:
++      grad_gout = terms[0]
++      for term in terms[1:]:
++        grad_gout = grad_gout + term
++  return grad_messages, None, grad_wigner, grad_gout
++
++
++def _edge_to_node_backward_batching_rule(vals, dims, *, num_nodes):
++  messages, edge_index, wigner, gout = vals
++  m_bdim, edge_bdim, w_bdim, gout_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(dim is batching.not_mapped for dim in (m_bdim, w_bdim, gout_bdim)):
++    return edge_to_node_backward_p.bind(
++      messages, edge_index, wigner, gout, num_nodes=num_nodes
++    ), (batching.not_mapped, batching.not_mapped)
++  batch_size = _batch_size(
++    (messages, wigner, gout), (m_bdim, w_bdim, gout_bdim)
++  )
++  messages = _move_or_broadcast_batch(messages, m_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  gout = _move_or_broadcast_batch(gout, gout_bdim, batch_size)
++  num_edges = messages.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  dmessages, dwigner = edge_to_node_backward_p.bind(
++    messages.reshape(batch_size * num_edges, *messages.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    gout.reshape(batch_size * num_nodes, *gout.shape[2:]),
++    num_nodes=batch_size * num_nodes,
++  )
++  return (
++    dmessages.reshape(batch_size, num_edges, *dmessages.shape[1:]),
++    dwigner.reshape(batch_size, num_edges, *dwigner.shape[1:]),
++  ), (0, 0)
++
++
++edge_to_node_backward_jvp_p = core.Primitive('uma_edge_to_node_backward_jvp')
++edge_to_node_backward_jvp_p.multiple_results = True
++
++
++def _edge_to_node_backward_jvp_impl(
++  messages, edge_index, wigner, gout, tmessages, twigner, tgout, *, num_nodes
++):
++  dmessages_from_gout, dw_from_gout = edge_to_node_backward_p.bind(
++    messages, edge_index, wigner, tgout, num_nodes=num_nodes
++  )
++  dmessages_from_wigner, _ = edge_to_node_backward_p.bind(
++    messages, edge_index, twigner, gout, num_nodes=num_nodes
++  )
++  _, dw_from_messages = edge_to_node_backward_p.bind(
++    tmessages,
++    edge_index,
++    jnp.zeros_like(wigner),
++    gout,
++    num_nodes=num_nodes,
++  )
++  return (
++    dmessages_from_gout + dmessages_from_wigner,
++    dw_from_gout + dw_from_messages,
++  )
++
++
++def _edge_to_node_backward_jvp_abstract_eval(
++  messages_aval,
++  edge_index_aval,
++  w_aval,
++  gout_aval,
++  tmessages_aval,
++  tw_aval,
++  tgout_aval,
++  *,
++  num_nodes,
++):
++  del edge_index_aval, tmessages_aval, tw_aval, tgout_aval, num_nodes
++  return (
++    core.ShapedArray(messages_aval.shape, gout_aval.dtype),
++    core.ShapedArray(w_aval.shape, gout_aval.dtype),
++  )
++
++
++def _edge_to_node_backward_jvp_transpose_rule(
++  cotangents,
++  messages,
++  edge_index,
++  wigner,
++  gout,
++  tmessages,
++  twigner,
++  tgout,
++  *,
++  num_nodes,
++):
++  ddmessages, ddwigner = cotangents
++  messages = _zero_if_undefined(messages)
++  wigner = _zero_if_undefined(wigner)
++  gout = _zero_if_undefined(gout)
++
++  grad_tmessages = None
++  grad_twigner = None
++  grad_tgout = None
++  if ad.is_undefined_primal(tmessages) and type(ddwigner) is not ad.Zero:
++    grad_tmessages, _ = edge_to_node_backward_p.bind(
++      jnp.zeros(tmessages.aval.shape, dtype=ddwigner.dtype),
++      edge_index,
++      ddwigner,
++      gout,
++      num_nodes=num_nodes,
++    )
++  if ad.is_undefined_primal(twigner) and type(ddmessages) is not ad.Zero:
++    _, grad_twigner = edge_to_node_backward_p.bind(
++      ddmessages,
++      edge_index,
++      jnp.zeros(twigner.aval.shape, dtype=ddmessages.dtype),
++      gout,
++      num_nodes=num_nodes,
++    )
++  if ad.is_undefined_primal(tgout):
++    terms = []
++    if type(ddmessages) is not ad.Zero:
++      terms.append(
++        edge_to_node_p.bind(ddmessages, edge_index, wigner, num_nodes=num_nodes)
++      )
++    if type(ddwigner) is not ad.Zero:
++      terms.append(
++        edge_to_node_p.bind(messages, edge_index, ddwigner, num_nodes=num_nodes)
++      )
++    if terms:
++      grad_tgout = terms[0]
++      for term in terms[1:]:
++        grad_tgout = grad_tgout + term
++  return None, None, None, None, grad_tmessages, grad_twigner, grad_tgout
++
++
++def _edge_to_node_backward_jvp_jvp_rule(primals, tangents, *, num_nodes):
++  messages, edge_index, wigner, gout, tmessages, twigner, tgout = primals
++  tm0, _, tw0, tgout0, ttm, ttw, ttgout = tangents
++  diff_primals = (messages, wigner, gout, tmessages, twigner, tgout)
++  diff_tangents = tuple(
++    jnp.zeros_like(primal) if type(tangent) is ad.Zero else tangent
++    for primal, tangent in zip(
++      diff_primals, (tm0, tw0, tgout0, ttm, ttw, ttgout)
++    )
++  )
++
++  def func(messages_, wigner_, gout_, tmessages_, twigner_, tgout_):
++    return _edge_to_node_backward_jvp_impl(
++      messages_,
++      edge_index,
++      wigner_,
++      gout_,
++      tmessages_,
++      twigner_,
++      tgout_,
++      num_nodes=num_nodes,
++    )
++
++  return jax.jvp(func, diff_primals, diff_tangents)
++
++
++def _edge_to_node_backward_jvp_batching_rule(vals, dims, *, num_nodes):
++  messages, edge_index, wigner, gout, tmessages, twigner, tgout = vals
++  m_bdim, edge_bdim, w_bdim, gout_bdim, tm_bdim, tw_bdim, tgout_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(
++    dim is batching.not_mapped
++    for dim in (m_bdim, w_bdim, gout_bdim, tm_bdim, tw_bdim, tgout_bdim)
++  ):
++    return edge_to_node_backward_jvp_p.bind(
++      messages,
++      edge_index,
++      wigner,
++      gout,
++      tmessages,
++      twigner,
++      tgout,
++      num_nodes=num_nodes,
++    ), (batching.not_mapped, batching.not_mapped)
++
++  batch_size = _batch_size(
++    (messages, wigner, gout, tmessages, twigner, tgout),
++    (m_bdim, w_bdim, gout_bdim, tm_bdim, tw_bdim, tgout_bdim),
++  )
++  messages = _move_or_broadcast_batch(messages, m_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  gout = _move_or_broadcast_batch(gout, gout_bdim, batch_size)
++  tmessages = _move_or_broadcast_batch(tmessages, tm_bdim, batch_size)
++  twigner = _move_or_broadcast_batch(twigner, tw_bdim, batch_size)
++  tgout = _move_or_broadcast_batch(tgout, tgout_bdim, batch_size)
++  num_edges = messages.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  dmessages, dwigner = edge_to_node_backward_jvp_p.bind(
++    messages.reshape(batch_size * num_edges, *messages.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    gout.reshape(batch_size * num_nodes, *gout.shape[2:]),
++    tmessages.reshape(batch_size * num_edges, *tmessages.shape[2:]),
++    twigner.reshape(batch_size * num_edges, *twigner.shape[2:]),
++    tgout.reshape(batch_size * num_nodes, *tgout.shape[2:]),
++    num_nodes=batch_size * num_nodes,
++  )
++  return (
++    dmessages.reshape(batch_size, num_edges, *dmessages.shape[1:]),
++    dwigner.reshape(batch_size, num_edges, *dwigner.shape[1:]),
++  ), (0, 0)
++
++
++edge_to_node_backward_jvp_p.def_impl(_edge_to_node_backward_jvp_impl)
++edge_to_node_backward_jvp_p.def_abstract_eval(
++  _edge_to_node_backward_jvp_abstract_eval
++)
++mlir.register_lowering(
++  edge_to_node_backward_jvp_p,
++  mlir.lower_fun(_edge_to_node_backward_jvp_impl, multiple_results=True),
++)
++ad.primitive_jvps[edge_to_node_backward_jvp_p] = (
++  _edge_to_node_backward_jvp_jvp_rule
++)
++ad.primitive_transposes[edge_to_node_backward_jvp_p] = (
++  _edge_to_node_backward_jvp_transpose_rule
++)
++batching.primitive_batchers[edge_to_node_backward_jvp_p] = (
++  _edge_to_node_backward_jvp_batching_rule
++)
++
++
++edge_to_node_backward_p.def_impl(_edge_to_node_backward_impl)
++edge_to_node_backward_p.def_abstract_eval(_edge_to_node_backward_abstract_eval)
++mlir.register_lowering(
++  edge_to_node_backward_p,
++  mlir.lower_fun(_edge_to_node_backward_impl, multiple_results=True),
++)
++ad.primitive_jvps[edge_to_node_backward_p] = _edge_to_node_backward_jvp_rule
++ad.primitive_transposes[edge_to_node_backward_p] = (
++  _edge_to_node_backward_transpose_rule
++)
++batching.primitive_batchers[edge_to_node_backward_p] = (
++  _edge_to_node_backward_batching_rule
++)
++
++
++edge_to_node_p = core.Primitive('uma_edge_to_node')
++edge_to_node_p.multiple_results = False
++
++
++def _edge_to_node_abstract_eval(
++  messages_aval, edge_index_aval, w_aval, *, num_nodes
++):
++  del edge_index_aval, w_aval
++  return core.ShapedArray(
++    (num_nodes, COEFFICIENT_DIM, messages_aval.shape[-1]),
++    messages_aval.dtype,
++  )
++
++
++def _edge_to_node_jvp_rule(primals, tangents, *, num_nodes):
++  messages, edge_index, wigner = primals
++  tmessages, _, twigner = tangents
++  out = edge_to_node_p.bind(messages, edge_index, wigner, num_nodes=num_nodes)
++  tangent_out = edge_to_node_jvp_p.bind(
++    messages,
++    edge_index,
++    wigner,
++    _zero_tangent(tmessages, messages),
++    _zero_tangent(twigner, wigner),
++    num_nodes=num_nodes,
++  )
++  return out, tangent_out
++
++
++def _edge_to_node_transpose_rule(
++  cotangent, messages, edge_index, wigner, *, num_nodes
++):
++  if type(cotangent) is ad.Zero:
++    return None, None, None
++  grad_messages = None
++  grad_wigner = None
++  if ad.is_undefined_primal(messages):
++    dummy_messages = jnp.zeros(messages.aval.shape, dtype=cotangent.dtype)
++    grad_messages, _ = edge_to_node_backward_p.bind(
++      dummy_messages, edge_index, wigner, cotangent, num_nodes=num_nodes
++    )
++  if ad.is_undefined_primal(wigner):
++    dummy_w = jnp.zeros(wigner.aval.shape, dtype=cotangent.dtype)
++    _, grad_wigner = edge_to_node_backward_p.bind(
++      messages, edge_index, dummy_w, cotangent, num_nodes=num_nodes
++    )
++  return grad_messages, None, grad_wigner
++
++
++def _edge_to_node_batching_rule(vals, dims, *, num_nodes):
++  messages, edge_index, wigner = vals
++  m_bdim, edge_bdim, w_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(dim is batching.not_mapped for dim in (m_bdim, w_bdim)):
++    return (
++      edge_to_node_p.bind(messages, edge_index, wigner, num_nodes=num_nodes),
++      batching.not_mapped,
++    )
++  batch_size = _batch_size((messages, wigner), (m_bdim, w_bdim))
++  messages = _move_or_broadcast_batch(messages, m_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  num_edges = messages.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  out = edge_to_node_p.bind(
++    messages.reshape(batch_size * num_edges, *messages.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    num_nodes=batch_size * num_nodes,
++  )
++  return out.reshape(batch_size, num_nodes, *out.shape[1:]), 0
++
++
++edge_to_node_jvp_p = core.Primitive('uma_edge_to_node_jvp')
++edge_to_node_jvp_p.multiple_results = False
++
++
++def _edge_to_node_jvp_impl(
++  messages, edge_index, wigner, tmessages, twigner, *, num_nodes
++):
++  return edge_to_node_p.bind(
++    tmessages, edge_index, wigner, num_nodes=num_nodes
++  ) + edge_to_node_p.bind(messages, edge_index, twigner, num_nodes=num_nodes)
++
++
++def _edge_to_node_jvp_abstract_eval(
++  messages_aval, edge_index_aval, w_aval, tmessages_aval, tw_aval, *, num_nodes
++):
++  del edge_index_aval, w_aval, tmessages_aval, tw_aval
++  return core.ShapedArray(
++    (num_nodes, COEFFICIENT_DIM, messages_aval.shape[-1]),
++    messages_aval.dtype,
++  )
++
++
++def _edge_to_node_jvp_transpose_rule(
++  cotangent, messages, edge_index, wigner, tmessages, twigner, *, num_nodes
++):
++  if type(cotangent) is ad.Zero:
++    return None, None, None, None, None
++  messages = _zero_if_undefined(messages)
++  wigner = _zero_if_undefined(wigner)
++  grad_tmessages = None
++  grad_twigner = None
++  if ad.is_undefined_primal(tmessages):
++    grad_tmessages, _ = edge_to_node_backward_p.bind(
++      jnp.zeros(tmessages.aval.shape, dtype=cotangent.dtype),
++      edge_index,
++      wigner,
++      cotangent,
++      num_nodes=num_nodes,
++    )
++  if ad.is_undefined_primal(twigner):
++    _, grad_twigner = edge_to_node_backward_p.bind(
++      messages,
++      edge_index,
++      jnp.zeros(twigner.aval.shape, dtype=cotangent.dtype),
++      cotangent,
++      num_nodes=num_nodes,
++    )
++  return None, None, None, grad_tmessages, grad_twigner
++
++
++def _edge_to_node_jvp_jvp_rule(primals, tangents, *, num_nodes):
++  messages, edge_index, wigner, tmessages, twigner = primals
++  tm0, _, tw0, ttm, ttw = tangents
++  diff_primals = (messages, wigner, tmessages, twigner)
++  diff_tangents = tuple(
++    jnp.zeros_like(primal) if type(tangent) is ad.Zero else tangent
++    for primal, tangent in zip(diff_primals, (tm0, tw0, ttm, ttw))
++  )
++
++  def func(messages_, wigner_, tmessages_, twigner_):
++    return _edge_to_node_jvp_impl(
++      messages_, edge_index, wigner_, tmessages_, twigner_, num_nodes=num_nodes
++    )
++
++  return jax.jvp(func, diff_primals, diff_tangents)
++
++
++def _edge_to_node_jvp_batching_rule(vals, dims, *, num_nodes):
++  messages, edge_index, wigner, tmessages, twigner = vals
++  m_bdim, edge_bdim, w_bdim, tm_bdim, tw_bdim = dims
++  if edge_bdim is not batching.not_mapped:
++    raise NotImplementedError(
++      'Batched edge_index is not supported by UMA kernels.'
++    )
++  if all(
++    dim is batching.not_mapped for dim in (m_bdim, w_bdim, tm_bdim, tw_bdim)
++  ):
++    return edge_to_node_jvp_p.bind(
++      messages,
++      edge_index,
++      wigner,
++      tmessages,
++      twigner,
++      num_nodes=num_nodes,
++    ), batching.not_mapped
++
++  batch_size = _batch_size(
++    (messages, wigner, tmessages, twigner),
++    (m_bdim, w_bdim, tm_bdim, tw_bdim),
++  )
++  messages = _move_or_broadcast_batch(messages, m_bdim, batch_size)
++  wigner = _move_or_broadcast_batch(wigner, w_bdim, batch_size)
++  tmessages = _move_or_broadcast_batch(tmessages, tm_bdim, batch_size)
++  twigner = _move_or_broadcast_batch(twigner, tw_bdim, batch_size)
++  num_edges = messages.shape[1]
++  flat_edge_index = _batched_edge_index(edge_index, batch_size, num_nodes)
++  out = edge_to_node_jvp_p.bind(
++    messages.reshape(batch_size * num_edges, *messages.shape[2:]),
++    flat_edge_index,
++    wigner.reshape(batch_size * num_edges, *wigner.shape[2:]),
++    tmessages.reshape(batch_size * num_edges, *tmessages.shape[2:]),
++    twigner.reshape(batch_size * num_edges, *twigner.shape[2:]),
++    num_nodes=batch_size * num_nodes,
++  )
++  return out.reshape(batch_size, num_nodes, *out.shape[1:]), 0
++
++
++edge_to_node_jvp_p.def_impl(_edge_to_node_jvp_impl)
++edge_to_node_jvp_p.def_abstract_eval(_edge_to_node_jvp_abstract_eval)
++mlir.register_lowering(
++  edge_to_node_jvp_p,
++  mlir.lower_fun(_edge_to_node_jvp_impl, multiple_results=False),
++)
++ad.primitive_jvps[edge_to_node_jvp_p] = _edge_to_node_jvp_jvp_rule
++ad.primitive_transposes[edge_to_node_jvp_p] = _edge_to_node_jvp_transpose_rule
++batching.primitive_batchers[edge_to_node_jvp_p] = (
++  _edge_to_node_jvp_batching_rule
++)
++
++
++edge_to_node_p.def_impl(_edge_to_node_scatter)
++edge_to_node_p.def_abstract_eval(_edge_to_node_abstract_eval)
++mlir.register_lowering(
++  edge_to_node_p,
++  mlir.lower_fun(_edge_to_node_scatter, multiple_results=False),
++)
++ad.primitive_jvps[edge_to_node_p] = _edge_to_node_jvp_rule
++ad.primitive_transposes[edge_to_node_p] = _edge_to_node_transpose_rule
++batching.primitive_batchers[edge_to_node_p] = _edge_to_node_batching_rule
++
++
++def edge_to_node_wigner_inverse(
++  messages: jnp.ndarray,
++  edge_index: jnp.ndarray,
++  wigner_and_m_mapping_inv: jnp.ndarray,
++  num_nodes: int,
++) -> jnp.ndarray:
++  return edge_to_node_p.bind(
++    messages, edge_index, wigner_and_m_mapping_inv, num_nodes=num_nodes
++  )
+diff --git a/jax_md/_nn/uma/model.py b/jax_md/_nn/uma/model.py
+index 15a39eb9..70531566 100644
+--- a/jax_md/_nn/uma/model.py
++++ b/jax_md/_nn/uma/model.py
+@@ -58,6 +58,8 @@ class UMAConfig:
+       dataset_list: List of dataset names for dataset embedding.
+       use_dataset_embedding: Whether to use dataset embedding.
+       activation_checkpointing: Whether to use activation checkpointing (nn.remat).
++      use_kernels: Whether to use optimized GPU kernels for eligible UMA
++        operations.
+   """
+ 
+   max_num_elements: int = 100
+@@ -77,6 +79,7 @@ class UMAConfig:
+   dataset_list: List[str] | None = field(default=None)
+   use_dataset_embedding: bool = True
+   activation_checkpointing: bool = False
++  use_kernels: bool = False
+ 
+ 
+ def default_config() -> UMAConfig:
+@@ -98,6 +101,7 @@ def default_config() -> UMAConfig:
+     chg_spin_emb_type='pos_emb',
+     dataset_list=['oc20', 'omol', 'omat', 'odac', 'omc'],
+     use_dataset_embedding=True,
++    use_kernels=False,
+   )
+ 
+ 
+@@ -329,6 +333,7 @@ def __call__(
+         to_grid_mat=self.so3_grid_lmax_lmax.to_grid_mat,
+         from_grid_mat=self.so3_grid_lmax_lmax.from_grid_mat,
+         mapping_to_m=self.mapping.to_m,
++        use_kernels=cfg.use_kernels,
+         name=f'blocks_{i}',
+       )
+ 
+@@ -348,6 +353,8 @@ def __call__(
+         edge_index,
+         wigner_and_M_mapping,
+         wigner_and_M_mapping_inv,
++        wigner,
++        wigner_inv,
+         edge_envelope,
+         sys_node_embedding=sys_node_embedding,
+         node_offset=0,
+diff --git a/jax_md/_nn/uma/model_moe.py b/jax_md/_nn/uma/model_moe.py
+index 8f4e0f7d..3a357cbc 100644
+--- a/jax_md/_nn/uma/model_moe.py
++++ b/jax_md/_nn/uma/model_moe.py
+@@ -48,7 +48,7 @@
+ )
+ from jax_md._nn.uma.nn.layer_norm import get_normalization_layer
+ from jax_md._nn.uma.nn.activation import GateActivation, SeparableS2Activation
+-from jax_md._nn.uma.nn.mole import MOLELinear, RoutingMLP
++from jax_md._nn.uma.nn.mole import MOLELinear, MOLEWeights, RoutingMLP
+ 
+ 
+ @dataclass
+@@ -65,6 +65,8 @@ class UMAMoEConfig(UMAConfig):
+   routing_hidden_channels: int = 64
+   charge_balanced_channels: Tuple[int, ...] = ()
+   spin_balanced_channels: Tuple[int, ...] = ()
++  merged_mole: bool = False
++  so2_block_gemm: bool = False
+ 
+ 
+ def channel_range(channels: Tuple[int, ...]) -> Tuple[int, int]:
+@@ -100,6 +102,39 @@ def balance_channels(
+   return emb.at[:, 0, start_idx:end_idx].set(channels - corrections[batch])
+ 
+ 
++def merge_mole_params(params: Dict, expert_coefficients: jnp.ndarray) -> Dict:
++  """Return a params tree with MOLE expert weights pre-mixed.
++
++  This is intended for single-system inference. Any parameter named
++  ``weights`` with shape ``[num_experts, out, in]`` is replaced by the
++  corresponding mixed weight with shape ``[out, in]``.
++  """
++  coeff = expert_coefficients[0]
++  num_experts = coeff.shape[0]
++
++  def merge_leaf(key, value):
++    if (
++      key == 'weights'
++      and hasattr(value, 'ndim')
++      and value.ndim == 3
++      and value.shape[0] == num_experts
++    ):
++      return jnp.einsum('e,eoi->oi', coeff, value)
++    return value
++
++  def recurse(tree):
++    if isinstance(tree, dict):
++      return {k: recurse_value(k, v) for k, v in tree.items()}
++    return tree
++
++  def recurse_value(key, value):
++    if isinstance(value, dict):
++      return recurse(value)
++    return merge_leaf(key, value)
++
++  return recurse(params)
++
++
+ class SO2MConvMoE(nn.Module):
+   """SO(2) convolution for a single order m, with MoE expert weights.
+ 
+@@ -119,6 +154,42 @@ class SO2MConvMoE(nn.Module):
+   m_output_channels: int
+   lmax: int
+   num_experts: int
++  merged_mole: bool = False
++  so2_block_gemm: bool = False
++
++  def _block_gemm(
++    self,
++    x_m: jnp.ndarray,
++    weights: jnp.ndarray,
++    expert_coefficients: jnp.ndarray,
++  ) -> Tuple[jnp.ndarray, jnp.ndarray] | None:
++    """Apply SO2 complex multiply as one block GEMM."""
++    num_coefficients = self.lmax - self.m + 1
++    out_channels_half = self.m_output_channels * num_coefficients
++    if weights.ndim == 3:
++      if expert_coefficients.shape[0] != 1:
++        return None
++      weights = jnp.einsum('e,eoi->oi', expert_coefficients[0], weights)
++
++    w1, w2 = jnp.split(weights, 2, axis=0)
++    w_block = jnp.concatenate(
++      [
++        jnp.concatenate([w1, -w2], axis=1),
++        jnp.concatenate([w2, w1], axis=1),
++      ],
++      axis=0,
++    )
++    batch_size = x_m.shape[0]
++    x_cat = x_m.reshape(batch_size, -1)
++    out_cat = jnp.einsum('ni,oi->no', x_cat, w_block)
++    out = out_cat.reshape(batch_size, 2, out_channels_half)
++    x_m_r = out[:, 0, :].reshape(
++      batch_size, num_coefficients, self.m_output_channels
++    )
++    x_m_i = out[:, 1, :].reshape(
++      batch_size, num_coefficients, self.m_output_channels
++    )
++    return x_m_r, x_m_i
+ 
+   @nn.compact
+   def __call__(
+@@ -140,11 +211,27 @@ def __call__(
+     num_coefficients = self.lmax - self.m + 1
+     out_channels_half = self.m_output_channels * num_coefficients
+ 
++    can_block_gemm = self.so2_block_gemm and (
++      self.merged_mole or expert_coefficients.shape[0] == 1
++    )
++    if can_block_gemm:
++      weights = MOLEWeights(
++        num_experts=self.num_experts,
++        in_features=num_coefficients * self.sphere_channels,
++        out_features=2 * out_channels_half,
++        merged=self.merged_mole,
++        name='fc',
++      )()
++      block_out = self._block_gemm(x_m, weights, expert_coefficients)
++      if block_out is not None:
++        return block_out
++
+     fc = MOLELinear(
+       num_experts=self.num_experts,
+       in_features=num_coefficients * self.sphere_channels,
+       out_features=2 * out_channels_half,
+       use_bias=False,
++      merged=self.merged_mole,
+       name='fc',
+     )
+ 
+@@ -195,6 +282,8 @@ class SO2ConvolutionMoE(nn.Module):
+   internal_weights: bool = True
+   edge_channels_list: List[int] | None = None
+   extra_m0_output_channels: int | None = None
++  merged_mole: bool = False
++  so2_block_gemm: bool = False
+ 
+   @nn.compact
+   def __call__(
+@@ -223,6 +312,7 @@ def __call__(
+       in_features=num_channels_m0,
+       out_features=m0_output_channels,
+       use_bias=True,
++      merged=self.merged_mole,
+       name='fc_m0',
+     )
+ 
+@@ -243,21 +333,59 @@ def __call__(
+ 
+     num_edges = x.shape[0]
+ 
++    use_static_l2_layout = (
++      self.lmax == 2
++      and self.mmax == 2
++      and len(self.m_size) == 3
++      and self.m_size[0] == 3
++      and self.m_size[1] == 4
++      and self.m_size[2] == 2
++    )
++
++    so2_m_conv_modules = {}
++    for m in range(1, self.mmax + 1):
++      so2_m_conv_modules[m] = SO2MConvMoE(
++        m=m,
++        sphere_channels=self.sphere_channels,
++        m_output_channels=self.m_output_channels,
++        lmax=self.lmax,
++        num_experts=self.num_experts,
++        merged_mole=self.merged_mole,
++        so2_block_gemm=self.so2_block_gemm,
++        name=f'so2_m_conv_{m}',
++      )
++
+     if rad_func is not None:
+       x_edge_weights = rad_func(x_edge)
+-      x_edge_by_m = jnp.split(
+-        x_edge_weights,
+-        np.cumsum(edge_split_sizes[:-1]),
+-        axis=1,
+-      )
++    else:
++      x_edge_weights = None
++
++    if x_edge_weights is not None:
++      if use_static_l2_layout:
++        edge_m0 = num_channels_m0
++        edge_m1 = edge_m0 + 2 * self.sphere_channels
++        x_edge_by_m = [
++          x_edge_weights[:, :edge_m0],
++          x_edge_weights[:, edge_m0:edge_m1],
++          x_edge_weights[:, edge_m1:],
++        ]
++      else:
++        x_edge_by_m = jnp.split(
++          x_edge_weights,
++          np.cumsum(edge_split_sizes[:-1]),
++          axis=1,
++        )
+     else:
+       x_edge_by_m = [None] * (self.mmax + 1)
+ 
+-    x_by_m = jnp.split(
+-      x,
+-      np.cumsum(m_split_sizes[:-1]),
+-      axis=1,
+-    )
++    if use_static_l2_layout:
++      x_by_m = [x[:, :3], x[:, 3:7], x[:, 7:9]]
++    else:
++      x_by_m = jnp.split(
++        x,
++        np.cumsum(m_split_sizes[:-1]),
++        axis=1,
++      )
+ 
+     # m=0 with MoE
+     x_0 = x_by_m[0].reshape(num_edges, -1)
+@@ -277,15 +405,7 @@ def __call__(
+       if x_edge_by_m[m] is not None:
+         x_m = x_m * x_edge_by_m[m][:, None, :]
+ 
+-      so2_m_conv = SO2MConvMoE(
+-        m=m,
+-        sphere_channels=self.sphere_channels,
+-        m_output_channels=self.m_output_channels,
+-        lmax=self.lmax,
+-        num_experts=self.num_experts,
+-        name=f'so2_m_conv_{m}',
+-      )
+-      x_m_r, x_m_i = so2_m_conv(x_m, expert_coefficients, edge_batch)
++      x_m_r, x_m_i = so2_m_conv_modules[m](x_m, expert_coefficients, edge_batch)
+       out.append(x_m_r)
+       out.append(x_m_i)
+ 
+@@ -310,6 +430,9 @@ class EdgewiseMoE(nn.Module):
+   to_grid_mat: jnp.ndarray | None = None
+   from_grid_mat: jnp.ndarray | None = None
+   mapping_to_m: jnp.ndarray | None = None
++  use_kernels: bool = False
++  merged_mole: bool = False
++  so2_block_gemm: bool = False
+ 
+   @nn.compact
+   def __call__(
+@@ -319,6 +442,8 @@ def __call__(
+     edge_index,
+     wigner_and_M_mapping,
+     wigner_and_M_mapping_inv,
++    wigner,
++    wigner_inv,
+     edge_envelope,
+     expert_coefficients,
+     edge_batch,
+@@ -339,6 +464,8 @@ def __call__(
+       internal_weights=False,
+       edge_channels_list=self.edge_channels_list,
+       extra_m0_output_channels=extra_m0,
++      merged_mole=self.merged_mole,
++      so2_block_gemm=self.so2_block_gemm,
+       name='so2_conv_1',
+     )
+ 
+@@ -350,6 +477,8 @@ def __call__(
+       m_size=self.m_size,
+       num_experts=self.num_experts,
+       internal_weights=True,
++      merged_mole=self.merged_mole,
++      so2_block_gemm=self.so2_block_gemm,
+       name='so2_conv_2',
+     )
+ 
+@@ -371,23 +500,63 @@ def __call__(
+         name='act',
+       )
+ 
+-    x_source = x[edge_index[0]]
+-    x_target = x[edge_index[1]]
+-    x_message = jnp.concatenate([x_source, x_target], axis=2)
+-    x_message = jnp.einsum('nmj,njc->nmc', wigner_and_M_mapping, x_message)
++    # Gather source/target node features and rotate to edge-aligned frames.
++    if (
++      self.use_kernels
++      and wigner is not None
++      and wigner.shape[-2:] == (9, 9)
++      and x.shape[-2] == 9
++      and jax.default_backend() == 'gpu'
++    ):
++      from jax_md._nn.uma import kernels
++
++      x_message = kernels.node_to_edge_wigner_permute(x, edge_index, wigner)
++    else:
++      if x.shape[0] == 0:
++        return jnp.zeros_like(x)
++      sender = jnp.where(edge_index[0] >= 0, edge_index[0], x.shape[0])
++      receiver = jnp.where(edge_index[1] >= 0, edge_index[1], x.shape[0])
++      x_source = jnp.take(x, sender, axis=0, mode='fill', fill_value=0.0)
++      x_target = jnp.take(x, receiver, axis=0, mode='fill', fill_value=0.0)
++      x_message = jnp.concatenate([x_source, x_target], axis=2)
++      x_message = jnp.einsum('nmj,njc->nmc', wigner_and_M_mapping, x_message)
+ 
+     x_message, x_0_gating = so2_conv_1(
+       x_message, x_edge, expert_coefficients, edge_batch
+     )
++
+     x_message = act(x_0_gating, x_message)
++
+     x_message = so2_conv_2(x_message, x_edge, expert_coefficients, edge_batch)
+ 
++    # Apply envelope
+     x_message = x_message * edge_envelope
+-    x_message = jnp.einsum('njm,nmc->njc', wigner_and_M_mapping_inv, x_message)
+ 
+-    target_indices = edge_index[1] - node_offset
+-    new_embedding = jnp.zeros_like(x).at[target_indices].add(x_message)
+-    return new_embedding
++    # Rotate back to global frame and aggregate to target nodes
++    if (
++      self.use_kernels
++      and wigner_inv is not None
++      and wigner_inv.shape[-2:] == (9, 9)
++      and x_message.shape[-2] == 9
++      and jax.default_backend() == 'gpu'
++      and node_offset == 0
++    ):
++      from jax_md._nn.uma import kernels
++
++      return kernels.edge_to_node_wigner_inverse(
++        x_message, edge_index, wigner_inv, x.shape[0]
++      )
++    else:
++      edge_messages = jnp.einsum(
++        'njm,nmc->njc', wigner_and_M_mapping_inv, x_message
++      )
++      target_indices = edge_index[1] - node_offset
++      target_indices = jnp.where(
++        target_indices >= 0, target_indices, x.shape[0]
++      )
++      return (
++        jnp.zeros_like(x).at[target_indices].add(edge_messages, mode='drop')
++      )
+ 
+ 
+ class UMABlockMoE(nn.Module):
+@@ -406,6 +575,9 @@ class UMABlockMoE(nn.Module):
+   to_grid_mat: jnp.ndarray | None = None
+   from_grid_mat: jnp.ndarray | None = None
+   mapping_to_m: jnp.ndarray | None = None
++  use_kernels: bool = False
++  merged_mole: bool = False
++  so2_block_gemm: bool = False
+ 
+   @nn.compact
+   def __call__(
+@@ -415,6 +587,8 @@ def __call__(
+     edge_index,
+     wigner_and_M_mapping,
+     wigner_and_M_mapping_inv,
++    wigner,
++    wigner_inv,
+     edge_envelope,
+     expert_coefficients,
+     edge_batch,
+@@ -448,6 +622,9 @@ def __call__(
+       to_grid_mat=self.to_grid_mat,
+       from_grid_mat=self.from_grid_mat,
+       mapping_to_m=self.mapping_to_m,
++      use_kernels=self.use_kernels,
++      merged_mole=self.merged_mole,
++      so2_block_gemm=self.so2_block_gemm,
+       name='edge_wise',
+     )
+     x = edgewise(
+@@ -456,6 +633,8 @@ def __call__(
+       edge_index,
+       wigner_and_M_mapping,
+       wigner_and_M_mapping_inv,
++      wigner,
++      wigner_inv,
+       edge_envelope,
+       expert_coefficients,
+       edge_batch,
+@@ -586,45 +765,49 @@ def __call__(
+     mix_csd = nn.Dense(cfg.sphere_channels, name='mix_csd')
+     csd_mixed_emb = nn.silu(mix_csd(csd_cat))
+ 
+-    # === Routing MLP for MoE ===
+-    routing_input_parts = []
+-
+-    if cfg.use_composition_embedding:
+-      composition_emb_layer = nn.Embed(
+-        num_embeddings=cfg.max_num_elements,
+-        features=cfg.sphere_channels,
+-        name='composition_embedding',
++    if cfg.merged_mole:
++      expert_coefficients = jnp.zeros(
++        (charge.shape[0], cfg.num_experts), dtype=positions.dtype
+       )
+-      comp_per_atom = composition_emb_layer(atomic_numbers)
+-      # Mean-pool composition per system via index_reduce mean
+-      # include_self depends on model_version:
+-      #   v1.0: include_self=True -> mean = sum / (N + 1)
+-      #   v1.1+: include_self=False -> mean = sum / N
+-      num_systems = charge.shape[0]
+-      comp_sum = (
+-        jnp.zeros((num_systems, cfg.sphere_channels))
+-        .at[batch]
+-        .add(comp_per_atom)
+-      )
+-      atom_counts = jnp.zeros(num_systems).at[batch].add(1.0)
+-      if cfg.model_version < 1.05:
+-        composition = comp_sum / jnp.maximum(atom_counts[:, None] + 1.0, 1.0)
+-      else:
+-        composition = comp_sum / jnp.maximum(atom_counts[:, None], 1.0)
+-
+-      routing_input_parts.append(composition)
++    else:
++      # === Routing MLP for MoE ===
++      routing_input_parts = []
++
++      if cfg.use_composition_embedding:
++        composition_emb_layer = nn.Embed(
++          num_embeddings=cfg.max_num_elements,
++          features=cfg.sphere_channels,
++          name='composition_embedding',
++        )
++        comp_per_atom = composition_emb_layer(atomic_numbers)
++        # Mean-pool composition per system via index_reduce mean
++        # include_self depends on model_version:
++        #   v1.0: include_self=True -> mean = sum / (N + 1)
++        #   v1.1+: include_self=False -> mean = sum / N
++        num_systems = charge.shape[0]
++        comp_sum = (
++          jnp.zeros((num_systems, cfg.sphere_channels))
++          .at[batch]
++          .add(comp_per_atom)
++        )
++        atom_counts = jnp.zeros(num_systems).at[batch].add(1.0)
++        if cfg.model_version < 1.05:
++          composition = comp_sum / jnp.maximum(atom_counts[:, None] + 1.0, 1.0)
++        else:
++          composition = comp_sum / jnp.maximum(atom_counts[:, None], 1.0)
+ 
+-    routing_input_parts.append(csd_mixed_emb)
+-    routing_input = jnp.concatenate(routing_input_parts, axis=-1)
++        routing_input_parts.append(composition)
+ 
+-    routing_mlp = RoutingMLP(
+-      hidden_channels=cfg.routing_hidden_channels,
+-      num_experts=cfg.num_experts,
+-      dropout_rate=cfg.moe_dropout,
+-      name='routing_mlp',
+-    )
+-    expert_coefficients = routing_mlp(routing_input, deterministic=True)
++      routing_input_parts.append(csd_mixed_emb)
++      routing_input = jnp.concatenate(routing_input_parts, axis=-1)
+ 
++      routing_mlp = RoutingMLP(
++        hidden_channels=cfg.routing_hidden_channels,
++        num_experts=cfg.num_experts,
++        dropout_rate=cfg.moe_dropout,
++        name='routing_mlp',
++      )
++      expert_coefficients = routing_mlp(routing_input, deterministic=True)
+     # === Edge features ===
+     edge_distance = jnp.linalg.norm(edge_distance_vec, axis=-1)
+     dist_scaled = edge_distance / cfg.cutoff
+@@ -723,6 +906,9 @@ def __call__(
+         to_grid_mat=self.so3_grid_lmax_lmax.to_grid_mat,
+         from_grid_mat=self.so3_grid_lmax_lmax.from_grid_mat,
+         mapping_to_m=self.mapping.to_m,
++        use_kernels=cfg.use_kernels,
++        merged_mole=cfg.merged_mole,
++        so2_block_gemm=cfg.so2_block_gemm,
+         name=f'blocks_{i}',
+       )
+       x_message = block(
+@@ -731,6 +917,8 @@ def __call__(
+         edge_index,
+         wigner_and_M_mapping,
+         wigner_and_M_mapping_inv,
++        wigner,
++        wigner_inv,
+         edge_envelope,
+         expert_coefficients,
+         edge_batch,
+@@ -764,6 +952,7 @@ def __call__(
+     return {
+       'node_embedding': x_message,
+       'batch': batch,
++      'expert_coefficients': expert_coefficients,
+     }
+ 
+ 
+@@ -887,6 +1076,9 @@ def _load_native(model_name: str, head_dataset: str):
+       )
+     ),
+     spin_balanced_channels=tuple(cfg.get('spin_balanced_channels', ())),
++    merged_mole=cfg.get('merged_mole', False),
++    use_kernels=cfg.get('use_kernels', False),
++    so2_block_gemm=cfg.get('so2_block_gemm', False),
+   )
+ 
+   # Load params — unflatten from key/value pairs
+@@ -1070,6 +1262,9 @@ def load_pretrained(
+     model_version=float(get('model_version', 1.0)),
+     charge_balanced_channels=tuple(get('charge_balanced_channels', ())),
+     spin_balanced_channels=tuple(get('spin_balanced_channels', ())),
++    merged_mole=get('merged_mole', False),
++    use_kernels=bool(get('use_kernels', False)),
++    so2_block_gemm=get('so2_block_gemm', False),
+   )
+ 
+   _, params, metadata = convert_checkpoint(
+diff --git a/jax_md/_nn/uma/nn/embedding.py b/jax_md/_nn/uma/nn/embedding.py
+index 936a195d..4dbb8e1e 100644
+--- a/jax_md/_nn/uma/nn/embedding.py
++++ b/jax_md/_nn/uma/nn/embedding.py
+@@ -271,7 +271,6 @@ def __call__(
+         Updated node features, same shape as x.
+     """
+     m_0_num_coefficients = self.m_size[0]
+-    m_all_num_coefficients = sum(self.m_size)
+ 
+     # Radial MLP
+     edge_channels = list(self.edge_channels_list)
+@@ -284,17 +283,13 @@ def __call__(
+       -1, m_0_num_coefficients, self.sphere_channels
+     )
+ 
+-    # Pad to full size
+-    num_edges = x_edge_m_0.shape[0]
+-    x_edge_embedding = jnp.zeros(
+-      (num_edges, m_all_num_coefficients, self.sphere_channels)
++    # Only m=0 radial features are nonzero here, so multiply by the matching
++    # inverse-Wigner columns directly instead of padding to all coefficients.
++    x_edge_embedding = jnp.einsum(
++      'njk,nkc->njc',
++      wigner_inv[:, :, :m_0_num_coefficients],
++      x_edge_m_0,
+     )
+-    x_edge_embedding = x_edge_embedding.at[:, :m_0_num_coefficients, :].set(
+-      x_edge_m_0
+-    )
+-
+-    # Apply inverse Wigner rotation
+-    x_edge_embedding = jnp.einsum('njk,nkc->njc', wigner_inv, x_edge_embedding)
+ 
+     # Apply envelope
+     x_edge_embedding = x_edge_embedding * edge_envelope
+diff --git a/jax_md/_nn/uma/nn/mole.py b/jax_md/_nn/uma/nn/mole.py
+index 916cbeef..091ac9bb 100644
+--- a/jax_md/_nn/uma/nn/mole.py
++++ b/jax_md/_nn/uma/nn/mole.py
+@@ -4,8 +4,6 @@
+   1. Routing MLP: system features -> mixing coefficients [num_systems, num_experts]
+   2. Weight mixing: einsum('eoi,be->boi', expert_weights, coefficients)
+   3. Application: each atom uses its system's mixed weight matrix
+-
+-This is the JAX equivalent of fairchem's MOLE/MOLEDGL modules.
+ """
+ 
+ from __future__ import annotations
+@@ -17,6 +15,31 @@
+ import jax.numpy as jnp
+ 
+ 
++class MOLEWeights(nn.Module):
++  """MOLE weight parameter container with the same path as MOLELinear."""
++
++  num_experts: int
++  in_features: int
++  out_features: int
++  merged: bool = False
++
++  @nn.compact
++  def __call__(self) -> jnp.ndarray:
++    bound = math.sqrt(1.0 / self.in_features)
++    weight_shape = (
++      (self.out_features, self.in_features)
++      if self.merged
++      else (self.num_experts, self.out_features, self.in_features)
++    )
++    return self.param(
++      'weights',
++      lambda key, shape: jax.random.uniform(
++        key, shape, minval=-bound, maxval=bound
++      ),
++      weight_shape,
++    )
++
++
+ class MOLELinear(nn.Module):
+   """Mixture-of-Linear-Experts layer.
+ 
+@@ -35,6 +58,8 @@ class MOLELinear(nn.Module):
+   in_features: int
+   out_features: int
+   use_bias: bool = True
++  merged: bool = False
++  assume_equal_contiguous_batches: bool = False
+ 
+   @nn.compact
+   def __call__(
+@@ -54,53 +79,78 @@ def __call__(
+         Output tensor, shape [N, ..., out_features].
+     """
+     bound = math.sqrt(1.0 / self.in_features)
+-
++    weight_shape = (
++      (self.out_features, self.in_features)
++      if self.merged
++      else (self.num_experts, self.out_features, self.in_features)
++    )
+     weights = self.param(
+       'weights',
+       lambda key, shape: jax.random.uniform(
+         key, shape, minval=-bound, maxval=bound
+       ),
+-      (self.num_experts, self.out_features, self.in_features),
++      weight_shape,
+     )
+ 
+-    # Mix experts per system: [E, O, I] x [B, E] -> [B, O, I]
+-    mixed_weights = jnp.einsum('eoi,be->boi', weights, expert_coefficients)
+-
+-    # Avoid materializing [N, O, I] per-item weights
+-    if x.ndim == 2:
+-      if mixed_weights.shape[0] == 1:
+-        out = jnp.einsum('ni,oi->no', x, mixed_weights[0])
++    if self.merged:
++      if x.ndim == 2:
++        out = jnp.einsum('ni,oi->no', x, weights)
++      elif x.ndim == 3:
++        out = jnp.einsum('nci,oi->nco', x, weights)
+       else:
+-
+-        def apply_system(acc, inputs):
+-          system_weights, system_idx = inputs
+-          system_out = jnp.einsum('ni,oi->no', x, system_weights)
+-          mask = batch_indices == system_idx
+-          return acc + jnp.where(mask[:, None], system_out, 0.0), None
+-
+-        init = jnp.zeros(x.shape[:-1] + (self.out_features,), dtype=x.dtype)
+-        system_ids = jnp.arange(
+-          mixed_weights.shape[0], dtype=batch_indices.dtype
+-        )
+-        out, _ = jax.lax.scan(apply_system, init, (mixed_weights, system_ids))
+-    elif x.ndim == 3:
+-      if mixed_weights.shape[0] == 1:
+-        out = jnp.einsum('nci,oi->nco', x, mixed_weights[0])
++        raise ValueError(f'MOLELinear: unsupported input ndim={x.ndim}')
++    elif expert_coefficients.shape[0] == 1:
++      mixed_weight = jnp.einsum('e,eoi->oi', expert_coefficients[0], weights)
++      if x.ndim == 2:
++        out = jnp.einsum('ni,oi->no', x, mixed_weight)
++      elif x.ndim == 3:
++        out = jnp.einsum('nci,oi->nco', x, mixed_weight)
+       else:
+-
+-        def apply_system(acc, inputs):
+-          system_weights, system_idx = inputs
+-          system_out = jnp.einsum('nci,oi->nco', x, system_weights)
+-          mask = batch_indices == system_idx
+-          return acc + jnp.where(mask[:, None, None], system_out, 0.0), None
++        raise ValueError(f'MOLELinear: unsupported input ndim={x.ndim}')
++    else:
++      # Mix experts per system: [E, O, I] x [B, E] -> [B, O, I].
++      mixed_weights = jnp.einsum('eoi,be->boi', weights, expert_coefficients)
++      B = mixed_weights.shape[0]
++      N = x.shape[0]
++
++      if self.assume_equal_contiguous_batches and N % B == 0:
++        # The caller guarantees batch_indices are [0,0,...,1,1,...] with exactly N/B rows per system.
++        R = N // B
++        if x.ndim == 2:
++          out = jnp.einsum(
++            'bni,boi->bno', x.reshape(B, R, -1), mixed_weights
++          ).reshape(N, -1)
++        elif x.ndim == 3:
++          C = x.shape[1]
++          out = jnp.einsum(
++            'bnci,boi->bnco', x.reshape(B, R, C, -1), mixed_weights
++          ).reshape(N, C, -1)
++        else:
++          raise ValueError(f'MOLELinear: unsupported input ndim={x.ndim}')
++      else:
++        # General multi-system case: per-system matmul via scan. Each step
++        # multiplies all rows by one system's weight and masks the rows that
++        # belong to that system. This handles uneven and interleaved batches.
++        if x.ndim == 2:
++
++          def apply_system(acc, inputs):
++            system_weights, system_idx = inputs
++            system_out = jnp.einsum('ni,oi->no', x, system_weights)
++            mask = batch_indices == system_idx
++            return acc + jnp.where(mask[:, None], system_out, 0.0), None
++        elif x.ndim == 3:
++
++          def apply_system(acc, inputs):
++            system_weights, system_idx = inputs
++            system_out = jnp.einsum('nci,oi->nco', x, system_weights)
++            mask = batch_indices == system_idx
++            return acc + jnp.where(mask[:, None, None], system_out, 0.0), None
++        else:
++          raise ValueError(f'MOLELinear: unsupported input ndim={x.ndim}')
+ 
+         init = jnp.zeros(x.shape[:-1] + (self.out_features,), dtype=x.dtype)
+-        system_ids = jnp.arange(
+-          mixed_weights.shape[0], dtype=batch_indices.dtype
+-        )
++        system_ids = jnp.arange(B, dtype=batch_indices.dtype)
+         out, _ = jax.lax.scan(apply_system, init, (mixed_weights, system_ids))
+-    else:
+-      raise ValueError(f'MOLELinear: unsupported input ndim={x.ndim}')
+ 
+     if self.use_bias:
+       bias = self.param(
+diff --git a/jax_md/_nn/uma/pretrained.py b/jax_md/_nn/uma/pretrained.py
+index be466c83..0fe5b67a 100644
+--- a/jax_md/_nn/uma/pretrained.py
++++ b/jax_md/_nn/uma/pretrained.py
+@@ -113,6 +113,166 @@ def download_pretrained(
+   )
+ 
+ 
++def load_atom_references(
++  model_name: str,
++  dataset: str = 'omat',
++  cache_dir: str | None = None,
++) -> jnp.ndarray:
++  """Load UMA isolated atom references from FairChem's external ref file."""
++  try:
++    from huggingface_hub import hf_hub_download
++  except ImportError:
++    raise ImportError(
++      'huggingface_hub is required to download UMA atom references. '
++      'Install with: pip install huggingface_hub'
++    )
++  try:
++    import yaml
++  except ImportError:
++    raise ImportError(
++      'pyyaml is required to parse UMA atom references. '
++      'Install with: pip install pyyaml'
++    )
++
++  if model_name not in PRETRAINED_MODELS:
++    raise ValueError(
++      'UMA atom references can be loaded automatically only for known '
++      f'pretrained model names, got {model_name!r}. Pass atom_refs explicitly '
++      'when using a local checkpoint path.'
++    )
++
++  if cache_dir is None:
++    cache_dir = os.path.expanduser('~/.cache/fairchem')
++
++  path = hf_hub_download(
++    filename='iso_atom_elem_refs.yaml',
++    repo_id=PRETRAINED_MODELS[model_name]['repo_id'],
++    subfolder='references',
++    cache_dir=cache_dir,
++  )
++
++  with open(path) as f:
++    refs = yaml.safe_load(f)
++
++  key = f'{dataset}_elem_refs'
++  if key not in refs:
++    raise ValueError(
++      f'Missing {key!r} in UMA atom references. Available keys: '
++      f'{sorted(k for k in refs if k.endswith("_elem_refs"))}'
++    )
++  values = refs[key]
++  if not isinstance(values, (list, tuple)):
++    raise ValueError(
++      f'UMA atom references for {dataset!r} are not a flat element array. '
++      'Pass atom_refs explicitly for this dataset.'
++    )
++  return jnp.asarray(values, dtype=jnp.float32)
++
++
++def _config_get(config: Any, key: str, default: Any = None) -> Any:
++  if config is None:
++    return default
++  if isinstance(config, dict):
++    return config.get(key, default)
++  get = getattr(config, 'get', None)
++  if callable(get):
++    try:
++      return get(key, default)
++    except TypeError:
++      pass
++  if hasattr(config, key):
++    return getattr(config, key)
++  try:
++    return config[key]
++  except (KeyError, IndexError, TypeError):
++    return default
++
++
++def _config_list(value: Any) -> list[Any]:
++  if value is None:
++    return []
++  if isinstance(value, str):
++    return [value]
++  try:
++    return list(value)
++  except TypeError:
++    return [value]
++
++
++def _config_float(value: Any, default: float) -> float:
++  if value is None:
++    return default
++  if hasattr(value, 'detach'):
++    value = value.detach().cpu().numpy()
++  array = np.asarray(value)
++  if array.size == 0:
++    return default
++  return float(array.reshape(-1)[0])
++
++
++def _extract_element_references(element_references: Any) -> jnp.ndarray | None:
++  if element_references is None:
++    return None
++
++  values = _config_get(element_references, 'element_references')
++  args = _config_get(values, '_args_')
++  if args is not None and len(_config_list(args)) > 0:
++    values = _config_list(args)[0]
++
++  if hasattr(values, 'detach'):
++    values = values.detach().cpu().numpy()
++  if values is None:
++    return None
++
++  return jnp.asarray(values, dtype=jnp.float32)
++
++
++def extract_energy_correction(
++  tasks_config: Any,
++  dataset: str = 'omat',
++) -> Dict[str, Any]:
++  """Extract FairChem energy normalizer and element references from tasks."""
++  energy_task = None
++  expected_name = f'{dataset}_energy'
++  for task in tasks_config:
++    name = _config_get(task, 'name')
++    prop = _config_get(task, 'property')
++    datasets = _config_list(_config_get(task, 'datasets'))
++    if name == expected_name or (prop == 'energy' and dataset in datasets):
++      energy_task = task
++      break
++
++  if energy_task is None:
++    raise ValueError(f'No energy task found for dataset {dataset!r}.')
++
++  normalizer = _config_get(energy_task, 'normalizer')
++  mean = _config_float(_config_get(normalizer, 'mean'), 0.0)
++  rmsd = _config_float(_config_get(normalizer, 'rmsd'), 1.0)
++  element_refs = _extract_element_references(
++    _config_get(energy_task, 'element_references')
++  )
++
++  return {
++    'mean': jnp.asarray(mean, dtype=jnp.float32),
++    'rmsd': jnp.asarray(rmsd, dtype=jnp.float32),
++    'element_refs': element_refs,
++  }
++
++
++def load_energy_correction(
++  model_name_or_path: str,
++  dataset: str = 'omat',
++  cache_dir: str | None = None,
++) -> Dict[str, Any]:
++  """Load FairChem task-level energy correction from a UMA checkpoint."""
++  checkpoint_path = model_name_or_path
++  if model_name_or_path in PRETRAINED_MODELS:
++    checkpoint_path = download_pretrained(model_name_or_path, cache_dir)
++
++  ckpt = load_checkpoint_raw(checkpoint_path)
++  return extract_energy_correction(ckpt.tasks_config, dataset)
++
++
+ def load_checkpoint_raw(checkpoint_path: str) -> Any:
+   """Load a FairChem UMA checkpoint without requiring fairchem installed.
+ 
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index 31752745..2a51bfdc 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -27,7 +27,16 @@
+ from jax.tree_util import tree_map
+ from jax import vmap
+ from jax.scipy.special import erfc  # error function
+-from jax_md import space, smap, partition, nn, quantity, interpolate, util
++from jax_md import (
++  custom_partition,
++  space,
++  smap,
++  partition,
++  nn,
++  quantity,
++  interpolate,
++  util,
++)
+ 
+ from ml_collections import ConfigDict
+ 
+@@ -2514,11 +2523,17 @@ def uma_neighbor_list(
+   atoms=None,
+   checkpoint_path=None,
+   head_type='mlp',
+-  neighbor_list_fn: Callable = partition.neighbor_list,
++  neighbor_list_fn: Callable = custom_partition.neighbor_list_multi_image,
+   featurizer_fn: Callable | None = None,
+   charge=None,
+   spin=None,
+   dataset_idx=None,
++  head_dataset='omat',
++  apply_atom_refs=True,
++  atom_refs=None,
++  use_kernels=True,
++  merge_mole=None,
++  so2_block_gemm=None,
+   **nl_kwargs,
+ ):
+   """Convenience wrapper to compute UMA energy using a neighbor list.
+@@ -2536,14 +2551,28 @@ def uma_neighbor_list(
+         If provided, ``init_fn`` returns the converted weights instead of
+         random initialization.
+     head_type: Energy head type: ``'mlp'`` or ``'linear'``.
+-    neighbor_list_fn: Neighbor list constructor (default: ``partition.neighbor_list``).
++    neighbor_list_fn: Neighbor list constructor (default:
++        ``custom_partition.neighbor_list_multi_image``).
+     featurizer_fn: Function to create a UMA featurizer. Defaults to
+-        ``uma_featurizer`` for standard MIC neighbor lists. When using
+-        ``custom_partition.neighbor_list_multi_image``, pass
+-        ``uma_multi_image_featurizer`` explicitly.
++        ``uma_multi_image_featurizer`` for multi-image neighbor lists. When
++        using ``partition.neighbor_list``, pass ``uma_featurizer`` explicitly.
+     charge: System charge(s), shape ``[num_systems]`` (default: ``[0]``).
+     spin: System spin(s), shape ``[num_systems]`` (default: ``[0]``).
+     dataset_idx: Integer dataset index, shape ``[num_systems]`` (default: ``[0]``).
++    head_dataset: Dataset name for pretrained MoE energy head selection.
++    apply_atom_refs: Whether to apply checkpoint task normalizer and element
++        references for pretrained checkpoints. Defaults to True when refs are
++        available.
++    atom_refs: Optional per-element task reference array, or a dictionary with
++        ``element_refs``, ``mean``, and ``rmsd`` values. If only an array is
++        provided, ``mean=0`` and ``rmsd=1`` are used.
++    use_kernels: UMA kernel toggle. True enables eligible JAX-MD UMA Pallas
++        kernels.
++    merge_mole: If True, pre-mix MoE expert weights for single-system
++        inference and skip runtime routing. If None, disabled by default.
++    so2_block_gemm: If True, use a block GEMM formulation for SO2 m>0
++        convolutions. If None, enabled for pretrained MoE checkpoints and
++        disabled otherwise.
+     **nl_kwargs: Additional kwargs for neighbor list (e.g., ``fractional_coordinates``).
+ 
+   Returns:
+@@ -2564,7 +2593,9 @@ def uma_neighbor_list(
+   if checkpoint_path is not None:
+     from jax_md._nn.uma.model_moe import load_pretrained
+ 
+-    moe_config, backbone_params, head_params = load_pretrained(checkpoint_path)
++    moe_config, backbone_params, head_params = load_pretrained(
++      checkpoint_path, head_dataset=head_dataset
++    )
+     cfg = moe_config
+     is_moe = True
+     pretrained_params = {
+@@ -2579,11 +2610,85 @@ def uma_neighbor_list(
+   # If callers provide a preloaded MoE config/params pair, use the MoE
+   # backbone even when checkpoint_path is not passed here.
+   is_moe = is_moe or hasattr(cfg, 'num_experts')
++  auto_moe_optimizations = checkpoint_path is not None and is_moe
++  merge_mole = False if merge_mole is None else bool(merge_mole)
++  so2_block_gemm = (
++    auto_moe_optimizations if so2_block_gemm is None else bool(so2_block_gemm)
++  )
++
++  if use_kernels is not None:
++    from dataclasses import replace
++
++    cfg = replace(cfg, use_kernels=bool(use_kernels))
++  if so2_block_gemm:
++    if not is_moe:
++      raise ValueError('so2_block_gemm=True requires a UMA MoE config.')
++    from dataclasses import replace
++
++    cfg = replace(cfg, so2_block_gemm=True)
++
++  if merge_mole and not is_moe:
++    raise ValueError('merge_mole=True requires a UMA MoE checkpoint/config.')
++  runtime_cfg = cfg
++  if merge_mole:
++    from dataclasses import replace
++
++    runtime_cfg = replace(cfg, merged_mole=True)
++
++  resolved_atom_refs = None
++  energy_mean = None
++  energy_rmsd = None
++  should_apply_atom_refs = apply_atom_refs and (
++    checkpoint_path is not None or atom_refs is not None
++  )
++  if should_apply_atom_refs:
++    if atom_refs is None:
++      from jax_md._nn.uma.pretrained import load_energy_correction
++
++      correction = None
++      if checkpoint_path is not None:
++        try:
++          correction = load_energy_correction(
++            checkpoint_path, dataset=head_dataset
++          )
++        except Exception as exc:
++          raise ValueError(
++            'Failed to load UMA atom references or energy normalizer for '
++            f'{checkpoint_path!r}. Pass apply_atom_refs=False to use raw '
++            'checkpoint energies, or pass atom_refs explicitly.'
++          ) from exc
++      if correction is not None:
++        atom_refs = correction.get('element_refs')
++        energy_mean = correction.get('mean')
++        energy_rmsd = correction.get('rmsd')
++      else:
++        energy_mean = 0.0
++        energy_rmsd = 1.0
++    elif isinstance(atom_refs, dict):
++      correction = atom_refs
++      atom_refs = correction.get('element_refs', correction.get('atom_refs'))
++      energy_mean = correction.get('mean', 0.0)
++      energy_rmsd = correction.get('rmsd', 1.0)
++    else:
++      energy_mean = 0.0
++      energy_rmsd = 1.0
++    if atom_refs is not None:
++      resolved_atom_refs = jnp.asarray(atom_refs, dtype=jnp.float32)
++    energy_mean = jnp.asarray(energy_mean, dtype=jnp.float32)
++    energy_rmsd = jnp.asarray(energy_rmsd, dtype=jnp.float32)
++
++  # Build neighbor list. The UMA default uses explicit periodic images and
++  # expects a box matrix; keep vector boxes working for common orthorhombic use.
++  neighbor_box = box
++  if neighbor_list_fn is custom_partition.neighbor_list_multi_image:
++    neighbor_box = jnp.asarray(box)
++    if neighbor_box.ndim == 1:
++      neighbor_box = jnp.diag(neighbor_box)
++    nl_kwargs.setdefault('fractional_coordinates', False)
+ 
+-  # Build neighbor list
+   neighbor_fn = neighbor_list_fn(
+     displacement_fn,
+-    box,
++    neighbor_box,
+     cfg.cutoff,
+     format=partition.Sparse,
+     **nl_kwargs,
+@@ -2598,6 +2703,9 @@ def uma_neighbor_list(
+   class UMAEnergyModel(flax_nn.Module):
+     config: object
+     use_moe: bool = False
++    atom_refs: object = None
++    energy_mean: object = None
++    energy_rmsd: object = None
+ 
+     @flax_nn.compact
+     def __call__(self, features):
+@@ -2632,9 +2740,35 @@ def __call__(self, features):
+ 
+       num_systems = features['charge'].shape[0]
+       result = head(emb['node_embedding'], features['batch'], num_systems)
+-      return result['energy']
+-
+-  model = UMAEnergyModel(config=cfg, use_moe=is_moe)
++      energy = result['energy']
++      if self.energy_rmsd is not None:
++        energy = energy * self.energy_rmsd.astype(energy.dtype)
++        energy = energy + self.energy_mean.astype(energy.dtype)
++      if self.atom_refs is not None:
++        ref_shift = (
++          jnp.zeros((num_systems,), dtype=energy.dtype)
++          .at[features['batch']]
++          .add(self.atom_refs[features['atomic_numbers']].astype(energy.dtype))
++        )
++        energy = energy + ref_shift
++      return energy
++
++  model = UMAEnergyModel(
++    config=runtime_cfg,
++    use_moe=is_moe,
++    atom_refs=resolved_atom_refs,
++    energy_mean=energy_mean,
++    energy_rmsd=energy_rmsd,
++  )
++  init_model = model
++  if merge_mole:
++    init_model = UMAEnergyModel(
++      config=cfg,
++      use_moe=is_moe,
++      atom_refs=resolved_atom_refs,
++      energy_mean=energy_mean,
++      energy_rmsd=energy_rmsd,
++    )
+ 
+   def init_fn(key, position, neighbor, **kwargs):
+     _atoms = kwargs.pop('atoms', atoms)
+@@ -2656,8 +2790,32 @@ def init_fn(key, position, neighbor, **kwargs):
+     )
+ 
+     if pretrained_params is not None:
+-      return pretrained_params
+-    return model.init(key, features)
++      result_params = pretrained_params
++    else:
++      result_params = init_model.init(key, features)
++
++    if merge_mole:
++      if features['charge'].shape[0] != 1:
++        raise ValueError('merge_mole=True supports only one system.')
++      from jax_md._nn.uma.model_moe import UMAMoEBackbone, merge_mole_params
++
++      routing_backbone = UMAMoEBackbone(config=cfg)
++      routing_out = routing_backbone.apply(
++        {'params': result_params['params']['backbone']},
++        features['positions'],
++        features['atomic_numbers'],
++        features['batch'],
++        features['edge_index'],
++        features['edge_distance_vec'],
++        features['charge'],
++        features['spin'],
++        features.get('dataset_idx'),
++      )
++      result_params = merge_mole_params(
++        result_params, routing_out['expert_coefficients']
++      )
++
++    return result_params
+ 
+   def energy_fn(params, position, neighbor, **kwargs):
+     _atoms = kwargs.pop('atoms', atoms)
+@@ -2677,7 +2835,6 @@ def energy_fn(params, position, neighbor, **kwargs):
+       dataset_idx=_dataset_idx,
+       **kwargs,
+     )
+-    # Sum over systems (typically 1 for MD)
+     return model.apply(params, features).sum()
+ 
+   return neighbor_fn, init_fn, energy_fn
+diff --git a/tests/uma_test.py b/tests/uma_test.py
+index 274e7161..5f918f53 100644
+--- a/tests/uma_test.py
++++ b/tests/uma_test.py
+@@ -4,6 +4,7 @@
+ """
+ 
+ import os
++from dataclasses import replace
+ 
+ from absl.testing import absltest
+ 
+@@ -11,13 +12,22 @@
+ import jax.numpy as jnp
+ import numpy as np
+ 
++from jax_md import energy
++from jax_md import space
+ from jax_md import test_util
+ from jax_md._nn.uma.model import UMABackbone, UMAConfig
++from jax_md._nn.uma.model_moe import (
++  SO2MConvMoE,
++  UMAMoEConfig,
++  merge_mole_params,
++)
+ from jax_md._nn.uma.heads import MLPEnergyHead, LinearForceHead
++from jax_md._nn.uma.nn.mole import MOLELinear
+ from jax_md._nn.uma.nn.so2_layers import SO2MConv
+ from jax_md._nn.uma.nn.so3_layers import SO3Linear
+ from jax_md._nn.uma.nn.radial import PolynomialEnvelope, RadialMLP
+ from jax_md._nn.uma.nn.layer_norm import EquivariantRMSNorm
++from jax_md._nn.uma.pretrained import extract_energy_correction
+ from jax_md._nn.uma.nn.embedding import (
+   DatasetEmbedding,
+   dataset_names_to_indices,
+@@ -34,6 +44,9 @@
+ )
+ 
+ 
++TEST_TOL = 1e-12
++
++
+ def create_test_data(num_atoms=10, num_systems=2, cutoff=5.0, seed=42):
+   """Create synthetic test data for UMA model testing."""
+   np.random.seed(seed)
+@@ -133,7 +146,7 @@ def test_wigner_identity(self):
+     gamma = jnp.zeros(1)
+     wigner = eulers_to_wigner((alpha, beta, gamma), 0, 2, Jd_list)
+     expected = jnp.eye(9).reshape(1, 9, 9)
+-    self.assertTrue(jnp.allclose(wigner, expected, atol=1e-5))
++    self.assertAllClose(wigner, expected, atol=TEST_TOL, rtol=TEST_TOL)
+ 
+   def test_wigner_orthogonal(self):
+     """Wigner D-matrices should be orthogonal (D @ D^T = I)."""
+@@ -144,7 +157,7 @@ def test_wigner_orthogonal(self):
+     wigner = eulers_to_wigner((alpha, beta, gamma), 0, 2, Jd_list)
+     product = jnp.einsum('bij,bkj->bik', wigner, wigner)
+     expected = jnp.eye(9).reshape(1, 9, 9)
+-    self.assertTrue(jnp.allclose(product, expected, atol=1e-5))
++    self.assertAllClose(product, expected, atol=TEST_TOL, rtol=TEST_TOL)
+ 
+ 
+ class SO2MConvTest(test_util.JAXMDTestCase):
+@@ -174,6 +187,186 @@ def test_so2mconv_jit(self):
+     self.assertTrue(jnp.all(jnp.isfinite(x_r)))
+ 
+ 
++def manual_mole_linear(params, x, expert_coefficients, batch_indices, use_bias):
++  weights = params['params']['weights']
++  mixed_weights = jnp.einsum('eoi,be->boi', weights, expert_coefficients)
++  per_item_weights = mixed_weights[batch_indices]
++  if x.ndim == 2:
++    out = jnp.einsum('ni,noi->no', x, per_item_weights)
++  else:
++    out = jnp.einsum('nci,noi->nco', x, per_item_weights)
++  if use_bias:
++    out = out + params['params']['bias']
++  return out
++
++
++class MOLEInferencePathTest(test_util.JAXMDTestCase):
++  """Tests for UMA MoE inference helpers."""
++
++  def test_mole_linear_inference_paths_match_reference(self):
++    key = jax.random.PRNGKey(12)
++    keys = jax.random.split(key, 6)
++    cases = [
++      (
++        jax.random.normal(keys[0], (7, 5)),
++        jax.nn.softmax(jax.random.normal(keys[1], (1, 4)), axis=-1),
++        jnp.zeros((7,), dtype=jnp.int32),
++        True,
++      ),
++      (
++        jax.random.normal(keys[2], (8, 2, 5)),
++        jax.nn.softmax(jax.random.normal(keys[3], (2, 4)), axis=-1),
++        jnp.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=jnp.int32),
++        False,
++      ),
++    ]
++    for x, coefficients, batch_indices, use_bias in cases:
++      layer = MOLELinear(4, 5, 6, use_bias=use_bias)
++      params = layer.init(keys[4], x, coefficients, batch_indices)
++      actual = layer.apply(params, x, coefficients, batch_indices)
++      expected = manual_mole_linear(
++        params, x, coefficients, batch_indices, use_bias
++      )
++      self.assertAllClose(actual, expected, atol=TEST_TOL, rtol=TEST_TOL)
++
++  def test_mole_linear_accepts_merged_weights(self):
++    key = jax.random.PRNGKey(14)
++    keys = jax.random.split(key, 4)
++    x = jax.random.normal(keys[0], (6, 5))
++    coefficients = jax.nn.softmax(jax.random.normal(keys[1], (1, 4)), axis=-1)
++    batch_indices = jnp.zeros((6,), dtype=jnp.int32)
++    layer = MOLELinear(4, 5, 6, use_bias=True)
++    params = layer.init(keys[2], x, coefficients, batch_indices)
++    expected = layer.apply(params, x, coefficients, batch_indices)
++    merged_params = {
++      'params': {
++        'weights': jnp.einsum(
++          'e,eoi->oi', coefficients[0], params['params']['weights']
++        ),
++        'bias': params['params']['bias'],
++      }
++    }
++    merged_layer = MOLELinear(4, 5, 6, use_bias=True, merged=True)
++    actual = merged_layer.apply(merged_params, x, coefficients, batch_indices)
++    self.assertAllClose(actual, expected, atol=TEST_TOL, rtol=TEST_TOL)
++
++  def test_so2_m_conv_block_gemm_matches_reference(self):
++    key = jax.random.PRNGKey(16)
++    keys = jax.random.split(key, 4)
++    x_m = jax.random.normal(keys[0], (5, 2, 6))
++    coefficients = jax.nn.softmax(jax.random.normal(keys[1], (1, 2)), axis=-1)
++    edge_batch = jnp.zeros((5,), dtype=jnp.int32)
++    ref = SO2MConvMoE(
++      m=1,
++      sphere_channels=3,
++      m_output_channels=4,
++      lmax=2,
++      num_experts=2,
++      so2_block_gemm=False,
++    )
++    block = SO2MConvMoE(
++      m=1,
++      sphere_channels=3,
++      m_output_channels=4,
++      lmax=2,
++      num_experts=2,
++      so2_block_gemm=True,
++    )
++    params = ref.init(keys[2], x_m, coefficients, edge_batch)
++    ref_out = ref.apply(params, x_m, coefficients, edge_batch)
++    block_out = block.apply(params, x_m, coefficients, edge_batch)
++    self.assertAllClose(block_out[0], ref_out[0], atol=TEST_TOL, rtol=TEST_TOL)
++    self.assertAllClose(block_out[1], ref_out[1], atol=TEST_TOL, rtol=TEST_TOL)
++
++    merged_params = merge_mole_params(params, coefficients)
++    merged_block = SO2MConvMoE(
++      m=1,
++      sphere_channels=3,
++      m_output_channels=4,
++      lmax=2,
++      num_experts=2,
++      merged_mole=True,
++      so2_block_gemm=True,
++    )
++    merged_out = merged_block.apply(
++      merged_params, x_m, coefficients, edge_batch
++    )
++    self.assertAllClose(merged_out[0], ref_out[0], atol=TEST_TOL, rtol=TEST_TOL)
++    self.assertAllClose(merged_out[1], ref_out[1], atol=TEST_TOL, rtol=TEST_TOL)
++
++  def test_extract_energy_correction_from_task_config(self):
++    tasks = [
++      {
++        'name': 'omat_energy',
++        'property': 'energy',
++        'datasets': ['omat'],
++        'normalizer': {'mean': 1.25, 'rmsd': 3.5},
++        'element_references': {
++          'element_references': {'_args_': [[0.0, -1.0, 2.0]]}
++        },
++      }
++    ]
++    correction = extract_energy_correction(tasks, 'omat')
++    self.assertAllClose(
++      correction['mean'], jnp.asarray(1.25, dtype=jnp.float32)
++    )
++    self.assertAllClose(correction['rmsd'], jnp.asarray(3.5, dtype=jnp.float32))
++    self.assertAllClose(
++      correction['element_refs'],
++      jnp.array([0.0, -1.0, 2.0], dtype=jnp.float32),
++    )
++
++  def test_uma_neighbor_list_merge_mole_matches_unmerged(self):
++    cfg = UMAMoEConfig(
++      sphere_channels=4,
++      lmax=1,
++      mmax=1,
++      num_layers=1,
++      hidden_channels=4,
++      cutoff=2.0,
++      edge_channels=4,
++      num_distance_basis=4,
++      ff_type='spectral',
++      use_dataset_embedding=False,
++      use_composition_embedding=False,
++      num_experts=2,
++      routing_hidden_channels=4,
++      use_kernels=False,
++    )
++    box = jnp.array([5.0, 5.0, 5.0], dtype=jnp.float32)
++    displacement_fn, _ = space.periodic(box)
++    atoms = jnp.array([1, 6, 8], dtype=jnp.int32)
++    position = jnp.array(
++      [[0.1, 0.1, 0.1], [0.8, 0.1, 0.1], [0.1, 0.9, 0.1]],
++      dtype=jnp.float32,
++    )
++    neighbor_fn, init_fn, energy_fn = energy.uma_neighbor_list(
++      displacement_fn,
++      box,
++      cfg=cfg,
++      atoms=atoms,
++      disable_cell_list=True,
++    )
++    _, merge_init_fn, merge_energy_fn = energy.uma_neighbor_list(
++      displacement_fn,
++      box,
++      cfg=cfg,
++      atoms=atoms,
++      merge_mole=True,
++      disable_cell_list=True,
++    )
++    neighbors = neighbor_fn.allocate(position)
++    key = jax.random.PRNGKey(15)
++    params = init_fn(key, position, neighbors)
++    merged_params = merge_init_fn(key, position, neighbors)
++    self.assertAllClose(
++      merge_energy_fn(merged_params, position, neighbors),
++      energy_fn(params, position, neighbors),
++      atol=TEST_TOL,
++      rtol=TEST_TOL,
++    )
++
++
+ class SO3LinearTest(test_util.JAXMDTestCase):
+   """Tests for SO3Linear."""
+ 
+@@ -704,12 +897,16 @@ def test_z_rot_mat_matches_pytorch(self):
+     pt_rot = _load_pt_module('pt_rot', f'{_FAIRCHEM_SRC}/common/rotation.py')
+     from jax_md._nn.uma.common.rotation import _z_rot_mat
+ 
+-    angles = np.array([0.0, 0.7, -1.3, 3.14], dtype=np.float32)
++    angles = np.array([0.0, 0.7, -1.3, 3.14], dtype=np.float64)
+     for l in range(4):
+       M_pt = pt_rot._z_rot_mat(torch.tensor(angles), l).numpy()
+       M_jax = np.array(_z_rot_mat(jnp.array(angles), l))
+       np.testing.assert_allclose(
+-        M_jax, M_pt, atol=1e-6, err_msg=f'_z_rot_mat mismatch at l={l}'
++        M_jax,
++        M_pt,
++        atol=TEST_TOL,
++        rtol=TEST_TOL,
++        err_msg=f'_z_rot_mat mismatch at l={l}',
+       )
+ 
+   def test_wigner_D_matches_pytorch(self):
+@@ -722,13 +919,12 @@ def test_wigner_D_matches_pytorch(self):
+     Jd_pt = torch.load(
+       'jax_md/_nn/uma/Jd.pt', map_location='cpu', weights_only=False
+     )
+-    # Cast Jd to float32 to match angle dtype
+-    Jd_pt = [J.float() for J in Jd_pt]
++    Jd_pt = [J.double() for J in Jd_pt]
+     Jd_jax = load_jacobi_matrices_from_file(3)
+ 
+-    alpha = np.array([0.5, -0.3], dtype=np.float32)
+-    beta = np.array([0.8, 1.5], dtype=np.float32)
+-    gamma = np.zeros(2, dtype=np.float32)
++    alpha = np.array([0.5, -0.3], dtype=np.float64)
++    beta = np.array([0.8, 1.5], dtype=np.float64)
++    gamma = np.zeros(2, dtype=np.float64)
+ 
+     for l in range(4):
+       D_pt = pt_rot.wigner_D(
+@@ -740,7 +936,11 @@ def test_wigner_D_matches_pytorch(self):
+         )
+       )
+       np.testing.assert_allclose(
+-        D_jax, D_pt, atol=1e-5, err_msg=f'wigner_D mismatch at l={l}'
++        D_jax,
++        D_pt,
++        atol=TEST_TOL,
++        rtol=TEST_TOL,
++        err_msg=f'wigner_D mismatch at l={l}',
+       )
+ 
+   def test_coefficient_mapping_to_m_matches_pytorch(self):
+@@ -783,7 +983,7 @@ def test_so2mconv_matches_pytorch(self):
+     num_channels = num_coefficients * sc
+     out_channels_half = moc * num_coefficients
+ 
+-    pt_fc = tnn.Linear(num_channels, 2 * out_channels_half, bias=False)
++    pt_fc = tnn.Linear(num_channels, 2 * out_channels_half, bias=False).double()
+ 
+     def pt_so2m_forward(x_m):
+       x_m = pt_fc(x_m)
+@@ -798,7 +998,7 @@ def pt_so2m_forward(x_m):
+     )
+ 
+     np.random.seed(123)
+-    x_np = np.random.randn(7, 2, num_channels).astype(np.float32)
++    x_np = np.random.randn(7, 2, num_channels).astype(np.float64)
+ 
+     key = jax.random.PRNGKey(0)
+     jax_params = jax_conv.init(key, jnp.array(x_np))
+@@ -815,12 +1015,14 @@ def pt_so2m_forward(x_m):
+     np.testing.assert_allclose(
+       np.array(jax_r),
+       pt_r.numpy(),
+-      atol=1e-5,
++      atol=TEST_TOL,
++      rtol=TEST_TOL,
+     )
+     np.testing.assert_allclose(
+       np.array(jax_i),
+       pt_i.numpy(),
+-      atol=1e-5,
++      atol=TEST_TOL,
++      rtol=TEST_TOL,
+     )
+ 
+   def test_so3linear_matches_pytorch(self):
+@@ -832,11 +1034,13 @@ def test_so3linear_matches_pytorch(self):
+     lmax, in_f, out_f = 2, 16, 8
+     sph = (lmax + 1) ** 2
+ 
+-    pt_lin = pt_so3l.SO3_Linear(in_features=in_f, out_features=out_f, lmax=lmax)
++    pt_lin = pt_so3l.SO3_Linear(
++      in_features=in_f, out_features=out_f, lmax=lmax
++    ).double()
+     jax_lin = SO3Linear(out_features=out_f, lmax=lmax, use_bias=True)
+ 
+     np.random.seed(77)
+-    x_np = np.random.randn(4, sph, in_f).astype(np.float32)
++    x_np = np.random.randn(4, sph, in_f).astype(np.float64)
+ 
+     key = jax.random.PRNGKey(0)
+     jax_params = jax_lin.init(key, jnp.array(x_np))
+@@ -852,7 +1056,7 @@ def test_so3linear_matches_pytorch(self):
+       pt_out = pt_lin(torch.tensor(x_np)).numpy()
+     jax_out = np.array(jax_lin.apply(jax_params_loaded, jnp.array(x_np)))
+ 
+-    np.testing.assert_allclose(jax_out, pt_out, atol=1e-6)
++    np.testing.assert_allclose(jax_out, pt_out, atol=TEST_TOL, rtol=TEST_TOL)
+ 
+   def test_rms_norm_matches_pytorch(self):
+     """EquivariantRMSNorm with copied weights should match PyTorch."""
+@@ -863,11 +1067,16 @@ def test_rms_norm_matches_pytorch(self):
+     lmax, ch = 2, 16
+     sph = (lmax + 1) ** 2
+ 
+-    pt_norm = pt_ln.EquivariantRMSNormArraySphericalHarmonicsV2(lmax, ch)
++    torch_default_dtype = torch.get_default_dtype()
++    torch.set_default_dtype(torch.float64)
++    try:
++      pt_norm = pt_ln.EquivariantRMSNormArraySphericalHarmonicsV2(lmax, ch)
++    finally:
++      torch.set_default_dtype(torch_default_dtype)
+     jax_norm = EquivariantRMSNorm(lmax=lmax, num_channels=ch)
+ 
+     np.random.seed(55)
+-    x_np = np.random.randn(5, sph, ch).astype(np.float32)
++    x_np = np.random.randn(5, sph, ch).astype(np.float64)
+ 
+     key = jax.random.PRNGKey(0)
+     jax_params = jax_norm.init(key, jnp.array(x_np))
+@@ -883,7 +1092,7 @@ def test_rms_norm_matches_pytorch(self):
+       pt_out = pt_norm(torch.tensor(x_np)).numpy()
+     jax_out = np.array(jax_norm.apply(jax_params_loaded, jnp.array(x_np)))
+ 
+-    np.testing.assert_allclose(jax_out, pt_out, atol=1e-5)
++    np.testing.assert_allclose(jax_out, pt_out, atol=TEST_TOL, rtol=TEST_TOL)
+ 
+   def test_euler_angles_match_pytorch(self):
+     """Euler angle computation should match PyTorch (alpha, beta)."""
+@@ -892,14 +1101,18 @@ def test_euler_angles_match_pytorch(self):
+     pt_rot = _load_pt_module('pt_rot', f'{_FAIRCHEM_SRC}/common/rotation.py')
+ 
+     np.random.seed(99)
+-    vecs = np.random.randn(20, 3).astype(np.float32)
++    vecs = np.random.randn(20, 3).astype(np.float64)
+ 
+     g_pt, b_pt, a_pt = pt_rot.init_edge_rot_euler_angles(torch.tensor(vecs))
+     g_jax, b_jax, a_jax = init_edge_rot_euler_angles(jnp.array(vecs))
+ 
+     # alpha and beta should match; gamma differs (random vs zero)
+-    np.testing.assert_allclose(np.array(b_jax), b_pt.numpy(), atol=1e-5)
+-    np.testing.assert_allclose(np.array(a_jax), a_pt.numpy(), atol=1e-5)
++    np.testing.assert_allclose(
++      np.array(b_jax), b_pt.numpy(), atol=TEST_TOL, rtol=TEST_TOL
++    )
++    np.testing.assert_allclose(
++      np.array(a_jax), a_pt.numpy(), atol=TEST_TOL, rtol=TEST_TOL
++    )
+ 
+ 
+ class EndToEndComparisonTest(test_util.JAXMDTestCase):
+@@ -1085,5 +1298,497 @@ def get(self, k, *a, **kw):
+     self.assertTrue(torch.all(torch.isfinite(emb)))
+ 
+ 
++_UMA_FULL_TO_M = (0, 5, 1, 3, 8, 6, 2, 4, 7)
++_UMA_BLOCKS = ((0, 1), (1, 3), (4, 5))
++
++
++def _uma_node_to_edge_reference(x, edge_index, wigner):
++  sender = edge_index[0]
++  receiver = edge_index[1]
++  sender_valid = (sender >= 0) & (sender < x.shape[0])
++  receiver_valid = (receiver >= 0) & (receiver < x.shape[0])
++  sender = jnp.clip(sender, 0, x.shape[0] - 1)
++  receiver = jnp.clip(receiver, 0, x.shape[0] - 1)
++  xs = jnp.where(sender_valid[:, None, None], x[sender], 0.0)
++  xt = jnp.where(receiver_valid[:, None, None], x[receiver], 0.0)
++  ys = jnp.zeros((edge_index.shape[1], 9, x.shape[2]), dtype=x.dtype)
++  yt = jnp.zeros_like(ys)
++
++  for start, width in _UMA_BLOCKS:
++    for row in range(start, start + width):
++      y_s = jnp.zeros((edge_index.shape[1], x.shape[2]), dtype=x.dtype)
++      y_t = jnp.zeros_like(y_s)
++      for col in range(start, start + width):
++        w = wigner[:, row, col, None]
++        y_s = y_s + w * xs[:, col, :]
++        y_t = y_t + w * xt[:, col, :]
++      ys = ys.at[:, _UMA_FULL_TO_M[row], :].set(y_s)
++      yt = yt.at[:, _UMA_FULL_TO_M[row], :].set(y_t)
++  return jnp.concatenate([ys, yt], axis=2)
++
++
++def _uma_edge_to_node_reference(messages, edge_index, wigner_inv, num_nodes):
++  edge_messages = jnp.zeros(
++    (edge_index.shape[1], 9, messages.shape[2]), dtype=messages.dtype
++  )
++  for start, width in _UMA_BLOCKS:
++    for row in range(start, start + width):
++      y = jnp.zeros(
++        (edge_index.shape[1], messages.shape[2]), dtype=messages.dtype
++      )
++      for col in range(start, start + width):
++        y = (
++          y
++          + wigner_inv[:, row, col, None] * messages[:, _UMA_FULL_TO_M[col], :]
++        )
++      edge_messages = edge_messages.at[:, row, :].set(y)
++
++  receiver = edge_index[1]
++  receiver_valid = (receiver >= 0) & (receiver < num_nodes)
++  receiver = jnp.clip(receiver, 0, num_nodes - 1)
++  edge_messages = jnp.where(receiver_valid[:, None, None], edge_messages, 0.0)
++  return (
++    jnp.zeros((num_nodes, 9, messages.shape[2]), dtype=messages.dtype)
++    .at[receiver]
++    .add(edge_messages)
++  )
++
++
++class UMAKernelBackendTest(test_util.JAXMDTestCase):
++  """GPU-only UMA kernel backend parity checks."""
++
++  def test_pallas_wigner_kernels_match_jax(self):
++    if jax.default_backend() != 'gpu':
++      self.skipTest('Pallas GPU backend is not available.')
++    from jax_md._nn.uma import kernels
++
++    key = jax.random.PRNGKey(0)
++    kx, kw, km = jax.random.split(key, 3)
++    x = jax.random.normal(kx, (4, 9, 5))
++    wigner0 = jax.random.normal(kw, (6, 9, 9))
++    raw_wigner = (
++      jnp.zeros_like(wigner0)
++      .at[:, 0:1, 0:1]
++      .set(wigner0[:, 0:1, 0:1])
++      .at[:, 1:4, 1:4]
++      .set(wigner0[:, 1:4, 1:4])
++      .at[:, 4:9, 4:9]
++      .set(wigner0[:, 4:9, 4:9])
++    )
++    messages = jax.random.normal(km, (6, 9, 5))
++    edge_index = jnp.array(
++      [[0, 1, 2, 3, 0, 2], [1, 2, 3, 0, 2, 1]], dtype=jnp.int32
++    )
++    to_m = create_coefficient_mapping(2, 2).to_m
++    node_wigner = jnp.einsum('mk,ekj->emj', to_m, raw_wigner)
++    edge_wigner = jnp.einsum('ejk,mk->ejm', raw_wigner, to_m)
++    x_edge = jnp.concatenate([x[edge_index[0]], x[edge_index[1]]], axis=2)
++    expected_n2e = jnp.einsum('emj,ejc->emc', node_wigner, x_edge)
++    actual_n2e = kernels.node_to_edge_wigner_permute(x, edge_index, raw_wigner)
++    self.assertAllClose(actual_n2e, expected_n2e, atol=TEST_TOL, rtol=TEST_TOL)
++
++    edge_messages = jnp.einsum('ejm,emc->ejc', edge_wigner, messages)
++    expected_e2n = (
++      jnp.zeros((x.shape[0], 9, messages.shape[-1]))
++      .at[edge_index[1]]
++      .add(edge_messages)
++    )
++    actual_e2n = kernels.edge_to_node_wigner_inverse(
++      messages, edge_index, raw_wigner, x.shape[0]
++    )
++    self.assertAllClose(actual_e2n, expected_e2n, atol=TEST_TOL, rtol=TEST_TOL)
++
++  def test_pallas_wigner_kernel_transform_orders_match_jax(self):
++    if jax.default_backend() != 'gpu':
++      self.skipTest('Pallas GPU backend is not available.')
++    from jax_md._nn.uma import kernels
++
++    key = jax.random.PRNGKey(23)
++    kx, kw, km, ktx, ktw, ktm = jax.random.split(key, 6)
++    num_nodes, num_edges, channels = 3, 2, 1
++    x = 0.1 * jax.random.normal(kx, (num_nodes, 9, channels))
++    wigner0 = 0.1 * jax.random.normal(kw, (num_edges, 9, 9))
++    raw_wigner = (
++      jnp.zeros_like(wigner0)
++      .at[:, 0:1, 0:1]
++      .set(wigner0[:, 0:1, 0:1])
++      .at[:, 1:4, 1:4]
++      .set(wigner0[:, 1:4, 1:4])
++      .at[:, 4:9, 4:9]
++      .set(wigner0[:, 4:9, 4:9])
++    )
++    messages = 0.1 * jax.random.normal(km, (num_edges, 9, channels))
++    edge_index = jnp.array([[0, 1], [1, 2]], dtype=jnp.int32)
++
++    tx = 0.01 * jax.random.normal(ktx, x.shape)
++    tw = 0.01 * jax.random.normal(ktw, raw_wigner.shape)
++    tm = 0.01 * jax.random.normal(ktm, messages.shape)
++
++    def squared_loss(fn):
++      return lambda *args: jnp.sum(fn(*args) ** 2)
++
++    def forward_over_reverse_hvp(loss_fn, primals, tangents):
++      grad_fn = jax.grad(loss_fn, argnums=tuple(range(len(primals))))
++      return jax.jvp(lambda *args: grad_fn(*args), primals, tangents)[1]
++
++    def reverse_over_reverse_hvp(loss_fn, primals, tangents):
++      argnums = tuple(range(len(primals)))
++      grad_fn = jax.grad(loss_fn, argnums=argnums)
++
++      def grad_dot(*args):
++        return sum(
++          jnp.vdot(grad, tangent)
++          for grad, tangent in zip(grad_fn(*args), tangents)
++        )
++
++      return jax.grad(grad_dot, argnums=argnums)(*primals)
++
++    cases = (
++      (
++        squared_loss(
++          lambda x_, w_: _uma_node_to_edge_reference(x_, edge_index, w_)
++        ),
++        squared_loss(
++          lambda x_, w_: kernels.node_to_edge_wigner_permute(x_, edge_index, w_)
++        ),
++        (x, raw_wigner),
++        (tx, tw),
++        (jnp.stack([tx, 2.0 * tx]), jnp.stack([tw, -tw])),
++      ),
++      (
++        squared_loss(
++          lambda messages_, w_: _uma_edge_to_node_reference(
++            messages_, edge_index, w_, num_nodes
++          )
++        ),
++        squared_loss(
++          lambda messages_, w_: kernels.edge_to_node_wigner_inverse(
++            messages_, edge_index, w_, num_nodes
++          )
++        ),
++        (messages, raw_wigner),
++        (tm, tw),
++        (jnp.stack([tm, 2.0 * tm]), jnp.stack([tw, -tw])),
++      ),
++    )
++
++    for ref_loss, kernel_loss, primals, tangents, batched_tangents in cases:
++      argnums = tuple(range(len(primals)))
++      for transform in (
++        lambda fn: jax.grad(fn, argnums=argnums),
++        lambda fn: jax.hessian(fn, argnums=argnums),
++        lambda fn: jax.jacfwd(jax.jacrev(fn, argnums=argnums), argnums=argnums),
++        lambda fn: jax.jacrev(jax.jacfwd(fn, argnums=argnums), argnums=argnums),
++      ):
++        self.assertAllClose(
++          transform(kernel_loss)(*primals),
++          transform(ref_loss)(*primals),
++          atol=TEST_TOL,
++          rtol=TEST_TOL,
++        )
++
++      self.assertAllClose(
++        forward_over_reverse_hvp(kernel_loss, primals, tangents),
++        forward_over_reverse_hvp(ref_loss, primals, tangents),
++        atol=TEST_TOL,
++        rtol=TEST_TOL,
++      )
++
++      # Batched reverse-over-reverse HVPs exercise primitive batching rules.
++      actual_batched_hvp = jax.vmap(
++        lambda *batched_tangent: reverse_over_reverse_hvp(
++          kernel_loss, primals, batched_tangent
++        )
++      )(*batched_tangents)
++      expected_batched_hvp = jax.vmap(
++        lambda *batched_tangent: reverse_over_reverse_hvp(
++          ref_loss, primals, batched_tangent
++        )
++      )(*batched_tangents)
++      self.assertAllClose(
++        actual_batched_hvp,
++        expected_batched_hvp,
++        atol=TEST_TOL,
++        rtol=TEST_TOL,
++      )
++
++  def test_pallas_wigner_hessian_ignores_padded_edges(self):
++    if jax.default_backend() != 'gpu':
++      self.skipTest('Pallas GPU backend is not available.')
++    from jax_md._nn.uma import kernels
++
++    key = jax.random.PRNGKey(31)
++    kx, kw = jax.random.split(key)
++    x = 0.1 * jax.random.normal(kx, (3, 9, 1))
++    wigner0 = 0.1 * jax.random.normal(kw, (4, 9, 9))
++    raw_wigner = (
++      jnp.zeros_like(wigner0)
++      .at[:, 0:1, 0:1]
++      .set(wigner0[:, 0:1, 0:1])
++      .at[:, 1:4, 1:4]
++      .set(wigner0[:, 1:4, 1:4])
++      .at[:, 4:9, 4:9]
++      .set(wigner0[:, 4:9, 4:9])
++    )
++    edge_index = jnp.array([[0, -1, 2, 3], [1, 2, 3, -1]], dtype=jnp.int32)
++
++    def ref_loss(x_, w_):
++      out = _uma_node_to_edge_reference(x_, edge_index, w_)
++      return jnp.sum(out * out)
++
++    def kernel_loss(x_, w_):
++      out = kernels.node_to_edge_wigner_permute(x_, edge_index, w_)
++      return jnp.sum(out * out)
++
++    self.assertAllClose(
++      jax.hessian(kernel_loss, argnums=(0, 1))(x, raw_wigner),
++      jax.hessian(ref_loss, argnums=(0, 1))(x, raw_wigner),
++      atol=TEST_TOL,
++      rtol=TEST_TOL,
++    )
++
++  def test_pallas_edge_to_node_ignores_padded_edges(self):
++    if jax.default_backend() != 'gpu':
++      self.skipTest('Pallas GPU backend is not available.')
++    from jax_md._nn.uma import kernels
++
++    key = jax.random.PRNGKey(37)
++    km = jax.random.split(key, 1)[0]
++    num_nodes, num_edges, channels = 4, 4, 2
++    messages = jax.random.normal(km, (num_edges, 9, channels))
++    raw_wigner = jnp.broadcast_to(jnp.eye(9), (num_edges, 9, 9))
++    edge_index = jnp.array([[0, 1, 2, 3], [1, -1, 3, 10]], dtype=jnp.int32)
++
++    expected = _uma_edge_to_node_reference(
++      messages, edge_index, raw_wigner, num_nodes
++    )
++    actual = kernels.edge_to_node_wigner_inverse(
++      messages, edge_index, raw_wigner, num_nodes
++    )
++    self.assertAllClose(actual, expected, atol=TEST_TOL, rtol=TEST_TOL)
++
++    def kernel_loss(messages_, w_):
++      out = kernels.edge_to_node_wigner_inverse(
++        messages_, edge_index, w_, num_nodes
++      )
++      return jnp.sum(out * out)
++
++    def ref_loss(messages_, w_):
++      out = _uma_edge_to_node_reference(messages_, edge_index, w_, num_nodes)
++      return jnp.sum(out * out)
++
++    self.assertAllClose(
++      jax.grad(kernel_loss, argnums=(0, 1))(messages, raw_wigner),
++      jax.grad(ref_loss, argnums=(0, 1))(messages, raw_wigner),
++      atol=TEST_TOL,
++      rtol=TEST_TOL,
++    )
++
++  def test_pallas_wigner_zero_edge_gradients(self):
++    from jax_md._nn.uma import kernels
++
++    num_nodes, channels = 3, 2
++    x = jnp.ones((num_nodes, 9, channels), dtype=jnp.float32)
++    messages = jnp.ones((0, 9, channels), dtype=jnp.float32)
++    raw_wigner = jnp.zeros((0, 9, 9), dtype=jnp.float32)
++    edge_index = jnp.zeros((2, 0), dtype=jnp.int32)
++
++    def n2e_loss(x_, w_):
++      out = kernels.node_to_edge_wigner_permute(x_, edge_index, w_)
++      self.assertEqual(out.shape, (0, 9, 2 * channels))
++      return jnp.sum(out * out)
++
++    def e2n_loss(messages_, w_):
++      out = kernels.edge_to_node_wigner_inverse(
++        messages_, edge_index, w_, num_nodes
++      )
++      self.assertEqual(out.shape, (num_nodes, 9, channels))
++      return jnp.sum(out * out)
++
++    gx, gw_n2e = jax.grad(n2e_loss, argnums=(0, 1))(x, raw_wigner)
++    gm, gw_e2n = jax.grad(e2n_loss, argnums=(0, 1))(messages, raw_wigner)
++    self.assertAllClose(gx, jnp.zeros_like(x), atol=TEST_TOL, rtol=TEST_TOL)
++    self.assertEqual(gw_n2e.shape, raw_wigner.shape)
++    self.assertEqual(gm.shape, messages.shape)
++    self.assertEqual(gw_e2n.shape, raw_wigner.shape)
++
++  def test_edgewise_fallback_ignores_invalid_targets(self):
++    from jax_md._nn.uma.blocks import Edgewise
++
++    key = jax.random.PRNGKey(41)
++    num_nodes, channels = 4, 2
++    x = jax.random.normal(key, (num_nodes, 9, channels))
++    x_shifted = x.at[-1].add(10.0)
++    x_edge = jnp.ones((3, 4), dtype=x.dtype)
++    edge_index = jnp.array([[0, 1, -1], [1, -1, 2]], dtype=jnp.int32)
++    wigner = jnp.broadcast_to(jnp.eye(9, dtype=x.dtype), (3, 9, 9))
++    edge_envelope = jnp.ones((3, 1, 1), dtype=x.dtype)
++    mapping = create_coefficient_mapping(2, 2)
++    edgewise = Edgewise(
++      sphere_channels=channels,
++      hidden_channels=2,
++      lmax=2,
++      mmax=2,
++      edge_channels_list=[4],
++      m_size=list(mapping.m_size),
++      use_kernels=False,
++    )
++    params = edgewise.init(
++      key,
++      x,
++      x_edge,
++      edge_index,
++      wigner,
++      wigner,
++      None,
++      None,
++      edge_envelope,
++    )
++
++    actual = edgewise.apply(
++      params,
++      x,
++      x_edge,
++      edge_index,
++      wigner,
++      wigner,
++      None,
++      None,
++      edge_envelope,
++    )
++    actual_shifted = edgewise.apply(
++      params,
++      x_shifted,
++      x_edge,
++      edge_index,
++      wigner,
++      wigner,
++      None,
++      None,
++      edge_envelope,
++    )
++    self.assertAllClose(
++      actual[3], jnp.zeros_like(actual[3]), atol=TEST_TOL, rtol=TEST_TOL
++    )
++    self.assertAllClose(
++      actual[2], actual_shifted[2], atol=TEST_TOL, rtol=TEST_TOL
++    )
++
++  def test_edgewise_moe_fallback_ignores_invalid_targets(self):
++    from jax_md._nn.uma.model_moe import EdgewiseMoE
++
++    key = jax.random.PRNGKey(43)
++    num_nodes, channels = 4, 2
++    x = jax.random.normal(key, (num_nodes, 9, channels))
++    x_shifted = x.at[-1].add(10.0)
++    x_edge = jnp.ones((3, 4), dtype=x.dtype)
++    edge_index = jnp.array([[0, 1, -1], [1, -1, 2]], dtype=jnp.int32)
++    wigner = jnp.broadcast_to(jnp.eye(9, dtype=x.dtype), (3, 9, 9))
++    edge_envelope = jnp.ones((3, 1, 1), dtype=x.dtype)
++    expert_coefficients = jnp.array([[0.25, 0.75]], dtype=x.dtype)
++    edge_batch = jnp.zeros((3,), dtype=jnp.int32)
++    mapping = create_coefficient_mapping(2, 2)
++    edgewise = EdgewiseMoE(
++      sphere_channels=channels,
++      hidden_channels=2,
++      lmax=2,
++      mmax=2,
++      edge_channels_list=[4],
++      m_size=list(mapping.m_size),
++      num_experts=2,
++      use_kernels=False,
++    )
++    params = edgewise.init(
++      key,
++      x,
++      x_edge,
++      edge_index,
++      wigner,
++      wigner,
++      None,
++      None,
++      edge_envelope,
++      expert_coefficients,
++      edge_batch,
++    )
++
++    actual = edgewise.apply(
++      params,
++      x,
++      x_edge,
++      edge_index,
++      wigner,
++      wigner,
++      None,
++      None,
++      edge_envelope,
++      expert_coefficients,
++      edge_batch,
++    )
++    actual_shifted = edgewise.apply(
++      params,
++      x_shifted,
++      x_edge,
++      edge_index,
++      wigner,
++      wigner,
++      None,
++      None,
++      edge_envelope,
++      expert_coefficients,
++      edge_batch,
++    )
++    self.assertAllClose(
++      actual[3], jnp.zeros_like(actual[3]), atol=TEST_TOL, rtol=TEST_TOL
++    )
++    self.assertAllClose(
++      actual[2], actual_shifted[2], atol=TEST_TOL, rtol=TEST_TOL
++    )
++
++  def test_pallas_backbone_matches_jax(self):
++    if jax.default_backend() != 'gpu':
++      self.skipTest('Pallas GPU backend is not available.')
++    inputs = (
++      jnp.array(
++        [[0.0, 0.0, 0.0], [0.7, 0.1, 0.0], [0.1, 0.8, 0.1]],
++        dtype=jnp.float32,
++      ),
++      jnp.array([1, 6, 8], dtype=jnp.int32),
++      jnp.zeros(3, dtype=jnp.int32),
++      jnp.array([[0, 1, 2, 0], [1, 2, 0, 2]], dtype=jnp.int32),
++      jnp.array(
++        [
++          [-0.7, -0.1, 0.0],
++          [0.6, -0.7, 0.0],
++          [0.1, 0.8, 0.1],
++          [-0.1, -0.8, -0.1],
++        ],
++        dtype=jnp.float32,
++      ),
++      jnp.zeros(1, dtype=jnp.float32),
++      jnp.zeros(1, dtype=jnp.float32),
++      jnp.zeros(1, dtype=jnp.int32),
++    )
++    cfg = UMAConfig(
++      sphere_channels=4,
++      lmax=2,
++      mmax=2,
++      num_layers=1,
++      hidden_channels=4,
++      cutoff=3.0,
++      edge_channels=4,
++      num_distance_basis=4,
++      ff_type='spectral',
++      use_dataset_embedding=False,
++      use_kernels=False,
++    )
++    jax_model = UMABackbone(config=cfg)
++    pallas_model = UMABackbone(config=replace(cfg, use_kernels=True))
++    params = jax_model.init(jax.random.PRNGKey(17), *inputs)
++    jax_out = jax_model.apply(params, *inputs)['node_embedding']
++    pallas_out = pallas_model.apply(params, *inputs)['node_embedding']
++    self.assertAllClose(pallas_out, jax_out, atol=TEST_TOL, rtol=TEST_TOL)
++
++
+ if __name__ == '__main__':
+   absltest.main()

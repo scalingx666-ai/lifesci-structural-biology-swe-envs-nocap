@@ -1,0 +1,308 @@
+diff --git a/examples/hello.rs b/examples/hello.rs
+index 56426403..d91deffb 100644
+--- a/examples/hello.rs
++++ b/examples/hello.rs
+@@ -120,7 +120,7 @@ impl TabViewer for MyContext {
+         }
+     }
+ 
+-    fn is_closeable(&self, tab: &mut Self::Tab) -> bool {
++    fn is_closeable(&self, tab: &Self::Tab) -> bool {
+         ["Inspector", "Style Editor"].contains(&tab.as_str())
+     }
+ 
+diff --git a/examples/simple.rs b/examples/simple.rs
+index 0745dc19..03273e76 100644
+--- a/examples/simple.rs
++++ b/examples/simple.rs
+@@ -29,7 +29,7 @@ impl egui_dock::TabViewer for TabViewer {
+ 
+     fn on_close(&mut self, _tab: &mut Self::Tab) -> OnCloseResponse {
+         println!("Closed tab: {_tab}");
+-        OnCloseResponse::Focus
++        OnCloseResponse::Close
+     }
+ }
+ 
+diff --git a/src/dock_state/mod.rs b/src/dock_state/mod.rs
+index 30646d04..75431da9 100644
+--- a/src/dock_state/mod.rs
++++ b/src/dock_state/mod.rs
+@@ -304,6 +304,14 @@ impl<Tab> DockState<Tab> {
+         removed_tab
+     }
+ 
++    /// Remove a leaf at the specified surface, and node index.
++    pub fn remove_leaf(&mut self, (surface_index, node_index): (SurfaceIndex, NodeIndex)) {
++        self[surface_index].remove_leaf(node_index);
++        if !surface_index.is_main() && self[surface_index].is_empty() {
++            self.remove_surface(surface_index);
++        }
++    }
++
+     /// Creates two new nodes by splitting a given `parent` node and assigns them as its children. The first (old) node
+     /// inherits content of the `parent` from before the split, and the second (new) has `tabs`.
+     ///
+diff --git a/src/widgets/dock_area/show/leaf.rs b/src/widgets/dock_area/show/leaf.rs
+index a5fd1a92..bad553e3 100644
+--- a/src/widgets/dock_area/show/leaf.rs
++++ b/src/widgets/dock_area/show/leaf.rs
+@@ -5,7 +5,7 @@ use egui::{
+ };
+ use std::ops::RangeInclusive;
+ 
+-use crate::dock_area::tab_removal::TabRemoval;
++use crate::dock_area::tab_removal::{ForcedRemoval, TabRemoval};
+ use crate::{
+     dock_area::{
+         drag_and_drop::{DragData, DragDropState, HoverData, TreeComponent},
+@@ -16,7 +16,6 @@ use crate::{
+ };
+ 
+ use crate::popup::popup_under_widget;
+-use crate::tab_viewer::OnCloseResponse;
+ 
+ impl<Tab> DockArea<'_, Tab> {
+     pub(super) fn show_leaf(
+@@ -70,8 +69,12 @@ impl<Tab> DockArea<'_, Tab> {
+             .expect("This node must be a leaf here");
+         for (tab_index, tab) in tabs.iter_mut().enumerate() {
+             if tab_viewer.force_close(tab) {
+-                self.to_remove
+-                    .push((surface_index, node_index, TabIndex(tab_index)).into());
++                self.to_remove.push(TabRemoval::Tab(
++                    surface_index,
++                    node_index,
++                    TabIndex(tab_index),
++                    ForcedRemoval(true),
++                ));
+             }
+         }
+     }
+@@ -308,7 +311,7 @@ impl<Tab> DockArea<'_, Tab> {
+                     *active == tab_index || is_being_dragged,
+                     tab_viewer.title(&mut tabs[tab_index.0]),
+                     tab_style.unwrap_or(style.tab.clone()),
+-                    tab_viewer.is_closeable(&mut tabs[tab_index.0]),
++                    tab_viewer.is_closeable(&tabs[tab_index.0]),
+                 )
+             };
+ 
+@@ -410,14 +413,24 @@ impl<Tab> DockArea<'_, Tab> {
+                             ui.close_menu();
+                         }
+                         if show_close_button && ui.add(close_button).clicked() {
+-                            self.close_tab(tab_viewer, surface_index, node_index, tab_index);
++                            self.to_remove.push(TabRemoval::Tab(
++                                surface_index,
++                                node_index,
++                                tab_index,
++                                ForcedRemoval(false),
++                            ));
+                             ui.close_menu();
+                         }
+                     });
+                 }
+ 
+                 if close_clicked {
+-                    self.close_tab(tab_viewer, surface_index, node_index, tab_index);
++                    self.to_remove.push(TabRemoval::Tab(
++                        surface_index,
++                        node_index,
++                        tab_index,
++                        ForcedRemoval(false),
++                    ));
+                 }
+ 
+                 if let Some(pos) = state.last_hover_pos {
+@@ -463,35 +476,12 @@ impl<Tab> DockArea<'_, Tab> {
+ 
+             if self.show_close_buttons && tab_viewer.is_closeable(tab) && response.middle_clicked()
+             {
+-                self.close_tab(tab_viewer, surface_index, node_index, tab_index);
+-            }
+-        }
+-    }
+-
+-    fn close_tab(
+-        &mut self,
+-        tab_viewer: &mut impl TabViewer<Tab = Tab>,
+-        surface_index: SurfaceIndex,
+-        node_index: NodeIndex,
+-        tab_index: TabIndex,
+-    ) {
+-        let Node::Leaf { tabs, active, .. } = &mut self.dock_state[surface_index][node_index]
+-        else {
+-            unreachable!()
+-        };
+-        let tab = &mut tabs[tab_index.0];
+-
+-        match tab_viewer.on_close(tab) {
+-            OnCloseResponse::Close => {
+-                self.to_remove
+-                    .push((surface_index, node_index, tab_index).into());
+-            }
+-            OnCloseResponse::Focus => {
+-                *active = tab_index;
+-                self.new_focused = Some((surface_index, node_index));
+-            }
+-            OnCloseResponse::Ignore => {
+-                // no-op
++                self.to_remove.push(TabRemoval::Tab(
++                    surface_index,
++                    node_index,
++                    tab_index,
++                    ForcedRemoval(false),
++                ));
+             }
+         }
+     }
+@@ -679,7 +669,8 @@ impl<Tab> DockArea<'_, Tab> {
+                         self.to_remove.push(TabRemoval::Window(surface_index));
+                     }
+                 } else if !disabled {
+-                    self.to_remove.push((surface_index, node_index).into());
++                    self.to_remove
++                        .push(TabRemoval::Node(surface_index, node_index));
+                 }
+             }
+ 
+diff --git a/src/widgets/dock_area/show/mod.rs b/src/widgets/dock_area/show/mod.rs
+index 0e846892..da71a87a 100644
+--- a/src/widgets/dock_area/show/mod.rs
++++ b/src/widgets/dock_area/show/mod.rs
+@@ -6,14 +6,15 @@ use egui::{
+ use duplicate::duplicate;
+ use paste::paste;
+ 
++use super::{drag_and_drop::TreeComponent, state::State, tab_removal::TabRemoval};
++use crate::dock_area::tab_removal::ForcedRemoval;
++use crate::tab_viewer::OnCloseResponse;
+ use crate::{
+     utils::{expand_to_pixel, fade_dock_style, map_to_pixel},
+     AllowedSplits, DockArea, Node, NodeIndex, OverlayType, Style, SurfaceIndex, TabDestination,
+     TabViewer,
+ };
+ 
+-use super::{drag_and_drop::TreeComponent, state::State, tab_removal::TabRemoval};
+-
+ mod leaf;
+ mod main_surface;
+ mod window_surface;
+@@ -129,22 +130,57 @@ impl<Tab> DockArea<'_, Tab> {
+             );
+         }
+ 
+-        for index in self.to_remove.drain(..).rev() {
+-            match index {
+-                TabRemoval::Node(surface, node, tab) => {
+-                    self.dock_state[surface].remove_tab((node, tab));
+-                    if self.dock_state[surface].is_empty() && !surface.is_main() {
+-                        self.dock_state.remove_surface(surface);
++        for removal in self.to_remove.drain(..).rev() {
++            match removal {
++                TabRemoval::Tab(surface, node, tab, ForcedRemoval(is_forced)) => {
++                    if is_forced {
++                        self.dock_state.remove_tab((surface, node, tab));
++                    } else {
++                        let Node::Leaf { tabs, active, .. } = &mut self.dock_state[surface][node]
++                        else {
++                            unreachable!()
++                        };
++                        match tab_viewer.on_close(&mut tabs[tab.0]) {
++                            OnCloseResponse::Close => {
++                                self.dock_state.remove_tab((surface, node, tab));
++                            }
++                            OnCloseResponse::Focus => {
++                                *active = tab;
++                                self.new_focused = Some((surface, node));
++                            }
++                            OnCloseResponse::Ignore => {
++                                // no-op
++                            }
++                        }
+                     }
+                 }
+-                TabRemoval::Leaf(surface, node) => {
+-                    self.dock_state[surface].remove_leaf(node);
+-                    if self.dock_state[surface].is_empty() && !surface.is_main() {
+-                        self.dock_state.remove_surface(surface);
++                TabRemoval::Node(surface, node) => {
++                    let mut all_tabs_are_closable = true;
++                    for tab in self.dock_state[surface][node].iter_tabs_mut() {
++                        if !(tab_viewer.is_closeable(tab)
++                            && matches!(tab_viewer.on_close(tab), OnCloseResponse::Close))
++                        {
++                            all_tabs_are_closable = false;
++                        }
++                    }
++                    if all_tabs_are_closable {
++                        self.dock_state.remove_leaf((surface, node));
+                     }
+                 }
+-                TabRemoval::Window(index) => {
+-                    self.dock_state.remove_surface(index);
++                TabRemoval::Window(surface) => {
++                    let mut all_tabs_are_closable = true;
++                    for node in self.dock_state[surface].iter_mut() {
++                        for tab in node.iter_tabs_mut() {
++                            if !(tab_viewer.is_closeable(tab)
++                                && matches!(tab_viewer.on_close(tab), OnCloseResponse::Close))
++                            {
++                                all_tabs_are_closable = false;
++                            }
++                        }
++                    }
++                    if all_tabs_are_closable {
++                        self.dock_state.remove_surface(surface);
++                    }
+                 }
+             }
+         }
+diff --git a/src/widgets/dock_area/tab_removal.rs b/src/widgets/dock_area/tab_removal.rs
+index ec3681d2..29b91631 100644
+--- a/src/widgets/dock_area/tab_removal.rs
++++ b/src/widgets/dock_area/tab_removal.rs
+@@ -3,25 +3,10 @@ use crate::{NodeIndex, SurfaceIndex, TabIndex};
+ /// An enum expressing an entry in the `to_remove` field in [`DockArea`].
+ #[derive(Debug, Clone, Copy)]
+ pub(super) enum TabRemoval {
+-    Node(SurfaceIndex, NodeIndex, TabIndex),
+-    Leaf(SurfaceIndex, NodeIndex),
++    Tab(SurfaceIndex, NodeIndex, TabIndex, ForcedRemoval),
++    Node(SurfaceIndex, NodeIndex),
+     Window(SurfaceIndex),
+ }
+ 
+-impl From<SurfaceIndex> for TabRemoval {
+-    fn from(index: SurfaceIndex) -> Self {
+-        TabRemoval::Window(index)
+-    }
+-}
+-
+-impl From<(SurfaceIndex, NodeIndex)> for TabRemoval {
+-    fn from((si, ni): (SurfaceIndex, NodeIndex)) -> TabRemoval {
+-        TabRemoval::Leaf(si, ni)
+-    }
+-}
+-
+-impl From<(SurfaceIndex, NodeIndex, TabIndex)> for TabRemoval {
+-    fn from((si, ni, ti): (SurfaceIndex, NodeIndex, TabIndex)) -> TabRemoval {
+-        TabRemoval::Node(si, ni, ti)
+-    }
+-}
++#[derive(Debug, Clone, Copy)]
++pub(super) struct ForcedRemoval(pub bool);
+diff --git a/src/widgets/tab_viewer.rs b/src/widgets/tab_viewer.rs
+index 54b30a17..27b5044f 100644
+--- a/src/widgets/tab_viewer.rs
++++ b/src/widgets/tab_viewer.rs
+@@ -45,7 +45,7 @@ pub trait TabViewer {
+     /// Returns `true` if the user of your app should be able to close a given `_tab`.
+     ///
+     /// By default, `true` is always returned.
+-    fn is_closeable(&self, _tab: &mut Self::Tab) -> bool {
++    fn is_closeable(&self, _tab: &Self::Tab) -> bool {
+         true
+     }
+ 

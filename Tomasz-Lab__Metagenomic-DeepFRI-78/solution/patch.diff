@@ -1,0 +1,425 @@
+diff --git a/mDeepFRI/bio_utils.py b/mDeepFRI/bio_utils.py
+index 1a5cb22..ae439b6 100644
+--- a/mDeepFRI/bio_utils.py
++++ b/mDeepFRI/bio_utils.py
+@@ -1,3 +1,4 @@
++import logging
+ from io import StringIO
+ from typing import Dict, List, Tuple
+ 
+@@ -11,6 +12,12 @@
+ 
+ from mDeepFRI.alignment_utils import alignment_identity, pairwise_sqeuclidean
+ 
++logging.basicConfig(
++    level=logging.DEBUG,
++    format='[%(asctime)s] %(module)s.%(funcName)s %(levelname)s: %(message)s',
++    datefmt='%Y-%m-%d %H:%M:%S')
++logger = logging.getLogger(__name__)
++
+ 
+ class AlignmentResult:
+     """
+@@ -214,12 +221,13 @@ def extract_residues_coordinates(structure_string: str,
+         mmcif = PDBxFile.read(StringIO(structure_string))
+         structure = get_structure(mmcif, model=1)
+     except UnboundLocalError:
+-        pdb = PDBFile(StringIO(structure_string))
++        pdb = PDBFile.read(StringIO(structure_string))
+         structure = pdb.get_structure()[0]
+ 
+     protein_chain = structure[structure.chain_id == chain]
+     # extract CA atoms coordinates
+     ca_atoms = protein_chain[protein_chain.atom_name == "CA"]
++
+     residues = str(ProteinSequence(ca_atoms.res_name))
+     coords = ca_atoms.coord
+ 
+@@ -367,11 +375,9 @@ def align_contact_map(query_alignment: str,
+         output_contact_map[i, i] = 1
+     # Fill the contacts from the sparse query contact map
+     for i, j in sparse_query_contact_map:
+-        if i < 0:
+-            continue
+         if i >= query_index:
+             continue
+-        # Apply symmetry
++        # Apply symmetryR
+         output_contact_map[i, j] = 1
+         output_contact_map[j, i] = 1
+ 
+@@ -381,7 +387,6 @@ def align_contact_map(query_alignment: str,
+ def retrieve_align_contact_map(
+         alignment: AlignmentResult,
+         database: str = "pdb100",
+-        max_seq_len: int = 1000,
+         threshold: float = 6,
+         generated_contacts: int = 2) -> Tuple[AlignmentResult, np.ndarray]:
+     """
+@@ -390,7 +395,6 @@ def retrieve_align_contact_map(
+     Args:
+         alignment (AlignmentResult): Alignment of query and target sequences.
+         database (str): Path to FoldComp database. If empty, the structure will be retrieved from the PDB.
+-        max_seq_len (int): Maximum sequence length.
+         threshold (float): Distance threshold for contact map.
+         generated_contacts (int): Number of generated contacts to add for gapped regions in the query alignment.
+ 
+@@ -402,14 +406,40 @@ def retrieve_align_contact_map(
+         database = "pdb100"
+ 
+     idx = alignment.target_name.rsplit(".", 1)[0]
+-    coordinates = retrieve_structure_features(idx, database_path=database)[1]
+-
+-    cmap = calculate_contact_map(coordinates,
+-                                 threshold=threshold,
+-                                 mode="sparse")
++    try:
++        coordinates = retrieve_structure_features(idx,
++                                                  database_path=database)[1]
++
++    # catch error for non-standard aminoacids in database
++    except KeyError as e:
++        coordinates = None
++        pdb_id, chain = idx.upper().split("_")
++
++        logger.warning(
++            f"Error extracting residues and coordinates for PDB ID {pdb_id}[Chain {chain}] - "
++            f"non-standard residue {str(e)} present; {alignment.query_name} alignment skipped."
++        )
++
++    # output of the function might None
++    if coordinates is not None:
++
++        cmap = calculate_contact_map(coordinates,
++                                     threshold=threshold,
++                                     mode="sparse")
++        logger.debug("Aligning contact map for %s against %s.", idx,
++                     alignment.query_name)
++        try:
++            aligned_cmap = align_contact_map(alignment.gapped_sequence,
++                                             alignment.gapped_target, cmap,
++                                             generated_contacts)
++        except KeyError:
++            pdb_id, chain = idx.upper().split("_")
++            logger.warning(
++                f"Error aligning contact map for PDB ID {pdb_id}[Chain {chain}] "
++                f"against {alignment.query_name}.")
++            aligned_cmap = None
+ 
+-    aligned_cmap = align_contact_map(alignment.gapped_sequence,
+-                                     alignment.gapped_target, cmap,
+-                                     generated_contacts)
++    else:
++        aligned_cmap = None
+ 
+     return (alignment, aligned_cmap)
+diff --git a/mDeepFRI/cli.py b/mDeepFRI/cli.py
+index 9e2d1a9..af3f94e 100644
+--- a/mDeepFRI/cli.py
++++ b/mDeepFRI/cli.py
+@@ -169,13 +169,37 @@ def get_models(ctx, output, version):
+     type=int,
+     help="Number of threads to use. Default is 1.",
+ )
++@click.option(
++    "--skip-pdb",
++    default=False,
++    type=bool,
++    is_flag=True,
++    help="Skip PDB100 database search.",
++)
++@click.option(
++    "--min-length",
++    default=60,
++    type=int,
++    help="Minimum length of the protein sequence. Default is 60.\n" \
++         "DANGER: Model behavior was not tested for sequences shorter than 60 amino acids. " \
++         "It might still be useful, interpret results at your own risk;)"
++)
++@click.option(
++    "--max-length",
++    default=1000,
++    type=int,
++    help="Maximum length of the protein sequence. Default is 1000.\n" \
++         "DANGER: Model behavior was not tested for sequences longer than 1000 amino acids. " \
++         "It might still be useful, interpret results at your own risk;)"
++)
+ @click.pass_context
+ def predict_function(ctx, input, db_path, weights, output, processing_modes,
+                      angstrom_contact_thresh, generate_contacts,
+                      mmseqs_min_bitscore, mmseqs_max_evalue,
+                      mmseqs_min_identity, top_k, alignment_gap_open,
+                      alignment_gap_extend, alignment_min_identity,
+-                     remove_intermediate, overwrite, threads):
++                     remove_intermediate, overwrite, threads, skip_pdb,
++                     min_length, max_length):
+     """Predict protein function from sequence."""
+     logger.info("Starting Metagenomic-DeepFRI.")
+ 
+@@ -199,7 +223,10 @@ def predict_function(ctx, input, db_path, weights, output, processing_modes,
+         identity_threshold=alignment_min_identity,
+         remove_intermediate=remove_intermediate,
+         overwrite=overwrite,
+-        threads=threads)
++        threads=threads,
++        skip_pdb=skip_pdb,
++        min_length=min_length,
++        max_length=max_length)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/mDeepFRI/pdb.py b/mDeepFRI/pdb.py
+index 4443974..885d0b2 100644
+--- a/mDeepFRI/pdb.py
++++ b/mDeepFRI/pdb.py
+@@ -22,9 +22,10 @@ def create_pdb_mmseqs():
+     PDB100 = "https://wwwuser.gwdg.de/~compbiol/colabfold/pdb100_230517.fasta.gz"
+     # check if pdb exists in a build dir
+     build_dir = Path(mDeepFRI.__path__[0]).parent
+-    pdb100_path = str(build_dir / "pdb100_230517.fasta.gz")
++    pdb100_path = Path(build_dir / "pdb100_230517.fasta.gz")
+     # remove additional suffix
+-    pdb100_path = Path(pdb100_path.split(".")[0])
++    base, first_ext, second_ext = pdb100_path.name.partition(".")
++    pdb100_path = pdb100_path.with_name(base)
+     uncompressed_path = pdb100_path.with_suffix(".fasta")
+     compressed_path = pdb100_path.with_suffix(".fasta.gz")
+ 
+diff --git a/mDeepFRI/pipeline.py b/mDeepFRI/pipeline.py
+index 5c806aa..d56672b 100644
+--- a/mDeepFRI/pipeline.py
++++ b/mDeepFRI/pipeline.py
+@@ -22,7 +22,6 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-# TODO: input an MMSeqs DB as query
+ def predict_protein_function(
+         query_file: str,
+         databases: Tuple[str],
+@@ -40,11 +39,14 @@ def predict_protein_function(
+         identity_threshold: float = 0.5,
+         remove_intermediate=False,
+         overwrite=False,
+-        threads: int = 1):
+-
+-    MIN_SEQ_LEN = 60
+-    MAX_SEQ_LEN = 1000
+-    logger.info("DeepFRI protein sequence limit: %i-%i", MIN_SEQ_LEN,
++        threads: int = 1,
++        skip_pdb: bool = False,
++        min_length: int = 60,
++        max_length: int = 1000):
++
++    MIN_SEQ_LEN = min_length
++    MAX_SEQ_LEN = max_length
++    logger.info("DeepFRI protein sequence limit: %i-%i aa.", MIN_SEQ_LEN,
+                 MAX_SEQ_LEN)
+ 
+     query_file = pathlib.Path(query_file)
+@@ -67,11 +69,13 @@ def predict_protein_function(
+ 
+     deepfri_dbs = []
+     # PDB100 database
+-    logger.info(
+-        "Creating PDB100 database. This may take a bit during a first run.")
+-    pdb100 = create_pdb_mmseqs()
+-    deepfri_dbs.append(pdb100)
+-    logger.info("PDB100 database created.")
++    if not skip_pdb:
++        logger.info(
++            "Creating PDB100 database. This may take a bit during a first run."
++        )
++        pdb100 = create_pdb_mmseqs()
++        deepfri_dbs.append(pdb100)
++        logger.info("PDB100 database created.")
+ 
+     # design solution
+     # database is built in the same directory
+@@ -86,42 +90,77 @@ def predict_protein_function(
+         )
+         deepfri_dbs.append(db)
+ 
+-    # SEQUENCE ALIGNMENT
+-    aligned_queries = {}
+     query_seqs = load_fasta_as_dict(query_file)
++    aligned_cmaps = []
+ 
+     for db in deepfri_dbs:
+-        aligned = len(aligned_queries)
+-        logger.info("Aligning %s sequences against %s", len(query_seqs),
++        # SEQUENCE ALIGNMENT
++        # calculate already aligned sequences
++        aligned = len(aligned_cmaps)
++        logger.info("Aligning %s sequences against %s.", len(query_seqs),
+                     db.name)
++
++        # align new sequences agains db
+         alignments = run_alignment(query_file, db.mmseqs_db, db.sequence_db,
+                                    output_path, mmseqs_min_bitscore,
+                                    mmseqs_max_eval, mmseqs_min_identity, top_k,
+                                    alignment_gap_open,
+                                    alignment_gap_continuation, threads)
+-        if alignments:
+-            # filter alignments by identity
+-            alignments = [
+-                aln for aln in alignments if aln.identity > identity_threshold
+-            ]
+-
+-            # set a db name for alignments
+-            for aln in alignments:
+-                aln.db_name = db.name
+-            new_alignments = {
+-                aln.query_name: aln
+-                for aln in alignments
+-                if aln.query_name not in aligned_queries.keys()
+-            }
+-            aligned_queries.update(new_alignments)
+-        else:
+-            logger.info("No alignments found for %s", db.name)
+-
+-        logger.info("Aligned %i sequences.", len(aligned_queries) - aligned)
+ 
++        # if anything aligned
++        if not alignments:
++            logger.info("No alignments found for %s.", db.name)
++            continue
++        # filter alignments by identity
++        alignments = [
++            aln for aln in alignments if aln.identity > identity_threshold
++        ]
++
++        if not alignments:
++            logger.info("All alignments below identity threshold for %s.",
++                        db.name)
++            continue
++
++        # set a db name for alignments
++        for aln in alignments:
++            aln.db_name = db.name
++
++        aligned_queries = [aln[0].query_name for aln in aligned_cmaps]
++        new_alignments = {
++            aln.query_name: aln
++            for aln in alignments if aln.query_name not in aligned_queries
++        }
++
++        # CONTACT MAP ALIGNMENT
++        # initially designed as a separate step
++        # some protein structures in PDB are not formatted correctly
++        # so contact map alignment fails for them
++        # for this cases we replace closest experimental structure with
++        # closest predicted structure if available
++        # if no alignments were found - report
++        logger.info("Aligning contact maps for %i proteins against %s.",
++                    len(new_alignments), db.name)
++
++        partial_align = partial(retrieve_align_contact_map,
++                                database=db.foldcomp_db,
++                                threshold=angstrom_contact_threshold,
++                                generated_contacts=generate_contacts)
++
++        with Pool(threads) as p:
++            partial_cmaps = p.map(partial_align, new_alignments.values())
++
++        # filter errored contact maps
++        # returned as Tuple[AlignmentResult, None] from `retrieve_align_contact_map`
++        partial_cmaps = [cmap for cmap in partial_cmaps if cmap[1] is not None]
++        aligned_cmaps.extend(partial_cmaps)
++
++    # report alignments for each database
++    logger.info("Aligned %i sequences.", len(aligned_queries) - aligned)
++
++    aligned_queries = [aln.query_name for aln in alignments]
+     unaligned_queries = {
+         k: v
+-        for k, v in query_seqs.items() if k not in aligned_queries.keys()
++        for k, v in query_seqs.items() if k not in aligned_queries
+     }
+ 
+     # deepfri_processing_modes = ['mf', 'bp', 'cc', 'ec']
+@@ -129,32 +168,6 @@ def predict_protein_function(
+     # bp = biological_process
+     # cc = cellular_component
+     # ec = enzyme_commission
+-    gcn_prots, cnn_prots = len(aligned_queries), len(unaligned_queries)
+-
+-    # CONTACT MAP ALIGNMENT
+-    aligned_cmaps = []
+-    if gcn_prots > 0:
+-        for db in deepfri_dbs:
+-            aligned = len(aligned_cmaps)
+-            # select only alignments from db
+-            # print db name
+-            db_alignments = [
+-                v for v in aligned_queries.values() if v.db_name == db.name
+-            ]
+-            if len(db_alignments) == 0:
+-                continue
+-
+-            logger.info("Aligning contact maps for %i proteins against %s",
+-                        len(db_alignments), db.name)
+-            partial_align = partial(retrieve_align_contact_map,
+-                                    database=db.foldcomp_db,
+-                                    threshold=angstrom_contact_threshold,
+-                                    generated_contacts=generate_contacts)
+-
+-            with Pool(threads) as p:
+-                partial_cmaps = p.map(partial_align, db_alignments)
+-
+-            aligned_cmaps.extend(partial_cmaps)
+ 
+     # sort cmaps by length of query sequence
+     aligned_cmaps = sorted(aligned_cmaps,
+@@ -178,6 +191,7 @@ def predict_protein_function(
+     # FUNCTION PREDICTION
+     for i, mode in enumerate(deepfri_processing_modes):
+         # GCN
++        gcn_prots = len(aligned_cmaps)
+         if gcn_prots > 0:
+             net_type = "gcn"
+             logger.info("Processing mode: %s; %i/%i", mode, i + 1,
+@@ -189,13 +203,15 @@ def predict_protein_function(
+             gcn = Predictor(gcn_path, threads=threads)
+ 
+             for i, (aln, aligned_cmap) in enumerate(aligned_cmaps):
+-                if len(aln.query_sequence) > MAX_SEQ_LEN:
+-                    logger.info("Skipping %s; sequence too long %i",
++
++                ### PROTEIN LENGTH CHECKS
++                if len(aln.query_sequence) < MIN_SEQ_LEN:
++                    logger.info("Skipping %s; sequence too short %i aa",
+                                 aln.query_name, len(aln.query_sequence))
+                     continue
+ 
+-                elif len(aln.query_sequence) < MIN_SEQ_LEN:
+-                    logger.info("Skipping %s; sequence too short %i",
++                elif len(aln.query_sequence) > MAX_SEQ_LEN:
++                    logger.info("Skipping %s; sequence too long - %i aa",
+                                 aln.query_name, len(aln.query_sequence))
+                     continue
+ 
+@@ -219,6 +235,7 @@ def predict_protein_function(
+             del gcn
+ 
+         # CNN for queries without satisfying alignments
++        cnn_prots = len(unaligned_queries)
+         if cnn_prots > 0:
+             net_type = "cnn"
+             logger.info("Predicting with CNN: %i proteins", cnn_prots)
+@@ -248,11 +265,13 @@ def predict_protein_function(
+ 
+     output_buffer.close()
+ 
+-    # sort predictions by score
++    # sort predictions by protein name and score
+     with open(output_file_name, "r", encoding="utf-8") as f:
+         reader = csv.reader(f, delimiter="\t")
+         header = next(reader)
+-        rows = sorted(reader, key=lambda row: float(row[2]), reverse=True)
++        # row[0] - protein name
++        # row[2] - DeepFRI score
++        rows = sorted(reader, key=lambda row: (str(row[0]), -float(row[2])))
+ 
+     with open(output_file_name, "w", encoding="utf-8") as f:
+         writer = csv.writer(f, delimiter="\t")

@@ -1,0 +1,198 @@
+diff --git a/deepblast/alignment.py b/deepblast/alignment.py
+index a43318c..4d5184f 100644
+--- a/deepblast/alignment.py
++++ b/deepblast/alignment.py
+@@ -81,7 +81,34 @@ def forward(self, x, order):
+             aln = self.nw.decode(theta, A)
+             return aln, theta, A
+ 
++    def score(self, x, order):
++        with torch.no_grad():
++            zx, _, zy, _ = unpack_sequences(self.match_embedding(x), order)
++            gx, _, gy, _ = unpack_sequences(self.gap_embedding(x), order)
++
++            # Obtain theta through an inner product across latent dimensions
++            theta = F.softplus(torch.einsum('bid,bjd->bij', zx, zy))
++            A = F.logsigmoid(torch.einsum('bid,bjd->bij', gx, gy))
++            ascore = self.nw(theta, A)
++            return ascore
++
+     def traceback(self, x, order):
++        """ Generate alignment matrix.
++
++        Parameters
++        ----------
++        x : PackedSequence
++            Packed sequence object of proteins to align.
++        order : np.array
++            The origin order of the sequences
++
++        Returns
++        -------
++        decoded : list of tuple
++            State string representing alignment coordinates
++        aln : torch.Tensor
++            Alignment Matrix (dim B x N x M)
++        """
+         # dim B x N x D
+         with torch.enable_grad():
+             zx, _, zy, _ = unpack_sequences(self.match_embedding(x), order)
+diff --git a/deepblast/dataset/__init__.py b/deepblast/dataset/__init__.py
+index 4688185..0655c8e 100644
+--- a/deepblast/dataset/__init__.py
++++ b/deepblast/dataset/__init__.py
+@@ -1,4 +1,5 @@
+-from deepblast.dataset.dataset import MaliAlignmentDataset, TMAlignDataset
++from deepblast.dataset.dataset import (MaliAlignmentDataset, TMAlignDataset,
++                                       FastaDataset)
+ 
+ 
+-__all__ = ['MaliAlignmentDataset', 'TMAlignDataset']
++__all__ = ['MaliAlignmentDataset', 'TMAlignDataset', 'FastaDataset']
+diff --git a/deepblast/dataset/dataset.py b/deepblast/dataset/dataset.py
+index 1c9a6e8..506081e 100644
+--- a/deepblast/dataset/dataset.py
++++ b/deepblast/dataset/dataset.py
+@@ -2,7 +2,7 @@
+ import pandas as pd
+ import math
+ import torch
+-from torch.utils.data import Dataset
++from torch.utils.data import Dataset, IterableDataset
+ from deepblast.dataset.alphabet import UniprotTokenizer
+ from deepblast.constants import m
+ from deepblast.dataset.utils import (
+@@ -10,6 +10,7 @@
+     clip_boundaries, states2matrix, states2edges,
+     path_distance_matrix, gap_mask
+ )
++from Bio import SeqIO
+ 
+ 
+ def reshape(x, N, M):
+@@ -228,3 +229,36 @@ def __getitem__(self, i):
+         pos = torch.Tensor(pos).long()
+         alignment_matrix = torch.from_numpy(states2matrix(states))
+         return gene, pos, states, alignment_matrix
++
++
++class FastaDataset(IterableDataset):
++    """ Dataset for fasta files
++
++    This is appropriate when searching fasta files with pretrained models.
++    """
++    def __init__(self, query_file, db_file, tokenizer=UniprotTokenizer()):
++        """ Read in pairs of proteins
++
++        Parameters
++        ----------
++        query_file : path
++            Path to query protein sequences.
++        db_file : path
++            Path to database protein sequences.
++        """
++        self.tokenizer = tokenizer
++
++        self.query_file = query_file
++        self.db_file = db_file
++        self.db_seqs = SeqIO.parse(self.db_file, format='fasta')
++
++    def __iter__(self):
++        # load all of the contents of the query file
++        query_seqs = SeqIO.parse(self.query_file, format='fasta')
++        db = next(self.db_seqs)
++        dbid, dbseq = db.id, str(db.seq)
++        for q in query_seqs:
++            qid, qseq = q.id, str(q.seq)
++            dbtoks = torch.Tensor(self.tokenizer(str.encode(dbseq))).long()
++            qtoks = torch.Tensor(self.tokenizer(str.encode(qseq))).long()
++            yield qid, dbid, qtoks, dbtoks
+diff --git a/deepblast/dataset/utils.py b/deepblast/dataset/utils.py
+index a2e53f2..3cb5bef 100644
+--- a/deepblast/dataset/utils.py
++++ b/deepblast/dataset/utils.py
+@@ -285,6 +285,15 @@ def test_collate_f(batch):
+     return genes, others, states, dm, p, G, gene_names, other_names
+ 
+ 
++def collate_fasta_f(batch):
++    gene_ids = [x[0] for x in batch]
++    other_ids = [x[1] for x in batch]
++    genes = [x[2] for x in batch]
++    others = [x[3] for x in batch]
++    seqs, order = pack_sequences(genes, others)
++    return gene_ids, other_ids, seqs, order
++
++
+ def path_distance_matrix(pi):
+     """ Builds a min path distance matrix.
+ 
+diff --git a/scripts/deepblast-search b/scripts/deepblast-search
+new file mode 100644
+index 0000000..eee0732
+--- /dev/null
++++ b/scripts/deepblast-search
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++
++import argparse
++import os
++
++import torch
++import numpy as np
++from pytorch_lightning import Trainer
++from deepblast.trainer import LightningAligner
++from deepblast.dataset import FastaDataset
++from deepblast.dataset.utils import collate_fasta_f
++from deepblast.dataset.utils import unpack_sequences
++from torch.utils.data import DataLoader
++from tqdm import tqdm
++
++
++def fasta_dataloader(args):
++    dataset = FastaDataset(args.query_fasta, args.db_fasta)
++    dataloader = DataLoader(
++        dataset, args.batch_size, shuffle=False,
++        collate_fn=collate_fasta_f, num_workers=args.num_workers,
++        pin_memory=True)
++    return dataloader
++
++
++def main(args):
++    print('args', args)
++    model = LightningAligner.load_from_checkpoint(
++        args.load_from_checkpoint)
++    dataloader = fasta_dataloader(args)
++    if args.gpu:
++        model = model.cuda()
++    with open(args.output_file, 'w') as out_handle:
++        for batch in tqdm(dataloader):
++            qids, dids, seqs, order = batch
++            if args.gpu:
++                seqs = seqs.cuda()
++            A = model.align.score(seqs, order)
++            _, qlen, _, dlen = unpack_sequences(seqs, order)
++            lens = zip(qlen, dlen)
++            for i, ln in enumerate(lens):
++                ql, dl = ln
++                aln_score = np.asscalar(A[i].detach().cpu().numpy())
++                norm_score = aln_score / (float(ql) * float(dl))
++                q_id, d_id = qids[i], dids[i]
++                res = [q_id, d_id, np.round(aln_score, decimals=4),
++                       np.round(norm_score, decimals=4)]
++                res = list(map(str, res))
++                out_handle.write('\t'.join(res) + '\n')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--query-fasta', type=str, required=True)
++    parser.add_argument('--db-fasta', type=str, required=True)
++    parser.add_argument('--load-from-checkpoint', type=str, required=True)
++    parser.add_argument('--output-file', type=str, required=True)
++    parser.add_argument('--gpu', type=bool, default=None)
++    parser.add_argument('--num-workers', type=int, default=1)
++    parser.add_argument('--batch-size', type=int, default=10)
++
++    hparams = parser.parse_args()
++    main(hparams)

@@ -1,0 +1,719 @@
+diff --git a/Project.toml b/Project.toml
+index 4400ee9bbe..36f109fe59 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -14,6 +14,7 @@ JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+ LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+ NLSolvers = "337daf1e-9722-11e9-073e-8b9effe078ba"
++OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+ PackedVectorsOfVectors = "7713531c-48ef-4bdd-9821-9ff7a8736089"
+ PositiveFactorizations = "85a6dd25-e78a-55b7-8502-1745935b8125"
+ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+@@ -52,14 +53,17 @@ julia = "1.6"
+ [weakdeps]
+ Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+ CoolProp = "e084ae63-2819-5025-826e-f8e611a84251"
++Metaheuristics = "bcdb8e00-2c21-11e9-3065-2b553b22f898"
+ 
+ [extensions]
+ ClapeyronSymbolicsExt = "Symbolics"
+ ClapeyronCoolPropExt = "CoolProp"
++ClapeyronMetaheuristicsExt = "Metaheuristics"
+ 
+ [extras]
+ Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+ CoolProp = "e084ae63-2819-5025-826e-f8e611a84251"
++Metaheuristics = "bcdb8e00-2c21-11e9-3065-2b553b22f898"
+ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+ 
+ [targets]
+diff --git a/docs/src/api/parameters.md b/docs/src/api/parameters.md
+index a030256d4c..8a6db517dd 100755
+--- a/docs/src/api/parameters.md
++++ b/docs/src/api/parameters.md
+@@ -62,6 +62,11 @@ Clapeyron.is_splittable
+ Clapeyron.index_reduction
+ ```
+ 
++## Model Exporting
++```@docs
++Clapeyron.export_model
++```
++
+ ## Model Citing
+ ```@docs
+ Clapeyron.doi
+diff --git a/ext/ClapeyronMetaheuristicsExt.jl b/ext/ClapeyronMetaheuristicsExt.jl
+new file mode 100644
+index 0000000000..57a0ecbbc5
+--- /dev/null
++++ b/ext/ClapeyronMetaheuristicsExt.jl
+@@ -0,0 +1,30 @@
++module ClapeyronMetaheuristicsExt
++
++using Clapeyron
++using Metaheuristics
++
++function logger(st)
++    if st.iteration % 10 == 0
++        println("Iteration: ",st.iteration)
++        println("Best solution: ",st.best_sol.x)
++        println("Best value: ",st.best_sol.f)
++    end
++end
++
++function Metaheuristics.optimize(f::Function,estimator::Estimation{T},method::Metaheuristics.AbstractAlgorithm = Metaheuristics.ECA();verbose=false,logger::Function = (status) -> logger(status)) where T<:EoSModel
++    nparams = length(estimator.toestimate.upper)
++    upper = [estimator.toestimate.upper[i][1] for i ∈ 1:nparams]
++    lower = [estimator.toestimate.lower[i][1] for i ∈ 1:nparams]
++    bounds  = [lower upper]'
++    if verbose
++        results = Metaheuristics.optimize(f,bounds,method;logger=logger)
++    else
++        results = Metaheuristics.optimize(f,bounds,method;logger=(status) -> nothing)
++    end
++    
++    params = minimizer(results)
++    model = return_model(estimator,estimator.model,params)
++    return params, model
++end
++
++end
+\ No newline at end of file
+diff --git a/src/Clapeyron.jl b/src/Clapeyron.jl
+index 7777f5818c..85a2e17e3a 100755
+--- a/src/Clapeyron.jl
++++ b/src/Clapeyron.jl
+@@ -82,6 +82,9 @@ include("utils/index_reduction.jl")
+ #splitting models, useful for methods.
+ include("utils/split_model.jl")
+ 
++#exportting models, useful for parameter estimation.
++include("utils/export_model.jl")
++
+ # Gustavo: acceleration for successive substitution
+ include("utils/acceleration_ss.jl")
+ 
+diff --git a/src/base/EoSModel.jl b/src/base/EoSModel.jl
+index a23750cf79..20cce96858 100755
+--- a/src/base/EoSModel.jl
++++ b/src/base/EoSModel.jl
+@@ -104,6 +104,9 @@ Base.eltype(model::EoSModel) = __eltype(model)
+         return Float64
+     end
+ end
++
++Base.summary(model::EoSModel) = string(parameterless_type(model))
++
+ """
+     @comps
+ 
+diff --git a/src/database/UserReader.jl b/src/database/UserReader.jl
+index 4464bf4ace..299ca9315b 100755
+--- a/src/database/UserReader.jl
++++ b/src/database/UserReader.jl
+@@ -1,4 +1,4 @@
+-PARAM_LOCATION = "" 
++PARAM_LOCATION = ""
+ import UUIDs
+ const PKG_UUID = parse(UUIDs.UUID,"7c7805af-46cc-48c9-995b-ed0ed2dc909a")
+ 
+@@ -21,8 +21,9 @@ Creates a clapeyron CSV file and returns the location of that file. the type det
+ - `:pair` creates a table with pair parameters
+ - `:assoc` creates a table with association parameters
+ - `:group` creates a table with association parameters
+-By default, the name is generated randomly, and the table is stored as a temporary scratch space (provided by Scratch.jl). 
+-You can clean said scratch space by using `Clapeyron.cleartemp!()`. 
++By default, the name is generated randomly, and the table is stored as a temporary scratch space (provided by Scratch.jl).
++You can clean said scratch space by using `Clapeyron.cleartemp!()`.
++
+ ## Examples:
+ ```julia-repl
+ julia> data = (species = ["water"],Mw = [18.03]) #it could be a Dict, a named tuple, or any Tables.jl compatible table
+@@ -59,7 +60,7 @@ function ParamTable(type::Symbol,data;
+     _,_,_ = col_indices(table_type,normalised_headers,options) #basically to check the schema
+     file = joinpath(location,csvname)
+     io = open(file,"w")
+-    pretext = 
++    pretext =
+     """Clapeyron Database File
+     $(name) Parameters [csvtype = $type, grouptype = $grouptype]
+     """
+@@ -70,7 +71,7 @@ function ParamTable(type::Symbol,data;
+ end
+ 
+ function generate_location!()
+-    if PARAM_LOCATION === "" 
++    if PARAM_LOCATION === ""
+         global PARAM_LOCATION = @get_scratch!("ParamTables")
+     end
+     return PARAM_LOCATION
+diff --git a/src/database/database.jl b/src/database/database.jl
+index 3f82bf8606..f5923ec9e7 100755
+--- a/src/database/database.jl
++++ b/src/database/database.jl
+@@ -449,7 +449,7 @@ function col_indices(csvtype,headernames,options=DefaultOptions)
+ end
+ 
+ 
+-function read_csv(filepath,options::ParamOptions = DefaultOptions,sep = :auto)::CSV.File
++function read_csv(filepath,options::ParamOptions,sep = :auto)::CSV.File
+     #actual reading
+     ignorelist = deepcopy(options.ignore_headers)
+     map!(normalisestring,ignorelist,ignorelist)
+@@ -476,6 +476,11 @@ function read_csv(filepath,options::ParamOptions = DefaultOptions,sep = :auto)::
+     return df
+ end
+ 
++function read_csv(path;relativetodatabase = true)
++    path_norm = getpath(path;relativetodatabase)
++    return read_csv(path_norm,ParamOptions(ignore_headers = String[]))
++end
++
+ function findparamsincsv(components,filepath,
+     options::ParamOptions = DefaultOptions,
+     parsegroups = :off,
+@@ -840,5 +845,6 @@ function valid_headerparams(csvheaders, options::ParamOptions = DefaultOptions)
+ end
+ 
+ include("database_group.jl")
++include("database_writer.jl")
+ 
+ export getparams
+\ No newline at end of file
+diff --git a/src/database/database_utils.jl b/src/database/database_utils.jl
+index a66f20f459..3c472addb5 100644
+--- a/src/database/database_utils.jl
++++ b/src/database/database_utils.jl
+@@ -109,6 +109,8 @@ end
+ 
+ flattenfilepaths(locations,userlocations::String) = flattenfilepaths(locations,[userlocations])
+ 
++getpath(location;relativetodatabase = true) = only(getpaths(location; relativetodatabase))
++
+ Base.@nospecialize
+ function flattenfilepaths(locations,userlocations::Union{NamedTuple,AbstractDict})
+     return String[]
+diff --git a/src/database/database_writer.jl b/src/database/database_writer.jl
+new file mode 100644
+index 0000000000..9ee48c95d2
+--- /dev/null
++++ b/src/database/database_writer.jl
+@@ -0,0 +1,106 @@
++function get_header(path)
++    io = IOBuffer()
++    _sep = Any[1]
++    file = open(getpath(path),"r")
++    for (k,i) in enumerate(eachline(file))
++        
++        if k == 2
++            io2 = IOBuffer()
++            print(io2,i)
++            str = String(take!(io2))
++            _sep[] = _read_csv_options(str)
++        end
++        if k == 3
++            break
++        end
++        println(io,i)
++    end
++    header = String(take!(io))
++    close(file)
++    _delims = (comma = ',',space = ' ')
++    sep = _sep[][:sep]
++    if sep isa Symbol
++        _delim = get(_delims,sep,string(sep))
++    else
++        _delim = sep
++    end
++    return header,_delim,_sep[]
++end
++
++#overwrites csv in a path
++function write_csv!(path,_database;relativetodatabase = true)
++    database = deepcopy(normalise_db(_database))
++    header,delim,_ = get_header(path)
++    io = IOBuffer()
++    print(io,header)
++    CSV.write(io,database,delim = delim,writeheader = true,append = true)
++    normpath = getpath(path)
++    f = open(normpath,"w")
++    write(f,String(take!(io)))
++    close(f)
++    return nothing
++end
++
++function make_header(_database,name = nothing,grouptype = :unknown)
++    
++    io = IOBuffer()
++    println(io,"Clapeyron Database File")
++    if name !== nothing
++        print(io,name)
++    end
++
++    #create a csv options type, based on the column names stored.
++    headers = normalisestring.(String.(Tables.columnnames(_database)))
++    if all(in(headers),("species","groups"))
++        csvtype = :group
++    elseif all(in(headers),("species1","species2","site1","site2"))
++        csvtype = :assoc
++    elseif all(in(headers),("species1","species2"))
++        csvtype = :pair
++    elseif all(in(headers),("species"))
++        csvtype = :like
++    else
++        csvtype = :invalid
++    end
++    
++    print(io,"[csvtype = $csvtype")
++    if grouptype == :unknown
++        opts = (;csvtype)
++        print(io,"; grouptype = $grouptype")
++    else
++        opts = (;csvtype,grouptype)
++    end
++    print(io,"]")
++    header = String(take!(io))
++    sep = ','
++    return header,sep,opts
++end
++
++#creates a new csv, be sure that the path actually exists.
++function write_csv(path,database;relativetodatabase = true,grouptype = :unknown, name = nothing)
++    _database = normalise_db(database)
++    database = deepcopy(_database)
++    header,delim,_ = make_header(_database,name,grouptype)
++    io = IOBuffer()
++    print(io,header)
++    CSV.write(io,database,delim = delim,writeheader = true,append = true)
++    normpath = getpath(path;relativetodatabase)
++    f = open(normpath,"w")
++    write(f,String(take!(io)))
++    close(f)
++    return nothing
++end
++
++function normalise_db(db)
++    Tables.istable(typeof(db)) && return db
++    throw(error("cannot normalise database into a Tables.jl compatible type."))
++end
++
++function normalise_db(db::AbstractDict{K,Any}) where {K<:AbstractString}
++    return OrderedCollections.OrderedDict{Symbol,AbstractVector}(Symbol(k) => db[k] for k in keys(db))
++end
++
++
++
++
++
+diff --git a/src/estimation/estimation.jl b/src/estimation/estimation.jl
+index bd8020983f..f4e3fbf614 100644
+--- a/src/estimation/estimation.jl
++++ b/src/estimation/estimation.jl
+@@ -64,12 +64,13 @@ export Estimation
+ # Mutable for now to make it easy to just replace the model
+ """
+     Estimation
+-    Estimation(model,toestimate,filepaths,ignorefield)
++    Estimation(model,toestimate,filepaths,ignorefield,objective_form)
+ ## Input parameters:
+ - ` model`: The initial model containing the species we wish to parameterise
+ - `toestimate`: The dictionary of parameters being fitted
+ - `filepaths` or `filepaths_weights`: The location of the data files used to fit. Can also contain the weights of each dataset
+ - `ignorefield`: Specify which EoSModel fields to ignore in the main model
++- `objective_form`: Specify the functional form of the objective function in the form `objective_form(pred,exp)`
+ ## Output: 
+ Estimator object which contains the following:
+ - `model`: The model whose parameters will be varied
+@@ -77,6 +78,7 @@ Estimator object which contains the following:
+ - `toestimate`: ToEstimate struct which contains all the information on the parameters
+ - `data`: Vector of `EstimationData` structs where all the information on the data is stored
+ - `ignorefield`: Vector of fields to ignore in the parameter estimation
++- `objective_form`: Function to evaluate the error measure for the objective function
+ The following objects are also output:
+ - `objective`: The objective function which is used to fit the parameters
+ - `x0`: Initial guesses for the parameters
+@@ -91,6 +93,7 @@ mutable struct Estimation{T<:EoSModel}
+     toestimate::ToEstimate
+     data::Vector{EstimationData}
+     ignorefield::Union{Nothing,Vector{Symbol}}
++    objective_form::Function
+ end
+ 
+ function Base.show(io::IO, mime::MIME"text/plain", estimation::Estimation)
+@@ -113,8 +116,8 @@ function Base.show(io::IO, estimation::Estimation)
+     print(io, typeof(estimation))
+ end
+ 
+-function Estimation(model::EoSModel, toestimate::Vector{Dict{Symbol,Any}}, filepaths::Union{Array{String},Array{Tuple{Float64, String}}}, ignorefield::Vector{Symbol})
+-    estimation = Estimation(model, deepcopy(model), ToEstimate(toestimate), EstimationData(filepaths),ignorefield)
++function Estimation(model::EoSModel, toestimate::Vector{Dict{Symbol,Any}}, filepaths::Union{Array{String},Array{Tuple{Float64, String}}}, ignorefield::Vector{Symbol}, objective_form::Function = mse(pred,exp) = ((pred-exp)/exp)^2)
++    estimation = Estimation(model, deepcopy(model), ToEstimate(toestimate), EstimationData(filepaths),ignorefield,objective_form)
+     
+     nparams = length(estimation.toestimate.params)
+ 
+@@ -126,8 +129,8 @@ function Estimation(model::EoSModel, toestimate::Vector{Dict{Symbol,Any}}, filep
+     return estimation, objective, x0, upper, lower
+ end
+ 
+-function Estimation(model::EoSModel, toestimate::Vector{Dict{Symbol,Any}}, filepaths::Union{Array{String},Array{Tuple{Float64, String}}})
+-    estimation = Estimation(model, deepcopy(model), ToEstimate(toestimate), EstimationData(filepaths),Symbol[])
++function Estimation(model::EoSModel, toestimate::Vector{Dict{Symbol,Any}}, filepaths::Union{Array{String},Array{Tuple{Float64, String}}}, objective_form::Function = mse(pred,exp) = ((pred-exp)/exp)^2)
++    estimation = Estimation(model, deepcopy(model), ToEstimate(toestimate), EstimationData(filepaths), Symbol[], objective_form)
+     
+     nparams = length(estimation.toestimate.params)
+ 
+@@ -308,6 +311,7 @@ The objective function used within parameter estimation.
+ function objective_function(estimation::Estimation,guesses)
+     F = 0
+     model = return_model(estimation, estimation.model, guesses)
++    objective_form = estimation.objective_form
+     for i ∈ 1:length(estimation.data)
+         if estimation.data[i].species == ["all"]
+             model_r = model
+@@ -336,9 +340,9 @@ function objective_function(estimation::Estimation,guesses)
+         end
+ 
+         if length(outputs)==1
+-            F += sum(((prediction.-outputs[1])./outputs[1]).^2)/length(outputs[1])*weights[1]
++            F += sum(objective_form.(prediction,outputs[1]))/length(outputs[1])*weights[1]
+         else
+-            F += sum([sum([((prediction[k][j].-outputs[j][k])./outputs[j][k]).^2 for j in 1:length(prediction[k])])*weights[1] for k in 1:length(prediction)])/length(outputs[1])
++            F += sum([sum([objective_form.(prediction[k][j],outputs[j][k]) for j in 1:length(prediction[k])])*weights[1] for k in 1:length(prediction)])/length(outputs[1])
+         end
+     end
+     if isnan(F)
+diff --git a/src/utils/export_model.jl b/src/utils/export_model.jl
+new file mode 100644
+index 0000000000..b36d807f11
+--- /dev/null
++++ b/src/utils/export_model.jl
+@@ -0,0 +1,283 @@
++using OrderedCollections
++
++"""
++    export_model(model::EoSModel,name="";location=".")
++Exports model parameters to CSVs. Unless the `name` kwarg is specified, the name of the files will follow the convention `singledata_EoS`, `pairdata_EoS` and `assocdata_EoS`. Files will be saved within the current directory unless the `location` argument is specified.
++
++Note that it will export all submodel parameters (e.g. Alpha function parameters for cubic EoS).
++"""
++function export_model(model::EoSModel,name="";location=".")
++    M = typeof(model)
++    model_name = summary(model)
++
++    if hasfield(M,:groups)
++        species = model.groups.flattenedgroups
++        ncomps = length(species)
++    else
++        species = model.components
++        ncomps = length(species)
++    end
++
++    if hasfield(M,:params)
++        P = typeof(model.params)
++        params = fieldnames(P)
++        export_like(model,params,name,location,species,ncomps)
++        export_unlike(model,params,name,location,species,ncomps)
++        export_assoc(model,params,name,location,species,ncomps)
++    end
++
++
++    f = fieldnames(M)
++    for i in f
++        if fieldtype(M,i) <: EoSModel && hasfield(fieldtype(M,i),:components) && i!=:vrmodel
++            export_model(getfield(model,i),name;location=location)
++        end
++    end
++end
++
++export export_model
++
++function export_like(model::EoSModel,params,name,location,species,ncomps)
++    M = typeof(model)
++    P = typeof(model.params)
++    model_name = summary(model)
++
++    like = OrderedDict{Symbol,AbstractVector}()
++    like[:species] = species
++
++    for i in 1:length(params)
++        paramtype = fieldtype(P,i)
++        paramname = params[i]
++        paramvalue = getfield(model.params,params[i])
++        if paramtype <: SingleParam
++            like[paramname] = paramvalue.values
++        elseif paramtype <: PairParam
++            if paramname == :sigma
++                like[:sigma] = diagvalues(paramvalue.values) * 1e10
++            elseif all(!iszero,diagvalues(paramvalue.values)) #all nonzero diagonal values
++                like[paramname] = diagvalues(paramvalue.values)
++            end
++        end
++    end
++
++    if hasfield(M,:sites)
++        site_types = model.sites.flattenedsites
++        n_flatsites = model.sites.n_flattenedsites
++        for i in 1:length(site_types)
++            nsites = [n_flatsites[j][i] for j in 1:ncomps]
++            like[Symbol("n_"*site_types[i])] = nsites
++        end
++    end
++
++    if name==""
++        name = model_name
++    else
++        name=name*"_"*model_name
++    end
++
++    if length(like) != 1
++        ParamTable(:like, Tables.columntable(like); name=name, location=location)
++    end
++end
++
++function export_unlike(model::EoSModel,params,name,location,species,ncomps)
++    M = typeof(model)
++    P = typeof(model.params)
++    model_name = summary(model)
++
++    species1 = Vector{String}()
++    species2 = Vector{String}()
++
++    for i in 1:ncomps-1
++        append!(species1,fill(species[i],ncomps-i))
++        append!(species2,species[i+1:end])
++    end
++
++    unlike = OrderedDict{Symbol,AbstractVector}()
++    unlike[:species1] = species1
++    unlike[:species2] = species2
++
++    for i in 1:length(params)
++        paramtype = fieldtype(P,i)
++        paramname = params[i]
++        paramvalue = getfield(model.params,params[i])
++
++        if paramtype <: PairParam
++            binary = Vector{Float64}()
++            if params[i] == :sigma
++                for j in 1:ncomps-1
++                    append!(binary,paramvalue.values[j+1:end,j]*1e10)
++                end
++            else
++                for j in 1:ncomps-1
++                    append!(binary,paramvalue.values[j+1:end,j])
++                end
++            end
++            unlike[paramname] = binary
++        end
++    end
++
++    if name==""
++        name = model_name
++    else
++        name=name*"_"*model_name
++    end
++
++    if length(unlike) != 2
++        ParamTable(:unlike, Tables.columntable(unlike); name=name, location=location)
++    end
++end
++
++function export_unlike(model::ActivityModel,params,name,location,species,ncomps)
++    M = typeof(model)
++    P = typeof(model.params)
++    model_name = summary(model)
++
++    species1 = Vector{String}()
++    species2 = Vector{String}()
++
++    for i in 1:ncomps
++        for j in 1:ncomps
++            if i != j
++                append!(species1,[species[i]])
++                append!(species2,[species[j]])
++            end
++        end
++    end
++
++    unlike = OrderedDict{Symbol,AbstractVector}()
++    unlike[:species1] = species1
++    unlike[:species2] = species2
++
++    for i in 1:length(params)
++        paramtype = fieldtype(P,i)
++        paramname = params[i]
++        paramvalue = getfield(model.params,params[i])
++        if paramtype <: PairParam
++            binary = Vector{Float64}()
++            for j in 1:ncomps
++                append!(binary,paramvalue.values[j,1:end .!=j])
++            end
++            unlike[paramname] = binary
++        end
++    end
++
++    if name==""
++        name = model_name
++    else
++        name=name*"_"*model_name
++    end
++
++    if length(unlike) != 2
++        ParamTable(:unlike, Tables.columntable(unlike); name=name, location=location)
++    end
++end
++
++function export_unlike(model::ABCubicModel,params,name,location,species,ncomps)
++    M = typeof(model)
++    P = typeof(model.params)
++    model_name = summary(model)
++
++    species1 = Vector{String}()
++    species2 = Vector{String}()
++
++    for i in 1:ncomps-1
++        append!(species1,fill(species[i],ncomps-i))
++        append!(species2,species[i+1:end])
++    end
++
++    unlike = OrderedDict{Symbol,AbstractVector}()
++    unlike[:species1] = species1
++    unlike[:species2] = species2
++
++    for i in 1:length(params)
++        paramtype = fieldtype(P,i)
++        paramname = params[i]
++        paramvalue = getfield(model.params,params[i])
++        if paramtype <: PairParam
++            if params[i] == :a
++                binary = Vector{Float64}()
++                for j in 1:ncomps-1
++                    aij = paramvalue.values[j+1:end,j]
++                    aj = paramvalue.values[j,j]
++                    ai = diagvalues(paramvalue.values)[j+1:end]
++                    kij = @. 1-aij/(sqrt(ai*aj))
++                    append!(binary,kij)
++                end
++                unlike[paramname] = binary
++            elseif params[i] == :b
++                binary = Vector{Float64}()
++                for j in 1:ncomps-1
++                    bij = paramvalue.values[j+1:end,j]
++                    bj = paramvalue.values[j,j]
++                    bi = diagvalues(paramvalue.values)[j+1:end]
++                    lij = @. 1-2*bij/(bi+bj)
++                    append!(binary,lij)
++                end
++                unlike[paramname] = binary
++            end
++        end
++    end
++
++    if name==""
++        name = model_name
++    else
++        name=name*"_"*model_name
++    end
++
++    if length(unlike) != 2
++        ParamTable(:unlike, Tables.columntable(unlike); name=name, location=location)
++    end
++end
++
++function export_assoc(model::EoSModel,params,name,location,species,ncomps)
++    M = typeof(model)
++    P = typeof(model.params)
++    model_name = summary(model)
++
++    assoc = OrderedDict{Symbol,AbstractVector}()
++
++    for i in 1:length(params)
++        paramtype = fieldtype(P,i)
++        paramname = params[i]
++        paramvalue = getfield(model.params,params[i])
++        if paramtype <: AssocParam
++            site_types = model.sites.flattenedsites
++            mat = paramvalue.values
++            nassoc = length(mat.values)
++            spe1 = Vector{String}()
++            spe2 = Vector{String}()
++            site1 = Vector{String}()
++            site2 = Vector{String}()
++            vals = zeros(nassoc)
++            for j in 1:nassoc
++                outer_idx = mat.outer_indices[j]
++                inner_idx = mat.inner_indices[j]
++                push!(spe1,species[outer_idx[1]])
++                push!(spe2,species[outer_idx[2]])
++                push!(site1,site_types[inner_idx[1]])
++                push!(site2,site_types[inner_idx[2]])
++                vals[j] = mat.values[j]
++            end
++
++            if !any(keys(assoc).==:species1)
++                assoc[:species1] = spe1
++                assoc[:species2] = spe2
++                assoc[:site1] = site1
++                assoc[:site2] = site2
++            end
++
++            assoc[paramname] = vals
++        end
++    end
++
++    if name==""
++        name = model_name
++    else
++        name=name*"_"*model_name
++    end
++
++    if !isempty(assoc)
++        ParamTable(:assoc, Tables.columntable(assoc); name=name, location=location)
++    end
++end
+\ No newline at end of file
+diff --git a/test/test_misc.jl b/test/test_misc.jl
+index 76f2ac33ed..c51a5f8ef5 100755
+--- a/test/test_misc.jl
++++ b/test/test_misc.jl
+@@ -58,6 +58,38 @@ end
+         @test model0.params.epsilon.values[1,1] == model0_split.params.epsilon.values[1,1]
+     end
+ 
++    @testset "export_model" begin
++        @testset "SAFT Model" begin
++            model_og = PCSAFT(["water","ethanol"])
++            export_model(model_og)
++            model_ex = PCSAFT(["water","ethanol"]; userlocations = ["singledata_PCSAFT.csv","pairdata_PCSAFT.csv","assocdata_PCSAFT.csv"])
++
++            @test model_og.params.segment.values == model_ex.params.segment.values
++            @test model_og.params.epsilon.values == model_ex.params.epsilon.values
++            @test model_og.params.epsilon_assoc.values.values == model_ex.params.epsilon_assoc.values.values
++        end
++
++        @testset "Cubic Model" begin
++            model_og = PR(["water","ethanol"])
++            export_model(model_og)
++            model_ex = PR(["water","ethanol"]; userlocations = ["singledata_PR.csv","pairdata_PR.csv"],
++                                       alpha_userlocations = ["singledata_PRAlpha.csv"])
++
++            @test model_og.params.a.values == model_ex.params.a.values
++            @test model_og.alpha.params.acentricfactor.values == model_ex.alpha.params.acentricfactor.values
++        end
++
++        @testset "Activity & GC Model" begin
++            model_og = UNIFAC(["water","ethanol"])
++            export_model(model_og)
++            model_ex = UNIFAC(["water","ethanol"]; userlocations = ["singledata_UNIFAC.csv","pairdata_UNIFAC.csv"])
++
++            @test model_og.params.Q.values == model_ex.params.Q.values
++            @test model_og.params.A.values == model_ex.params.A.values
++        end
++
++    end
++
+     @testset "single component error" begin
+         model = PCSAFT(["water","methane"])
+         @test_throws DimensionMismatch saturation_pressure(model,300.15)

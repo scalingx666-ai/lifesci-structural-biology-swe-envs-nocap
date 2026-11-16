@@ -1,0 +1,149 @@
+diff --git a/meeko/cli/mk_prepare_ligand.py b/meeko/cli/mk_prepare_ligand.py
+index 0c446342..99159f06 100755
+--- a/meeko/cli/mk_prepare_ligand.py
++++ b/meeko/cli/mk_prepare_ligand.py
+@@ -206,7 +206,7 @@ def cmd_lineparser():
+     )
+     config_group.add_argument(
+         "--charge_model",
+-        choices=("gasteiger", "espaloma", "zero", "read"),
++        choices=("gasteiger", "espaloma", "zero", "read", "nagl"),
+         help="default is 'gasteiger', 'zero' sets all zeros",
+         default="gasteiger",
+     )
+diff --git a/meeko/molsetup.py b/meeko/molsetup.py
+index 19ade15c..89223af0 100644
+--- a/meeko/molsetup.py
++++ b/meeko/molsetup.py
+@@ -1544,7 +1544,7 @@ def from_mol(
+         mol: Chem.Mol,
+         keep_chorded_rings: bool = False,
+         keep_equivalent_rings: bool = False,
+-        compute_gasteiger_charges: bool = True,
++        charge_model: str = "gasteiger",
+         read_charges_from_prop: str = None,
+         conformer_id: int = -1,
+     ):
+@@ -1600,7 +1600,7 @@ def from_mol(
+         molsetup.atom_true_count = molsetup.get_num_mol_atoms()
+         molsetup.name = molsetup.get_mol_name()
+         coords = rdkit_conformer.GetPositions()
+-        molsetup.init_atom(compute_gasteiger_charges, read_charges_from_prop, coords)
++        molsetup.init_atom(charge_model, read_charges_from_prop, coords)
+         molsetup.init_bond()
+         molsetup.perceive_rings(keep_chorded_rings, keep_equivalent_rings)
+         # molsetup.rmsd_symmetry_indices = cls.get_symmetries_for_rmsd(mol)
+@@ -1615,7 +1615,7 @@ def from_mol(
+ 
+         return molsetup
+ 
+-    def init_atom(self, compute_gasteiger_charges: bool, read_charges_from_prop: str, coords: list[np.ndarray]):
++    def init_atom(self, charge_model: str, read_charges_from_prop: str, coords: list[np.ndarray]):
+         """
+         Generates information about the atoms in an RDKit Mol and adds them to an RDKitMoleculeSetup.
+ 
+@@ -1631,12 +1631,39 @@ def init_atom(self, compute_gasteiger_charges: bool, read_charges_from_prop: str
+         None
+         """
+         # extract/generate charges
+-        if compute_gasteiger_charges: 
++        if charge_model == "gasteiger": 
+             if read_charges_from_prop is not None: 
+-                raise ValueError(
+-                    "Conflicting options: compute_gasteiger_charges and read_charges_from_prop cannot both be set. "
+-                )
+-            charges = rdkitutils.compute_gasteiger_charges(self.mol)
++                raise ValueError("Conflicting options: charge_model cannot be gasteiger and read_charges_from_prop cannot both be set.")
++            
++            try:
++                charges = rdkitutils.compute_gasteiger_charges(self.mol)
++            except Exception as e:
++                print("gasteiger charge computation failed with: ")
++                print(e)
++        
++        elif charge_model == "nagl":
++            if read_charges_from_prop is not None: 
++                raise ValueError("Conflicting options: charge_model cannot be nagl and read_charges_from_prop cannot both be set.")
++            
++            # compute nagl charges
++            # note this requires the latest openff versions
++            try:
++                from openff.toolkit import Molecule
++            except ImportError:
++                print("A recent version of OpenFF is required for NAGL charges")
++
++            
++            mol_off = Molecule.from_rdkit(self.mol)
++            try:
++                mol_off.assign_partial_charges(
++                    partial_charge_method="openff-gnn-am1bcc-1.0.0.pt",
++                    )
++                charges = mol_off.partial_charges.magnitude
++            except Exception as e:
++                print("NAGL charge computation failed with with exception:")
++                print(e)
++                print("Make sure you've installed the latest version of openff")
++
+         elif read_charges_from_prop is not None: 
+             if not isinstance(read_charges_from_prop, str) or not read_charges_from_prop: 
+                 raise ValueError(
+@@ -1656,6 +1683,9 @@ def init_atom(self, compute_gasteiger_charges: bool, read_charges_from_prop: str
+                 )  
+         else:
+             charges = [0.0] * self.mol.GetNumAtoms()
++
++
++
+         # register atom
+         for a in self.mol.GetAtoms():
+             idx = a.GetIdx()
+diff --git a/meeko/preparation.py b/meeko/preparation.py
+index b2afa838..9007f33a 100644
+--- a/meeko/preparation.py
++++ b/meeko/preparation.py
+@@ -162,7 +162,7 @@ def __init__(
+             raise NotImplementedError("load_offatom_params not implemented")
+         self.load_offatom_params = load_offatom_params
+ 
+-        allowed_charge_models = ["espaloma", "gasteiger", "zero", "read"]
++        allowed_charge_models = ["espaloma", "gasteiger", "zero", "read", "nagl"]
+         if charge_model not in allowed_charge_models:
+             raise ValueError(
+                 "unrecognized charge_model: %s, allowed options are: %s"
+@@ -538,7 +538,7 @@ def prepare(
+             mol,
+             keep_chorded_rings=self.keep_chorded_rings,
+             keep_equivalent_rings=self.keep_equivalent_rings,
+-            compute_gasteiger_charges=self.charge_model == "gasteiger",
++            charge_model= self.charge_model,
+             read_charges_from_prop=self.charge_atom_prop,
+             conformer_id=conformer_id,
+         )
+@@ -569,7 +569,7 @@ def prepare(
+                 self.espaloma_model.set_espaloma_charges(setup, molgraph)
+             else:
+                 setup.atoms[0].charge = float(mol.GetAtomWithIdx(0).GetFormalCharge())
+-
++        
+ 
+         # merge hydrogens (or any terminal atoms)
+         indices = set()
+diff --git a/meeko/writer.py b/meeko/writer.py
+index 95f7949f..ecf5e07d 100644
+--- a/meeko/writer.py
++++ b/meeko/writer.py
+@@ -493,11 +493,11 @@ def _is_molsetup_ok(setup, bad_charge_ok):
+                 success = False
+             c = atom.charge
+             if not bad_charge_ok and (
+-                type(c) != float and type(c) != int or math.isnan(c) or math.isinf(c)
++                type(c) not in (np.float32, np.float64, float, int) or math.isnan(c) or math.isinf(c)
+             ):
+                 error_msg += (
+-                    "atom number %d has non finite charge, mol name: %s, charge: %s\n"
+-                    % (atom.index, setup.get_mol_name(), str(c))
++                    "atom number %d has non finite charge, mol name: %s, charge: %s, type: %s\n"
++                    % (atom.index, setup.get_mol_name(), str(c), type(c))
+                 )
+                 success = False
+ 

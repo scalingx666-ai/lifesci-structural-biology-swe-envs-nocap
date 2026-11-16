@@ -1,0 +1,131 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a64bab7..fcbda0e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,7 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Added PyTorch 2.14 to the supported range. It joins the per-pull-request `tests-torch` matrix, the documented range, and the default version list of the manual GPU validation script. The resolver floor is now `torch>=2.10` with no upper bound and the locked torch stays at 2.13.0, so 2.14 is tested and supported without being required. The scheduled `torch-latest` lane keeps its job as an early-warning probe for whatever ships next; it had already been passing against 2.14.0 for weeks before this promotion.
+ - Added `aimnet.calculators.vibrations`, a numpy-only harmonic vibrational analysis of the calculator's dense Hessian. `analyze_hessian` symmetrizes and mass-weights the `(N, 3, N, 3)` or `(3N, 3N)` Hessian, projects out rigid translations and rotations with an SVD-orthonormalized basis (three for a single atom, five for a linear molecule, six otherwise), diagonalizes only the vibrational subspace, and returns wavenumbers in cm^-1 with imaginary modes as negative values, vibrational quanta in eV, and unit-norm Cartesian normal modes; `vibrational_analysis(calc, data)` wraps the `hessian=True` evaluation for a single structure and warns when the model embeds a dispersion module whose curvature the Hessian currently omits. Unlike `ase.vibrations.VibrationsData`, which does not project rigid-body motions, or the former `sorted(freqs)[6:]` recipe, which mishandled linear molecules and could hide an imaginary mode, the result is orientation-independent and correct for linear and near-linear geometries. Masses come from the bundled `aimnet.constants` table, so no ASE install is required; the geometry-optimization tutorial's thermochemistry step now uses it.
+ - Added `aimnet download <model...|--all>` to prefetch registry model weights into the local cache for offline/HPC use.
+-- Added `deterministic=True` calculator option: routes external DFT-D3 and DSF Coulomb through their differentiable pure-torch paths, making repeated identical evaluations bitwise reproducible on the same machine/build (issue #93). Ewald/PME kernels are not covered and warn once.
++- Added `deterministic=True` calculator option: routes external DFT-D3 and DSF Coulomb through their differentiable pure-torch paths, making repeated identical evaluations bitwise reproducible on the same machine/build (issue #93). This holds only on the dense CUDA layout (3D input with at most `nb_threshold` atoms per system, no cell, no Hessian) and for the same batch composition; the packed neighbor-list layout, used above `nb_threshold` and for periodic systems, is not yet covered on CUDA (issue #140). CPU always uses the packed layout and has been bitwise repeatable in testing, though that is not yet guaranteed. Ewald/PME kernels are not covered and warn once.
+ - Added weekly and manually dispatched strict fleet CI covering every official registry digest, strict-policy artifact load, and exact role-specific YAML defaults.
+ - Added `aimnet info` reporting package/torch/warp versions, CUDA availability, registered kernel ops, and the model cache location.
+ - Added a `weights` pytest marker on modules that need model weights, enabling a verified fully-offline test run (`-m "not weights ..."`) for packaging environments.
+diff --git a/aimnet/calculators/calculator.py b/aimnet/calculators/calculator.py
+index 54f349a..7aceb21 100644
+--- a/aimnet/calculators/calculator.py
++++ b/aimnet/calculators/calculator.py
+@@ -86,12 +86,19 @@ class AIMNet2Calculator:
+     deterministic : bool
+         Route external DFT-D3 (and DSF Coulomb) through their differentiable
+         pure-torch paths instead of the atomics-based nvalchemiops CUDA
+-        kernels, making repeated identical evaluations bitwise reproducible
+-        (same machine, same build). Default is False. The kernel defaults are
+-        faster on large systems but accumulate in nondeterministic order,
+-        giving run-to-run noise of ~1e-7 eV that iterative optimizers can
+-        amplify. Ewald/PME Coulomb is not covered (a one-time warning fires);
+-        the static DFTD3 cache does not apply in this mode.
++        kernels. Default is False. On CUDA this makes repeated identical
++        evaluations bitwise reproducible only on the dense layout: 3D input
++        with at most ``nb_threshold`` atoms per system, no ``cell``, no
++        Hessian, and no caller-supplied ``mol_idx`` or ``nbmat``. On CUDA the
++        packed neighbor-list layout used otherwise keeps run-to-run noise of
++        ~1e-6 eV/A in forces (issue #140). CPU always uses the packed layout;
++        repeated CPU evaluations have been bitwise identical in testing, but
++        that is not yet guaranteed. Ewald/PME Coulomb is not covered (a
++        one-time warning fires). Reproducibility also requires
++        the same batch composition and order, GPU, and software build;
++        changing any of them, or switching layout, shifts results at the
++        rounding level, which iterative optimizers can amplify. The static
++        DFTD3 cache does not apply in this mode.
+     ensemble_member : int
+         Zero-based member selected from a Hugging Face ensemble.
+     revision : str | None
+diff --git a/docs/calculator.md b/docs/calculator.md
+index c0f0891..15b87ab 100644
+--- a/docs/calculator.md
++++ b/docs/calculator.md
+@@ -275,7 +275,9 @@ For ordinary energy/force/charge inference (including external autograd through
+ 
+ Route external DFT-D3 (and DSF Coulomb) through their differentiable pure-torch paths instead of the atomics-based nvalchemiops CUDA kernels. Default: `False`.
+ 
+-The kernel defaults accumulate pairwise terms with atomic adds, so repeated identical evaluations differ at the float32 rounding level (~1e-7 eV in energies). That noise is physically negligible but is amplified chaotically by iterative optimizers: batched geometry optimizations from byte-identical inputs can follow different trajectories. With `deterministic=True`, identical inputs give bitwise-identical energies and forces on the same machine and build, at negligible cost for typical batched workloads.
++The kernel defaults accumulate pairwise terms with atomic adds, so repeated identical evaluations differ at the float32 rounding level (~1e-7 eV in energies). That noise is physically negligible but is amplified chaotically by iterative optimizers: batched geometry optimizations from byte-identical inputs can follow different trajectories. With `deterministic=True`, identical inputs give bitwise-identical energies and forces on the same machine and build **on the dense layout only**, at negligible cost for typical batched workloads.
++
++The dense layout is used on CUDA for 3D input with at most `nb_threshold` atoms per system (default 120), no `cell`, no Hessian, and no caller-supplied `mol_idx` or `nbmat`. Everything else runs on the packed neighbor-list layout, which `deterministic=True` does not yet make reproducible on CUDA: its neighbor-list row order, per-molecule reductions, and the ConvSV backward kernel still accumulate in varying order, leaving run-to-run noise of about 1e-6 eV/Å in forces ([#140](https://github.com/isayevlab/aimnetcentral/issues/140)). CPU evaluations always use the packed layout; they have been bitwise repeatable in testing, but that is not yet guaranteed.
+ 
+ ```python
+ calc = AIMNet2Calculator("aimnet2", deterministic=True)
+@@ -286,6 +288,8 @@ Notes:
+ - Covers external D3 and `simple`/`dsf` Coulomb. Ewald/PME kernels are not covered; a one-time `UserWarning` fires if combined.
+ - The pure-torch paths materialize pairwise tensors, so for very large single systems the kernel defaults are faster; benchmark before enabling in large-system MD.
+ - Reproducibility holds per machine/build; a different GPU or PyTorch build still shifts results at rounding level.
++- Reproducibility also requires the same batch composition and order. Adding an unrelated molecule to a batch, or switching between the dense and packed layouts, changes forces at the rounding level (about 1e-6 eV/Å), and an optimizer can amplify that into a different local minimum.
++- For conformer ranking, converge tightly (for example `fmax` of 1e-3 eV/Å) before ranking, and re-optimize the finalists one at a time on the dense layout (raise `nb_threshold` above the molecule size if needed; peak memory grows, roughly 3x at 128 atoms).
+ - The `cache_static` DFTD3 term cache does not apply in this mode.
+ 
+ #### `ensemble_member`
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 7745723..4b92307 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -152,6 +152,7 @@ def _factory() -> Generator[Path, None, None]:
+ 
+ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+ CAFFEINE_FILE = os.path.join(DATA_DIR, "caffeine.xyz")
++TAXOL_FILE = os.path.join(os.path.dirname(__file__), "..", "examples", "taxol.xyz")  # 113 atoms
+ CIF_PHENYLGLYCINIUM = os.path.join(DATA_DIR, "1100172.cif")  # Phenylglycinium nitrate (~50 atoms)
+ CIF_SPIRO = os.path.join(DATA_DIR, "2000054.cif")  # Spiro compound (~28 atoms)
+ 
+diff --git a/tests/test_calculator_gpu.py b/tests/test_calculator_gpu.py
+index 67a7dca..d8e2768 100644
+--- a/tests/test_calculator_gpu.py
++++ b/tests/test_calculator_gpu.py
+@@ -6,7 +6,7 @@
+ 
+ import pytest
+ import torch
+-from conftest import CAFFEINE_FILE, load_mol
++from conftest import CAFFEINE_FILE, TAXOL_FILE, load_mol
+ 
+ from aimnet.calculators import AIMNet2Calculator
+ from aimnet.modules.lr import _mode2_backend_inputs
+@@ -772,3 +772,38 @@ def test_batched_evals_bitwise_reproducible(self):
+             out = calc(dict(data), forces=True)
+             assert torch.equal(out["energy"], out0["energy"])
+             assert torch.equal(out["forces"], out0["forces"])
++
++    # Ten repeats: a single packed-layout repeat matched by chance about one
++    # time in twenty, so a strict xfail with fewer repeats could pass spuriously.
++    _REPEATS = 10
++
++    @staticmethod
++    def _repeat_taxol(nb_threshold: int) -> list[dict[str, torch.Tensor]]:
++        """Evaluate taxol (113 atoms) repeatedly on the dense or packed layout."""
++        mol = load_mol(TAXOL_FILE)
++        data = {
++            "coord": torch.as_tensor(mol["coord"], dtype=torch.float32, device="cuda").unsqueeze(0),
++            "numbers": torch.as_tensor(mol["numbers"], device="cuda").unsqueeze(0),
++            "charge": torch.zeros(1, device="cuda"),
++        }
++        calc = AIMNet2Calculator("aimnet2", deterministic=True, nb_threshold=nb_threshold)
++        return [calc(dict(data), forces=True) for _ in range(TestDeterministicMode._REPEATS)]
++
++    @pytest.mark.ase
++    def test_dense_layout_bitwise_reproducible_for_drug_sized_molecule(self):
++        outs = self._repeat_taxol(nb_threshold=200)
++        for out in outs[1:]:
++            assert torch.equal(out["energy"], outs[0]["energy"])
++            assert torch.equal(out["forces"], outs[0]["forces"])
++
++    @pytest.mark.ase
++    @pytest.mark.xfail(strict=True, reason="#140: packed-layout neighbor order and reductions are nondeterministic")
++    def test_packed_layout_energy_bitwise_reproducible(self):
++        outs = self._repeat_taxol(nb_threshold=0)
++        assert all(torch.equal(out["energy"], outs[0]["energy"]) for out in outs[1:])
++
++    @pytest.mark.ase
++    @pytest.mark.xfail(strict=True, reason="#140: the Warp conv_sv_2d_sp backward accumulates with atomics")
++    def test_packed_layout_forces_bitwise_reproducible(self):
++        outs = self._repeat_taxol(nb_threshold=0)
++        assert all(torch.equal(out["forces"], outs[0]["forces"]) for out in outs[1:])

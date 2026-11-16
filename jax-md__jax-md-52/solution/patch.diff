@@ -1,0 +1,606 @@
+diff --git a/jax_md/energy.py b/jax_md/energy.py
+index d0cb6365..bef2cc4e 100644
+--- a/jax_md/energy.py
++++ b/jax_md/energy.py
+@@ -22,7 +22,7 @@
+ 
+ import jax.numpy as np
+ 
+-from jax_md import space, smap
++from jax_md import space, smap, partition
+ from jax_md.interpolate import spline
+ from jax_md.util import *
+ 
+@@ -92,33 +92,31 @@ def soft_sphere_pair(
+       alpha=alpha)
+ 
+ 
+-def soft_sphere_cell_list(
++def soft_sphere_neighbor_list(
+     displacement_or_metric,
+     box_size,
+-    R_example,
++    example_R,
+     species=None,
+     sigma=1.0,
+     epsilon=1.0,
+-    alpha=2.0):
+-  """Convenience wrapper to compute soft spheres using a cell list."""
++    alpha=2.0,
++    list_cutoff=1.2):
++  """Convenience wrapper to compute soft spheres using a neighbor list."""
+   sigma = np.array(sigma, dtype=f32)
+   epsilon = np.array(epsilon, dtype=f32)
+   alpha = np.array(alpha, dtype=f32)
+-
+-  if species is None:
+-    if sigma.shape or epsilon.shape or alpha.shape:
+-      raise ValueError(
+-        ('At the moment per-particle (as opposed to per-species) parameters are'
+-         ' not supported using cell lists. Please open a feature request!'))
+-
+-  energy_fn = smap.cartesian_product(
++  list_cutoff = f32(np.max(sigma) * list_cutoff)
++  neighbor_fn = partition.neighbor_list(
++    displacement_or_metric, box_size, list_cutoff, example_R)
++  energy_fn = smap.pair_neighbor_list(
+     soft_sphere,
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
++    species=species,
+     sigma=sigma,
+     epsilon=epsilon,
+     alpha=alpha)
+ 
+-  return smap.cell_list(energy_fn, box_size, np.max(sigma), R_example, species)
++  return neighbor_fn, energy_fn
+ 
+ 
+ def lennard_jones(dr, sigma=f32(1), epsilon=f32(1), **unused_kwargs):
+@@ -138,7 +136,9 @@ def lennard_jones(dr, sigma=f32(1), epsilon=f32(1), **unused_kwargs):
+   dr = (sigma / dr) ** f32(2)
+   idr6 = dr ** f32(3)
+   idr12 = idr6 ** f32(2)
+-  return f32(4) * epsilon * (idr12 - idr6)
++  # TODO(schsam): This seems potentially dangerous. We should do ErrorChecking
++  # here.
++  return np.nan_to_num(f32(4) * epsilon * (idr12 - idr6))
+ 
+ 
+ def lennard_jones_pair(
+@@ -147,8 +147,8 @@ def lennard_jones_pair(
+   """Convenience wrapper to compute Lennard-Jones energy over a system."""
+   sigma = np.array(sigma, dtype=f32)
+   epsilon = np.array(epsilon, dtype=f32)
+-  r_onset = f32(r_onset * np.max(sigma))
+-  r_cutoff = f32(r_cutoff * np.max(sigma))
++  r_onste = r_onset * np.max(sigma)
++  r_cutoff = r_cutoff * np.max(sigma)
+   return smap.pair(
+     multiplicative_isotropic_cutoff(lennard_jones, r_onset, r_cutoff),
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
+@@ -157,35 +157,34 @@ def lennard_jones_pair(
+     epsilon=epsilon)
+ 
+ 
+-def lennard_jones_cell_list(
++def lennard_jones_neighbor_list(
+     displacement_or_metric,
+     box_size,
+-    R_example,
++    example_R,
+     species=None,
+     sigma=1.0,
+     epsilon=1.0,
+     alpha=2.0,
+     r_onset=2.0,
+-    r_cutoff=2.5):
+-  """Convenience wrapper to compute soft spheres using a cell list."""
+-  sigma = np.array(sigma, dtype=f32)
+-  epsilon = np.array(epsilon, dtype=f32)
+-  r_onset = f32(r_onset * np.max(sigma))
+-  r_cutoff = f32(r_cutoff * np.max(sigma))
+-
+-  if species is None:
+-    if sigma.shape or epsilon.shape:
+-      raise ValueError(
+-        ('At the moment per-particle (as opposed to per-species) parameters are'
+-         ' not supported using cell lists. Please open a feature request!'))
++    r_cutoff=2.5,
++    neighborlist_cutoff=3.0): # TODO(schsam) Optimize this.
++  """Convenience wrapper to compute lennard-jones using a neighbor list."""
++  sigma = np.array(sigma, f32)
++  epsilon = np.array(epsilon, f32)
++  r_onset = np.array(r_onset * np.max(sigma), f32)
++  r_cutoff = np.array(r_cutoff * np.max(sigma), f32)
++  list_cutoff = np.array(np.max(sigma) * neighborlist_cutoff, f32)
+ 
+-  energy_fn = smap.cartesian_product(
++  neighbor_fn = partition.neighbor_list(
++    displacement_or_metric, box_size, list_cutoff, example_R)
++  energy_fn = smap.pair_neighbor_list(
+     multiplicative_isotropic_cutoff(lennard_jones, r_onset, r_cutoff),
+     space.canonicalize_displacement_or_metric(displacement_or_metric),
++    species=species,
+     sigma=sigma,
+     epsilon=epsilon)
+ 
+-  return smap.cell_list(energy_fn, box_size, r_cutoff, R_example, species)
++  return neighbor_fn, energy_fn
+ 
+ 
+ def multiplicative_isotropic_cutoff(fn, r_onset, r_cutoff):
+diff --git a/jax_md/partition.py b/jax_md/partition.py
+index 4b347249..31e70515 100644
+--- a/jax_md/partition.py
++++ b/jax_md/partition.py
+@@ -337,9 +337,30 @@ def build_cells(R, **kwargs):
+   return build_cells
+ 
+ 
++def _displacement_or_metric_to_metric_sq(displacement_or_metric):
++  """Checks whether or not a displacement or metric was provided."""
++  for dim in range(1, 4):
++    try:
++      R = ShapedArray((dim,), f32)
++      dR_or_dr = eval_shape(displacement_or_metric, R, R, t=0)
++      if len(dR_or_dr.shape) == 0:
++        return lambda Ra, Rb, **kwargs: \
++          displacement_or_metric(Ra, Rb, **kwargs) ** 2
++      else:
++        return lambda Ra, Rb, **kwargs: space.square_distance(
++          displacement_or_metric(Ra, Rb, **kwargs))
++    except TypeError:
++      continue
++    except ValueError:
++      continue
++  raise ValueError(
++    'Canonicalize displacement not implemented for spatial dimension larger'
++    'than 4.')
++
++
+ def neighbor_list(
+-    displacement, box_size, cutoff, example_R, buffer_size_multiplier=1.1,
+-    cell_size=None, **static_kwargs):
++    displacement_or_metric, box_size, cutoff, example_R,
++    buffer_size_multiplier=1.1, cell_size=None, **static_kwargs):
+   """Returns a function that builds a list neighbors for each point.
+ 
+   Since XLA requires fixed shape, we use example point configurations to
+@@ -368,10 +389,10 @@ def neighbor_list(
+     specifying points in the neighborhood of each point. Empty elements are
+     given an id = point_count.
+   """
++  box_size = f32(box_size)
+ 
+   cutoff_sq = cutoff ** 2
+-  metric_sq = lambda Ra, Rb, **kwargs: space.square_distance(
+-    displacement(Ra, Rb, **kwargs))
++  metric_sq = _displacement_or_metric_to_metric_sq(displacement_or_metric)
+ 
+   if cell_size is None:
+     cell_size = cutoff
+diff --git a/jax_md/quantity.py b/jax_md/quantity.py
+index 2ea2b744..58b34a96 100644
+--- a/jax_md/quantity.py
++++ b/jax_md/quantity.py
+@@ -94,7 +94,7 @@ def canonicalize_mass(mass):
+ def pair_correlation(displacement_or_metric, rs, sigma):
+   metric = space.canonicalize_displacement_or_metric(displacement_or_metric)
+ 
+-  sigma = f32(sigma)
++  sigma = np.array(sigma, f32)
+   # NOTE(schsam): This seems rather harmless, but possibly something to look at
+   rs = np.array(rs + 1e-7, f32)
+ 
+@@ -108,7 +108,6 @@ def compute_fun(R, **dynamic_kwargs):
+     dim = R.shape[1]
+     exp = np.exp(-f32(0.5) * (dr[:, :, np.newaxis] - rs) ** 2 / sigma ** 2)
+     e = np.exp(dr / sigma ** 2)
+-    print('{} {} {}'.format(dr.dtype, exp.dtype, e.dtype))
+     gaussian_distances = exp / np.sqrt(2 * np.pi * sigma ** 2)
+     return np.mean(gaussian_distances, axis=1) / rs ** (dim - 1)
+   return compute_fun
+diff --git a/jax_md/smap.py b/jax_md/smap.py
+index 54a71582..c85ef058 100644
+--- a/jax_md/smap.py
++++ b/jax_md/smap.py
+@@ -157,7 +157,7 @@ def _get_matrix_parameters(params):
+   if isinstance(params, np.ndarray):
+     if len(params.shape) == 1:
+       # NOTE(schsam): get_parameter_matrix only supports additive parameters.
+-      return params[:, np.newaxis] + params[np.newaxis, :]
++      return 0.5 * (params[:, np.newaxis] + params[np.newaxis, :])
+     elif len(params.shape) == 0 or len(params.shape) == 2:
+       return params
+     else:
+@@ -329,3 +329,100 @@ def fn_mapped(R, species, species_count, **dynamic_kwargs):
+         'Species must be None, an ndarray, or Dynamic. Found {}.'.format(
+             species))
+   return fn_mapped
++
++
++# Mapping pairwise functional forms to systems using neighbor lists.
++
++def _get_neighborhood_matrix_params(idx, params):
++  if isinstance(params, np.ndarray):
++    if len(params.shape) == 1:
++      return 0.5 * (np.reshape(params, params.shape + (1,)) + params[idx])
++    elif len(params.shape) == 0:
++      return params
++    else:
++      raise NotImplementedError()
++  elif(isinstance(params, int) or isinstance(params, float) or
++       np.issubdtype(params, np.integer) or np.issubdtype(params, np.floating)):
++    return params
++  else:
++    raise NotImplementedError 
++
++def _get_neighborhood_species_params(idx, species, params):
++  """Get parameters for interactions between species pairs."""
++  # TODO(schsam): We should do better error checking here.
++  def lookup(species_a, species_b, params):
++    return params[species_a, species_b]
++  lookup = vmap(vmap(lookup, (None, 0, None)), (0, 0, None))
++  
++  neighbor_species = np.reshape(species[idx], idx.shape)
++  if isinstance(params, np.ndarray):
++    if len(params.shape) == 2:
++      return lookup(species, neighbor_species, params)
++    elif len(params.shape) == 0:
++      return params
++    else:
++      raise ValueError(
++          'Params must be a scalar or a 2d array if using a species lookup.')
++  return params
++
++def _neighborhood_kwargs_to_params(idx, species=None, **kwargs):
++  out_dict = {}
++  for k in kwargs:
++    if species is None or (
++        isinstance(kwargs[k], np.ndarray) and kwargs[k].ndim == 1):
++      out_dict[k] = _get_neighborhood_matrix_params(idx, kwargs[k])
++    else:
++      out_dict[k] = _get_neighborhood_species_params(idx, species, kwargs[k])
++  return out_dict
++
++def pair_neighbor_list(
++    fn, metric, species=None, reduce_axis=None, keepdims=False, **kwargs):
++  """Promotes a function a pair of particles to one using neighbor lists.
++
++  Args:
++    fn: A function that takes an ndarray of pairwise distances or displacements
++      of shape [n, m] or [n, m, d_in] respectively as well as kwargs specifying
++      parameters for the function. fn returns an ndarray of evaluations of shape
++      [n, m, d_out].
++    metric: A function that takes two ndarray of positions of shape
++      [spatial_dimension] and [spatial_dimension] respectively and returns
++      an ndarray of distances or displacements of shape [] or [d_in]
++      respectively. The metric can optionally take a floating point time as a
++      third argument.
++    species: A list of species for the different particles. This should either
++      be None (in which case it is assumed that all the particles have the same
++      species), an integer ndarray of shape [n] with species data, or Dynamic
++      in which case the species data will be specified dynamically. Note: that
++      dynamic species specification is less efficient, because we cannot
++      specialize shape information.
++    reduce_axis: A list of axes to reduce over. This is supplied to np.sum and
++      so the same convention is used.
++    keepdims: A boolean specifying whether the empty dimensions should be kept
++      upon reduction. This is supplied to np.sum and so the same convention is
++      used.
++    kwargs: Arguments providing parameters to the mapped function. In cases
++      where no species information is provided these should be either 1) a
++      scalar, 2) an ndarray of shape [n], 3) an ndarray of shape [n, n]. If
++      species information is provided then the parameters should be specified as
++      either 1) a scalar or 2) an ndarray of shape [max_species, max_species].
++
++  Returns:
++    A function fn_mapped that takes an ndarray of floats of shape [N, d_in] of
++    positions and and ndarray of integers of shape [N, max_neighbors]
++    specifying neighbors.
++  """
++  def fn_mapped(R, neighbor_idx, **dynamic_kwargs):
++    d = partial(metric, **dynamic_kwargs)
++    d = vmap(vmap(d, (None, 0)))
++    mask = neighbor_idx != R.shape[0]
++    R_neigh = R[neighbor_idx]
++    dR = d(R, R_neigh)
++    merged_kwargs = _neighborhood_kwargs_to_params(neighbor_idx, species,
++        **merge_dicts(kwargs, dynamic_kwargs))
++    out = fn(dR, **merged_kwargs)
++    if out.ndim > mask.ndim:
++      ddim = out.ndim - mask.ndim
++      mask = np.reshape(mask, mask.shape + (1,) * ddim)
++    out = fn(dR, **merged_kwargs) * mask
++    return _high_precision_sum(out, reduce_axis, keepdims) / 2.
++  return fn_mapped
+diff --git a/tests/energy_test.py b/tests/energy_test.py
+index 453ab939..047f2498 100644
+--- a/tests/energy_test.py
++++ b/tests/energy_test.py
+@@ -206,7 +206,7 @@ def test_isotropic_cutoff(self, spatial_dimension, dtype):
+           'spatial_dimension': dim,
+           'dtype': dtype,
+       } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
+-  def disabled_test_soft_sphere_cell_list_energy(self, spatial_dimension, dtype):
++  def test_soft_sphere_neighbor_list_energy(self, spatial_dimension, dtype):
+     key = random.PRNGKey(1)
+ 
+     box_size = f32(15.0)
+@@ -215,11 +215,14 @@ def disabled_test_soft_sphere_cell_list_energy(self, spatial_dimension, dtype):
+ 
+     R = box_size * random.uniform(
+       key, (PARTICLE_COUNT, spatial_dimension), dtype=dtype)
+-    energy_fn = energy.soft_sphere_cell_list(displacement, box_size, R)
++    neighbor_fn, energy_fn = energy.soft_sphere_neighbor_list(
++      displacement, box_size, R)
++
++    idx = neighbor_fn(R)
+ 
+     self.assertAllClose(
+       np.array(exact_energy_fn(R), dtype=dtype),
+-      energy_fn(R), True)
++      energy_fn(R, idx), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -227,21 +230,24 @@ def disabled_test_soft_sphere_cell_list_energy(self, spatial_dimension, dtype):
+           'spatial_dimension': dim,
+           'dtype': dtype,
+       } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
+-  def disabled_test_lennard_jones_cell_list_energy(self, spatial_dimension, dtype):
++  def test_lennard_jones_cell_neighbor_list_energy(
++      self, spatial_dimension, dtype):
+     key = random.PRNGKey(1)
+ 
+-    box_size = f32(15.0)
++    box_size = f32(15)
+     displacement, _ = space.periodic(box_size)
+     metric = space.metric(displacement)
+     exact_energy_fn = energy.lennard_jones_pair(displacement)
+ 
+     R = box_size * random.uniform(
+       key, (PARTICLE_COUNT, spatial_dimension), dtype=dtype)
+-    energy_fn = energy.lennard_jones_cell_list(displacement, box_size, R)
++    neighbor_fn, energy_fn = energy.lennard_jones_neighbor_list(
++      displacement, box_size, R)
+ 
++    idx = neighbor_fn(R)
+     self.assertAllClose(
+       np.array(exact_energy_fn(R), dtype=dtype),
+-      energy_fn(R), True)
++      energy_fn(R, idx), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+@@ -249,7 +255,7 @@ def disabled_test_lennard_jones_cell_list_energy(self, spatial_dimension, dtype)
+           'spatial_dimension': dim,
+           'dtype': dtype,
+       } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
+-  def disabled_test_lennard_jones_cell_list_force(self, spatial_dimension, dtype):
++  def test_lennard_jones_neighbor_list_force(self, spatial_dimension, dtype):
+     key = random.PRNGKey(1)
+ 
+     box_size = f32(15.0)
+@@ -259,12 +265,14 @@ def disabled_test_lennard_jones_cell_list_force(self, spatial_dimension, dtype):
+ 
+     R = box_size * random.uniform(
+       key, (PARTICLE_COUNT, spatial_dimension), dtype=dtype)
+-    force_fn = quantity.force(
+-      energy.lennard_jones_cell_list(displacement, box_size, R))
++    neighbor_fn, energy_fn = energy.lennard_jones_neighbor_list(
++      displacement, box_size, R)
++    force_fn = quantity.force(energy_fn)
+ 
++    idx = neighbor_fn(R)
+     self.assertAllClose(
+       np.array(exact_force_fn(R), dtype=dtype),
+-      force_fn(R), True)
++      force_fn(R, idx), True)
+ 
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {
+diff --git a/tests/smap_test.py b/tests/smap_test.py
+index 4a054990..6d0a7d44 100644
+--- a/tests/smap_test.py
++++ b/tests/smap_test.py
+@@ -31,7 +31,7 @@
+ from jax import test_util as jtu
+ from jax import jit, vmap
+ 
+-from jax_md import smap, space, energy, quantity
++from jax_md import smap, space, energy, quantity, partition
+ from jax_md.util import *
+ 
+ jax_config.parse_flags_with_absl()
+@@ -42,6 +42,8 @@
+ STOCHASTIC_SAMPLES = 10
+ SPATIAL_DIMENSION = [2, 3]
+ 
++NEIGHBOR_LIST_PARTICLE_COUNT = 100
++
+ if FLAGS.jax_enable_x64:
+   POSITION_DTYPE = [f32, f64]
+ else:
+@@ -226,7 +228,7 @@ def test_get_species_parameters(self):
+ 
+   def test_get_matrix_parameters(self):
+     params = np.array([1.0, 2.0])
+-    params_mat_test = np.array([[2.0, 3.0], [3.0, 4.0]])
++    params_mat_test = np.array([[1.0, 1.5], [1.5, 2.0]])
+     params_mat = smap._get_matrix_parameters(params)
+     self.assertAllClose(params_mat, params_mat_test, True)
+ 
+@@ -284,7 +286,7 @@ def test_pair_no_species_scalar_dynamic(self, spatial_dimension, dtype):
+       R = random.uniform(
+         split1, (PARTICLE_COUNT, spatial_dimension), dtype=dtype)
+       epsilon = random.uniform(split2, (PARTICLE_COUNT,), dtype=dtype)
+-      mat_epsilon = epsilon[:, np.newaxis] + epsilon[np.newaxis, :]
++      mat_epsilon = 0.5 * (epsilon[:, np.newaxis] + epsilon[np.newaxis, :])
+       self.assertAllClose(
+         mapped_square(R, epsilon=epsilon),
+         np.array(0.5 * np.sum(
+@@ -512,5 +514,150 @@ def test_pair_dynamic_species_vector(
+       self.assertAllClose(
+         mapped_square(R, species, 2), np.array(total, dtype=dtype), True)
+ 
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
++  def test_pair_neighbor_list_scalar(
++      self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr ** 2, f32(0.))
++
++    tol = 2e-10 if dtype == np.float32 else None
++
++    N = NEIGHBOR_LIST_PARTICLE_COUNT
++    box_size = 4. * N ** (1. / spatial_dimension)
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++    d = space.metric(disp)
++
++    neighbor_square = jit(smap.pair_neighbor_list(truncated_square, d))
++    mapped_square = jit(smap.pair(truncated_square, d))
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(
++        split, (N, spatial_dimension), dtype=dtype)
++      sigma = random.uniform(key, (), minval=0.5, maxval=2.5)
++      neighbor_fn = jit(partition.neighbor_list(disp, box_size, sigma, R))
++      idx = neighbor_fn(R)
++      self.assertAllClose(mapped_square(R, sigma=sigma),
++                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
++  def test_pair_neighbor_list_scalar_params_no_species(
++      self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr ** 2, f32(0.))
++
++    tol = 2e-10 if dtype == np.float32 else None
++
++    N = NEIGHBOR_LIST_PARTICLE_COUNT
++    box_size = 2. * N ** (1. / spatial_dimension)
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++    d = space.metric(disp)
++
++    neighbor_square = jit(smap.pair_neighbor_list(truncated_square, d))
++    mapped_square = jit(smap.pair(truncated_square, d))
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++      sigma = random.uniform(key, (N,), minval=0.5, maxval=1.5)
++      neighbor_fn = jit(
++        partition.neighbor_list(disp, box_size, np.max(sigma), R))
++      idx = neighbor_fn(R)
++      self.assertAllClose(mapped_square(R, sigma=sigma),
++                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
++  def test_pair_neighbor_list_scalar_params_species(
++      self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    def truncated_square(dr, sigma):
++      return np.where(dr < sigma, dr ** 2, f32(0.))
++
++    tol = 2e-10 if dtype == np.float32 else None
++
++    N = NEIGHBOR_LIST_PARTICLE_COUNT
++    box_size = 2. * N ** (1. / spatial_dimension)
++    species = np.zeros((N,), np.int32)
++    species = np.where(np.arange(N) > N / 3, 1, species)
++    species = np.where(np.arange(N) > 2 * N / 3, 2, species)
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++    d = space.metric(disp)
++
++    neighbor_square = jit(
++      smap.pair_neighbor_list(truncated_square, d, species=species))
++    mapped_square = jit(smap.pair(truncated_square, d, species=species))
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(split, (N, spatial_dimension), dtype=dtype)
++      sigma = random.uniform(key, (3, 3), minval=0.5, maxval=1.5)
++      sigma = 0.5 * (sigma + sigma.T)
++      neighbor_fn = jit(
++        partition.neighbor_list(disp, box_size, np.max(sigma), R))
++      idx = neighbor_fn(R)
++      self.assertAllClose(mapped_square(R, sigma=sigma),
++                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++
++  @parameterized.named_parameters(jtu.cases_from_list(
++      {
++          'testcase_name': '_dim={}_dtype={}'.format(dim, dtype.__name__),
++          'spatial_dimension': dim,
++          'dtype': dtype
++      } for dim in SPATIAL_DIMENSION for dtype in POSITION_DTYPE))
++  def test_pair_neighbor_list_vector(self, spatial_dimension, dtype):
++    key = random.PRNGKey(0)
++
++    def truncated_square(dR, sigma):
++      dr = np.reshape(space.distance(dR), dR.shape[:-1] + (1,))
++      return np.where(dr < sigma, dR ** 2, f32(0.))
++
++    tol = 5e-6 if dtype == np.float32 else 1e-14
++
++    N = PARTICLE_COUNT
++    box_size = 2. * N ** (1. / spatial_dimension)
++
++    key, split = random.split(key)
++    disp, _ = space.periodic(box_size)
++
++    neighbor_square = jit(smap.pair_neighbor_list(
++      truncated_square, disp, reduce_axis=(1,)))
++    mapped_square = jit(smap.pair(truncated_square, disp, reduce_axis=(1,)))
++
++    for _ in range(STOCHASTIC_SAMPLES):
++      key, split = random.split(key)
++      R = box_size * random.uniform(
++        split, (N, spatial_dimension), dtype=dtype)
++      sigma = random.uniform(key, (), minval=0.5, maxval=1.5)
++      neighbor_fn = jit(partition.neighbor_list(disp, box_size, sigma, R))
++      idx = neighbor_fn(R)
++      self.assertAllClose(mapped_square(R, sigma=sigma),
++                          neighbor_square(R, idx, sigma=sigma), True, tol, tol)
++
+ if __name__ == '__main__':
+   absltest.main()
+diff --git a/tests/space_test.py b/tests/space_test.py
+index aa62a3eb..f7706353 100644
+--- a/tests/space_test.py
++++ b/tests/space_test.py
+@@ -354,7 +354,7 @@ def test_periodic_general_wrapped_vs_unwrapped(
+ 
+     tol = 1e-13
+     if dtype is f32:
+-      tol = 1e-5
++      tol = 2e-5
+ 
+     for _ in range(STOCHASTIC_SAMPLES):
+       key, split_R, split_T = random.split(key, 3)

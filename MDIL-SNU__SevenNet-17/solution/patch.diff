@@ -1,0 +1,691 @@
+diff --git a/example_inputs/training/input_full.yaml b/example_inputs/training/input_full.yaml
+index acd8b95b..30591d24 100644
+--- a/example_inputs/training/input_full.yaml
++++ b/example_inputs/training/input_full.yaml
+@@ -6,9 +6,9 @@
+ model:
+     chemical_species: 'Auto'                      # Chemical symbols present in the dataset, guess from load_dataset data if 'auto'
+     cutoff: 4.0                                   # Cutoff radius in Angstroms. If two atoms are within the cutoff, they are connected.
+-    channel: 4                                    # Equivalent to 'num_features' in nequip. Represents the multiplicity of node features. 32 is recomanded as default.
+-    lmax: 1                                       # Maximum order of irreps (rotation order). 1 is recomanded as default
+-    num_convolution_layer: 4                      # Equivalent to 'num_layers' in nequip. Represents the number of message passing layers in the model. 3 is recomanded as default
++    channel: 4                                    # Equivalent to 'num_features' in nequip. Represents the multiplicity of node features. 32 is recommended as default.
++    lmax: 1                                       # Maximum order of irreps (rotation order). 1 is recommended as default
++    num_convolution_layer: 4                      # Equivalent to 'num_layers' in nequip. Represents the number of message passing layers in the model. 3 is recommended as default
+ 
+     weight_nn_hidden_neurons: [64, 64]            # Equivalent to 'invariant_layers' and 'neurons' in nequip. Represents the neural network for the radial basis
+     radial_basis:                                 # Function and its parameters to encode radial distance
+@@ -24,7 +24,6 @@ model:
+ 
+     is_parity: True                               # Pairy False (to SE(3) group) is not supported yet (on working!)
+ 
+-    avg_num_neigh       : True                    # Normalize the aggregation of messages by the average number of neighbors calculated from the training set
+     train_shift_scale   : False                   # Enable training for shift & scale. Useful if the dataset is augmented
+     train_avg_num_neigh : False                   # Enable training for avg_num_neigh. Useful if the dataset is augmented
+     optimize_by_reduce: False                     # Speed-up by eliminating non-scalar computations at the last layer
+@@ -48,16 +47,19 @@ train:
+ 
+     per_epoch:  10                                 # Generate checkpoints every this epoch
+ 
++    # TotalEnergy, Energy, Force, Stress, Stress_GPa, TotalLoss
++    # RMSE, MAE, Loss available
+     error_record:
+         - ['Energy', 'RMSE']
+         - ['Force', 'RMSE']
+         - ['Stress', 'RMSE']
+         - ['TotalLoss', 'None']
+ 
+-    # continue: 
+-    #    reset_optimizer: False 
+-    #    reset_scheduler: False 
+-    #    checkpoint: 'path_to_previous_checkpoint/checkpoint_best.pth'
++    #continue: 
++        #reset_optimizer: False 
++        #reset_scheduler: False  
++        #checkpoint: 'path_to_previous_checkpoint/checkpoint_best.pth'
++        #use_statistic_values_of_checkpoint: False # whether use shift, scale, and avg_num_neigh from checkpoint or update from new dataset
+ 
+ data:
+     batch_size: 2                                 # Batch size. If training fails due to memory shortage, lower this value
+diff --git a/sevenn/_const.py b/sevenn/_const.py
+index 7efeeab0..4e38550e 100644
+--- a/sevenn/_const.py
++++ b/sevenn/_const.py
+@@ -94,7 +94,7 @@ def error_record_condition(x):
+     KEY.NUM_CONVOLUTION: 3,
+     KEY.ACTIVATION_SCARLAR: {"e": "silu", "o": "tanh"},
+     KEY.ACTIVATION_GATE: {"e": "silu", "o": "tanh"},
+-    KEY.AVG_NUM_NEIGHBOR: True,
++    KEY.AVG_NUM_NEIGH: True,
+     KEY.TRAIN_AVG_NUM_NEIGH: False,
+     KEY.TRAIN_SHIFT_SCALE: False,
+     KEY.OPTIMIZE_BY_REDUCE: False,
+@@ -140,6 +140,7 @@ def error_record_condition(x):
+         KEY.RESET_OPTIMIZER: False,
+         KEY.RESET_SCHEDULER: False,
+         KEY.RESET_EPOCH: False,
++        KEY.USE_STATISTIC_VALUES_OF_CHECKPOINT: True,
+     },
+     KEY.CSV_LOG: "log.csv",
+     KEY.NUM_WORKERS: 0,
+@@ -215,6 +216,7 @@ def error_record_condition(x):
+         KEY.RESET_OPTIMIZER: None,
+         KEY.RESET_SCHEDULER: None,
+         KEY.RESET_EPOCH: None,
++        KEY.USE_STATISTIC_VALUES_OF_CHECKPOINT: None,
+     },
+     KEY.IS_TRACE_STRESS: None,
+     KEY.IS_TRAIN_STRESS: None,
+diff --git a/sevenn/_keys.py b/sevenn/_keys.py
+index 02b8941d..142540d8 100644
+--- a/sevenn/_keys.py
++++ b/sevenn/_keys.py
+@@ -118,6 +118,7 @@
+ RESET_OPTIMIZER = "reset_optimizer"
+ RESET_SCHEDULER = "reset_scheduler"
+ RESET_EPOCH = "reset_epoch"
++USE_STATISTIC_VALUES_OF_CHECKPOINT = "use_statistic_values_of_checkpoint"
+ 
+ CSV_LOG = "csv_log"
+ 
+@@ -176,7 +177,8 @@
+ READOUT_FCN_HIDDEN_NEURONS = "readout_fcn_hidden_neurons"
+ READOUT_FCN_ACTIVATION = "readout_fcn_activation"
+ 
+-AVG_NUM_NEIGHBOR = "avg_num_neigh"
++AVG_NUM_NEIGHBOR = "avg_num_neigh"  # deprecated
++AVG_NUM_NEIGH = "avg_num_neigh"
+ SHIFT = "shift"
+ SCALE = "scale"
+ 
+diff --git a/sevenn/model_build.py b/sevenn/model_build.py
+index 4c29e6cd..bc12f85f 100644
+--- a/sevenn/model_build.py
++++ b/sevenn/model_build.py
+@@ -119,7 +119,9 @@ def build_E3_equivariant_model(model_config: dict, parallel=False):
+     radial_basis_module, radial_basis_num = init_radial_basis(model_config)
+     cutoff_function_module = init_cutoff_function(model_config)
+ 
+-    avg_num_neigh = model_config[KEY.AVG_NUM_NEIGHBOR]
++    avg_num_neigh = model_config[KEY.AVG_NUM_NEIGH]
++    if type(avg_num_neigh) is not list:
++        avg_num_neigh = [avg_num_neigh] * num_convolution_layer
+     train_avg_num_neigh = model_config[KEY.TRAIN_AVG_NUM_NEIGH]
+ 
+     edge_embedding = EdgeEmbedding(
+@@ -281,7 +283,7 @@ def build_E3_equivariant_model(model_config: dict, parallel=False):
+                 weight_layer_input_to_hidden=weight_nn_layers,
+                 weight_layer_act=act_radial,
+                 # TODO: BOTNet says no sqrt is better
+-                denumerator=avg_num_neigh**0.5,
++                denumerator=avg_num_neigh[i]**0.5,
+                 train_denumerator=train_avg_num_neigh,
+                 is_parallel=parallel)
+ 
+diff --git a/sevenn/parse_input.py b/sevenn/parse_input.py
+index de69aa11..267be38d 100644
+--- a/sevenn/parse_input.py
++++ b/sevenn/parse_input.py
+@@ -149,12 +149,12 @@ def init_model_config(config: dict):
+         model_meta[KEY.IRREPS_MANUAL] = config[KEY.IRREPS_MANUAL]
+ 
+     #TODO: implement this behavior in _const.py not here
+-    if KEY.AVG_NUM_NEIGHBOR not in config.keys():
+-        model_meta[KEY.AVG_NUM_NEIGHBOR] = defaults[KEY.AVG_NUM_NEIGHBOR]
++    if KEY.AVG_NUM_NEIGH not in config.keys():
++        model_meta[KEY.AVG_NUM_NEIGH] = defaults[KEY.AVG_NUM_NEIGH]
+     else:
+-        if type(config[KEY.AVG_NUM_NEIGHBOR]) not in [float, bool]:
+-            raise ValueError("avg_num_neighbor should be float or bool")
+-        model_meta[KEY.AVG_NUM_NEIGHBOR] = config[KEY.AVG_NUM_NEIGHBOR]
++        if type(config[KEY.AVG_NUM_NEIGH]) not in [float, bool, list]:
++            raise ValueError("avg_num_neigh should be float or bool")
++        model_meta[KEY.AVG_NUM_NEIGH] = config[KEY.AVG_NUM_NEIGH]
+ 
+     # init simpler ones
+     for key, cond in _const.MODEL_CONFIG_CONDITION.items():
+@@ -212,7 +212,9 @@ def init_train_config(config: dict):
+     param_type_dicts = [optim_param_name_type_dict,
+                         scheduler_param_name_type_dict,
+                         loss_param_name_type_dict]
+-    for idx, param_key in enumerate([KEY.OPTIM_PARAM, KEY.SCHEDULER_PARAM, KEY.LOSS_PARAM]):
++    for idx, param_key in enumerate([KEY.OPTIM_PARAM,
++                                     KEY.SCHEDULER_PARAM,
++                                     KEY.LOSS_PARAM]):
+         if param_key not in config.keys():
+             continue
+         user_input = config[param_key]
+@@ -308,7 +310,7 @@ def init_data_config(config: dict):
+             config[KEY.USE_SPECIES_WISE_SHIFT_SCALE] = True
+             data_meta[KEY.USE_SPECIES_WISE_SHIFT_SCALE] = True
+         else:
+-            raise ValueError(f"shift/scale should be float or list of float")
++            raise ValueError("shift/scale should be float or list of float")
+ 
+     for key, cond in _const.DATA_CONFIG_CONDITION.items():
+         data_meta[key] = config_initialize(key, config, defaults, cond)
+diff --git a/sevenn/scripts/deploy.py b/sevenn/scripts/deploy.py
+index 1bec1e0c..a9dba8c5 100644
+--- a/sevenn/scripts/deploy.py
++++ b/sevenn/scripts/deploy.py
+@@ -192,46 +192,3 @@ def get_parallel_from_checkpoint(fname):
+ 
+     deploy_parallel(stct_dct, config, "deployed_parallel")
+     deploy(stct_cp, config, "deployed_serial.pt")
+-
+-
+-def main():
+-    get_parallel_from_checkpoint('./checkpoint_260.pth')
+-    """
+-    from sevenn.nn.node_embedding import get_type_mapper_from_specie
+-    torch.manual_seed(777)
+-    config = _const.DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG
+-    config[KEY.CUTOFF] = 4.0
+-    config[KEY.LMAX] = 3
+-    config[KEY.NUM_CONVOLUTION] = 3
+-    config[KEY.NODE_FEATURE_MULTIPLICITY] = 32
+-    config[KEY.SHIFT] = -6.89
+-    config[KEY.SCALE] = 1.4791
+-    type_map = get_type_mapper_from_specie(['Cl', 'H', 'N', 'Ti'])
+-    #type_map = get_type_mapper_from_specie(['Hf', 'O'])
+-    config[KEY.TYPE_MAP] = type_map
+-    config[KEY.CHEMICAL_SPECIES] = ['Cl', 'H', 'N', 'Ti']
+-    #config[KEY.CHEMICAL_SPECIES] = ['Hf', 'O']
+-    config[KEY.NUM_SPECIES] = 4
+-    config[KEY.MODEL_TYPE] = 'E3_equivariant_model'
+-    config[KEY.DTYPE] = "single"
+-    config[KEY.AVG_NUM_NEIGHBOR] = 16.475
+-
+-    model = build_E3_equivariant_model(config)
+-    stct_dct_raw = model.state_dict()
+-    stct_dct_raw_cp = copy.deepcopy(stct_dct_raw)
+-    #print(stct_dct.keys())
+-    #deploy_parallel(stct_dct, config, "deployed_parallel")
+-    #deploy(stct_cp, config, "deployed_serial.pt")
+-    #deploy_parallel(model, config, "deployed_test")
+-    #deploy(model, config, "deployed_ref.pt")
+-    #get_parallel_from_checkpoint('./checkpoint_260.pth')
+-
+-    config = checkpoint['config']
+-    stct_dct = checkpoint['model_state_dict']
+-    stct_cp = copy.deepcopy(stct_dct)
+-
+-    """
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/sevenn/scripts/processing_continue.py b/sevenn/scripts/processing_continue.py
+index 4bee12d5..4da16bea 100644
+--- a/sevenn/scripts/processing_continue.py
++++ b/sevenn/scripts/processing_continue.py
+@@ -43,8 +43,6 @@ def check_config_compatible(config, config_cp):
+         raise ValueError("reset optimizer and scheduler if you want to change "
+                          + "trainable configs")
+ 
+-    if config_cp[KEY.TRAIN_AVG_NUM_NEIGH] is True and config[KEY.TRAIN_AVG_NUM_NEIGH] is False:
+-        raise ValueError("Trainable neigh > not trainable: NOT SUPPORTED YET, contact to the author")
+     #TODO add conition for changed optim/scheduler but not reset
+ 
+ 
+@@ -59,6 +57,7 @@ def processing_continue(config):
+         raise FileNotFoundError(
+             f"checkpoint file {continue_dct[KEY.CHECKPOINT]} not found"
+         )
++
+     # it will raise error if not compatible
+     check_config_compatible(config, config_cp)
+     Logger().write("Checkpoint config is compatible\n")
+@@ -70,32 +69,29 @@ def processing_continue(config):
+     scheduler_state_dict_cp = checkpoint['scheduler_state_dict'] \
+         if not continue_dct[KEY.RESET_SCHEDULER] else None
+ 
+-    # Use checkpoints values if not specified in yaml
+-    if type(config[KEY.SHIFT]) not in [list, float]:
+-        shift = model_state_dict_cp['rescale atomic energy.shift'].numpy()
+-        Logger().write("Use shift of (defined in checkpoint)\n")
+-        Logger().format_k_v("shift", ', '.join([f"{x:.4f}" for x in shift]), write=True)
+-        config.update({KEY.SHIFT: shift})
+-    if type(config[KEY.SCALE]) not in [list, float]:
+-        scale = model_state_dict_cp['rescale atomic energy.scale'].numpy()
+-        Logger().write("Use scale of (defined in checkpoint)\n")
+-        Logger().format_k_v("scale", ', '.join([f"{x:.4f}" for x in scale]), write=True)
+-        config.update({KEY.SCALE: scale})
+-    if type(config[KEY.AVG_NUM_NEIGHBOR]) is not float:
+-        avg_num_neigh = (model_state_dict_cp['1 convolution.denumerator']**2).item()
+-        Logger().write("Use avg_num_neigh of (defined in checkpoint)\n")
+-        Logger().format_k_v("avg_num_neigh", f"{avg_num_neigh:.4f}", write=True)
+-        config.update({KEY.AVG_NUM_NEIGHBOR: avg_num_neigh})
+-
+-    Logger().write("If you don't want to continue with these values, "
+-                   + "specify values you want to input yaml\n")
+-    Logger().write("If the values were trainable, it would be changed\n")
++    shift_cp = model_state_dict_cp['rescale atomic energy.shift'].numpy()
++    del model_state_dict_cp['rescale atomic energy.shift']
++
++    scale_cp = model_state_dict_cp['rescale atomic energy.scale'].numpy()
++    del model_state_dict_cp['rescale atomic energy.scale']
++
++    avg_num_neigh_cp = []
++    for i in range(config_cp[KEY.NUM_CONVOLUTION]):
++        avg_num_neigh_cp.append(
++            (model_state_dict_cp[f'{i} convolution.denumerator']**2).item())
++        del model_state_dict_cp[f'{i} convolution.denumerator']
++
++    # these dataset-dependent values should be later handled by processing_dataset.py
++    config.update({KEY.SHIFT + "_cp": shift_cp,
++                   KEY.SCALE + "_cp": scale_cp,
++                   KEY.AVG_NUM_NEIGH + "_cp": avg_num_neigh_cp})
+ 
+     chem_speices_related = {
+         KEY.TYPE_MAP: config_cp[KEY.TYPE_MAP],
+         KEY.NUM_SPECIES: config_cp[KEY.NUM_SPECIES],
+         KEY.CHEMICAL_SPECIES: config_cp[KEY.CHEMICAL_SPECIES],
+-        KEY.CHEMICAL_SPECIES_BY_ATOMIC_NUMBER: config_cp[KEY.CHEMICAL_SPECIES_BY_ATOMIC_NUMBER],
++        KEY.CHEMICAL_SPECIES_BY_ATOMIC_NUMBER:
++        config_cp[KEY.CHEMICAL_SPECIES_BY_ATOMIC_NUMBER],
+     }
+     config.update(chem_speices_related)
+ 
+@@ -112,7 +108,7 @@ def processing_continue(config):
+ 
+     # decide csv file to continue
+     init_csv = True
+-    csv_fname = config[KEY.CSV_LOG]
++    csv_fname = config_cp[KEY.CSV_LOG]
+     if os.path.isfile(csv_fname):
+         # I hope python compare dict well
+         if config_cp[KEY.ERROR_RECORD] == config[KEY.ERROR_RECORD]:
+@@ -127,7 +123,8 @@ def processing_continue(config):
+         Logger().writeline(
+             f"{csv_fname} file not found, new csv file will be created"
+         )
+-
+     Logger().writeline("checkpoint loading was successful")
+-    return (model_state_dict_cp, optimizer_state_dict_cp, scheduler_state_dict_cp), \
+-            start_epoch, init_csv
++
++    state_dicts =\
++        (model_state_dict_cp, optimizer_state_dict_cp, scheduler_state_dict_cp)
++    return state_dicts, start_epoch, init_csv
+diff --git a/sevenn/scripts/processing_dataset.py b/sevenn/scripts/processing_dataset.py
+index 281c860a..ea59d18a 100644
+--- a/sevenn/scripts/processing_dataset.py
++++ b/sevenn/scripts/processing_dataset.py
+@@ -3,7 +3,6 @@
+ import random
+ 
+ import torch
+-from torch_geometric.loader import DataLoader
+ 
+ from sevenn.train.dataset import AtomGraphDataset
+ from sevenn.train.dataload import match_reader, file_to_dataset
+@@ -21,7 +20,7 @@ def dataset_load(file: str, config):
+     Logger().timer_start("loading dataset")
+ 
+     if file.endswith(".sevenn_data"):
+-        dataset = torch.load(file)
++        dataset = torch.load(file, map_location="cpu")
+     else:
+         reader, _ = match_reader(config[KEY.DATA_FORMAT],
+                                  **config[KEY.DATA_FORMAT_ARGS])
+@@ -35,14 +34,70 @@ def dataset_load(file: str, config):
+     return dataset
+ 
+ 
++def handle_shift_scale(config, train_set, checkpoint_given):
++    shift, scale, avg_num_neigh = None, None, None
++
++    Logger().writeline("\nCalculating statistic values from dataset")
++    if not config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
++        shift = train_set.get_per_atom_energy_mean()
++        scale = train_set.get_force_rms()
++        Logger().write(f"calculated per_atom_energy mean shift is {shift:.6f} eV\n")
++        Logger().write(f"calculated force rms scale is {scale:.6f} eV/Angstrom\n")
++    else:
++        type_map = config[KEY.TYPE_MAP]
++        n_chem = len(type_map)
++        shift = \
++            train_set.get_species_ref_energy_by_linear_comb(n_chem)
++        scale = \
++            train_set.get_species_wise_force_rms(n_chem)
++        chem_strs = onehot_to_chem(list(range(n_chem)), type_map)
++        Logger().write("calculated specie wise shift, scale is\n")
++        for cstr, sh, sc in zip(chem_strs, shift, scale):
++            Logger().format_k_v(f"{cstr}", f"{sh:.6f}, {sc:.6f}", write=True)
++    avg_num_neigh = train_set.get_avg_num_neigh()
++    Logger().format_k_v("avg_num_neigh", f"{avg_num_neigh:.6f}", write=True)
++
++    if checkpoint_given \
++            and config[KEY.CONTINUE][KEY.USE_STATISTIC_VALUES_OF_CHECKPOINT]:
++        Logger().writeline("Overwrite shift, scale, avg_num_neigh from checkpoint")
++        # Values extracted from checkpoint in processing_continue.py
++        shift = config[KEY.SHIFT + "_cp"]
++        scale = config[KEY.SCALE + "_cp"]
++        avg_num_neigh = config[KEY.AVG_NUM_NEIGH + "_cp"]
++
++    # overwrite shift scale anyway if defined in yaml.
++    if config[KEY.SHIFT] is not False:
++        Logger().writeline("Overwrite shift to value given in yaml")
++        if type(config[KEY.SHIFT]) is float \
++                and config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
++            shift = [config[KEY.SHIFT]] * len(config[KEY.TYPE_MAP])
++        else:
++            shift = config[KEY.SHIFT]
++    if config[KEY.SCALE] is not False:
++        Logger().writeline("Overwrite scale to value given in yaml")
++        if type(config[KEY.SCALE]) is float \
++                and config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
++            scale = [config[KEY.SCALE]] * len(config[KEY.TYPE_MAP])
++        else:
++            scale = config[KEY.SCALE]
++    if type(config[KEY.AVG_NUM_NEIGH]) in [float, list]:
++        Logger().writeline("Overwrite avg_num_neigh to value given in yaml")
++        avg_num_neigh = config[KEY.AVG_NUM_NEIGH]
++
++    if type(avg_num_neigh) is float:
++        avg_num_neigh = [avg_num_neigh] * config[KEY.NUM_CONVOLUTION]
++
++    return shift, scale, avg_num_neigh
++
++
+ # TODO: This is too long
+ def processing_dataset(config, working_dir):
+     prefix = f"{os.path.abspath(working_dir)}/"
+     is_stress = (config[KEY.IS_TRACE_STRESS] or config[KEY.IS_TRAIN_STRESS])
+     checkpoint_given = config[KEY.CONTINUE][KEY.CHECKPOINT] is not False
++    cutoff = config[KEY.CUTOFF]
+ 
+     Logger().write("\nInitializing dataset...\n")
+-    cutoff = config[KEY.CUTOFF]
+ 
+     dataset = AtomGraphDataset({}, cutoff)
+     load_dataset = config[KEY.LOAD_DATASET]
+@@ -59,15 +114,24 @@ def processing_dataset(config, working_dir):
+     else:
+         dataset.toggle_requires_grad_of_data(KEY.EDGE_VEC, True)
+ 
++    # TODO: I think manual chemical species input is redundant
+     chem_in_db = dataset.get_species()
+     if config[KEY.CHEMICAL_SPECIES] == "auto" and not checkpoint_given:
++        Logger().writeline("Auto detect chemical species from dataset")
+         config.update(chemical_species_preprocess(chem_in_db))
++    elif config[KEY.CHEMICAL_SPECIES] == "auto" and checkpoint_given:
++        pass # copied from checkpoint in processing_continue.py
++    elif config[KEY.CHEMICAL_SPECIES] != "auto" and not checkpoint_given:
++        pass # processed in parse_input.py
++    else:  # config[KEY.CHEMICAL_SPECIES] != "auto" and checkpoint_given
++        Logger().writeline("Ignore chemical species in yaml, use checkpoint")
++        # already processed in processing_continue.py
+ 
+     # basic dataset compatibility check with previous model
+     if checkpoint_given:
+         chem_from_cp = config[KEY.CHEMICAL_SPECIES]
+         if not all(chem in chem_from_cp for chem in chem_in_db):
+-            raise ValueError("Chemical species in checkpoint is not compatible with dataset")
++            raise ValueError("Chemical species in checkpoint is not compatible")
+ 
+     #--------------- save dataset regardless of train/valid--------------#
+     save_dataset = config[KEY.SAVE_DATASET]
+@@ -171,50 +235,11 @@ def processing_dataset(config, working_dir):
+     Logger().write(Logger.format_k_v("training_set size", train_set.len()))
+     Logger().write(Logger.format_k_v("validation_set size", valid_set.len()))
+ 
+-    shift, scale, avg_num_neigh = config[KEY.SHIFT], config[KEY.SCALE], config[KEY.AVG_NUM_NEIGHBOR]
+-    # init shift, scale from trainset
+-    if not checkpoint_given:
+-        Logger().write("\nCalculating shift and scale from training set...\n")
+-        if not config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
+-            shift = train_set.get_per_atom_energy_mean()
+-            scale = train_set.get_force_rms()
+-            Logger().write(f"calculated per_atom_energy mean shift is {shift:.6f} eV\n")
+-            Logger().write(f"calculated force rms scale is {scale:.6f} eV/Angstrom\n")
+-        else:
+-            type_map = config[KEY.TYPE_MAP]
+-            n_chem = len(type_map)
+-            shift = \
+-                train_set.get_species_ref_energy_by_linear_comb(n_chem)
+-            scale = \
+-                train_set.get_species_wise_force_rms()
+-            chem_strs = onehot_to_chem(list(range(n_chem)), type_map)
+-            Logger().write("Calculated specie wise shift, scale is\n")
+-            for k, (sft, scl) in zip(chem_strs, zip(shift, scale)):
+-                Logger().write(f"{k:<3} : {sft:.6f} eV, {scl:.6f} eV/Angstrom\n")
+-        # init avg_num_niegh from trainset
+-        Logger().write("Calculating average number of neighbor...\n")
+-        avg_num_neigh = train_set.get_avg_num_neigh()
+-        Logger().write(f"average number of neighbor is {avg_num_neigh:.6f}\n")
+-
+-    # overwrite shift scale if defined in yaml, regardless of checkpoint
+-    if config[KEY.SHIFT] is not False:
+-        Logger().write(f"Overwrite shift to user defined (or from checkpot) value: {config[KEY.SHIFT]}\n")
+-        if type(config[KEY.SHIFT]) is float and config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
+-            shift = [config[KEY.SHIFT]] * len(config[KEY.TYPE_MAP])
+-        else:
+-            shift = config[KEY.SHIFT]  # overwrite shift
+-    if config[KEY.SCALE] is not False:
+-        Logger().write(f"Overwrite scale to user defined (or from checkpot) value: {config[KEY.SCALE]}\n")
+-        if type(config[KEY.SCALE]) is float and config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
+-            scale = [config[KEY.SCALE]] * len(config[KEY.TYPE_MAP])
+-        else:
+-            scale = config[KEY.SCALE]  # overwrite scale
+-    if type(config[KEY.AVG_NUM_NEIGHBOR]) is float:
+-        Logger().write(f"Overwrite avg_num_neigh to user defined (or from checkpot) value: {config[KEY.AVG_NUM_NEIGHBOR]}\n")
+-        avg_num_neigh = config[KEY.AVG_NUM_NEIGHBOR]  # overwrite avg_num_neigh
+-        Logger().write(f"Convolutions will be normalized by {avg_num_neigh**(0.5):.4f}\n")
+-
+-    config.update({KEY.SHIFT: shift, KEY.SCALE: scale, KEY.AVG_NUM_NEIGHBOR: avg_num_neigh})
++    shift, scale, avg_num_neigh =\
++        handle_shift_scale(config, train_set, checkpoint_given)
++    config.update({KEY.SHIFT: shift,
++                   KEY.SCALE: scale,
++                   KEY.AVG_NUM_NEIGH: avg_num_neigh})
+ 
+     data_lists = (train_set.to_list(), valid_set.to_list(), test_set.to_list())
+     if config[KEY.DATA_SHUFFLE]:
+diff --git a/sevenn/scripts/train.py b/sevenn/scripts/train.py
+index b0ab6d51..023b8f66 100644
+--- a/sevenn/scripts/train.py
++++ b/sevenn/scripts/train.py
+@@ -11,10 +11,11 @@
+ from sevenn.scripts.processing_continue import processing_continue
+ from sevenn.scripts.processing_epoch import processing_epoch
+ from sevenn.sevenn_logger import Logger
++import sevenn.util
+ import sevenn._keys as KEY
+ 
+ 
+-def init_loader(train, valid, _, config):
++def init_loaders(train, valid, _, config):
+     batch_size = config[KEY.BATCH_SIZE]
+     is_ddp = config[KEY.IS_DDP]
+     if is_ddp:
+@@ -26,33 +27,22 @@ def init_loader(train, valid, _, config):
+         valid_sampler = DistributedSampler(valid,
+                                            num_replicas=dist.get_world_size(),
+                                            rank=dist.get_rank())
+-        train_loader = DataLoader(train, batch_size=batch_size, sampler=train_sampler)
+-        valid_loader = DataLoader(valid, batch_size=batch_size, sampler=valid_sampler)
++        train_loader = DataLoader(train,
++                                  batch_size=batch_size,
++                                  sampler=train_sampler)
++        valid_loader = DataLoader(valid,
++                                  batch_size=batch_size,
++                                  sampler=valid_sampler)
+     else:
+-        train_loader = DataLoader(train, batch_size=batch_size, shuffle=config[KEY.TRAIN_SHUFFLE])
+-        valid_loader = DataLoader(valid, batch_size=batch_size)
++        train_loader = DataLoader(train,
++                                  batch_size=batch_size,
++                                  shuffle=config[KEY.TRAIN_SHUFFLE])
++        valid_loader = DataLoader(valid,
++                                  batch_size=batch_size)
+     return train_loader, valid_loader, None
+ 
+ 
+-def log_model_info(model, config):
+-    # print model irreps for each layer
+-    Logger().write("Irreps of features\n")
+-    Logger().format_k_v("edge_feature",
+-                        model.get_irreps_in("EdgeEmbedding", "irreps_out"),
+-                        write=True)
+-    for i in range(config[KEY.NUM_CONVOLUTION]):
+-        Logger().format_k_v(f"{i}th node_feature",
+-                            model.get_irreps_in(f"{i}_self_interaction_1"),
+-                            write=True)
+-    Logger().format_k_v(f"readout irreps",
+-                        model.get_irreps_in(f"{i} equivariant gate", "irreps_out"),
+-                        write=True)
+-    num_weights = sum(p.numel() for p in model.parameters() if p.requires_grad)
+-    Logger().write(f"Total number of weight in model is {num_weights}\n")
+-
+-
+ # TODO: E3_equivariant model assumed
+-# TODO: More clear logging
+ def train(config, working_dir: str):
+     """
+     Main program flow
+@@ -69,8 +59,9 @@ def train(config, working_dir: str):
+         state_dicts, start_epoch, init_csv = None, 1, True
+ 
+     # config updated
++    # Note that continue and dataset cannot be seperated completely
+     data_lists = processing_dataset(config, working_dir)
+-    loaders = init_loader(*data_lists, config)
++    loaders = init_loaders(*data_lists, config)
+ 
+     Logger().write("\nModel building...\n")
+     model = build_E3_equivariant_model(config)
+@@ -81,7 +72,8 @@ def train(config, working_dir: str):
+     if state_dicts is not None:
+         trainer.load_state_dicts(*state_dicts, strict=False)
+ 
+-    log_model_info(model, config)
++    Logger().print_model_info(model, config)
++    #log_model_info(model, config)
+ 
+     Logger().write("Trainer initialized, ready to training\n")
+     Logger().bar()
+diff --git a/sevenn/sevenn_logger.py b/sevenn/sevenn_logger.py
+index 39326e3e..664de33d 100644
+--- a/sevenn/sevenn_logger.py
++++ b/sevenn/sevenn_logger.py
+@@ -225,7 +225,8 @@ def write_full_table(dict_list, row_labels, decimal_places=6, pad=2):
+         header = " " * (label_len + pad) + " ".join(
+             col_name.ljust(pad) for col_name, pad in zip(col_names, max_col_lengths)
+         )
+-        separator = "-".join("-" * pad for pad in max_col_lengths) + "-" * (label_len + pad)
++        separator = "-".join("-" * pad for pad in max_col_lengths) \
++            + "-" * (label_len + pad)
+ 
+         # Print header and separator
+         Logger().writeline(header)
+@@ -346,3 +347,34 @@ def dict_of_counter(self, counter_dict):
+ 
+         self.writeline('\n'.join(table_output))
+ 
++    #TODO: print it without config
++    def print_model_info(self, model, config):
++        from functools import partial
++        kv_write = partial(self.format_k_v, write=True)
++        self.writeline("Irreps of features")
++        kv_write("edge_feature",
++                 model.get_irreps_in("EdgeEmbedding", "irreps_out"))
++        for i in range(config[KEY.NUM_CONVOLUTION]):
++            kv_write(f"{i}th node_feature",
++                     model.get_irreps_in(f"{i}_self_interaction_1"))
++        kv_write("readout irreps",
++                 model.get_irreps_in(f"{i} equivariant gate", "irreps_out"))
++        shift = model._modules["rescale atomic energy"].shift
++        scale = model._modules["rescale atomic energy"].scale
++        if not config[KEY.USE_SPECIES_WISE_SHIFT_SCALE]:
++            kv_write("global shift", f"{shift.item():.6f}")
++            kv_write("global scale", f"{scale.item():.6f}")
++        else:
++            chem_str =\
++                sevenn.util.onehot_to_chem(list(range(config[KEY.NUM_SPECIES])),
++                                           config[KEY.TYPE_MAP])
++            self.writeline("shift, scale tuple for each chemical species")
++            for cstr, sh, sc in zip(chem_str, shift, scale):
++                kv_write(f"{cstr}", f"{sh:.6f}, {sc:.6f}")
++
++        self.writeline("Denumerator (avg_num_neigh**0.5) for each layer")
++        for i in range(config[KEY.NUM_CONVOLUTION]):
++            denumerator = model._modules[f'{i} convolution'].denumerator
++            kv_write(f"{i}th layer denumerator", f"{denumerator.item():.6f}")
++        num_weights = sum(p.numel() for p in model.parameters() if p.requires_grad)
++        self.writeline(f"Total number of weight in model is {num_weights}\n")
+diff --git a/sevenn/train/dataset.py b/sevenn/train/dataset.py
+index bf657b7e..a442d188 100644
+--- a/sevenn/train/dataset.py
++++ b/sevenn/train/dataset.py
+@@ -8,6 +8,8 @@
+ from torch_scatter import scatter
+ import numpy as np
+ from sklearn.linear_model import LinearRegression
++from sklearn.linear_model import Lasso
++from sklearn.linear_model import Ridge
+ from ase.data import chemical_symbols
+ 
+ import sevenn.util as util
+@@ -257,7 +259,7 @@ def get_per_atom_energy_mean(self):
+         """
+         return self.get_per_atom_mean(self.DATA_KEY_ENERGY)
+ 
+-    def get_species_ref_energy_by_linear_comb(self, num_chem_species=0):
++    def get_species_ref_energy_by_linear_comb(self, num_chem_species):
+         """
+         Total energy as y, composition as c_i,
+         solve linear regression of y = c_i*X
+@@ -269,10 +271,6 @@ def get_species_ref_energy_by_linear_comb(self, num_chem_species=0):
+         assert self.x_is_one_hot_idx is True
+         data_list = self.to_list()
+ 
+-        if num_chem_species == 0:
+-            tmp = torch.concat([x[self.DATA_KEY_X] for x in data_list])
+-            num_chem_species = int(tmp.max() + 1)
+-
+         c = torch.zeros((len(data_list), num_chem_species))
+         for idx, datum in enumerate(data_list):
+             c[idx] = torch.bincount(datum[self.DATA_KEY_X],
+@@ -280,9 +278,15 @@ def get_species_ref_energy_by_linear_comb(self, num_chem_species=0):
+         y = torch.Tensor([x[self.DATA_KEY_ENERGY] for x in data_list])
+         c = c.numpy()
+         y = y.numpy()
+-        reg = LinearRegression(fit_intercept=False).fit(c, y)
+ 
+-        return torch.Tensor(reg.coef_)
++        # tweak to fine tune training from many-element to small element
++        zero_indicies = np.all(c == 0, axis=0)
++        c_reduced = c[:, ~zero_indicies]
++        full_coeff = np.zeros(num_chem_species)
++        coef_reduced = Ridge(alpha=0.1, fit_intercept=False).fit(c_reduced, y).coef_
++        full_coeff[~zero_indicies] = coef_reduced
++
++        return full_coeff
+ 
+     def get_force_rms(self):
+         force_list = []
+@@ -291,7 +295,7 @@ def get_force_rms(self):
+         force_list = torch.Tensor(force_list)
+         return float(torch.sqrt(torch.mean(torch.pow(force_list, 2))))
+ 
+-    def get_species_wise_force_rms(self):
++    def get_species_wise_force_rms(self, num_chem_species):
+         """
+         Return force rms for each species
+         Averaged by each components (x, y, z)
+@@ -302,9 +306,10 @@ def get_species_wise_force_rms(self):
+         atomx = torch.concat([d[self.DATA_KEY_X] for d in data_list])
+         force = torch.concat([d[self.DATA_KEY_FORCE] for d in data_list])
+ 
+-        return torch.sqrt(
+-            scatter(force.square(), atomx, dim=0, reduce='mean').mean(dim=1)
+-        )
++        rms = torch.sqrt(scatter(force.square(), atomx, dim=0, reduce='mean').mean(dim=1))
++        if len(rms) < num_chem_species:
++            rms = torch.cat([rms, torch.zeros(num_chem_species - len(rms))])
++        return rms
+ 
+     def get_avg_num_neigh(self):
+         n_neigh = []
