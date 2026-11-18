@@ -67,7 +67,7 @@ Hugging Face by repo2rlenv push.
 This release is a **partial snapshot** of an unfinished generation run.
 
 - Generation-complete flag: generation_complete_expansion.flag - **ABSENT** (not faked)
-- Bank progress at snapshot: **26225 / 100000** tasks (26.2%)
+- Bank progress at snapshot: **53477 / 100000** tasks (53.5%)
 - This domain: **4144** tasks from **123** repositories
 
 See PARTIAL_SNAPSHOT.md for the full statement.
